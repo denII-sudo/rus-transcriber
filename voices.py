@@ -1,0 +1,549 @@
+"""Голоса: отпечатки фрагментов, профили участников, проверка и исправление подписей.
+
+Отпечаток — та же модель WeSpeaker ResNet34, что внутри pyannote (pipe._embedding), поэтому
+профили, собранные из прошлых записей, сравнимы с кластерами новой записи.
+
+Профили лежат в DATA_DIR\\groups\\<group>\\voices.json (paths.voices_path) и с этого компьютера не уходят:
+это биометрия участников. Словарь группы (vocab.py) передаётся отдельно, без них.
+Профиль пополняется сам: перед расшифровкой берутся расшифровки из папки записи, в которых имена
+подтверждены (переименованы через rename_speakers), и ещё не учтённые.
+"""
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+SR = 16000
+CAP = 10.0            # от длинных фрагментов берём середину не длиннее
+MIN_EMB = 0.6         # короче — отпечаток слишком шумный
+LEARN_MIN = 2.0       # для профиля берём реплики от 2 с
+MATCH_MIN = 0.50      # кластер записи считается голосом участника при сходстве не ниже
+MATCH_MARGIN = 0.08   # и отрыве от второго по сходству участника
+WIN, HOP = 1.5, 0.75  # окна для поиска чужого голоса внутри реплики
+SCAN_MIN = 3.0        # проверяем внутри реплик не короче
+SPLIT_MARGIN = 0.12   # окно чужое, если сходство с другим голосом выше своего на столько
+SPLIT_MIN_RUN = 2     # минимум подряд чужих окон (≈2,25 с)
+REASSIGN_MIN = 1.0    # пореплично по профилям сверяем реплики от 1 с
+OWN_BONUS = 0.05      # поправка в пользу кластера, к которому реплику отнёс pyannote
+PROFILE_VERSION = 3   # 3: отпечатки без дополнения тишиной
+
+
+def _log(msg):
+    print(f"[voices] {msg}", file=sys.stderr, flush=True)
+
+
+def _norm(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 0 and np.isfinite(n) else None
+
+
+class Embedder:
+    def __init__(self, pipe, batch=32):
+        self.emb = getattr(pipe, "_embedding", None)
+        if self.emb is None:
+            raise RuntimeError("в pyannote нет модели отпечатков (_embedding)")
+        self.batch = batch
+        self.seconds = 0.0
+
+    def spans(self, audio, spans, cap=CAP, min_len=MIN_EMB, progress=None):
+        """spans: [(start, end)] в секундах -> список нормированных векторов или None.
+        progress(done, total) — после каждого пакета (для статуса задачи)."""
+        import torch
+        t0 = time.time()
+        items = []
+        for k, (s, e) in enumerate(spans):
+            if e - s < min_len:
+                continue
+            if e - s > cap:
+                mid = (s + e) / 2
+                s, e = mid - cap / 2, mid + cap / 2
+            a, b = int(max(0, s) * SR), int(min(len(audio) / SR, e) * SR)
+            if b - a >= int(min_len * SR):
+                items.append((k, a, b))
+        out = [None] * len(spans)
+        # Пакетом считаем только фрагменты одинаковой длины: дополнение тишиной искажает отпечаток
+        # (маски у этой модели его не убирают — проверено на записи 06.11). Разной длины — по одному.
+        groups, done_n = {}, 0
+        for k, a, b in items:
+            groups.setdefault(b - a, []).append((k, a, b))
+        for n, grp in groups.items():
+            for i in range(0, len(grp), self.batch):
+                part = grp[i:i + self.batch]
+                w = np.stack([audio[a:b] for _, a, b in part])[:, None, :].astype(np.float32)
+                vecs = np.asarray(self.emb(torch.from_numpy(w)))
+                for j, (k, _, _) in enumerate(part):
+                    out[k] = _norm(np.asarray(vecs[j], dtype=np.float32))
+                done_n += len(part)
+                if progress:
+                    progress(done_n, len(items))
+        self.seconds += time.time() - t0
+        return out
+
+
+def centroids(turns, embs, min_len=1.5):
+    """{label: вектор} по репликам записи, вес — длительность."""
+    acc = {}
+    for t, v in zip(turns, embs):
+        if v is None or t["e"] - t["s"] < min_len:
+            continue
+        w = min(t["e"] - t["s"], CAP)
+        acc.setdefault(t["label"], []).append((w, v))
+    out = {}
+    for lbl, items in acc.items():
+        c = _norm(sum(w * v for w, v in items))
+        if c is None:
+            continue
+        # отбрасываем явные чужие куски и пересчитываем
+        good = [(w, v) for w, v in items if float(v @ c) >= 0.25] or items
+        out[lbl] = _norm(sum(w * v for w, v in good))
+    return out
+
+
+# ---------- профили ----------
+def profile_path(group):
+    import paths
+    return paths.voices_path(group)
+
+
+def load_profile(path):
+    p = Path(path)
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if d.get("version") != PROFILE_VERSION:
+                _log(f"профиль {p.name} старой версии {d.get('version')} — собираю заново")
+                raise ValueError("old version")
+            for name, s in d.get("speakers", {}).items():
+                for part in s.get("parts", {}).values():
+                    part["vec"] = np.asarray(part["vec"], dtype=np.float32)
+            return d
+        except Exception as ex:
+            _log(f"профиль {p} не прочитан: {ex}")
+    return {"version": PROFILE_VERSION, "model": "wespeaker-resnet34 (pyannote community-1)", "speakers": {}, "sources": {}}
+
+
+def save_profile(path, prof):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    d = dict(prof)
+    d["schema_version"] = 1
+    d["speakers"] = {n: {"parts": {k: {**{kk: vv for kk, vv in part.items() if kk != "vec"},
+                                       "vec": [round(float(x), 6) for x in part["vec"]]}
+                                   for k, part in s.get("parts", {}).items()}}
+                     for n, s in prof["speakers"].items()}
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def voice_vectors(prof, exclude_audio=None):
+    """{имя: вектор} по всем учтённым записям, кроме exclude_audio (своя запись не подсказывает сама себе)."""
+    ex = str(Path(exclude_audio).resolve()).lower() if exclude_audio else None
+    out = {}
+    for name, s in prof.get("speakers", {}).items():
+        parts = [pt for src, pt in s.get("parts", {}).items() if src.lower() != ex]
+        if parts:
+            v = _norm(sum(pt["vec"] * pt["sec"] for pt in parts))
+            if v is not None:
+                out[name] = v
+    return out
+
+
+def _confirmed(data):
+    """Имена в расшифровке подтверждены (rename_speakers), а не угаданы по голосу."""
+    if data.get("names_confirmed"):
+        return True
+    return bool(data.get("speaker_names")) and not data.get("names_source")
+
+
+HUMAN_WEIGHT = 3.0    # отрезок, подписанный человеком, весит втрое больше обычного
+HUMAN_MIN = 0.8       # отрезки человека — от 0,8 с чистой речи
+DRIFT_MIN = 0.8       # сходство нового профиля со старым ниже — профиль «уплыл», показать человеку
+# защита от тёзок — разных людей с одним именем (другая группа, новый участник):
+SAME_MIN = 0.70       # вклад записи похож на профиль имени меньше — в карантин, а не в профиль
+SAME_MARGIN = 0.05    # или вклад ближе к другому участнику на столько
+GATE_MIN_SEC = 20.0   # проверка — когда у имени уже есть столько секунд из других записей
+GATE_PART_SEC = 4.0   # и вклад записи не короче (короткие отрезки слишком шумные для вывода)
+
+
+def group_of(data, _cache={}):
+    """Группа расшифровки: поле group, иначе group словаря, с которым она сделана (quality.vocab)."""
+    if data.get("group"):
+        return data["group"]
+    vp = (data.get("quality") or {}).get("vocab")
+    if not vp:
+        return None
+    if vp not in _cache:
+        try:
+            _cache[vp] = json.loads(Path(vp).read_text(encoding="utf-8-sig")).get("group")
+        except Exception:
+            _cache[vp] = None
+    return _cache[vp]
+
+
+def _spans(data, confirmed):
+    """Отрезки «говорящий — время» для профиля: (имя, начало, конец, человек?).
+    Человек: слова, подписанные или исправленные человеком (by=human), кроме наложений.
+    Модель: только в подтверждённых расшифровках и только слова без пометок сомнения."""
+    out = []
+    for seg in data["segments"]:
+        name = seg["speaker"]
+        if str(name).startswith("Спикер"):
+            continue
+        run, kind = [], None
+        for w in (seg.get("words") or []) + [None]:
+            if w is not None:
+                human = w.get("by") == "human" and "overlap" not in (w.get("flags") or [])
+                auto = confirmed and not w.get("flags") and w.get("by") != "human" and not w.get("inserted")
+                k = "h" if human else ("a" if auto else None)
+            else:
+                k = None
+            if run and k != kind:
+                s, e = run[0]["s"], run[-1]["e"]
+                if (kind == "h" and e - s >= HUMAN_MIN) or (kind == "a" and e - s >= LEARN_MIN):
+                    out.append((name, s, e, kind == "h"))
+                run = []
+            if k:
+                run.append(w)
+                kind = k
+        if not seg.get("words") and confirmed and seg["end"] - seg["start"] >= LEARN_MIN:
+            out.append((name, seg["start"], seg["end"], False))       # старые расшифровки без слов
+    return out
+
+
+def _human_pairs(data):
+    """Поправки человека «профиль/модель сказали A — это B» из журнала правок. -> {(A, B): n}."""
+    out = {}
+    for ed in data.get("edits") or []:
+        if ed.get("by") != "human":
+            continue
+        a, b = (ed.get("before") or {}).get("speaker"), (ed.get("after") or {}).get("speaker")
+        if a and b and a != b and "," not in a and "," not in b:
+            out[(a, b)] = out.get((a, b), 0) + 1
+        for line in (ed.get("pairs") or []):
+            out[tuple(line)] = out.get(tuple(line), 0) + 1
+    return out
+
+
+def confusions(prof, exclude_audio=None):
+    """{(сказал профиль, подтвердил человек): n} по всем записям, кроме exclude_audio."""
+    ex = str(Path(exclude_audio).resolve()).lower() if exclude_audio else None
+    out = {}
+    for akey, pairs in (prof.get("confusions") or {}).items():
+        if ex and akey.lower() == ex:
+            continue
+        for k, n in pairs.items():
+            a, b = k.split("|", 1)
+            out[(a, b)] = out.get((a, b), 0) + n
+    return out
+
+
+def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None):
+    """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
+    Вклад каждой записи хранится отдельно (ключ — путь к аудио) и при каждом учёте пересчитывается из
+    текущей стенограммы: отменённый ответ человека уходит из профиля сам. На одну запись берётся самая
+    свежая расшифровка, в которой есть подтверждённые имена или правки человека.
+    В профиль идут: отрезки, подписанные человеком (вес ×3), и — в подтверждённых расшифровках — слова
+    без пометок сомнения. Поправки «A → B» человеком копятся как спутанные пары (confusions).
+    Если профиль участника после пересчёта сильно отличается от прежнего (сходство < DRIFT_MIN),
+    это записывается в warnings. only — учесть только эти файлы .transcript.json.
+    Защита от тёзок: расшифровка другой группы (group) пропускается; вклад записи, непохожий на уже
+    собранный голос этого имени (SAME_MIN, SAME_MARGIN), в профиль не идёт, а ждёт решения человека
+    в prof["quarantine"] (resolve_voice: тот же человек или другой)."""
+    learned = []
+    files = sorted(set(Path(folder).glob("*.transcript.json")) | set(Path(folder).glob("*.rus-transcriber/*.transcript.json")))
+    if only:
+        files = [Path(p) for p in only]
+    best, conf_best = {}, {}
+    for jp in files:
+        try:
+            data = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        g = group_of(data)
+        if group and g and g != group:       # расшифровка другой группы: её «Анна» — не наша
+            continue
+        if data.get("no_profile"):           # общий словарь без group: в профили групп не идёт
+            continue
+        has_human = any(ed.get("by") == "human" for ed in data.get("edits") or [])
+        if not (_confirmed(data) or has_human):
+            continue
+        src = Path(data.get("file", ""))
+        if not src.exists():
+            continue
+        akey = str(src.resolve())
+        mt = jp.stat().st_mtime
+        if akey not in best or mt > best[akey][1]:
+            best[akey] = (jp, mt, data, src)
+        if _confirmed(data) and (akey not in conf_best or mt > conf_best[akey][1]):
+            conf_best[akey] = (jp, mt, data)
+    if only:      # подтверждённые расшифровки той же записи из её папки — для слов модели
+        for jp in sorted(set(Path(files[0]).parent.glob("*.transcript.json")) |
+                         set(Path(files[0]).parent.parent.glob("*.transcript.json"))) if files else []:
+            try:
+                data = json.loads(jp.read_text(encoding="utf-8"))
+                akey = str(Path(data.get("file", "")).resolve())
+                if akey in best and _confirmed(data):
+                    mt = jp.stat().st_mtime
+                    if akey not in conf_best or mt > conf_best[akey][1]:
+                        conf_best[akey] = (jp, mt, data)
+            except Exception:
+                continue
+    prof.setdefault("history", [])
+    prof.setdefault("warnings", [])
+    prof.setdefault("confusions", {})
+    for akey, (jp, mt, data, src) in best.items():
+        if len(learned) >= limit:
+            break
+        key = str(jp.resolve())
+        if prof["sources"].get(key) == mt and not only:
+            continue
+        try:
+            confirmed = _confirmed(data)
+            spans = _spans(data, confirmed)
+            if not confirmed and akey in conf_best:
+                # имена этой расшифровки не подтверждены: слова модели — из подтверждённой расшифровки той же
+                # записи, отрезки человека — из этой (самой свежей)
+                hum = [s for s in spans if s[3]]
+                auto = [s for s in _spans(conf_best[akey][2], True) if not s[3]
+                        and not any(s[1] < h[2] and h[1] < s[2] for h in hum)]   # человек главнее
+                spans = hum + auto
+            spans = [s for s in spans if not names or s[0] in names]
+            t0 = time.time()
+            before = voice_vectors(prof)
+            per = {}
+            if spans:
+                audio = load_audio(src)
+                vecs = embedder.spans(audio, [(s, e) for _, s, e, _ in spans], cap=8.0)
+                for (name, s, e, human), v in zip(spans, vecs):
+                    if v is not None:
+                        sec = min(e - s, 8.0)
+                        per.setdefault(name, []).append((sec * (HUMAN_WEIGHT if human else 1.0), v, human, sec))
+            # вклад этой записи заменяется целиком (в том числе убираются прежние ошибки)
+            for name, s in prof["speakers"].items():
+                s.get("parts", {}).pop(akey, None)
+            ident = prof.setdefault("identity", {}).get(akey, {})
+            quar = prof.setdefault("quarantine", {})
+            quar.pop(akey, None)
+            others = voice_vectors(prof)          # своя запись уже убрана
+            other_sec = {n: sum(pt["sec"] for pt in sp.get("parts", {}).values())
+                         for n, sp in prof["speakers"].items()}
+            same_sims = {}
+            for name, items in per.items():
+                if ident.get(name) == "different":
+                    continue                       # человек решил: в этой записи другой человек с этим именем
+                c = _norm(sum(w * v for w, v, _, _ in items))
+                good = [it for it in items if it[2] or float(it[1] @ c) >= 0.3] or items
+                c = _norm(sum(w * v for w, v, _, _ in good))
+                if c is None:
+                    continue
+                part_sec = sum(sec for _, _, _, sec in good)
+                if ident.get(name) != "same" and name in others and other_sec.get(name, 0) >= GATE_MIN_SEC \
+                        and part_sec >= GATE_PART_SEC:
+                    sim = float(c @ others[name])
+                    same_sims[name] = round(sim, 3)
+                    near = max(((float(c @ v), n) for n, v in others.items() if n != name), default=(-1.0, None))
+                    if sim < SAME_MIN or near[0] - sim >= SAME_MARGIN:
+                        quar.setdefault(akey, {})[name] = {
+                            "similarity": round(sim, 3), "closest_other": near[1],
+                            "closest_other_sim": round(near[0], 3), "sec": round(part_sec, 1),
+                            "from": jp.name, "json": str(jp), "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                        prof["warnings"].append({
+                            "at": time.strftime("%Y-%m-%d %H:%M:%S"), "speaker": name, "similarity": round(sim, 3),
+                            "from": jp.name, "kind": "namesake",
+                            "note": (f"голос «{name}» в этой записи не похож на собранный профиль"
+                                     + (f" (ближе к «{near[1]}»)" if near[0] - sim >= SAME_MARGIN else "")
+                                     + " — тёзка или ошибка подписи; в профиль не добавлено, решение — resolve_voice")})
+                        continue
+                prof["speakers"].setdefault(name, {"parts": {}})["parts"][akey] = {
+                    "vec": c, "sec": round(sum(sec for _, _, h, sec in good if not h)
+                                           + HUMAN_WEIGHT * sum(sec for _, _, h, sec in good if h), 1),
+                    "human_sec": round(sum(sec for _, _, h, sec in good if h), 1),
+                    "auto_sec": round(sum(sec for _, _, h, sec in good if not h), 1),
+                    "from": jp.name, "confirmed": confirmed}
+            pairs = _human_pairs(data)
+            prof["confusions"][akey] = {f"{a}|{b}": n for (a, b), n in pairs.items()}
+            after = voice_vectors(prof)
+            drift = {}
+            for name in after:
+                if name in before:
+                    sim = float(before[name] @ after[name])
+                    drift[name] = round(sim, 3)
+                    if sim < DRIFT_MIN:
+                        prof["warnings"].append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "speaker": name,
+                                                 "similarity": round(sim, 3), "from": jp.name,
+                                                 "note": "профиль сильно изменился — проверить отрезки этой записи"})
+            prof["history"].append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "from": jp.name,
+                                    "speakers": {n: {"human_sec": prof["speakers"][n]["parts"][akey]["human_sec"],
+                                                     "auto_sec": prof["speakers"][n]["parts"][akey]["auto_sec"]}
+                                                 for n in per if akey in prof["speakers"].get(n, {}).get("parts", {})},
+                                    "drift": drift, "pairs": {f"{a}|{b}": n for (a, b), n in pairs.items()},
+                                    "same_sim": same_sims,
+                                    **({"quarantine": sorted(quar[akey])} if quar.get(akey) else {})})
+            prof["history"] = prof["history"][-200:]
+            prof["warnings"] = prof["warnings"][-50:]
+            prof["revision"] = int(prof.get("revision", 0)) + 1
+            learned.append(jp.name)
+            _log(f"профиль пополнен из {jp.name}: {sorted(per)} за {time.time() - t0:.1f} с")
+            prof["sources"][key] = mt
+        except Exception as ex:
+            _log(f"{jp.name} пропущен: {type(ex).__name__}: {ex}")
+    return learned
+
+
+def match(cents, vecs, allowed=None):
+    """Каждый кластер записи сравнивается с голосами профиля отдельно: имя даётся при сходстве
+    ≥ MATCH_MIN и отрыве от второго ≥ MATCH_MARGIN. Несколько кластеров могут получить одно имя
+    (pyannote иногда делит голос надвое); отсутствующий в записи участник никому не навязывается.
+    -> {label: (имя, сходство)}"""
+    names = [n for n in vecs if not allowed or n in allowed]
+    out = {}
+    for lbl, c in cents.items():
+        sims = sorted(((float(c @ vecs[n]), n) for n in names), reverse=True)
+        if not sims:
+            continue
+        best, second = sims[0], (sims[1][0] if len(sims) > 1 else -1.0)
+        if best[0] >= MATCH_MIN and best[0] - second >= MATCH_MARGIN:
+            out[lbl] = (best[1], round(best[0], 3))
+    return out
+
+
+def references(cents, turns, mapping):
+    """Опорный голос каждого опознанного участника — центр его самого большого кластера в этой записи.
+    -> ({имя: вектор}, {имя: label})"""
+    size = {}
+    for t in turns:
+        size[t["label"]] = size.get(t["label"], 0.0) + t["e"] - t["s"]
+    refs, main = {}, {}
+    for lbl, (name, _) in mapping.items():
+        if lbl in cents and (name not in main or size.get(lbl, 0) > size.get(main[name], 0)):
+            main[name], refs[name] = lbl, cents[lbl]
+    return refs, main
+
+
+# ---------- проверка внутри записи ----------
+def _quiet_point(audio, t, radius=0.4, frame=0.03):
+    hop = int(frame * SR)
+    a, b = int(max(0, t - radius) * SR), int(min(len(audio) / SR, t + radius) * SR)
+    seg = audio[a:b]
+    n = len(seg) // hop
+    if n < 2:
+        return t
+    rms = np.sqrt((seg[:n * hop].reshape(n, hop) ** 2).mean(axis=1))
+    return (a + int(rms.argmin()) * hop + hop // 2) / SR
+
+
+def scan_split(audio, turns, refs, name_of, label_of, embedder, fixes):
+    """Ищет внутри длинных реплик куски с другим опознанным голосом и разрезает реплику.
+    refs: {имя: вектор}; name_of: {label: имя}; label_of: {имя: основной label}."""
+    names = list(refs)
+    if len(names) < 2:
+        return turns
+    C = np.stack([refs[n] for n in names])
+    out = []
+    for t in turns:
+        dur = t["e"] - t["s"]
+        if dur < SCAN_MIN or name_of.get(t["label"]) not in refs:
+            out.append(t)
+            continue
+        starts = np.arange(t["s"], t["e"] - WIN + 1e-6, HOP)
+        vecs = embedder.spans(audio, [(s, s + WIN) for s in starts], min_len=WIN * 0.9)
+        own = names.index(name_of[t["label"]])
+        tags = []
+        for v in vecs:
+            if v is None:
+                tags.append(own)
+                continue
+            sims = C @ v
+            j = int(sims.argmax())
+            tags.append(j if j != own and sims[j] - sims[own] >= SPLIT_MARGIN else own)
+        # серии чужих окон
+        runs, k = [], 0
+        while k < len(tags):
+            if tags[k] != own:
+                j = k
+                while j + 1 < len(tags) and tags[j + 1] == tags[k]:
+                    j += 1
+                if j - k + 1 >= SPLIT_MIN_RUN:
+                    runs.append((k, j, tags[k]))
+                k = j + 1
+            else:
+                k += 1
+        if not runs:
+            out.append(t)
+            continue
+        cur = t["s"]
+        for k0, k1, lab in runs:
+            a = _quiet_point(audio, max(t["s"], starts[k0] + HOP / 2))
+            b = _quiet_point(audio, min(t["e"], starts[k1] + WIN - HOP / 2))
+            a = cur if a - cur < 0.5 else a          # обрывок короче 0,5 с не оставляем
+            b = t["e"] if t["e"] - b < 0.5 else b
+            if b - a < 1.0 or a < cur:
+                continue
+            if a > cur:
+                out.append({**t, "s": cur, "e": a})
+            out.append({**t, "s": a, "e": b, "label": label_of[names[lab]],
+                        "fix": f"голос внутри реплики: {name_of[t['label']]}→{names[lab]}"})
+            fixes.append({"t": round(a, 1), "kind": "split", "from": name_of[t["label"]], "to": names[lab],
+                          "sec": round(b - a, 1)})
+            cur = b
+        if t["e"] > cur:
+            out.append({**t, "s": cur, "e": t["e"]})
+    return out
+
+
+def reassign(turns, embs, pvecs, name_of, label_of, fixes, debug=None, new_label=None):
+    """Пореплично сверяет голос с профилями участников. Своему кластеру даётся поправка OWN_BONUS:
+    реплика переходит к другому участнику, только если её голос ближе к его профилю с запасом.
+    Подобрано на отрывке 06.11 (профиль — только по 05.11): совпадение подписей с выверенной
+    стенограммой по словам 93,7% -> 95,1%. Участник, которого pyannote не выделил в отдельный кластер
+    (слил с другим), получает новую метку через new_label(имя).
+    debug: сюда пишется сходство каждой реплики с каждым голосом."""
+    names = list(pvecs)
+    if len(names) < 2:
+        return turns
+    C = np.stack([pvecs[n] for n in names])
+    out = []
+    for t, v in zip(turns, embs):
+        own = name_of.get(t["label"])
+        if v is None:
+            out.append(t)
+            continue
+        sims = C @ v
+        if debug is not None:
+            debug.append({"t": round(t["s"], 2), "dur": round(t["e"] - t["s"], 2), "speaker": own or t["label"],
+                          "sims": {n: round(float(x), 3) for n, x in zip(names, sims)}})
+        if t["e"] - t["s"] < REASSIGN_MIN or t.get("fix"):
+            out.append(t)
+            continue
+        score = sims + np.array([OWN_BONUS if n == own else 0.0 for n in names])
+        j = int(score.argmax())
+        best = names[j]
+        if own is None:
+            srt = np.sort(sims)
+            if sims[j] < MATCH_MIN or srt[-1] - srt[-2] < 0.05:
+                out.append(t)
+                continue
+        if best != own:
+            lbl = label_of.get(best) or (new_label(best) if new_label else None)
+            if lbl:
+                fixes.append({"t": round(t["s"], 1), "kind": "voice", "from": own or t["label"], "to": best,
+                              "sim": [round(float(sims[names.index(own)]), 2) if own in names else None,
+                                      round(float(sims[j]), 2)]})
+                t = {**t, "label": lbl, "fix": f"голос реплики: {own or t['label']}→{best}"}
+        out.append(t)
+    return out
+
+
+def merge_adjacent(turns, gap=0.3):
+    out = []
+    for t in sorted(turns, key=lambda x: x["s"]):
+        if out and out[-1]["label"] == t["label"] and t["s"] - out[-1]["e"] < gap and not t.get("fix") \
+                and not out[-1].get("fix"):
+            out[-1] = {**out[-1], "e": max(out[-1]["e"], t["e"])}
+        else:
+            out.append(dict(t))
+    return out

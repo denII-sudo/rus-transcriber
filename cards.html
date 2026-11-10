@@ -1,0 +1,378 @@
+<title>Разбор расшифровки</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Лента карточек: сводка сверху, одна колонка мест; у каждого — клип, реплика с местом, вопрос, варианты. */
+:root{
+  --bg:#f3f5f2; --surface:#ffffff; --fg:#1d2420; --muted:#5f6b64; --line:#d9dfd9;
+  --accent:#0d6e5b; --accent-ink:#ffffff; --mark:#f5d76e; --mark-ink:#1d2420;
+  --ok:#2f7d3a; --warn:#a15c00; --info:#2c5aa0;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#141917; --surface:#1c2320; --fg:#e4ebe6; --muted:#9aa8a0; --line:#2e3833;
+  --accent:#3fb59a; --accent-ink:#0b1310; --mark:#8a7322; --mark-ink:#fff6d6;
+  --ok:#6cc27a; --warn:#e2a64b; --info:#7fa8e6; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#141917; --surface:#1c2320; --fg:#e4ebe6; --muted:#9aa8a0; --line:#2e3833;
+  --accent:#3fb59a; --accent-ink:#0b1310; --mark:#8a7322; --mark-ink:#fff6d6;
+  --ok:#6cc27a; --warn:#e2a64b; --info:#7fa8e6; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 var(--f-body)}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 48px;display:grid;gap:16px}
+header{display:grid;gap:8px}
+h1{font:600 1.55rem/1.15 var(--f-display);margin:0;text-wrap:balance;letter-spacing:.01em}
+.sub{color:var(--muted);margin:0}
+.bar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.meter{flex:1 1 180px;height:8px;background:var(--line);border-radius:4px;overflow:hidden;min-width:120px}
+.meter i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.count{font:500 .9rem var(--f-mono);font-variant-numeric:tabular-nums}
+.filters{display:flex;gap:6px}
+.chip{font:500 .78rem var(--f-mono);border:1px solid var(--line);border-radius:999px;padding:2px 9px;color:var(--muted);background:transparent}
+button.chip{cursor:pointer}
+button.chip[aria-pressed="true"]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.note{border-left:3px solid var(--info);padding:6px 10px;color:var(--muted);background:var(--surface);font-size:.9rem}
+.note[data-kind="warn"]{border-color:var(--warn)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:grid;gap:10px;min-width:0}
+.card[data-done="1"]{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
+.head{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:baseline}
+.tc{font:500 .95rem var(--f-mono);font-variant-numeric:tabular-nums}
+.who{font-weight:600}
+.reasons{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+.ctx{display:grid;gap:4px;font-size:.93rem;min-width:0}
+.ctx .side{color:var(--muted)}
+.ctx p{margin:0;overflow-wrap:anywhere;white-space:pre-line}
+mark{background:var(--mark);color:var(--mark-ink);padding:0 2px;border-radius:2px}
+audio{width:100%;height:36px}
+.q{font-weight:600;margin:0}
+.opts{display:grid;gap:6px}
+.opt{display:flex;gap:10px;align-items:flex-start;text-align:left;width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);font:inherit;cursor:pointer}
+.opt:hover{border-color:var(--accent)}
+.opt .n{font:500 .85rem var(--f-mono);color:var(--muted);min-width:1.2em}
+.opt .lbl{flex:1;min-width:0;overflow-wrap:anywhere}
+.opt .rec{font:500 .72rem var(--f-mono);color:var(--accent);text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+.opt[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.opt[aria-pressed="true"] .n,.opt[aria-pressed="true"] .rec{color:var(--accent-ink)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.btn{font:500 .88rem var(--f-body);padding:6px 12px;border-radius:7px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer}
+.btn:hover{border-color:var(--fg)}
+.btn[aria-pressed="true"]{background:var(--fg);color:var(--bg)}
+.btn.rec-on{background:#c0392b;color:#fff;border-color:#c0392b}
+.free{display:flex;gap:8px;flex-wrap:wrap}
+.free input{flex:1 1 220px;min-width:0;font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg)}
+.state{font-size:.86rem;color:var(--muted);min-height:1.2em}
+.state b{color:var(--ok);font-weight:600}
+.last{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;padding:8px 12px;border-radius:8px;background:color-mix(in srgb,var(--ok) 12%,var(--surface));border:1px solid color-mix(in srgb,var(--ok) 35%,var(--line))}
+.last .k{font:500 .72rem var(--f-mono);text-transform:uppercase;letter-spacing:.06em;color:var(--ok)}
+.last .v{font-weight:600;min-width:0;overflow-wrap:anywhere;white-space:pre-wrap;flex:1 1 100%}
+.last .m{font:400 .8rem var(--f-mono);color:var(--muted)}
+.card[data-applied="1"] .opts,.card[data-applied="1"] .row,.card[data-applied="1"] .free{display:none}
+.edit-row{display:none;flex-wrap:wrap;gap:8px}
+.card[data-applied="1"] .edit-row{display:flex}
+.last[data-pending="1"]{background:color-mix(in srgb,var(--warn) 12%,var(--surface));border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.last[data-pending="1"] .k{color:var(--warn)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#list{display:grid;gap:12px}
+.empty{padding:28px 16px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 id="title">Разбор расшифровки</h1>
+    <p class="sub" id="sub">Загружаю пакет разбора…</p>
+    <div class="bar">
+      <div class="meter" aria-hidden="true"><i id="meter"></i></div>
+      <span class="count" id="count">0 / 0</span>
+      <div class="filters" role="group" aria-label="Показать">
+        <button class="chip" id="f-open" aria-pressed="true">без ответа</button>
+        <button class="chip" id="f-all" aria-pressed="false">все</button>
+      </div>
+    </div>
+    <div class="note" id="mode-note" hidden></div>
+  </header>
+  <main id="list"><div class="empty" id="empty">Пакет ещё не загружен. Здесь появятся сомнительные места расшифровки: клип, реплика с выделенным местом и варианты ответа.</div></main>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const LOCAL = /^(127\.0\.0\.1|localhost)$/.test(location.hostname);
+  const REASONS = {asr: "модели расходятся", conf: "модель не уверена", voice: "голоса похожи",
+                   overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь"};
+  const NUM = ["1", "2", "3", "4"];
+  let man = null, answers = {}, live = {}, showAll = false, api = null;
+  const editing = new Set();          // карточки с применённым ответом, которые сейчас меняют
+  const justAnswered = new Set();     // только что отвеченные карточки остаются в списке «без ответа»
+  // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
+  const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
+  const pending = (a) => !!(man.applied && a && (a.ts || "") > (man.applied_at || ""));
+  const appliedCard = (it, a) => !!(man.applied && a && !pending(a) && !editing.has(it.id));
+  // ответы этой версии вопросов из базы страницы: {id: ответ}, при повторах — более поздний
+  function pick(list) {
+    const o = {};
+    list.filter(a => a && a.id && a.version === man.version)
+        .forEach(a => { if (!o[a.id] || (a.ts || "") > (o[a.id].ts || "")) o[a.id] = a; });
+    return o;
+  }
+  // снимок ответов с ноутбука (в manifest) + ответы страницы: на каждое место — последний по времени
+  function merge() {
+    const o = {...pick(Object.values(man.answers || {}))};
+    Object.values(live).forEach(a => { if (!o[a.id] || (a.ts || "") > (o[a.id].ts || "")) o[a.id] = a; });
+    return o;
+  }
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- прослойка: localhost (ноутбук) или база страницы (облако) ----------
+  function localApi() {
+    return {
+      voiceMode: "record",
+      async load() { const r = await fetch("/api/answers"); live = pick(Object.values((await r.json()).answers || {})); return merge(); },
+      async answer(a) {
+        const r = await fetch("/api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
+        const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+        answers = await this.load(); return j;
+      },
+      async voice(id, blob) {
+        const r = await fetch(`/api/voice?id=${encodeURIComponent(id)}&version=${encodeURIComponent(man.version)}`,
+          {method: "POST", headers: {"Content-Type": blob.type || "audio/webm"}, body: blob});
+        const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+        answers = await this.load(); return j;
+      },
+      subscribe() {}
+    };
+  }
+  async function cloudApi() {
+    const db = await claude.use("db");
+    const assets = await claude.use("assets");
+    if (!db) throw new Error("db");
+    const col = db.collection("answers");
+    return {
+      voiceMode: assets ? "file" : null,
+      async load() { const s = await col.get(); return pick(s.docs.map(d => d.data())); },
+      async answer(a) {
+        const doc = {...a, source: "cloud", ts: new Date().toISOString().slice(0, 19)};
+        live[a.id] = doc; answers = merge(); render();
+        await col.doc(`${man.version}--${a.id}`).set(doc); return {};
+      },
+      async voice(id, file) {
+        const t = (file.type || "").toLowerCase();
+        const type = t.includes("webm") ? "video/webm" : (t.includes("mp4") || t.includes("m4a") || t.includes("aac")) ? "video/mp4" : null;
+        if (!type) throw new Error("Нужна запись m4a/mp4 или webm (диктофон телефона подходит).");
+        const up = await assets.upload(file, {type});
+        return this.answer({id, version: man.version, kind: "voice", audio_id: up.id});
+      },
+      subscribe() {
+        let timer = setTimeout(() => note("Ответы из базы пока не получены — показываю без них.", "warn"), 10000);
+        col.onSnapshot(s => {
+          if (!s.metadata.fromCache) clearTimeout(timer);
+          live = pick(s.docs.map(d => d.data())); answers = merge(); render();
+        }, () => clearTimeout(timer));
+      }
+    };
+  }
+
+  function note(text, kind) { const n = $("mode-note"); n.textContent = text; n.dataset.kind = kind || ""; n.hidden = !text; }
+
+  // ---------- отрисовка ----------
+  function markReply(reply) {
+    const frag = document.createDocumentFragment();
+    String(reply || "").split(/(⟦[^⟧]*⟧)/).forEach(part => {
+      if (part.startsWith("⟦")) { const m = document.createElement("mark"); m.textContent = part.slice(1, -1); frag.append(m); }
+      else frag.append(document.createTextNode(part));
+    });
+    return frag;
+  }
+  function describe_unused(a, it) {
+    if (!a) return "";
+    const src = a.source === "local" ? "ноутбук" : "облако";
+    const when = (a.ts || "").replace("T", " ").slice(5, 16);
+    let what = {human: "оставлено человеку", skip: "пропущено", voice: "голосовой ответ, ждёт распознавания на ноутбуке",
+                free: `свой ответ: «${a.text || ""}»`}[a.kind];
+    if ((a.kind === "option" || a.kind === "recommended") && a.option != null) what = `вариант ${a.option + 1}: ${it.options[a.option].label}`;
+    return `Ответ (${src}, ${when}): ${what || a.kind}` + (a.heard && a.text && a.kind !== "free" ? ` — услышано «${a.text}»` : "");
+  }
+  function when(ts) {
+    if (!ts) return "";
+    const d = new Date(/Z$|[+-]\d\d:?\d\d$/.test(ts) ? ts : ts + "Z");
+    return isNaN(d) ? ts : d.toLocaleString("ru-RU", {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+  }
+  function lastAnswer(a, it) {
+    const box = document.createElement("div"); box.className = "last";
+    const kind = kindOf(a);
+    let what = {human: "оставлено человеку", skip: "пропущено", voice: "голосовой ответ — распознается на ноутбуке",
+                revert: "ответ отменён — место вернётся как распознала модель",
+                free: `свой ответ: «${a.text || ""}»`}[kind] || kind || "ответ";
+    if (kind === "human" && a.text) what += ` («${a.text}»)`;
+    if (a.option != null && it.options[a.option] && (kind === "option" || kind === "recommended"))
+      what = `${a.option + 1} — ${it.options[a.option].label}`;
+    const k = document.createElement("span"); k.className = "k";
+    k.textContent = pending(a) ? "новый ответ — применится по «применяй ответы»" : man.applied ? "применён ответ" : "последний ответ";
+    if (pending(a)) box.dataset.pending = "1";
+    const v = document.createElement("span"); v.className = "v"; v.textContent = what;
+    const m = document.createElement("span"); m.className = "m";
+    m.textContent = `${a.source === "local" ? "ноутбук" : "облако"} · ${when(a.ts)}` + (a.heard && a.text && kind !== "free" ? ` · услышано «${a.text}»` : "");
+    box.append(k, v, m);
+    return box;
+  }
+  function speak(it) {
+    if (!("speechSynthesis" in window)) return;
+    speechSynthesis.cancel();
+    const text = `${it.question} ` + it.options.map((o, k) => `Вариант ${k + 1}: ${o.label}.`).join(" ")
+      + (it.recommended != null ? ` Рекомендую вариант ${it.recommended + 1}.` : "");
+    const u = new SpeechSynthesisUtterance(text); u.lang = "ru-RU";
+    const v = speechSynthesis.getVoices().find(v => /^ru/i.test(v.lang)); if (v) u.voice = v;
+    speechSynthesis.speak(u);
+  }
+  async function send(it, a, stateEl) {
+    stateEl.textContent = "Сохраняю…";
+    editing.delete(it.id);
+    try {
+      const r = await api.answer({id: it.id, version: man.version, ...a});
+      const acc = (r.accepted || [])[0];
+      const rejected = r.rejected && r.rejected.length;
+      if (!rejected) justAnswered.add(it.id);          // карточка с ответом остаётся на месте
+      render();
+      if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
+      else flash(it.id, acc && acc.answer ? "Принято: " + acc.answer : "Ответ записан");
+    } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
+  }
+  function flash(id, text) { const el = document.querySelector(`[data-id="${id}"] .state`); if (el) el.textContent = text; }
+
+  function card(it) {
+    const a = answers[it.id];
+    const c = document.createElement("article");
+    c.className = "card"; c.dataset.id = it.id; c.dataset.done = a ? "1" : "0"; c.dataset.applied = appliedCard(it, a) ? "1" : "0";
+    const head = document.createElement("div"); head.className = "head";
+    head.innerHTML = `<span class="tc"></span><span class="who"></span><span class="reasons"></span>`;
+    head.querySelector(".tc").textContent = it.t;
+    head.querySelector(".who").textContent = it.speaker || "";
+    (it.reasons || []).forEach(r => { const s = document.createElement("span"); s.className = "chip"; s.textContent = REASONS[r] || r; head.querySelector(".reasons").append(s); });
+    c.append(head);
+
+    if (!man.clips_removed) {
+      const au = document.createElement("audio"); au.controls = true; au.preload = "none"; au.src = it.clip;
+      c.append(au);
+    }
+
+    const ctx = document.createElement("div"); ctx.className = "ctx";
+    if (it.before) { const p = document.createElement("p"); p.className = "side"; p.textContent = it.before; ctx.append(p); }
+    const p = document.createElement("p"); p.append(markReply(it.reply || `${it.speaker}: ⟦${it.text}⟧`)); ctx.append(p);
+    if (it.after) { const q = document.createElement("p"); q.className = "side"; q.textContent = it.after; ctx.append(q); }
+    c.append(ctx);
+
+    const q = document.createElement("p"); q.className = "q"; q.textContent = it.question; c.append(q);
+    if (a) c.append(lastAnswer(a, it));
+    const state = document.createElement("div"); state.className = "state";
+    if (man.applied && a) {
+      const er = document.createElement("div"); er.className = "edit-row";
+      const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
+      eb.onclick = () => { editing.add(it.id); render(); };
+      const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button"; rb.textContent = "Отменить ответ";
+      rb.title = "Вернуть место как распознала модель и снова открыть его для разбора";
+      rb.onclick = () => send(it, {kind: "revert"}, state);
+      er.append(eb, rb); c.append(er);
+    }
+
+    const opts = document.createElement("div"); opts.className = "opts";
+    it.options.forEach((o, k) => {
+      const b = document.createElement("button"); b.className = "opt"; b.type = "button";
+        b.setAttribute("aria-pressed", String(!!a && a.option === k && (a.kind === "option" || a.kind === "recommended" || !a.kind)));
+      b.innerHTML = `<span class="n"></span><span class="lbl"></span>`;
+      b.querySelector(".n").textContent = NUM[k]; b.querySelector(".lbl").textContent = o.label;
+      if (it.recommended === k) { const r = document.createElement("span"); r.className = "rec"; r.textContent = "рекомендую"; b.append(r); }
+      b.onclick = () => send(it, {option: k}, state);
+      opts.append(b);
+    });
+    c.append(opts);
+
+    const row = document.createElement("div"); row.className = "row";
+    const mk = (label, fn, pressed) => { const b = document.createElement("button"); b.className = "btn"; b.type = "button"; b.textContent = label; b.onclick = fn; if (pressed) b.setAttribute("aria-pressed", "true"); row.append(b); return b; };
+    mk("Оставить человеку", () => send(it, {kind: "human"}, state), a && a.kind === "human");
+    if (editing.has(it.id)) mk("Не менять", () => { editing.delete(it.id); render(); });
+    mk("Пропустить", () => send(it, {kind: "skip", text: "пропущено"}, state), a && a.kind === "skip");
+    if ("speechSynthesis" in window) mk("Озвучить вопрос", () => speak(it));
+    if (api.voiceMode === "record" && window.MediaRecorder && navigator.mediaDevices) {
+      let rec = null, chunks = [];
+      const b = mk("Ответить голосом", async () => {
+        if (rec) { rec.stop(); return; }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+          rec = new MediaRecorder(stream); chunks = [];
+          rec.ondataavailable = e => chunks.push(e.data);
+          rec.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop()); b.classList.remove("rec-on"); b.textContent = "Ответить голосом";
+            const blob = new Blob(chunks, {type: rec.mimeType || "audio/webm"}); rec = null;
+            state.textContent = "Распознаю ответ…";
+            try { const r = await api.voice(it.id, blob); render(); const acc = (r.accepted || [])[0];
+                  flash(it.id, `Услышано «${r.heard || ""}»` + (acc && acc.answer ? ` → ${acc.answer}` : "")); }
+            catch (e) { state.textContent = "Не получилось: " + e.message; }
+          };
+          rec.start(); b.classList.add("rec-on"); b.textContent = "Стоп";
+        } catch (e) { state.textContent = "Микрофон недоступен: " + e.message; }
+      });
+    } else if (api.voiceMode === "file") {
+      const id = `voice-${it.id}`;
+      const lab = document.createElement("label"); lab.className = "btn"; lab.htmlFor = id; lab.textContent = "Голосовой ответ (запись)";
+      const inp = document.createElement("input"); inp.type = "file"; inp.accept = "audio/*"; inp.capture = "user"; inp.id = id; inp.hidden = true;
+      inp.onchange = async () => { const f = inp.files[0]; if (!f) return; state.textContent = "Загружаю запись…";
+        try { await api.voice(it.id, f); render(); } catch (e) { state.textContent = "Не загрузилось: " + e.message; } };
+      row.append(lab, inp);
+    }
+    c.append(row);
+
+    const free = document.createElement("form"); free.className = "free";
+    const inp = document.createElement("input"); inp.id = `free-${it.id}`; inp.placeholder = "Свой ответ текстом (например, «это не Анна, а Вера»)";
+    const ok = document.createElement("button"); ok.className = "btn"; ok.type = "submit"; ok.textContent = "Записать";
+    if (a && kindOf(a) === "free" && editing.has(it.id)) inp.value = a.text || "";   // «Изменить ответ» — с прежним текстом
+    free.append(inp, ok);
+    free.onsubmit = (e) => { e.preventDefault(); if (inp.value.trim()) send(it, {text: inp.value.trim()}, state); };
+    c.append(free, state);
+    return c;
+  }
+
+  function render() {
+    if (!man) return;
+    const list = $("list");
+    const done = man.items.filter(it => answers[it.id]).length;
+    $("count").textContent = `${done} / ${man.items.length}`;
+    $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
+    const show = man.items.filter(it => showAll || man.applied || !answers[it.id] || justAnswered.has(it.id));
+    const active = document.activeElement && document.activeElement.id;
+    list.replaceChildren(...(show.length ? show.map(card) : [Object.assign(document.createElement("div"),
+      {className: "empty", textContent: "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
+    if (active && $(active)) $(active).focus();
+  }
+
+  $("f-open").onclick = () => { showAll = false; $("f-open").setAttribute("aria-pressed", "true"); $("f-all").setAttribute("aria-pressed", "false"); render(); };
+  $("f-all").onclick = () => { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false"); render(); };
+
+  async function start() {
+    try {
+      const r = await fetch("manifest.json", {cache: "no-store"});
+      if (!r.ok) throw new Error("manifest.json не найден");
+      man = await r.json();
+    } catch (e) { $("sub").textContent = "Пакет разбора не найден: " + e.message; return; }
+    $("title").textContent = "Разбор: " + (man.audio || "").replace(/\.[^.]+$/, "");
+    $("sub").textContent = `${man.items.length} мест · версия ${man.version}` + (LOCAL ? " · на этом компьютере" : " · облако");
+    answers = merge();
+    if (man.applied) { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false");
+      note(`Ответы применены к стенограмме ${when(man.applied_at)}.` + (man.clips_removed ? " Клипы удалены." : "")
+           + " Любой ответ можно изменить или отменить — изменения применятся по команде «применяй ответы».", ""); }
+    try {
+      api = LOCAL ? localApi() : await cloudApi();
+      answers = await api.load();
+      api.subscribe();
+      if (!LOCAL && !man.applied) note(api.voiceMode ? "Голосовой ответ — файлом с диктофона (m4a или webm). Ответы применяются на ноутбуке." :
+                                       "Голосовые ответы здесь недоступны — отвечайте касанием или текстом.");
+    } catch (e) {
+      api = {voiceMode: null, async load() { return merge(); }, async answer() { throw new Error("ответы сохранить негде"); }, subscribe() {}};
+      if (!man.applied) note("Сохранение ответов недоступно в этом просмотре: откройте страницу под своей учётной записью.", "warn");
+    }
+    render();
+  }
+  start();
+})();
+</script>

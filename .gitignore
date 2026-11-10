@@ -1,0 +1,40 @@
+# личные данные и результаты — в репозиторий не попадают
+groups/
+jobs/
+profiles/
+exports/
+_backup*/
+_deleted/
+*.voices.json
+voices.json
+# результаты теста скорости (сейчас пишутся в <папка данных>\bench; старые версии писали рядом с программой)
+bench/
+bench_report*.md
+bench_texts*.json
+config.json
+cache/
+.venv/
+__pycache__/
+*.pyc
+*.transcript.*
+*.rus-transcriber/
+rus-transcriber.vocab.json
+# аудио и видео
+*.mp3
+*.m4a
+*.wav
+*.ogg
+*.opus
+*.flac
+*.aac
+*.mp4
+*.mkv
+*.webm
+# локальные списки (хранятся вне репозитория, на случай копирования рядом)
+forbidden_words.txt
+backup*/
+Claude outputs/
+
+# следы запуска MCP Inspector (npx)
+@modelcontextprotocol/
+node_modules/

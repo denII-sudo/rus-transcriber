@@ -1,0 +1,17 @@
+{
+  "_о_файле": "Пример настроек. Копировать не нужно: умолчания заданы в коде (settings.py), а <папка данных>\\config.json хранит только ваши отличия (его заполняет тест скорости bench.py). Здесь перечислены поддерживаемые ключи.",
+  "asr_backend": "auto",
+  "asr_device": "GPU",
+  "asr_model": "v3_e2e_rnnt",
+  "pad_to_seconds": 0,
+  "emotions": true,
+  "diar_embeddings": "auto",
+  "diar_ov_device": "GPU",
+  "diar_chunks_per_batch": 16,
+  "diar_segmentation_batch": 0,
+  "torch_threads": 0,
+  "max_heavy_jobs": 2,
+  "default_group": "",
+  "confirm_mode": "auto",
+  "confirm_timeout_sec": 180
+}
