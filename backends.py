@@ -1,6 +1,8 @@
 """Бэкенды распознавания GigaAM для Windows-ноутбука на Intel Core Ultra.
 
-  openvino  — onnx-asr + ONNX Runtime OpenVINO EP: устройство GPU (Intel Arc iGPU), NPU или CPU
+  openvino  — onnx-asr + ONNX Runtime OpenVINO EP: устройство GPU (Intel Arc iGPU) или CPU;
+              NPU по умолчанию отключён — включается тестом скорости только на новых NPU с FP32,
+              см. комментарий в OnnxASR.__init__
   dml       — onnx-asr + DirectML (любая DX12-видеокарта, запасной вариант для GPU)
   onnx-cpu  — onnx-asr на процессоре
   torch     — оригинальный пакет gigaam на PyTorch CPU (эталон, самый медленный)
@@ -55,6 +57,68 @@ def openvino_devices():
         return []
 
 
+def normalize_device(name, default="CPU"):
+    """Имя устройства OpenVINO — заглавными и без пробелов: «gpu » иначе не находится."""
+    return ":".join(part.strip().upper() for part in str(name or default).split(":"))
+
+
+def _npu_fp32(caps):
+    """Есть ли в возможностях NPU режим FP32. У Meteor Lake (Core Ultra Series 1) его нет."""
+    return any(str(c).strip().upper() in ("FP32", "F32") for c in caps)
+
+
+def npu_info():
+    """Что за NPU и годится ли он для GigaAM.
+
+    У NPU первого поколения (Meteor Lake, Core Ultra Series 1) нет FP32, а компилятор
+    вдобавок неверно считает GigaAM. Такой NPU нельзя ни тестировать, ни предлагать.
+    """
+    info = {"available": False, "fp32": False, "name": "", "capabilities": [],
+            "reason": "OpenVINO не видит NPU"}
+    try:
+        import openvino as ov
+        core = ov.Core()
+        if "NPU" not in core.available_devices:
+            return info
+        info["available"] = True
+        info["reason"] = "NPU не поддерживает FP32 (Meteor Lake / Core Ultra Series 1)"
+        try:
+            info["name"] = str(core.get_property("NPU", "FULL_DEVICE_NAME"))
+        except Exception:
+            pass
+        try:
+            info["capabilities"] = [str(x) for x in core.get_property("NPU", "OPTIMIZATION_CAPABILITIES")]
+        except Exception:
+            pass
+        info["fp32"] = _npu_fp32(info["capabilities"])
+        if info["fp32"]:
+            info["reason"] = "NPU поддерживает FP32"
+    except Exception as ex:
+        info["reason"] = f"NPU недоступен: {type(ex).__name__}: {ex}"
+    return info
+
+
+def npu_usable():
+    """NPU можно пробовать для GigaAM: он есть и поддерживает FP32."""
+    info = npu_info()
+    return bool(info["available"] and info["fp32"])
+
+
+def backend_for_device(device):
+    """Бэкенд по устройству: процессор — onnx-cpu, GPU/NPU — OpenVINO."""
+    return "onnx-cpu" if normalize_device(device) == "CPU" else "openvino"
+
+
+def actual_providers(model):
+    """Провайдеры, на которых реально создана сессия onnx-asr (или пусто, если не понять)."""
+    a = getattr(model, "asr", model)
+    for attr in ("_encoder", "_model", "_decoder"):
+        sess = getattr(a, attr, None)
+        if sess is not None and hasattr(sess, "get_providers"):
+            return list(sess.get_providers())
+    return []
+
+
 def _as_text(res):
     if isinstance(res, str):
         return res
@@ -67,18 +131,38 @@ def _as_text(res):
 
 
 class OnnxASR:
-    def __init__(self, model="v3_e2e_rnnt", device="GPU", provider="openvino", pad_to=0.0, batch=1,
-                 quant=None, language=None):
+    def __init__(self, model="v3_e2e_rnnt", device="CPU", provider="openvino", pad_to=0.0, batch=1,
+                 quant=None, language=None, allow_npu=False):
         import onnx_asr
         _ort_windows_openvino_libs()
         have = available_providers()
+        ov_options = None
+        device = normalize_device(device)
         if provider == "openvino":
             if "OpenVINOExecutionProvider" not in have:
                 raise RuntimeError(f"OpenVINO EP недоступен (есть: {have}). Нужен пакет onnxruntime-openvino")
             cache = OPENVINO_DIR
             cache.mkdir(parents=True, exist_ok=True)
-            providers = [("OpenVINOExecutionProvider", {"device_type": device, "cache_dir": str(cache)}),
-                         "CPUExecutionProvider"]
+            ov_options = {"device_type": device, "cache_dir": str(cache)}
+            if device == "NPU":
+                # NPU для GigaAM по умолчанию отключён. На Meteor Lake (Core Ultra Series 1)
+                # компилятор Intel NPU неверно считает блок относительного позиционного
+                # кодирования в self-attention: расхождение выхода энкодера с CPU около 93%
+                # (корреляция 0,51), текст искажается. Проверено на OpenVINO 2025.4.1 и 2026.4.1.
+                # Включается только тестом скорости: он сверяет текст с эталоном и сохраняет
+                # "asr_allow_npu": true лишь если NPU действительно даёт правильный текст.
+                info = npu_info()
+                if not allow_npu:
+                    raise RuntimeError(
+                        "NPU отключён: на GigaAM он может давать неверный текст "
+                        "(ошибка компилятора Intel NPU). Включить можно тестом скорости.")
+                if not info["available"]:
+                    raise RuntimeError(f"NPU не найден: {info['reason']}")
+                if not info["fp32"]:
+                    raise RuntimeError(
+                        f"NPU {info['name'] or ''} не поддерживает FP32 ({info['reason']}). "
+                        "Meteor Lake / Core Ultra Series 1 для GigaAM не тестируем.")
+            providers = [("OpenVINOExecutionProvider", ov_options), "CPUExecutionProvider"]
         elif provider == "dml":
             if "DmlExecutionProvider" not in have:
                 raise RuntimeError(f"DirectML недоступен (есть: {have}). Нужен пакет onnxruntime-directml")
@@ -94,6 +178,15 @@ class OnnxASR:
         self.language = language
         kw = {"quantization": quant} if quant else {}
         self.model = onnx_asr.load_model(ONNX_NAMES.get(model, model), providers=providers, **kw)
+        if provider == "openvino":
+            # onnxruntime умеет молча выбросить OpenVINO EP и посчитать на CPU, не сообщив
+            # об ошибке. Тогда «GPU» в статусе — неправда, и откат на следующий бэкенд
+            # не срабатывает. Проверяем, на чём создана сессия энкодера.
+            provs = actual_providers(self.model)
+            if provs and "OpenVINOExecutionProvider" not in provs:
+                raise RuntimeError(
+                    f"OpenVINO EP не подключился, сессия считает на {provs}. "
+                    "Проверьте драйвер Intel и версии openvino/onnxruntime.")
         if quant:
             self.name += f":{quant}"
 
@@ -146,13 +239,13 @@ class OnnxASR:
         model = self.model.with_timestamps()
         out = [None] * len(pieces)
         order = sorted(range(len(pieces)), key=lambda i: len(pieces[i]))
-        bs = max(1, min(self.batch, 8))  # куски длинные (до 20 с): пакет меньше, чтобы не раздувать память
+        bs = max(1, min(self.batch, 16))  # как в тесте скорости: пакет ограничен, чтобы не раздувать память
         done = g = 0
         while g < len(order):
             idx = order[g:g + bs]
             g += len(idx)
             try:
-                res = model.recognize([pieces[i].astype(np.float32) for i in idx], sample_rate=SR)
+                res = model.recognize([self._pad(pieces[i]) for i in idx], sample_rate=SR)
                 if not isinstance(res, (list, tuple)) or len(res) != len(idx):
                     raise TypeError(f"пакет вернул {type(res).__name__}")
                 for i, r in zip(idx, res):
@@ -166,7 +259,7 @@ class OnnxASR:
                 bs = 1
                 for i in idx:
                     try:
-                        out[i] = model.recognize(pieces[i].astype(np.float32), sample_rate=SR)
+                        out[i] = model.recognize(self._pad(pieces[i]), sample_rate=SR)
                     except Exception as ex2:
                         print(f"[asr] кусок не распознан: {ex2}", file=sys.stderr, flush=True)
             done += len(idx)
@@ -199,11 +292,10 @@ class OnnxASR:
 
 
 class WhisperOV:
-    """Whisper: тяжёлый кодировщик — напрямую в OpenVINO (видеокарта Arc, NPU или CPU), лёгкий декодер —
-    onnxruntime на процессоре. Модуль OpenVINO внутри onnxruntime (onnxruntime-openvino 1.24) на этом
-    компьютере не загружается (ошибка 127 — не совпадает с установленным openvino 2026), а у fp16-модели
-    оптимизатор onnxruntime падает на слиянии LayerNorm; поэтому кодировщик fp16 идёт в OpenVINO,
-    декодер — int8 (входы/выходы float32) в onnxruntime с базовой оптимизацией."""
+    """Whisper: тяжёлый кодировщик — напрямую в OpenVINO (видеокарта Arc или CPU), лёгкий декодер —
+    onnxruntime на процессоре. У fp16-модели оптимизатор onnxruntime падает на слиянии LayerNorm,
+    поэтому кодировщик fp16 идёт в OpenVINO, декодер — int8 (входы/выходы float32) в onnxruntime
+    с базовой оптимизацией."""
 
     def __init__(self, model="onnx-community/whisper-large-v3-turbo", device="GPU", quant="fp16",
                  dec_quant="int8", language="ru", batch=1):
@@ -334,11 +426,15 @@ def make_asr(cfg):
     """Создаёт бэкенд по config.json; при ошибке откатывается к следующему по списку."""
     model = cfg.get("asr_model", "v3_e2e_rnnt")
     backend = cfg.get("asr_backend", "auto")
-    device = cfg.get("asr_device", "GPU")
+    device = normalize_device(cfg.get("asr_device", "CPU"))
     pad = cfg.get("pad_to_seconds", 0)
     batch = cfg.get("asr_batch", 1)
+    allow_npu = bool(cfg.get("asr_allow_npu", False))
     if backend == "auto":
-        order = [("openvino", device), ("dml", None), ("onnx-cpu", None), ("torch", None)]
+        order = [("openvino", device)]
+        if device != "CPU":          # при явном выборе процессора DirectML не пробуем: он всегда GPU
+            order.append(("dml", None))
+        order += [("onnx-cpu", None), ("torch", None)]
     else:
         order = [(backend, device), ("onnx-cpu", None), ("torch", None)]
     if "whisper" in str(model):          # у пакета gigaam (PyTorch) Whisper нет
@@ -351,7 +447,8 @@ def make_asr(cfg):
             prov = {"onnx-cpu": "cpu"}.get(b, b)
             quant = cfg.get("asr_quant") if b != "onnx-cpu" else cfg.get("asr_quant_cpu", cfg.get("asr_quant"))
             return OnnxASR(model, device=d or "CPU", provider=prov, pad_to=pad if b != "onnx-cpu" else 0,
-                           batch=batch, quant=quant, language=cfg.get("asr_language")), errors
+                           batch=batch, quant=quant, language=cfg.get("asr_language"),
+                           allow_npu=allow_npu), errors
         except Exception as ex:
             errors.append(f"{b}{':' + d if d else ''}: {type(ex).__name__}: {ex}")
             print(f"[asr] {errors[-1]} → пробую следующий вариант", file=sys.stderr, flush=True)

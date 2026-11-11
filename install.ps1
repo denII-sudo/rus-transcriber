@@ -255,25 +255,28 @@ if (Test-Path $py) {
 
 Step "6/9" "PyTorch (процессор), pyannote, GigaAM, MCP"
 & $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu; Check "PyTorch"
-& $py -m pip install "pyannote.audio>=4.0" soundfile truststore "mcp[cli]" "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip"; Check "pyannote/GigaAM"
+& $py -m pip install "pyannote.audio>=4.0" "pytorch-metric-learning==2.9.0" soundfile truststore "mcp[cli]" "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip"; Check "pyannote/GigaAM"
+# pytorch-metric-learning 3.x требует numpy>=2.5.3, а OpenVINO 2025.4.1 — numpy<2.4.0: держим совместимую 2.9.0
 
-Step "7/9" "OpenVINO для видеокарты Arc и NPU"
-& $py -m pip install "onnx-asr[hub]" openvino; Check "onnx-asr/OpenVINO"
+Step "7/9" "OpenVINO для видеокарты Arc"
+& $py -m pip install "onnx-asr[hub]" "openvino==2025.4.1"; Check "onnx-asr/OpenVINO"
 # onnxruntime, onnxruntime-directml и onnxruntime-openvino дают один и тот же модуль:
 # убираем обычные сборки и ставим сборку с OpenVINO последней
 & $py -m pip uninstall -y onnxruntime onnxruntime-directml onnxruntime-gpu
 & $py -m pip install --force-reinstall --no-deps "onnxruntime-openvino==1.24.1"; Check "onnxruntime-openvino"
 # под Windows модуль OpenVINO в onnxruntime берёт библиотеки из пакета openvino — версии должны совпадать
 # (onnxruntime-openvino 1.24.x собран с OpenVINO 2025.4.1; с 2026.x — «ошибка 127» при загрузке)
-# Whisper работает на собственном движке OpenVINO (WhisperOV) и уже настроенной версии; принудительный откат
-# ломал бы подготовленные модели, поэтому версия ставится, только если OpenVINO ещё нет
-& $py -c "import openvino" 2>$null
-if ($LASTEXITCODE -ne 0) { & $py -m pip install "openvino==2025.4.1"; Check "OpenVINO 2025.4.1" }
-else { Write-Host "  OpenVINO уже установлен — версия не меняется" }
+# проверяем именно версию: одной проверки «import openvino» мало, потому что любая версия импортируется
+$ov = & $py -c "import openvino; print(openvino.__version__.split('-')[0])" 2>$null
+if ($ov -ne "2025.4.1") {
+    Write-Host "  OpenVINO $ov не подходит — ставлю 2025.4.1"
+    & $py -m pip install "openvino==2025.4.1"; Check "OpenVINO 2025.4.1"
+} else { Write-Host "  OpenVINO 2025.4.1 — версия подходит" }
+# после смены версии OpenVINO сохранённые модели Whisper пересоберутся при первом запуске (это нормально)
 # словарь русского языка: свободные ответы в карточках — отличать опечатку от настоящего слова
 & $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check "pymorphy3"
 & $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
-Write-Host "  ожидается ['CPU', 'GPU', 'NPU'] и OpenVINOExecutionProvider; если GPU нет — обновите драйвер Intel Arc" -ForegroundColor DarkGray
+Write-Host "  нужны CPU, OpenVINOExecutionProvider и желательно GPU; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
 
 Step "8/9" "Токен Hugging Face"
 if (-not $Token) {

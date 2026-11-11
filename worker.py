@@ -235,7 +235,7 @@ def diarize(audio, num_speakers, token, cfg, status, max_speakers=0, min_speaker
     try:
         import diar_fast
         diar_fast.install(pipe, mode=cfg.get("diar_embeddings", "auto"),
-                          ov_device=cfg.get("diar_ov_device", "GPU"),
+                          ov_device=cfg.get("diar_ov_device", "CPU"),
                           chunks_per_batch=int(cfg.get("diar_chunks_per_batch", 16)),
                           cache_dir=paths.OPENVINO_DIR, info=info)
     except Exception as ex:
@@ -388,7 +388,18 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         try:
             t2 = time.time()
             del asr
-            asr2, _ = make_asr({**cfg, "asr_model": second})
+            from backends import backend_for_device, normalize_device
+            main_dev = normalize_device(cfg.get("asr_device", "CPU"))
+            sec_dev = normalize_device(cfg.get("asr_second_device") or main_dev)
+            sec_backend = str(cfg.get("asr_second_backend") or "auto")
+            if sec_backend == "auto":
+                # своё устройство — свой бэкенд; если устройство то же, доверяем основному
+                sec_backend = (cfg.get("asr_backend", "auto") if sec_dev == main_dev
+                               else backend_for_device(sec_dev))
+            second_cfg = {**cfg, "asr_model": second, "asr_backend": sec_backend,
+                          "asr_device": sec_dev,
+                          "asr_batch": int(cfg.get("asr_second_batch") or cfg.get("asr_batch", 1))}
+            asr2, _ = make_asr(second_cfg)
             alt = W.transcribe(asr2, audio, chunks, progress=prog(62, 68, "второй проход распознавания (CTC)"))
             del asr2
             timing.update(asr2_sec=round(time.time() - t2), asr2_model=second)
@@ -412,8 +423,13 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     wpieces = [audio[int(wchunks[k]["a"] * SR):int(wchunks[k]["b"] * SR)] for k in selected]
     if third and alt is not None:
         # Whisper: на видеокарте Arc (OpenVINO, fp16), при сбое — процессор (int8)
-        dev = str(cfg.get("asr_third_device", "GPU")).upper()
-        tries = ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev in ("GPU", "NPU") else []) \
+        from backends import normalize_device
+        dev = normalize_device(cfg.get("asr_third_device", "CPU"))
+        if dev not in ("GPU", "CPU"):
+            print(f"[words] Whisper: устройство {dev} не поддерживается, считаю на CPU",
+                  file=sys.stderr, flush=True)
+            dev = "CPU"
+        tries = ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
             + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
         for backend, device, quant in tries:
             try:

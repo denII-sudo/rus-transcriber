@@ -66,7 +66,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.10"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.11"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -174,23 +174,33 @@ def voice_profiles() -> str:
 
 
 @mcp.tool()
-def start_benchmark(audio_path: str, seconds: int = 180, only: str = "", chunk_max: float = 6.0) -> str:
-    """Сравнивает варианты распознавания на этом компьютере (процессор, видеокарта Intel Arc через
-    OpenVINO, NPU, DirectML) по скорости и точности на отрывке записи и сохраняет лучший в config.json.
-    Запускать один раз после установки и после обновления драйверов.
+def start_benchmark(audio_path: str, seconds: int = 180, only: str = "", chunk_max: float = 20.0,
+                    min_similarity: float = 0.0) -> str:
+    """Сравнивает варианты распознавания на этом компьютере по скорости и точности на отрывке
+    записи и сохраняет лучший выбор в config.json этой машины. Запускать один раз после установки
+    и после обновления драйверов.
+
+    Порядок: процессор → видеокарта Intel Arc (OpenVINO) → NPU. NPU Meteor Lake (Core Ultra
+    Series 1) пропускается: он не поддерживает FP32 и считает GigaAM неверно. NPU новее
+    проверяется и выбирается только при совпадении текста с эталоном. Основной проход RNN-T,
+    второй проход CTC и Whisper проверяются отдельно и получают свои настройки.
 
     audio_path: путь к типичной записи с русской речью. seconds: длина отрывка для теста.
     only: id вариантов через запятую. RNN-T: torch-cpu (эталон), onnx-cpu, onnx-cpu-b8, onnx-cpu-b16,
-    ov-gpu, ov-gpu-b8, ov-gpu-pad5, ov-gpu-pad22, ov-npu-pad22, dml-gpu. CTC (быстрее, чуть менее точная):
-    ctc-cpu, ctc-cpu-b8, ctc-gpu, ctc-gpu-b8. Пусто — основной набор (без эталона, NPU и DirectML).
-    chunk_max: максимальная длина фрагмента в секундах (6 — как короткие реплики в разговоре).
+    ov-gpu, ov-gpu-b8, ov-gpu-pad5, ov-gpu-pad22, dml-gpu, ov-npu-pad22. CTC:
+    ctc-cpu, ctc-cpu-b8, ctc-gpu, ctc-gpu-b8, ctc-npu-pad22. Whisper: whisper-gpu, whisper-cpu.
+    Пусто — основной набор: RNN-T, CTC и Whisper на процессоре и видеокарте.
+    chunk_max: максимальная длина фрагмента в секундах (по умолчанию 20 — как в рабочем конвейере).
+    min_similarity: порог совпадения текста с эталоном, 0..1. 0 — взять `bench_min_similarity`
+    из config.json (по умолчанию 0.97). Поднимите до 0.99, если точность важнее скорости:
+    тогда тест выберет более точный вариант, даже если он медленнее.
     """
     try:
-        r = core.start_benchmark(audio_path, seconds, only, chunk_max)
+        r = core.start_benchmark(audio_path, seconds, only, chunk_max, min_similarity or None)
     except core.CoreError as ex:
         return str(ex)
     return json.dumps({**r, "hint": "Тест занимает 5–30 минут (первая компиляция под "
-                       "видеокарту и NPU долгая). Проверяйте transcription_status."}, ensure_ascii=False)
+                       "видеокарту долгая). Проверяйте transcription_status."}, ensure_ascii=False)
 
 
 @mcp.tool()

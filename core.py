@@ -163,11 +163,13 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     return {"job_id": launch("worker.py", args, src, "transcribe"), "file": str(src)}
 
 
-def start_benchmark(audio_path, seconds=180, only="", chunk_max=6.0):
+def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_similarity=None):
     src = Path(audio_path).expanduser()
     if not src.exists():
         raise CoreError(f"Файл не найден: {src}")
     args = ["--seconds", str(seconds), "--chunk-max", str(chunk_max)] + (["--only", only] if only else [])
+    if min_similarity is not None and float(min_similarity) > 0:
+        args += ["--min-similarity", str(min_similarity)]
     return {"job_id": launch("bench.py", args, src, "benchmark")}
 
 

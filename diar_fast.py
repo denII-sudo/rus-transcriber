@@ -29,6 +29,12 @@ def _log(msg):
     print(f"[diar] {msg}", file=sys.stderr, flush=True)
 
 
+def device_name(name):
+    """Имя устройства OpenVINO — только заглавными: «cpu» из config.json иначе не находится
+    («Device with "cpu" name is not registered»), и ускорение молча отключается."""
+    return ":".join(part.strip().upper() for part in str(name or "GPU").split(":"))
+
+
 class TorchTrunk:
     name = "cpu"
 
@@ -126,6 +132,7 @@ def install(pipe, mode="auto", ov_device="GPU", chunks_per_batch=16, cache_dir=N
     """Подменяет pipe.get_embeddings быстрым вариантом. info — dict, куда пишется, что выбрано."""
     info = info if info is not None else {}
     info["embeddings_backend"] = "original"
+    ov_device = device_name(ov_device)
     if mode == "original":
         return info
     emb = getattr(pipe, "_embedding", None)
