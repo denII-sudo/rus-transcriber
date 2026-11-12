@@ -161,12 +161,58 @@ def _confirmed(data):
 
 HUMAN_WEIGHT = 3.0    # отрезок, подписанный человеком, весит втрое больше обычного
 HUMAN_MIN = 0.8       # отрезки человека — от 0,8 с чистой речи
+LEARN_MAX_GAP = 0.5   # экспериментальный предел паузы между словами в одном отрезке
+LEARN_CAP = 8.0       # окно обучения не пересекает границы отобранных слов
 DRIFT_MIN = 0.8       # сходство нового профиля со старым ниже — профиль «уплыл», показать человеку
 # защита от тёзок — разных людей с одним именем (другая группа, новый участник):
 SAME_MIN = 0.70       # вклад записи похож на профиль имени меньше — в карантин, а не в профиль
 SAME_MARGIN = 0.05    # или вклад ближе к другому участнику на столько
 GATE_MIN_SEC = 20.0   # проверка — когда у имени уже есть столько секунд из других записей
 GATE_PART_SEC = 4.0   # и вклад записи не короче (короткие отрезки слишком шумные для вывода)
+
+
+def profile_sufficiency(prof, expected_names):
+    """Оценка полноты, не оценка точности: 90 с и три записи для каждого известного участника."""
+    names = set(expected_names or ()) | set(prof.get("speakers", {}))
+    result = {}
+    for name in sorted(names):
+        parts = prof.get("speakers", {}).get(name, {}).get("parts", {})
+        seconds = 0.0
+        records = 0
+        for part in parts.values():
+            # Старый взвешенный sec не равен длительности речи; без раздельных полей не засчитываем.
+            a, h = part.get("auto_sec"), part.get("human_sec")
+            if not isinstance(a, (int, float)) or not isinstance(h, (int, float)):
+                continue
+            duration = a + h
+            if math.isfinite(duration) and duration > 0 and a >= 0 and h >= 0:
+                seconds += duration
+                records += 1
+        result[name] = {"seconds": round(seconds, 1), "recordings": records,
+                        "sufficient": seconds >= 90 and records >= 3}
+    return {"sufficient": bool(result) and all(v["sufficient"] for v in result.values()), "speakers": result}
+
+
+def auto_learn_group(prof, group, expected_names, learn_fn, save_fn):
+    """Обычное автопополнение; распознавание и ручное обновление вызываются отдельно."""
+    import settings
+    try:
+        policy = settings.group_voice_settings(group, initialize=True)
+    except (ValueError, OSError) as ex:
+        return [], {"enabled": False, "reason": "settings_error", "error": str(ex)}
+    if not policy["auto_learn"]:
+        return [], {"enabled": False, "reason": policy.get("reason", "manual")}
+    sufficiency = profile_sufficiency(prof, expected_names)
+    learned = []
+    if not sufficiency["sufficient"]:
+        learned = learn_fn()
+        if learned:
+            save_fn()
+        sufficiency = profile_sufficiency(prof, expected_names)
+    if sufficiency["sufficient"]:
+        settings.save_group_voice_settings(group, {"auto_learn": False, "reason": "sufficient"})
+        return learned, {"enabled": False, "reason": "sufficient"}
+    return learned, {"enabled": True, "reason": policy.get("reason", "default")}
 
 
 def group_of(data, _cache={}):
@@ -185,40 +231,63 @@ def group_of(data, _cache={}):
 
 
 def _word_human(word):
-    """Действующее человеческое подтверждение слова по новым полям, с откатом к старому `by`."""
-    if word.get("by") == "human":
-        return True
-    return any(isinstance(v, dict) and v.get("by") == "human"
-               for v in (word.get("provenance") or {}).values())
+    """Человек подтвердил именно говорящего; старое общее `by` этого не доказывает."""
+    speaker = (word.get("provenance") or {}).get("speaker")
+    return isinstance(speaker, dict) and speaker.get("by") == "human"
 
 
-def _spans(data, confirmed):
+def _spans(data, confirmed, report=None):
     """Отрезки «говорящий — время» для профиля: (имя, начало, конец, человек?).
-    Человек: слова, подписанные или исправленные человеком, кроме наложений.
-    Модель: только в подтверждённых расшифровках и только слова без пометок сомнения."""
+    Человек: слова с подтверждённым автором, кроме наложений.
+    Модель: только в подтверждённых расшифровках и только слова без пометок сомнения.
+    report, если передан, получает счётчики причин без аудио и биометрии."""
     out = []
+    def note(reason):
+        if report is not None:
+            report[reason] = report.get(reason, 0) + 1
     for seg in data["segments"]:
         name = seg["speaker"]
         if str(name).startswith("Спикер"):
+            note("unknown_speaker")
             continue
         run, kind = [], None
         for w in (seg.get("words") or []) + [None]:
             if w is not None:
-                human = _word_human(w) and "overlap" not in (w.get("flags") or [])
-                auto = confirmed and not w.get("flags") and not _word_human(w) and not w.get("inserted")
+                overlap = seg.get("overlap") or w.get("overlap") or "overlap" in (w.get("flags") or [])
+                human = _word_human(w) and not overlap
+                auto = confirmed and not overlap and not w.get("flags") and not human and not w.get("inserted")
                 k = "h" if human else ("a" if auto else None)
+                if overlap:
+                    note("overlap")
+                elif not k:
+                    note("unconfirmed_or_flagged")
+                valid = isinstance(w.get("s"), (int, float)) and isinstance(w.get("e"), (int, float))
+                valid = valid and math.isfinite(w["s"]) and math.isfinite(w["e"]) and 0 <= w["s"] < w["e"]
+                if not valid:
+                    k = None
+                    note("invalid_time")
+                elif w["e"] - w["s"] > LEARN_CAP:
+                    k = None
+                    note("word_too_long")
             else:
                 k = None
-            if run and k != kind:
-                s, e = run[0]["s"], run[-1]["e"]
+            separated = bool(run and k and (w["s"] < run[-1]["s"] or w["s"] - run[-1]["e"] > LEARN_MAX_GAP
+                                             or max(w["e"], *(x["e"] for x in run)) - run[0]["s"] > LEARN_CAP))
+            if separated:
+                note("gap_or_order")
+            if run and (k != kind or separated):
+                s, e = run[0]["s"], max(x["e"] for x in run)
                 if (kind == "h" and e - s >= HUMAN_MIN) or (kind == "a" and e - s >= LEARN_MIN):
                     out.append((name, s, e, kind == "h"))
+                    note("accepted_human" if kind == "h" else "accepted_auto")
+                else:
+                    note("too_short")
                 run = []
             if k:
                 run.append(w)
                 kind = k
-        if not seg.get("words") and confirmed and seg["end"] - seg["start"] >= LEARN_MIN:
-            out.append((name, seg["start"], seg["end"], False))       # старые расшифровки без слов
+        if not seg.get("words"):
+            note("legacy_without_word_times")
     return out
 
 
@@ -255,7 +324,8 @@ def confusions(prof, exclude_audio=None):
     return out
 
 
-def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None):
+def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
+          stop_when=None):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
     Вклад каждой записи хранится отдельно (ключ — путь к аудио) и при каждом учёте пересчитывается из
     текущей стенограммы: отменённый ответ человека уходит из профиля сам. На одну запись берётся самая
@@ -310,19 +380,19 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     prof.setdefault("warnings", [])
     prof.setdefault("confusions", {})
     for akey, (jp, mt, data, src) in best.items():
-        if len(learned) >= limit:
+        if len(learned) >= limit or (stop_when is not None and stop_when()):
             break
         key = str(jp.resolve())
         if prof["sources"].get(key) == mt and not only:
             continue
         try:
             confirmed = _confirmed(data)
-            spans = _spans(data, confirmed)
+            spans = _spans(data, confirmed, selection_report)
             if not confirmed and akey in conf_best:
                 # имена этой расшифровки не подтверждены: слова модели — из подтверждённой расшифровки той же
                 # записи, отрезки человека — из этой (самой свежей)
                 hum = [s for s in spans if s[3]]
-                auto = [s for s in _spans(conf_best[akey][2], True) if not s[3]
+                auto = [s for s in _spans(conf_best[akey][2], True, selection_report) if not s[3]
                         and not any(s[1] < h[2] and h[1] < s[2] for h in hum)]   # человек главнее
                 spans = hum + auto
             spans = [s for s in spans if not names or s[0] in names]
@@ -331,10 +401,10 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             per = {}
             if spans:
                 audio = load_audio(src)
-                vecs = embedder.spans(audio, [(s, e) for _, s, e, _ in spans], cap=8.0)
+                vecs = embedder.spans(audio, [(s, e) for _, s, e, _ in spans], cap=LEARN_CAP)
                 for (name, s, e, human), v in zip(spans, vecs):
                     if v is not None:
-                        sec = min(e - s, 8.0)
+                        sec = min(e - s, LEARN_CAP)
                         per.setdefault(name, []).append((sec * (HUMAN_WEIGHT if human else 1.0), v, human, sec))
             # вклад этой записи заменяется целиком (в том числе убираются прежние ошибки)
             for name, s in prof["speakers"].items():

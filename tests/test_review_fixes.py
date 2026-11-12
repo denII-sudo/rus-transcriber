@@ -252,7 +252,8 @@ class SpanAndReopen(unittest.TestCase):
 class AnswerIntegrity(unittest.TestCase):
     def test_reverted_edit_is_not_a_human_confirmation(self):
         import voices
-        word = {"w": "одно", "s": 0.0, "e": 1.0, "by": "human"}
+        word = {"w": "одно", "s": 0.0, "e": 1.0, "by": "human",
+                "provenance": {"speaker": {"by": "human"}}}
         data = {"names_confirmed": True, "segments": [seg("Анна", [word])],
                 "edits": [{"id": "r1", "by": "human", "reverted": True,
                            "before": {"speaker": "Борис"}, "after": {"speaker": "Анна"},

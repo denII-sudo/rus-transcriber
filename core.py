@@ -629,6 +629,27 @@ def settings_info():
             "groups": paths.list_groups()}
 
 
+def set_voice_auto_learn(enabled, group=""):
+    if type(enabled) is not bool:
+        raise CoreError("значение должно быть true или false")
+    if not group:
+        try:
+            for existing in paths.list_groups():
+                with settings.group_voice_lock(existing):
+                    settings.group_voice_settings(existing, initialize=True)
+        except (ValueError, OSError) as ex:
+            raise CoreError(f"не удалось сохранить настройки существующих групп: {ex}") from ex
+        settings.update(explicit=("voice_auto_learn_default",), voice_auto_learn_default=enabled)
+        return {"default_for_new_groups": enabled}
+    if group not in paths.list_groups():
+        raise CoreError("группа не найдена")
+    try:
+        with settings.group_voice_lock(group):
+            return {"group": group, **settings.save_group_voice_settings(group, {"auto_learn": enabled, "reason": "manual"})}
+    except (ValueError, OSError) as ex:
+        raise CoreError(str(ex)) from ex
+
+
 def voice_profiles():
     """Сводка по голосовым профилям групп; сами отпечатки не выводятся."""
     out = []
@@ -642,7 +663,19 @@ def voice_profiles():
         for pairs in (d.get("confusions") or {}).values():
             for k, v in pairs.items():
                 conf[k.replace("|", " → ")] = conf.get(k.replace("|", " → "), 0) + v
+        try:
+            policy = settings.group_voice_settings(p.parent.name)
+        except ValueError:
+            policy = {"auto_learn": False, "reason": "settings_error"}
+        import voices
+        vocab_file = p.parent / "vocab.json"
+        try:
+            vocab = json.loads(vocab_file.read_text(encoding="utf-8"))
+            expected = [x["name"] for x in vocab.get("participants", []) if x.get("name")]
+        except (OSError, ValueError, TypeError):
+            expected = []
         out.append({"group": p.parent.name, "revision": d.get("revision"),
+                    "auto_learn": policy, "sufficiency": voices.profile_sufficiency(d, expected),
                     "speakers": {n: {"records": len(s.get("parts", {})),
                                      "seconds": round(sum(pt.get("auto_sec", pt["sec"]) + pt.get("human_sec", 0)
                                                           for pt in s.get("parts", {}).values())),

@@ -53,8 +53,9 @@ rus-transcriber: расшифровка русской речи (в том чи�
    прямые решения — apply_review. Приоритет: слово человека > голосовой профиль > распознавание > эвристики.
    Не выбирайте за человека, кто говорит в спорном месте. Остатки после разбора (слово вне места, неверное
    число) — edit_span(job_id, t1, t2, text, speaker) по словам человека; повторно решить место — reopen_review.
-5. Голоса: rename_speakers подтверждает имена («Спикер 1» → имя) и пополняет профиль; update_voice_profiles —
-   пересчёт по ответам; resolve_voice — только по решению человека о тёзке из карантина (voice_profiles → quarantine).
+5. Голоса: rename_speakers подтверждает имена в расшифровке; update_voice_profiles — отдельный пересчёт
+   после подтверждения человеком; resolve_voice — только по решению человека о тёзке из карантина.
+   Автопополнение зависит от настройки группы и отключается при достаточности; новые голоса по-прежнему обнаруживаются.
 6. Конспект пишете вы: цитаты «…» берите только из стенограммы; check_quotes проверяет их, conspect_link связывает
    с местами стенограммы, conspect_render собирает документ.
 7. После обновления программы — self_check (тесты, проверка файлов на личные данные, морфология).
@@ -66,7 +67,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.12.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.13.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -610,7 +611,7 @@ def review_pack_cloud(job_id: str, artifact_url: str = "") -> str:
 
 
 @mcp.tool()
-def update_voice_profiles(job_id: str) -> str:
+async def update_voice_profiles(job_id: str) -> str:
     """Пересчитывает голосовые профили по этой расшифровке после ответов человека (ответ человека главнее
     отпечатка): отрезки, подписанные человеком, идут в профиль с весом ×3 (кроме наложений и отрезков
     короче 0,8 с), из подтверждённых расшифровок — только слова без пометок сомнения; прежний вклад этой
@@ -626,8 +627,19 @@ def update_voice_profiles(job_id: str) -> str:
     audio = data.get("file")
     if not audio:
         return "В расшифровке нет пути к записи"
-    jid = _launch("worker.py", ["--learn-only", jp], audio, "learn")
-    return json.dumps({"job_id": jid, "hint": "Ход — transcription_status(job_id)"}, ensure_ascii=False)
+    return await _gated("Обновление голосового профиля", {"job_id": job_id, "json": jp},
+                        lambda: [f"Расшифровка: {jp}", "Пересчитать вклад записи в голосовой профиль?"],
+                        lambda: {"job_id": _launch("worker.py", ["--learn-only", jp], audio, "learn"),
+                                 "hint": "Ход — transcription_status(job_id)"})
+
+
+@mcp.tool()
+async def set_voice_auto_learn(enabled: bool, group: str = "") -> str:
+    """Настроить автопополнение группы; без group — умолчание для групп при первом использовании.
+    Изменение требует отдельного подтверждения человеком."""
+    return await _gated("Настройка автопополнения голосов", {"group": group, "enabled": enabled},
+                        lambda: [f"Группа: {group or 'умолчание новых групп'}", f"Автопополнение: {enabled}"],
+                        lambda: core.set_voice_auto_learn(enabled, group))
 
 
 @mcp.tool()
@@ -657,11 +669,27 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
         return json.dumps({"ambiguous": [{"group": h[0].parent.name, "recording": h[2], "from": h[3].get("from")}
                                          for h in hits]}, ensure_ascii=False)
     pf, d, akey, q = hits[0]
-    d.setdefault("identity", {}).setdefault(akey, {})[name] = decision
-    d["quarantine"][akey].pop(name, None)
-    if not d["quarantine"][akey]:
-        d["quarantine"].pop(akey)
-    pf.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    try:
+        confirm.require("Решение по голосовому профилю", {"name": name, "recording": akey, "decision": decision},
+                        [f"Группа: {pf.parent.name}", f"Участник: {name}", f"Решение: {decision}"])
+    except confirm.NotConfirmed as ex:
+        return str(ex)
+    import settings
+    with settings.group_voice_lock(pf.parent.name):
+        d = json.loads(pf.read_text(encoding="utf-8"))
+        current = (d.get("quarantine") or {}).get(akey, {}).get(name)
+        if current != q:
+            return "Карантин изменился; повторите просмотр и подтверждение."
+        d.setdefault("identity", {}).setdefault(akey, {})[name] = decision
+        d["quarantine"][akey].pop(name, None)
+        if not d["quarantine"][akey]:
+            d["quarantine"].pop(akey)
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=pf.parent, delete=False) as f:
+            json.dump(d, f, ensure_ascii=False)
+            tmp = f.name
+        os.replace(tmp, pf)
     if decision == "different":
         return json.dumps({"group": pf.parent.name, "name": name, "recording": akey,
                            "done": "в этот профиль запись по этому имени больше не идёт"}, ensure_ascii=False)

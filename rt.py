@@ -117,6 +117,7 @@ def build():
     ro = sub.add_parser("reopen"); ro.add_argument("job"); ro.add_argument("ids")
     c = sub.add_parser("cancel"); c.add_argument("job")
     sub.add_parser("settings"); sub.add_parser("profiles"); sub.add_parser("approve"); sub.add_parser("audit")
+    vl = sub.add_parser("voice-auto-learn"); vl.add_argument("state", choices=["on", "off"]); vl.add_argument("--group", default="")
     sc = sub.add_parser("self-check"); sc.add_argument("--no-tests", action="store_true")
     e = sub.add_parser("export"); e.add_argument("--group", default=""); e.add_argument("--dest", default=""); e.add_argument("--with-jobs", action="store_true")
     i = sub.add_parser("import"); i.add_argument("zip"); i.add_argument("--replace", action="store_true"); i.add_argument("--apply", action="store_true")
@@ -175,6 +176,10 @@ def run(a):
         out(core.settings_info())
     elif c == "profiles":
         out(core.voice_profiles())
+    elif c == "voice-auto-learn":
+        return gated("Настройка автопополнения голосов", [f"Группа: {a.group or 'умолчание новых групп'}",
+                     f"Автопополнение: {a.state}"],
+                     lambda: core.set_voice_auto_learn(a.state == "on", a.group))
     elif c == "audit":
         import data_io
         out(data_io.audit())

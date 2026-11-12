@@ -36,6 +36,7 @@ from transcript import hms  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 from settings import DEFAULTS, load_config  # noqa: E402,F401  (настройки: умолчания в коде + DATA_DIR\config.json)
+import settings
 
 SR = 16000
 MAX_CHUNK = 22.0   # GigaAM распознаёт куски до ~25 с
@@ -658,11 +659,12 @@ def learn_only(a, st, cfg, src):
         if tg and vgroup and tg != vgroup:
             allowed = []                           # участники словаря — другой группы: не ограничиваем
         ppath = voices.profile_path(group)
-        prof = voices.load_profile(ppath)
-        st.set(stage="профили: пересчёт по ответам человека", progress=40)
-        learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
-                               only=[a.learn_only], group=group)
-        voices.save_profile(ppath, prof)
+        with settings.group_voice_lock(group):
+            prof = voices.load_profile(ppath)
+            st.set(stage="профили: пересчёт по ответам человека", progress=40)
+            learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
+                                   only=[a.learn_only], group=group)
+            voices.save_profile(ppath, prof)
         last = prof.get("history", [])[-1] if learned else None
         st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
                revision=prof.get("revision"), last=last,
@@ -768,10 +770,13 @@ def main():
                 else:
                     group = vgroup or "default"
                     ppath = voices.profile_path(group)
-                    prof = voices.load_profile(ppath)
-                    learned = voices.learn(prof, src.parent, emb, load_audio, names=all_names or None, group=group)
-                    if learned:
-                        voices.save_profile(ppath, prof)
+                    with settings.group_voice_lock(group):
+                        prof = voices.load_profile(ppath)
+                        learned, quality["voice_auto_learn"] = voices.auto_learn_group(
+                            prof, group, all_names,
+                            lambda: voices.learn(prof, src.parent, emb, load_audio, names=all_names or None, group=group,
+                                                 stop_when=lambda: voices.profile_sufficiency(prof, all_names)["sufficient"]),
+                            lambda: voices.save_profile(ppath, prof))
                 st.set(stage="голоса: проверка реплик", progress=33)
                 embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
                 if cfg.get("voices_debug"):   # отпечатки реплик для подбора порогов (биометрия: только локально)

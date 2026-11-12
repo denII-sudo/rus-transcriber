@@ -2,6 +2,8 @@
 (результат теста скорости, свои пределы) и накладывается поверх них."""
 import json
 import sys
+import time
+from contextlib import contextmanager
 
 import paths
 
@@ -20,7 +22,7 @@ DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnn
             "asr_third_batch": 4, "asr_third_long_chunks": True, "asr_third_max_repeat": 3,
             "diar_embeddings": "auto", "diar_ov_device": "CPU", "diar_chunks_per_batch": 16,
             "diar_segmentation_batch": 0, "torch_threads": 0,
-            "pipeline": "words", "max_heavy_jobs": 2, "default_group": "",
+            "pipeline": "words", "max_heavy_jobs": 2, "default_group": "", "voice_auto_learn_default": True,
             # порог совпадения текста с эталоном при выборе устройства в тесте скорости.
             # 0.97 — обычный компромисс; для работы, где важнее точность, поднимите до 0.99.
             "bench_min_similarity": 0.97,
@@ -71,3 +73,53 @@ def update(explicit=(), **kv):
     cur = load_overrides()
     cur.update(kv)
     return save_overrides(cur, explicit=explicit)
+
+
+def group_voice_settings(group, initialize=False):
+    """Настройка группы фиксируется при первом использовании, затем не зависит от общего умолчания."""
+    if not group or paths.safe_group(group) != group:
+        raise ValueError("недопустимое имя группы")
+    p = paths.group_dir(group) / "voice-settings.json"
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or type(data.get("auto_learn")) is not bool:
+                raise ValueError("неверный формат")
+            return data
+        except (OSError, ValueError) as ex:
+            raise ValueError("настройки голосов группы повреждены; автопополнение запрещено") from ex
+    value = load_config().get("voice_auto_learn_default", True)
+    if type(value) is not bool:
+        raise ValueError("неверное глобальное умолчание автопополнения")
+    data = {"auto_learn": value, "reason": "default"}
+    if initialize:
+        save_group_voice_settings(group, data)
+    return data
+
+
+def save_group_voice_settings(group, data):
+    if not group or paths.safe_group(group) != group or type(data.get("auto_learn")) is not bool:
+        raise ValueError("неверные настройки группы")
+    p = paths.group_dir(group) / "voice-settings.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    import os
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent, delete=False) as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp = f.name
+    os.replace(tmp, p)
+    return data
+
+
+@contextmanager
+def group_voice_lock(group):
+    """Межпроцессная блокировка общего профиля и настройки группы."""
+    if not group or paths.safe_group(group) != group:
+        raise ValueError("недопустимое имя группы")
+    import jobslots
+    directory = paths.JOBS / "voice-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / (group + ".lock"), "a+") as f:
+        while not jobslots._try_lock(f):
+            time.sleep(0.1)
+        yield
