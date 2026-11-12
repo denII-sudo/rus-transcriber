@@ -437,7 +437,7 @@ def free_answers(json_path):
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and aid not in applied}
 
 
-def apply_free(json_path, md_path, free):
+def apply_free(json_path, md_path, free, dry_run=False):
     """Свободные ответы → правки слов (freeform.plan) → transcript.apply_word_edits. -> отчёт для человека."""
     from collections import Counter
     import freeform as F
@@ -473,9 +473,10 @@ def apply_free(json_path, md_path, free):
     edits = [e for e in edits if e.get("card") not in blocked]
     closed = {rid: via for rid, via in closed.items() if via not in blocked}
     if edits or closed:
-        _, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
-                                    answers={k: v.get("text") for k, v in valid_free.items()})
+        result_data, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
+                                    answers={k: v.get("text") for k, v in valid_free.items()}, dry_run=dry_run)
     else:
+        result_data = data
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
                "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
@@ -489,7 +490,7 @@ def apply_free(json_path, md_path, free):
             continue
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
-    if human:                                     # не понятые ответы — человеку, с текстом ответа
+    if human and not dry_run:                     # не понятые ответы — человеку, с текстом ответа
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
                                              "note": f"{h['why']}: «{h['answer']}»"} for h in human], by="human")
     return {"cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
@@ -504,7 +505,7 @@ def apply_free(json_path, md_path, free):
             "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"] + missing,
             "failed": rep["failed"],
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
-            "vocab_suggestions": [v for v in T.load(json_path).get("vocab_suggestions") or [] if v.get("card")],
+            "vocab_suggestions": [v for v in (result_data if dry_run else T.load(json_path)).get("vocab_suggestions") or [] if v.get("card")],
             "conspects": rep.get("conspects")}
 
 
@@ -527,6 +528,7 @@ def cloud_bundle(json_path, artifact_url=None):
     clips = {it["clip"]: pd / it["clip"] for it in man["items"]}
     have = {k: v for k, v in clips.items() if v.exists()}
     out = dict(man, answers={k: v for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
+               applied_answers=store.get("applied_answers") or {}, conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
                clips_removed=not have, artifact_url=meta.get("artifact_url"))
     out.pop("job_json", None)                        # пути ноутбука в облако не нужны

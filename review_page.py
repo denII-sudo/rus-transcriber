@@ -38,6 +38,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("json_path")
     ap.add_argument("--status")
+    ap.add_argument("--markdown")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--hours", type=float, default=3.0)
     a = ap.parse_args()
@@ -86,7 +87,9 @@ def main():
                 html = (HERE / "cards.html").read_text(encoding="utf-8")
                 return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"), "text/html; charset=utf-8")
             if u == "api/answers":
-                return self._send(200, P._read(pd / "answers.json", {"answers": {}}))
+                store = P._read(pd / "answers.json", {"answers": {}})
+                store["applied_answers"] = store.get("applied_answers") or {}
+                return self._send(200, store)
             f = (pd / u).resolve()
             if pd.resolve() in f.parents and f.is_file() and f.parent.name in ("clips", pd.name) \
                     and f.name != "answers.json":
@@ -97,17 +100,17 @@ def main():
             u = self._path(post=True)
             if u is None:
                 return
-            if u not in ("api/answer", "api/voice"):
+            if u not in ("api/answer", "api/voice", "api/apply", "api/preview"):
                 return self._send(404, {"error": "не найдено"})
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             types = {"audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/wav": "wav"}
-            if (u == "api/answer" and ctype != "application/json") or (u == "api/voice" and ctype not in types):
+            if (u != "api/voice" and ctype != "application/json") or (u == "api/voice" and ctype not in types):
                 return self._send(415, {"error": "недопустимый тип данных"})
             length = self.headers.get("Content-Length", "")
             if len(length) > 12 or not length.isascii() or not length.isdecimal() or self.headers.get("Transfer-Encoding"):
                 return self._send(400, {"error": "неверная длина запроса"})
             n = int(length)
-            if n <= 0 or n > (MAX_ANSWER_BYTES if u == "api/answer" else MAX_VOICE_BYTES):
+            if n <= 0 or n > (MAX_VOICE_BYTES if u == "api/voice" else MAX_ANSWER_BYTES):
                 return self._send(413, {"error": "недопустимый размер запроса"})
             self.connection.settimeout(30)
             try:
@@ -115,6 +118,25 @@ def main():
                 if len(body) != n:
                     return self._send(400, {"error": "неполный запрос"})
                 last[0] = time.time()
+                if u == "api/preview":
+                    obj = json.loads(body.decode("utf-8"))
+                    man = P.manifest(a.json_path) or {}
+                    if not isinstance(obj, dict) or obj.get("version") != man.get("version") or not any(
+                            it.get("id") == obj.get("id") for it in man.get("items", [])) or not isinstance(obj.get("text"), str) or not obj["text"].strip():
+                        return self._send(400, {"error": "неверная карточка, версия или текст"})
+                    with lock:
+                        result = P.apply_free(a.json_path, a.markdown, {obj["id"]: {"text": obj["text"]}}, dry_run=True)
+                    return self._send(200, result)
+                if u == "api/apply":
+                    obj = json.loads(body.decode("utf-8"))
+                    if not isinstance(obj, dict) or obj.get("version") != (P.manifest(a.json_path) or {}).get("version"):
+                        return self._send(400, {"error": "версия пакета изменилась"})
+                    if not a.markdown:
+                        return self._send(400, {"error": "путь к Markdown не указан; запустите страницу через review-page"})
+                    import core
+                    with lock:
+                        rep = core.apply_answers_files(a.json_path, a.markdown)
+                    return self._send(200, rep)
                 if u == "api/answer":
                     ans = json.loads(body.decode("utf-8"))
                     if not isinstance(ans, dict):
@@ -127,18 +149,14 @@ def main():
                 if u == "api/voice":
                     q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
                     man = P.manifest(a.json_path) or {}
-                    if q.get("version") != man.get("version") or not any(
-                            it.get("id") == q.get("id") for it in man.get("items", [])):
+                    item = next((it for it in man.get("items", []) if it.get("id") == q.get("id")), None)
+                    if q.get("version") != man.get("version") or item is None:
                         return self._send(400, {"error": "неизвестная карточка или версия"})
                     f = pd / "voice" / f"page-{uuid.uuid4().hex}.{types[ctype]}"
                     f.parent.mkdir(exist_ok=True)
                     f.write_bytes(body)
                     text = P.recognize_here([f]).get(str(f), "")
-                    with lock:
-                        rep = P.add_answers(a.json_path, [{"id": q["id"], "version": q.get("version"),
-                                                           "text": text, "audio": str(f), "heard": True}], "local")
-                    rep["heard"] = text
-                    return self._send(200, rep)
+                    return self._send(200, {"heard": text, "match": P.match(text, item)})
             except Exception as ex:
                 print(f"[page] ошибка запроса: {type(ex).__name__}", file=sys.stderr, flush=True)
                 return self._send(400, {"error": "не удалось обработать запрос"})

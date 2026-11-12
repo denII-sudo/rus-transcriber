@@ -24,7 +24,7 @@ class ReviewHTTP(unittest.TestCase):
         (cls.pack / "clips" / "r1.mp3").write_bytes(b"demo audio")
         (cls.pack / "manifest.json").write_text(json.dumps({
             "version": "v1", "audio": "demo.wav", "items": [{"id": "r1", "t": "00:00:01",
-                "clip": "clips/r1.mp3", "text": "да", "speaker": "Участник",
+                "clip": "clips/r1.mp3", "text": "да", "speaker": "Участник", "t1": 0.0, "t2": 0.0,
                 "question": "Как правильно?", "options": [{"label": "да", "decision": {}}]}]
         }), encoding="utf-8")
         (cls.pack / "answers.old.json").write_text('{"archive": true}', encoding="utf-8")
@@ -38,10 +38,10 @@ class ReviewHTTP(unittest.TestCase):
         # Голосовой маршрут проверяем без загрузки модели.
         code = ("import sys, review_page; "
                 "review_page.P.recognize_here=lambda files: {str(p): 'первый' for p in files}; "
-                "sys.argv=['review_page.py', sys.argv[1], '--status', sys.argv[2], '--port', '19350']; "
+                "sys.argv=['review_page.py', sys.argv[1], '--status', sys.argv[2], '--markdown', sys.argv[3], '--port', '19350']; "
                 "review_page.main()")
         cls.proc = subprocess.Popen([sys.executable, "-B", "-c", code, str(root / "demo.transcript.json"),
-                                     str(cls.status)], cwd=str(PROJECT), env=env,
+                                     str(cls.status), str(root / "demo.transcript.md")], cwd=str(PROJECT), env=env,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             if cls.status.exists():
@@ -109,10 +109,17 @@ class ReviewHTTP(unittest.TestCase):
         self.assertEqual(list(Path(self.tmp.name).glob("escape*")), [])
         self.assertEqual(self.post("api/voice?id=r1&version=old", b"demo",
                                   **{"Content-Type": "audio/wav"})[0], 400)
+        before = self.request("api/answers")[1]
         status, data, _ = self.post("api/voice?id=r1&version=v1", b"demo",
-                                    **{"Content-Type": "audio/wav"})
+                                     **{"Content-Type": "audio/wav"})
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(data)["heard"], "первый")
+        self.assertEqual(json.loads(data)["match"], {"kind": "option", "option": 0})
+        self.assertEqual(self.request("api/answers")[1], before)
+        answer = json.dumps({"id": "r1", "version": "v1", "text": "первый", "heard": True}).encode()
+        self.assertEqual(self.post("api/answer", answer, **{"Content-Type": "application/json"})[0], 200)
+        store = json.loads(self.request("api/answers")[1])
+        self.assertEqual(store["answers"]["r1"]["kind"], "option")
         self.assertEqual(len(list((self.pack / "voice").glob("page-*.wav"))), 1)
 
     def test_limits(self):
@@ -130,6 +137,40 @@ class ReviewHTTP(unittest.TestCase):
             self.assertEqual(conn.getresponse().status, 413)
         finally:
             conn.close()
+
+    def test_new_routes_enforce_origin_and_version(self):
+        payload = json.dumps({"id": "r1", "version": "old", "text": "пример"}).encode()
+        for route in ("api/preview", "api/apply"):
+            with self.subTest(route=route):
+                self.assertEqual(self.request(route, "POST", payload,
+                                 {"Origin": "https://evil.example", "Content-Type": "application/json"})[0], 403)
+                self.assertEqual(self.post(route, payload, **{"Content-Type": "text/plain"})[0], 415)
+                self.assertEqual(self.post(route, payload, **{"Content-Type": "application/json"})[0], 400)
+
+    def test_end_to_end_apply_and_undo(self):
+        root = Path(self.tmp.name)
+        jp, md = root / "demo.transcript.json", root / "demo.transcript.md"
+        jp.write_text(json.dumps({"file": "demo.wav", "duration": "00:00:01", "speakers": ["Участник"],
+            "segments": [{"speaker": "Участник", "label": "Участник", "start": 0.0, "end": 0.2,
+                "text": "да", "words": [{"w": "да", "s": 0.0, "e": 0.2, "c": 0.9}]}],
+            "review": [{"id": "r1", "t": 0.0, "t1": 0.0, "t2": 0.0, "speaker": "Участник",
+                        "text": "да", "status": "open", "reasons": []}], "edits": []}), encoding="utf-8")
+        md.write_text("demo", encoding="utf-8")
+        headers = {"Content-Type": "application/json"}
+        def post(route, obj):
+            code, body, _ = self.post(route, json.dumps(obj).encode(), **headers)
+            self.assertEqual(code, 200, body)
+            return json.loads(body)
+        preview = post("api/preview", {"id": "r1", "version": "v1", "text": "да"})
+        self.assertIn("cards", preview)
+        post("api/answer", {"id": "r1", "version": "v1", "option": 0})
+        result = post("api/apply", {"version": "v1"})
+        self.assertEqual(result["review"]["successful_ids"], ["r1"])
+        self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["review"][0]["status"], "resolved")
+        post("api/answer", {"id": "r1", "version": "v1", "kind": "revert"})
+        result = post("api/apply", {"version": "v1"})
+        self.assertEqual(result["reverted"], ["r1"])
+        self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["review"][0]["status"], "open")
 
 
 if __name__ == "__main__":

@@ -307,12 +307,16 @@ def build_review_pack(job_id, items=None):
 
 def start_review_page(job_id, port=8765):
     import review_pack as P
-    jp = _done_json(job_id)["json"]
+    job = _done_json(job_id)
+    jp = job["json"]
     if not P.manifest(jp):
         raise CoreError("Сначала подготовьте карточки: review-build / build_review_pack")
     if not 1 <= int(port) <= 65516:
         raise CoreError("port: от 1 до 65516")
-    jid = launch("review_page.py", ["--port", str(int(port))], jp, "page")
+    args = ["--port", str(int(port))]
+    if job.get("markdown"):
+        args += ["--markdown", job["markdown"]]
+    jid = launch("review_page.py", args, jp, "page")
     for _ in range(40):
         s = job_status(jid) or {}
         if s.get("url"):
@@ -340,16 +344,21 @@ def _merge_free_reports(parts):
 
 def apply_answers(job_id):
     """Применить сохранённые ответы человека; аудио не удаляется."""
-    import review_pack as P
-    import transcript
     jp, md = job_json(job_id)
     if not jp:
         raise CoreError("Расшифровка не найдена или ещё не готова")
+    return apply_answers_files(jp, md)
+
+
+def apply_answers_files(jp, md):
+    """Применить ответы к указанной паре файлов готовой задачи."""
+    import review_pack as P
+    import transcript
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
     undo = [d for d in decisions if "_undo_snapshot" in d]
     decisions = [d for d in decisions if "_undo_snapshot" not in d]
-    undone = []
+    undone, undo_failed = [], set()
     for d in undo:
         result = transcript.undo_answer(jp, md, d["id"], d["_undo_snapshot"])
         if result.get("reverted"):
@@ -357,6 +366,9 @@ def apply_answers(job_id):
             rep["reverted"].append(d["id"])
         else:
             rep.setdefault("undo_conflicts", []).append(result)
+            undo_failed.add(d["id"])
+    decisions = [d for d in decisions if d.get("id") not in undo_failed]
+    free = {aid: answer for aid, answer in free.items() if aid not in undo_failed}
     # Изменённый ответ тоже сначала отменяется, но в отчёте это изменение, а не отмена.
     rep["reverted"] = [x for x in rep.get("reverted") or [] if x not in rep.get("changed", [])]
     snapshots, report = {}, {}

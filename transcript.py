@@ -581,7 +581,7 @@ def vocab_candidate(word, data=None):
     return True
 
 
-def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None):
+def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False):
     """Правки по словам, а не по местам (свободные ответы человека, freeform.py; правка отрезка edit_span).
     edits: [{"op": "relabel", "t", "speaker"} | {"op": "replace", "t", "text"} |
             {"op": "insert", "s", "e", "text", "speaker", "after_t"?, "before_t"?} |
@@ -877,9 +877,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 data.setdefault("vocab_suggestions", []).append({"to": c, "from": None, "card": e.get("card"),
                                                                  "add": {"terms": [c]}})
     data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
-    save(data, json_path, md_path)
+    if not dry_run:
+        save(data, json_path, md_path)
     rep["open_left"] = sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")
-    rep["conspects"] = _refresh_conspects(json_path)
+    rep["conspects"] = None if dry_run else _refresh_conspects(json_path)
     return data, rep
 
 

@@ -548,6 +548,36 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertTrue(apply()["undo_conflicts"])
         self.assertEqual(T.load(c.json), later)
 
+    def test_changed_answer_does_not_apply_after_failed_undo(self):
+        c, P, apply = self._answer_case()
+        apply()
+        T.edit_span(c.json, c.md, 0.3, 0.3, "новое", by="human")
+        later = T.load(c.json)
+        pd = P.pack_dir(c.json)
+        man = P._read(pd / "manifest.json", {})
+        man["items"][0]["options"].append({"label": "другой", "decision": {"speaker": "Вера"}})
+        P._write(pd / "manifest.json", man)
+        store = P._read(pd / "answers.json", {})
+        store["answers"]["r1"].update(option=1, ts="2026-01-02")
+        P._write(pd / "answers.json", store)
+        self.assertTrue(apply()["undo_conflicts"])
+        self.assertEqual(T.load(c.json), later)
+
+    def test_free_preview_does_not_write(self):
+        import review_pack as P
+        c = Case([seg("Анна", W("и он", 0.0)), seg("Борис", W("Ну,", 0.55)),
+                  seg("Анна", W("у нас", 0.9))], [item("r1", 0.0, 1.2, "Анна", "и он Ну, у нас")])
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [dict(T.load(c.json)["review"][0], options=[])]})
+        before_json, before_md = c.json.read_bytes(), c.md.read_bytes()
+        result = P.apply_free(c.json, c.md, {"r1": {"text": "Анна: и он у нас"}}, dry_run=True)
+        self.assertEqual(result["successful_ids"], ["r1"])
+        self.assertTrue(result["cards"][0]["was_now"])
+        self.assertEqual(c.json.read_bytes(), before_json)
+        self.assertEqual(c.md.read_bytes(), before_md)
+        self.assertFalse((pd / "answers.json").exists())
+
     def test_free_answer_undo_preserves_structural_order_and_audio_times(self):
         from unittest.mock import patch
         import core

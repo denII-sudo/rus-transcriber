@@ -90,6 +90,8 @@ audio{width:100%;height:36px}
       </div>
     </div>
     <div class="note" id="mode-note" hidden></div>
+    <button class="btn" id="apply" type="button" hidden>Применить сохранённые ответы</button>
+    <div class="note" id="apply-report" hidden aria-live="polite"></div>
   </header>
   <main id="list"><div class="empty" id="empty">Пакет ещё не загружен. Здесь появятся сомнительные места расшифровки: клип, реплика с выделенным местом и варианты ответа.</div></main>
 </div>
@@ -105,8 +107,15 @@ audio{width:100%;height:36px}
   const editing = new Set();          // карточки с применённым ответом, которые сейчас меняют
   // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
   const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
-  const pending = (a) => !!(man.applied && a && (a.ts || "") > (man.applied_at || ""));
-  const appliedCard = (it, a) => !!(man.applied && a && !pending(a) && !editing.has(it.id));
+  const signature = (a) => [kindOf(a), a.option == null ? null : a.option,
+                            kindOf(a) === "free" ? (a.text || "").trim() : null];
+  const isApplied = (it, a) => !!(a && man.applied_answers && man.applied_answers[it.id] &&
+    JSON.stringify(man.applied_answers[it.id]) === JSON.stringify(signature(a)));
+  const pending = (it, a) => !!(a && man.applied_answers && man.applied_answers[it.id] && !isApplied(it, a));
+  const appliedCard = (it, a) => isApplied(it, a) && !editing.has(it.id);
+  const cardStatus = (it, a) => (man.conflicts || []).some(c => c.id === it.id) ? "конфликт — требуется проверка" :
+    kindOf(a) === "human" ? "требует проверки" : isApplied(it, a) ? "применён ответ" :
+    pending(it, a) ? "новый ответ — не применён" : "ответ сохранён";
   // ответы этой версии вопросов из базы страницы: {id: ответ}, при повторах — более поздний
   function pick(list) {
     const o = {};
@@ -126,7 +135,7 @@ audio{width:100%;height:36px}
   function localApi() {
     return {
       voiceMode: "record",
-      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); live = pick(Object.values((await r.json()).answers || {})); return merge(); },
+      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json(); man.applied_answers = s.applied_answers || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
@@ -136,7 +145,16 @@ audio{width:100%;height:36px}
         const r = await fetch(`api/voice?id=${encodeURIComponent(id)}&version=${encodeURIComponent(man.version)}`,
           {method: "POST", headers: {"Content-Type": blob.type || "audio/webm"}, body: blob});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+        return j;
+      },
+      async apply() {
+        const r = await fetch("api/apply", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({version: man.version})});
+        const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
         answers = await this.load(); return j;
+      },
+      async preview(id, text) {
+        const r = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id, text, version: man.version})});
+        const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j;
       },
       subscribe() {}
     };
@@ -148,7 +166,7 @@ audio{width:100%;height:36px}
     const col = db.collection("answers");
     return {
       voiceMode: assets ? "file" : null,
-      async load() { const s = await col.get(); return pick(s.docs.map(d => d.data())); },
+      async load() { const s = await col.get(); live = pick(s.docs.map(d => d.data())); return merge(); },
       async answer(a) {
         const doc = {...a, source: "cloud", ts: new Date().toISOString().slice(0, 19)};
         live[a.id] = doc; answers = merge(); render();
@@ -172,6 +190,18 @@ audio{width:100%;height:36px}
   }
 
   function note(text, kind) { const n = $("mode-note"); n.textContent = text; n.dataset.kind = kind || ""; n.hidden = !text; }
+
+  function optionPreview(decision) {
+    const d = decision || {}, parts = [];
+    if (d.text) parts.push(`текст → «${d.text}»`);
+    if (d.speaker) parts.push(`говорящий → ${d.speaker}`);
+    if (d.human_after || d.status === "human") parts.push("оставить человеку для проверки");
+    if (d.reopen) parts.push("снова открыть место");
+    if (d.note) parts.push(`примечание: ${d.note}`);
+    const other = Object.keys(d).filter(k => !["text", "speaker", "human_after", "status", "reopen", "note"].includes(k));
+    if (other.length) parts.push("другие параметры: " + other.map(k => `${k}: ${JSON.stringify(d[k])}`).join(", "));
+    return parts.join("; ") || "оставить как есть";
+  }
 
   // ---------- отрисовка ----------
   function markReply(reply) {
@@ -206,8 +236,8 @@ audio{width:100%;height:36px}
     if (a.option != null && it.options[a.option] && (kind === "option" || kind === "recommended"))
       what = `${a.option + 1} — ${it.options[a.option].label}`;
     const k = document.createElement("span"); k.className = "k";
-    k.textContent = pending(a) ? "новый ответ — применится по «применяй ответы»" : man.applied ? "применён ответ" : "последний ответ";
-    if (pending(a)) box.dataset.pending = "1";
+    k.textContent = cardStatus(it, a);
+    if (pending(it, a)) box.dataset.pending = "1";
     const v = document.createElement("span"); v.className = "v"; v.textContent = what;
     const m = document.createElement("span"); m.className = "m";
     m.textContent = `${a.source === "local" ? "ноутбук" : "облако"} · ${when(a.ts)}` + (a.heard && a.text && kind !== "free" ? ` · услышано «${a.text}»` : "");
@@ -262,12 +292,12 @@ audio{width:100%;height:36px}
     const q = document.createElement("p"); q.className = "q"; q.textContent = it.question; c.append(q);
     if (a) c.append(lastAnswer(a, it));
     const state = document.createElement("div"); state.className = "state";
-    if (man.applied && a) {
+    if (isApplied(it, a)) {
       const er = document.createElement("div"); er.className = "edit-row";
       const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
       eb.onclick = () => { editing.add(it.id); render(); };
-      const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button"; rb.textContent = "Отменить ответ";
-      rb.title = "Вернуть место как распознала модель и снова открыть его для разбора";
+      const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button"; rb.textContent = "Подготовить отмену";
+      rb.title = "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось.";
       rb.onclick = () => send(it, {kind: "revert"}, state);
       er.append(eb, rb); c.append(er);
     }
@@ -279,6 +309,7 @@ audio{width:100%;height:36px}
       b.innerHTML = `<span class="n"></span><span class="lbl"></span>`;
       b.querySelector(".n").textContent = NUM[k]; b.querySelector(".lbl").textContent = o.label;
       if (it.recommended === k) { const r = document.createElement("span"); r.className = "rec"; r.textContent = "рекомендую"; b.append(r); }
+      const preview = document.createElement("small"); preview.textContent = " Изменение: " + optionPreview(o.decision); b.append(preview);
       b.onclick = () => send(it, {option: k}, state);
       opts.append(b);
     });
@@ -302,8 +333,15 @@ audio{width:100%;height:36px}
             stream.getTracks().forEach(t => t.stop()); b.classList.remove("rec-on"); b.textContent = "Ответить голосом";
             const blob = new Blob(chunks, {type: rec.mimeType || "audio/webm"}); rec = null;
             state.textContent = "Распознаю ответ…";
-            try { const r = await api.voice(it.id, blob); render(); const acc = (r.accepted || [])[0];
-                  flash(it.id, `Услышано «${r.heard || ""}»` + (acc && acc.answer ? ` → ${acc.answer}` : "")); }
+            try { const r = await api.voice(it.id, blob);
+                  const proposed = r.match || {}; const selected = proposed.option != null && it.options[proposed.option];
+                  state.replaceChildren(document.createTextNode(`Услышано: «${r.heard || ""}». Предполагаемый ответ: ${selected ? selected.label : proposed.kind || "не распознан"}. `));
+                  const edit = document.createElement("input"); edit.value = r.heard || ""; edit.setAttribute("aria-label", "Исправить распознанный текст");
+                  const confirm = document.createElement("button"); confirm.type = "button"; confirm.textContent = "Подтвердить";
+                  confirm.onclick = () => { if (edit.value.trim()) send(it, {text: edit.value.trim(), heard: true}, state); };
+                  const repeat = document.createElement("button"); repeat.type = "button"; repeat.textContent = "Повторить";
+                  repeat.onclick = () => { state.textContent = "Запишите ответ заново."; };
+                  state.append(edit, confirm, repeat); }
             catch (e) { state.textContent = "Не получилось: " + e.message; }
           };
           rec.start(); b.classList.add("rec-on"); b.textContent = "Стоп";
@@ -324,6 +362,15 @@ audio{width:100%;height:36px}
     const ok = document.createElement("button"); ok.className = "btn"; ok.type = "submit"; ok.textContent = "Записать";
     if (a && kindOf(a) === "free" && editing.has(it.id)) inp.value = a.text || "";   // «Изменить ответ» — с прежним текстом
     free.append(inp, ok);
+    if (LOCAL && api.preview) {
+      const preview = document.createElement("button"); preview.type = "button"; preview.className = "btn"; preview.textContent = "Предпросмотр";
+      preview.onclick = async () => { if (!inp.value.trim()) return; state.textContent = "Проверяю без записи…";
+        try { const r = await api.preview(it.id, inp.value.trim()); const one = (r.cards || [])[0];
+          state.textContent = "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
+            ((r.left_to_human || []).length ? "; требуется проверка человеком" : "") + ((r.not_found || []).length ? "; место не найдено" : "") + ". Результат может измениться при последующих правках.";
+        } catch (e) { state.textContent = "Предпросмотр недоступен: " + e.message; } };
+      free.append(preview);
+    }
     free.onsubmit = (e) => { e.preventDefault(); if (inp.value.trim()) send(it, {text: inp.value.trim()}, state); };
     c.append(free, state);
     return c;
@@ -338,12 +385,32 @@ audio{width:100%;height:36px}
     const show = man.items.filter(it => showAll || !answers[it.id]);
     const active = document.activeElement && document.activeElement.id;
     list.replaceChildren(...(show.length ? show.map(card) : [Object.assign(document.createElement("div"),
-      {className: "empty", textContent: "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
+      {className: "empty", textContent: LOCAL ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки." : "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
     if (active && $(active)) $(active).focus();
   }
 
   $("f-open").onclick = () => { showAll = false; $("f-open").setAttribute("aria-pressed", "true"); $("f-all").setAttribute("aria-pressed", "false"); render(); };
   $("f-all").onclick = () => { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false"); render(); };
+  $("apply").onclick = async () => {
+    if (!confirm("Применить сохранённые ответы к стенограмме? Отмена возможна только при наличии снимка и отсутствии более поздних конфликтующих правок.")) return;
+    const box = $("apply-report"); box.hidden = false; box.textContent = "Применяю…"; $("apply").disabled = true;
+    try { const rep = await api.apply(); const lines = [];
+      const add = (label, values) => { if (values && values.length) lines.push(label + ": " + values.map(x => typeof x === "string" ? x : (x.id || "?") + (x.why ? " — " + x.why : "")).join(", ")); };
+      add("Применено", rep.review && rep.review.successful_ids); add("Отменено", rep.reverted);
+      add("Без изменений", rep.unchanged); add("Требует проверки", rep.human);
+      add("Конфликт отмены", rep.undo_conflicts); add("Отмена недоступна", rep.undo_unavailable);
+      add("Не найдено", rep.review && rep.review.not_found); add("Свободный ответ применён", rep.free_text && rep.free_text.successful_ids);
+      add("Свободный ответ требует проверки", rep.free_text && rep.free_text.left_to_human); add("Не найдено", rep.free_text && rep.free_text.not_found);
+      add("Конфликт применения", rep.review && rep.review.conflicts); add("Конфликт свободных ответов", rep.free_text && rep.free_text.conflicts);
+      if (rep.free_text) {
+        Object.entries(rep.free_text.failed || {}).forEach(([id, why]) => lines.push(`Не применено ${id}: ${why}`));
+        (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${c.id}: ${c.was_now}`); });
+      }
+      if (rep.source_conflict) lines.push("Конфликт источника: " + rep.source_conflict);
+      box.textContent = lines.length ? lines.join(" · ") : "Новых изменений нет. Проверьте сохранённые ответы."; showAll = true; render(); }
+    catch (e) { box.textContent = "Не удалось применить: " + e.message; }
+    finally { $("apply").disabled = false; }
+  };
 
   async function start() {
     try {
@@ -360,6 +427,7 @@ audio{width:100%;height:36px}
     try {
       api = LOCAL ? localApi() : await cloudApi();
       answers = await api.load();
+      $("apply").hidden = !LOCAL;
       api.subscribe();
       if (!LOCAL && !man.applied) note(api.voiceMode ? "Голосовой ответ — файлом с диктофона (m4a или webm). Ответы применяются на ноутбуке." :
                                        "Голосовые ответы здесь недоступны — отвечайте касанием или текстом.");
