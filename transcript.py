@@ -194,6 +194,8 @@ def load(json_path):
 
 def _undo_fingerprint(data):
     state = {k: data.get(k) for k in ("segments", "review", "edits")}
+    if state["edits"] is not None:
+        state["edits"] = [e for e in state["edits"] if not e.get("reverted")]
     raw = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

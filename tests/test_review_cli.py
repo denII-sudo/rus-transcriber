@@ -13,12 +13,14 @@ class ReviewCLI(unittest.TestCase):
     def test_only_successful_answers_are_marked_applied(self):
         with patch.object(core, "job_json", return_value=("demo.json", "demo.md")), \
                 patch("review_pack.decisions", return_value=([{"id": "r1"}, {"id": "r2"}], {"human": []})), \
-                patch("transcript.apply_review", return_value=(None, {"successful_ids": ["r1"],
-                                                                      "not_found": ["r2"]})), \
+                patch("transcript.load", return_value={"review": []}), \
+                patch("transcript.answer_snapshot", return_value={"snapshot": True}), \
+                patch("transcript.apply_review", side_effect=[({}, {"successful_ids": ["r1"]}),
+                                                               ({}, {"successful_ids": [], "not_found": ["r2"]})]), \
                 patch("review_pack.free_answers", return_value={}), \
                 patch("review_pack.mark_applied") as mark:
             core.apply_answers("demo")
-        mark.assert_called_once_with("demo.json", {"r1"})
+        mark.assert_called_once_with("demo.json", {"r1"}, snapshots={"r1": {"snapshot": True}})
 
     def test_neutral_questions(self):
         data = {"review": [{"id": "r1", "status": "open"},

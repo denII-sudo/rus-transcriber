@@ -250,6 +250,32 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_batch_options_can_be_undone_in_reverse_order(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("одно два", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "одно"), item("r2", 0.3, 0.3, "Анна", "два")])
+        before = T.load(c.json)
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        entries = [dict(r, options=[{"label": "исправить", "decision": {"text": new}}])
+                   for r, new in zip(before["review"], ["первое", "второе"])]
+        P._write(pd / "manifest.json", {"version": "v1", "items": entries})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {
+            rid: {"id": rid, "kind": "option", "option": 0, "source": "test", "ts": "2026-01-01"}
+            for rid in ("r1", "r2")}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            self.assertEqual(core.apply_answers("demo")["applied_from_answers"], 2)
+            for rid in ("r1", "r2"):
+                store = P._read(pd / "answers.json", {})
+                store["answers"][rid].update(kind="revert", ts="2026-01-02")
+                P._write(pd / "answers.json", store)
+                self.assertEqual(core.apply_answers("demo")["reverted"], [rid])
+        after = T.load(c.json)
+        self.assertEqual(after["segments"], before["segments"])
+        self.assertTrue(all(i["status"] == "open" for i in after["review"]))
+
     def test_new_pack_records_target_ids(self):
         from unittest.mock import patch
         import review_pack as P

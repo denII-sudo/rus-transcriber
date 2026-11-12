@@ -334,9 +334,6 @@ def apply_answers(job_id):
     free = P.free_answers(jp)
     undo = [d for d in decisions if "_undo_snapshot" in d]
     decisions = [d for d in decisions if "_undo_snapshot" not in d]
-    # Снимок назначается одному ответу; общую пакетную правку нельзя безопасно
-    # приписать отдельной карточке без дополнительной детализации журнала.
-    before = transcript.load(jp) if not undo and len(decisions) + len(free) == 1 else None
     undone = []
     for d in undo:
         result = transcript.undo_answer(jp, md, d["id"], d["_undo_snapshot"])
@@ -345,17 +342,49 @@ def apply_answers(job_id):
             rep["reverted"].append(d["id"])
         else:
             rep.setdefault("undo_conflicts", []).append(result)
-    _, report = transcript.apply_review(jp, md, decisions, by="human") if decisions else (None, {})
+    snapshots, report = {}, {}
+    snapshot_bytes = 0
+
+    def remember_snapshot(aid, before, after):
+        nonlocal snapshot_bytes
+        snapshot = transcript.answer_snapshot(before, after)
+        size = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+        # Полные снимки больших стенограмм нельзя неограниченно умножать на
+        # число карточек. Ответ без снимка останется применённым, но его
+        # автоматическая отмена будет недоступна и об этом сообщается.
+        if snapshot_bytes + size > 16 * 1024 * 1024:
+            rep.setdefault("undo_unavailable", []).append(aid)
+            return
+        snapshots[aid] = snapshot
+        snapshot_bytes += size
+
+    if decisions:
+        state = transcript.load(jp)
+        order = {it["id"]: it.get("t", 0) for it in state.get("review") or []}
+        for decision in sorted(decisions, key=lambda d: -order.get(d.get("id"), 0)):
+            before = transcript.load(jp)
+            after, result = transcript.apply_review(jp, md, [decision], by="human")
+            for key, value in result.items():
+                if isinstance(value, list) and key != "vocab_suggestions":
+                    report.setdefault(key, []).extend(value)
+                elif key in ("applied", "kept", "human"):
+                    report[key] = report.get(key, 0) + value
+                else:
+                    report[key] = value
+            aid = decision.get("id")
+            if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
+                remember_snapshot(aid, before, after)
     if free:
+        before_free = transcript.load(jp) if len(free) == 1 else None
         rep["free_text"] = P.apply_free(jp, md, free)
+        free_success = rep["free_text"].get("successful_ids", [])
+        if before_free is not None and len(free_success) == 1:
+            remember_snapshot(free_success[0], before_free, transcript.load(jp))
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
     successful.difference_update(rep.get("human", []))
     rep["applied_from_answers"] = sum(1 for d in decisions if d.get("id") in successful)
-    snapshots = {}
-    if before is not None and len(successful) == 1:
-        aid = next(iter(successful))
-        snapshots[aid] = transcript.answer_snapshot(before, transcript.load(jp))
+    snapshots = {aid: snapshot for aid, snapshot in snapshots.items() if aid in successful}
     successful.update(undone)
     if successful:
         if snapshots:
