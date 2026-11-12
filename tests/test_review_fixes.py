@@ -288,6 +288,82 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(after["segments"], before["segments"])
         self.assertFalse(any(w.get("by") == "human" for s in after["segments"] for w in s["words"]))
 
+    def test_free_answers_report_keeps_details_of_all_parts(self):
+        import core
+        merged = core._merge_free_reports([
+            {"successful_ids": ["r1"], "not_found": [], "cards": [{"id": "r1"}],
+             "conflicts": [], "left_to_human": [], "proposed_delete": [], "vocab_suggestions": [],
+             "closed_via": {"r1": "free"}, "failed": {}, "counts": {"relabel": 0, "replace": 1, "insert": 0},
+             "conspects": {"a": 1}},
+            {"successful_ids": [], "not_found": ["r2"], "cards": [{"id": "r2"}],
+             "conflicts": [{"word": "два", "cards": ["r2"]}],
+             "left_to_human": [{"id": "r2", "why": "не понят"}], "proposed_delete": [{"card": "r2"}],
+             "vocab_suggestions": [{"from": "два"}], "closed_via": {}, "failed": {"r2": "слово не найдено"},
+             "counts": {"relabel": 1, "replace": 2, "insert": 3}, "conspects": {"b": 2}}])
+        self.assertEqual(merged["successful_ids"], ["r1"])
+        self.assertEqual(merged["not_found"], ["r2"])
+        self.assertEqual(merged["failed"], {"r2": "слово не найдено"})
+        self.assertEqual(merged["left_to_human"], [{"id": "r2", "why": "не понят"}])
+        self.assertEqual(merged["closed_via"], {"r1": "free"})
+        self.assertEqual(merged["counts"], {"relabel": 1, "replace": 3, "insert": 3})
+        self.assertEqual([c["id"] for c in merged["cards"]], ["r1", "r2"])
+
+    def test_changed_answer_restores_model_and_applies_new_one(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [
+            {"id": "r1", "t1": 0.0, "t2": 0.0,
+             "options": [{"label": "Борис", "decision": {"speaker": "Борис"}},
+                         {"label": "другое", "decision": {"text": "другое"}}]}]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
+            "id": "r1", "kind": "option", "option": 0, "source": "test", "ts": "2026-01-01"}}})
+
+        def apply():
+            with patch.object(core, "job_json", return_value=(c.json, c.md)):
+                return core.apply_answers("demo")
+
+        self.assertEqual(apply()["review"]["applied"], 1)
+        self.assertEqual([s["speaker"] for s in T.load(c.json)["segments"]], ["Борис"])
+        store = P._read(pd / "answers.json", {})
+        store["answers"]["r1"].update(option=1, ts="2026-01-02")
+        P._write(pd / "answers.json", store)
+        result = apply()
+        self.assertEqual(result["changed"], ["r1"])
+        after = T.load(c.json)
+        self.assertEqual([s["speaker"] for s in after["segments"]], ["Анна"])
+        self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["другое"])
+
+    def test_changed_free_answer_is_undone_and_left_to_human(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        before = T.load(c.json)
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [dict(x) for x in before["review"]]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
+            "id": "r1", "kind": "free", "text": "первое", "source": "test", "ts": "2026-01-01"}}})
+
+        def apply():
+            with patch.object(core, "job_json", return_value=(c.json, c.md)):
+                return core.apply_answers("demo")
+
+        self.assertEqual(apply()["free_text"]["successful_ids"], ["r1"])
+        store = P._read(pd / "answers.json", {})
+        store["answers"]["r1"].update(text="второе", ts="2026-01-02")
+        P._write(pd / "answers.json", store)
+        result = apply()
+        self.assertEqual(result["changed"], ["r1"])
+        self.assertIn("r1", result["human"])
+        after = T.load(c.json)
+        self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["одно"])
+        self.assertEqual(after["review"][0]["status"], "human")
+
     def test_text_speaker_and_order_have_separate_provenance(self):
         c = Case([seg("Анна", W("одно два три", 0.0))],
                  [item("r1", 0.0, 0.0, "Анна", "одно"), item("r2", 0.3, 0.3, "Анна", "два"),

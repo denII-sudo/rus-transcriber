@@ -323,6 +323,21 @@ def start_review_page(job_id, port=8765):
     raise CoreError(f"Страница ещё запускается; проверьте status {jid}")
 
 
+def _merge_free_reports(parts):
+    """Свести отчёты по свободным ответам одного вызова, сохранив причины по каждой карточке."""
+    if not parts:
+        return {}
+    merged = dict(parts[0])
+    for key in ("successful_ids", "not_found", "cards", "conflicts", "left_to_human",
+                "proposed_delete", "vocab_suggestions"):
+        merged[key] = [x for part in parts for x in part.get(key) or []]
+    for key in ("closed_via", "failed", "conspects"):
+        merged[key] = {k: v for part in parts for k, v in (part.get(key) or {}).items()}
+    merged["counts"] = {k: sum((part.get("counts") or {}).get(k, 0) for part in parts)
+                        for k in ("relabel", "replace", "insert")}
+    return merged
+
+
 def apply_answers(job_id):
     """Применить сохранённые ответы человека; аудио не удаляется."""
     import review_pack as P
@@ -390,10 +405,7 @@ def apply_answers(job_id):
             if aid in part.get("successful_ids", []):
                 remember_snapshot(aid, before, transcript.load(jp))
         if free_items:
-            rep["free_text"] = {**free_items[0],
-                                "successful_ids": [x for part in free_items for x in part["successful_ids"]],
-                                "not_found": [x for part in free_items for x in part["not_found"]],
-                                "cards": [x for part in free_items for x in part["cards"]]}
+            rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
     successful.difference_update(rep.get("human", []))

@@ -349,19 +349,12 @@ def _applied_map(store):
     return m
 
 
-def _original(data, aid):
-    """Текст и говорящий места до первой правки по нему (как распознала модель) и сейчас."""
-    eds = [x for x in data.get("edits") or [] if x.get("id") == aid]
-    if not eds:
-        return None, None
-    return eds[0]["before"], eds[-1]["after"]
-
-
 def decisions(json_path):
     """Ответы пакета -> решения для apply_review. -> (decisions, отчёт).
     Уже применённый и не изменившийся ответ повторно не применяется. Если ответ на место изменили после
-    применения (на карточке «Изменить ответ») — прежняя правка откатывается к тексту и говорящему модели
-    и применяется новый ответ; ответ «отменить» только откатывает и снова открывает место."""
+    применения (на карточке «Изменить ответ») — при наличии структурного снимка прежняя правка сначала
+    отменяется, затем применяется новый ответ; без снимка изменение блокируется конфликтом. Ответ
+    «отменить» только откатывает и снова открывает место."""
     import transcript as T
     pd = pack_dir(json_path)
     man = manifest(json_path)
@@ -383,15 +376,26 @@ def decisions(json_path):
         if aid in applied and applied[aid] == _sig(a):
             rep["unchanged"].append(aid)
             continue
-        if aid in applied:
-            if a.get("kind") == "revert" and (store.get("undo_snapshots") or {}).get(aid):
-                out.append({"id": aid, "_undo_snapshot": store["undo_snapshots"][aid]})
-                continue
-            rep.setdefault("undo_conflicts", []).append({"id": aid, "why":
-                "для безопасной отмены нет проверенного структурного снимка"})
-            continue
         src = f"разбор ({a['source']}, {a['ts']})"
         k = a["kind"]
+        if aid in applied:
+            snapshot = (store.get("undo_snapshots") or {}).get(aid)
+            if not snapshot:
+                rep.setdefault("undo_conflicts", []).append({"id": aid, "why":
+                    "для безопасной отмены нет проверенного структурного снимка"})
+                continue
+            # Прежний ответ снимается структурно, а не по тексту отображения.
+            out.append({"id": aid, "_undo_snapshot": snapshot})
+            if k == "revert":
+                continue
+            if k == "free":
+                # Новую формулировку свободного ответа после отмены проверяет человек.
+                rep["human"].append(aid)
+                rep["changed"].append(aid)
+                out.append({"id": aid, "status": "human",
+                            "note": f"{src}: свой ответ изменён после применения — проверить: «{a.get('text')}»"})
+                continue
+            rep["changed"].append(aid)
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})
             if "word_ids" in it:
@@ -411,29 +415,14 @@ def decisions(json_path):
             rep["human"].append(aid)
         elif k == "free":
             # свободный ответ — правка услышанного в клипе: применяется по словам (apply_free, freeform.py)
-            if aid in applied:
-                d = {"human_after": True, "note": f"{src}: свой ответ изменён после применения — проверить: "
-                                                  f"«{a.get('text')}»"}
-                rep["human"].append(aid)
-            else:
-                rep["free"].append({"id": aid, "text": a.get("text")})
-                continue
+            rep["free"].append({"id": aid, "text": a.get("text")})
+            continue
         elif k == "revert":
             d = {"reopen": True, "note": f"{src}: ответ отменён, место снова открыто"}
         else:
             rep["skipped"].append(aid)
             continue
-        if aid in applied:                         # ответ меняли после применения: сначала откат к модели
-            orig, cur = _original(data, aid)
-            if orig and cur:
-                if "speaker" not in d and orig.get("speaker") != cur.get("speaker"):
-                    d["speaker"] = orig["speaker"]
-                if "text" not in d and orig.get("text") != cur.get("text"):
-                    d["text"] = orig["text"]
-            rep["changed" if k != "revert" else "reverted"].append(aid)
-            if k != "revert":
-                d["note"] = d["note"] + " (прежний ответ отменён)"
-        elif k == "revert":
+        if k == "revert":                          # отменять нечего: ответ не был применён
             rep["skipped"].append(aid)
             continue
         out.append({"id": aid, **d})
@@ -513,6 +502,7 @@ def apply_free(json_path, md_path, free):
                                and not r.get("human")
                                and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
             "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"] + missing,
+            "failed": rep["failed"],
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
             "vocab_suggestions": [v for v in T.load(json_path).get("vocab_suggestions") or [] if v.get("card")],
             "conspects": rep.get("conspects")}
