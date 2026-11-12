@@ -335,8 +335,12 @@ def apply_answers(job_id):
     free = P.free_answers(jp)
     if free:
         rep["free_text"] = P.apply_free(jp, md, free)
-    if decisions or rep.get("unchanged") or free:
-        P.mark_applied(jp)
+    successful = set(report.get("successful_ids", []))
+    successful.update(rep.get("free_text", {}).get("successful_ids", []))
+    successful.difference_update(rep.get("human", []))
+    rep["applied_from_answers"] = sum(1 for d in decisions if d.get("id") in successful)
+    if successful:
+        P.mark_applied(jp, successful)
     return {**rep, "review": report}
 
 

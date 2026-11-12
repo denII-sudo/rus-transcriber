@@ -249,6 +249,31 @@ class SpanAndReopen(unittest.TestCase):
         self.assertFalse(data["review_done"])
 
 
+class AnswerIntegrity(unittest.TestCase):
+    def test_missing_target_is_not_successful(self):
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 9.0, 9.0, "Анна", "нет")])
+        data, report = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        self.assertEqual(report["not_found"], ["r1"])
+        self.assertNotIn("r1", report["successful_ids"])
+        self.assertEqual(data["review"][0]["status"], "open")
+
+    def test_conflicting_review_does_not_change_or_close_card(self):
+        words = W("одно", 0.0)
+        words[0].update(edited="r0", by="human")
+        c = Case([seg("Анна", words)], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        data, report = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        self.assertEqual(data["segments"][0]["text"], "одно")
+        self.assertEqual(data["review"][0]["status"], "open")
+        self.assertNotIn("r1", report["successful_ids"])
+        self.assertEqual(report["conflicts"][0]["id"], "r1")
+
+    def test_explicit_empty_applied_map_is_not_legacy(self):
+        import review_pack as P
+        store = {"applied_at": "2026-11-12", "applied_answers": {},
+                 "answers": {"r1": {"kind": "revert", "ts": "2026-11-11"}}}
+        self.assertEqual(P._applied_map(store), {})
+
+
 class ReviewList(unittest.TestCase):
     def test_filters_and_brief(self):
         rv = [item("r1", 0.0, 0.2, "Борис", "а" * 300, ("voice",)), item("r2", 1.0, 3.0, "Анна", "б", ("asr", "conf")),

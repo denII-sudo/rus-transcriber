@@ -336,7 +336,7 @@ def _sig(a):
 def _applied_map(store):
     """{id: подпись применённого ответа}. Для пакетов до появления этой записи — ответы не позже applied_at."""
     m = dict(store.get("applied_answers") or {})
-    if not m and store.get("applied_at"):
+    if "applied_answers" not in store and store.get("applied_at"):
         for aid, a in store.get("answers", {}).items():
             if (a.get("ts") or "") <= store["applied_at"]:
                 m[aid] = _sig(a)
@@ -373,6 +373,10 @@ def decisions(json_path):
             continue
         if aid in applied and applied[aid] == _sig(a):
             rep["unchanged"].append(aid)
+            continue
+        if aid in applied:
+            rep.setdefault("undo_conflicts", []).append({"id": aid, "why":
+                "для безопасной отмены нет проверенного структурного снимка"})
             continue
         src = f"разбор ({a['source']}, {a['ts']})"
         k = a["kind"]
@@ -445,11 +449,21 @@ def apply_free(json_path, md_path, free):
     except Exception:
         pass
     edits, reports, closed, conflicts = F.plan(man, free, data, vocab_words)
+    conflict_ids = {cid for conflict in conflicts for cid in conflict.get("cards", [])}
+    blocked = conflict_ids | {r["id"] for r in reports if r.get("human") or r.get("proposed_delete")}
+    edits = [e for e in edits if e.get("card") not in blocked]
+    closed = {rid: via for rid, via in closed.items() if via not in blocked}
     _, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
                                 answers={k: v.get("text") for k, v in free.items()})
     items = {r["id"]: r for r in data.get("review") or []}
     human = []
     for r in reports:
+        if r["id"] in conflict_ids:
+            human.append({"id": r["id"], "why": "ответы на карточки конфликтуют", "answer": r["answer"]})
+            continue
+        if r.get("proposed_delete"):
+            human.append({"id": r["id"], "why": "удаление слов требует проверки", "answer": r["answer"]})
+            continue
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
     if human:                                     # не понятые ответы — человеку, с текстом ответа
@@ -460,6 +474,10 @@ def apply_free(json_path, md_path, free):
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
             "closed_via": closed, "conflicts": conflicts, "left_to_human": human,
+            "successful_ids": [r["id"] for r in reports if r["id"] in rep["cards"]
+                               and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
+                               and not r.get("human")
+                               and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
             "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"],
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
             "vocab_suggestions": [v for v in T.load(json_path).get("vocab_suggestions") or [] if v.get("card")],

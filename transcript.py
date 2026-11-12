@@ -742,7 +742,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
     data = load(json_path)
     items = {i["id"]: i for i in data.get("review") or []}
     name_to_label = {v: k for k, v in (data.get("speaker_names") or {}).items()}
-    report = {"applied": 0, "kept": 0, "human": 0, "unknown": []}
+    report = {"applied": 0, "kept": 0, "human": 0, "unknown": [], "successful_ids": []}
     edits = data.setdefault("edits", [])
     # правки по убыванию времени, чтобы разрезание реплик не сдвигало следующие места
     for d in sorted(decisions, key=lambda d: -(items.get(d.get("id"), {}).get("t", 0))):
@@ -755,7 +755,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             report["human"] += 1
             continue
         loc = _find_span(data, it)
-        if loc is None and (d.get("text") or d.get("speaker")):
+        if loc is None:
             report.setdefault("not_found", []).append(it["id"])     # место исчезло (перекрыто другой правкой)
             continue
         same_spk = loc is not None and d.get("speaker") in (None, data["segments"][loc[0]]["speaker"])
@@ -765,6 +765,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             if loc is not None and by == "human":           # человек подтвердил место как есть
                 for w in data["segments"][loc[0]]["words"][loc[1]:loc[2]]:
                     w["by"] = "human"
+            report["successful_ids"].append(it["id"])
             continue
         si, w1, w2 = loc
         seg = data["segments"][si]
@@ -773,6 +774,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         if (not d.get("text") or d["text"] == before["text"]) and d.get("speaker") in (None, seg["speaker"]):
             it["status"] = "resolved"
             report["kept"] += 1
+            report["successful_ids"].append(it["id"])
             continue
         new_text = d.get("text")
         if new_text and new_text != before["text"]:
@@ -780,6 +782,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             new_ws, conflicts = _diff_words(ws[w1:w2], new_text, it["id"])
             if conflicts:
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts})
+                continue
             ws[w1:w2] = new_ws
             w2 = w1 + len(new_ws)
             # одиночная замена слова на имя собственное — подсказка для словаря
@@ -821,6 +824,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                                 "speaker": new_spk}, "note": d.get("note")})
         it["status"] = "resolved"
         report["applied"] += 1
+        report["successful_ids"].append(it["id"])
     # соседние реплики одного говорящего после правок склеиваем
     merged = []
     for seg in data["segments"]:
