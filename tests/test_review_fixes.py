@@ -250,6 +250,46 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_new_pack_records_target_ids(self):
+        from unittest.mock import patch
+        import review_pack as P
+        c = Case([seg("Анна", W("первое", 0.0)), seg("Борис", W("второе", 0.0))],
+                 [item("r1", 0.0, 0.0, "Борис", "второе")])
+        data = T.load(c.json)
+        source = c.d / "demo.wav"
+        source.write_bytes(b"")
+        data["file"] = str(source)
+        T.save(data, c.json, c.md)
+        with patch.object(P, "cut_clip", return_value=0.0):
+            P.build(c.json, [{"id": "r1", "options": [{"label": "да", "decision": {}}]}])
+        manifest = P.manifest(c.json)
+        self.assertEqual(manifest["recording_id"], data["recording_id"])
+        self.assertEqual(manifest["source_revision"], data["source_revision"])
+        self.assertEqual(manifest["items"][0]["word_ids"], [data["segments"][1]["words"][0]["word_id"]])
+
+    def test_word_ids_prevent_retargeting_same_time(self):
+        c = Case([seg("Анна", W("первое", 0.0)), seg("Борис", W("второе", 0.0))],
+                 [item("r1", 0.0, 0.0, "Борис", "второе")])
+        data = T.load(c.json)
+        self.assertEqual(T._find_span(data, data["review"][0])[0], 1)
+        target = data["segments"][1]["words"][0]["word_id"]
+        data["segments"].pop(1)
+        T.save(data, c.json, c.md)
+        data, report = T.apply_review(c.json, c.md, [{"id": "r1", "word_ids": [target], "text": "иное"}], by="human")
+        self.assertEqual(report["not_found"], ["r1"])
+        self.assertEqual(data["segments"][0]["text"], "первое")
+        self.assertEqual(data["review"][0]["status"], "open")
+
+    def test_pack_rejects_another_recording(self):
+        c, P, apply = self._answer_case()
+        pd = P.pack_dir(c.json)
+        man = P._read(pd / "manifest.json", {})
+        man["recording_id"] = "other-recording"
+        P._write(pd / "manifest.json", man)
+        before = T.load(c.json)
+        self.assertIn("source_conflict", apply())
+        self.assertEqual(T.load(c.json), before)
+
     def _answer_case(self):
         from unittest.mock import patch
         import core

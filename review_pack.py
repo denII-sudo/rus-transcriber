@@ -111,8 +111,13 @@ def build(json_path, items, base_url_note=None):
         clip = pd / "clips" / f"{it['id']}.mp3"
         s0 = cut_clip(src, t1, t2, clip)
         row = rows.get(it["id"], {})
+        loc = T._find_span(data, it)
+        target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
+        ids = [w.get("word_id") for w in target_words]
+        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) else {}
         out.append({
             "id": it["id"], "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
+            **target,
             "clip": f"clips/{clip.name}", "clip_t1": round(t1 - s0, 2), "clip_t2": round(t2 - s0, 2),
             "speaker": it.get("speaker"), "text": it.get("text"),
             "reply": row.get("reply"), "before": row.get("before"), "after": row.get("after"),
@@ -367,6 +372,9 @@ def decisions(json_path):
     conflicted = {c["id"] for c in store.get("conflicts") or []}
     out, rep = [], {"applied_from_answers": 0, "human": [], "free": [], "skipped": [], "unanswered": [],
                     "unchanged": [], "changed": [], "reverted": []}
+    if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
+        rep["source_conflict"] = "пакет относится к другой стенограмме"
+        return out, rep
     for aid, it in by_id.items():
         a = store["answers"].get(aid)
         if not a:
@@ -386,6 +394,8 @@ def decisions(json_path):
         k = a["kind"]
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})
+            if "word_ids" in it:
+                d["word_ids"] = it["word_ids"]
             note = f"{src}: {it['options'][a['option']]['label']}"
             if aid in conflicted:
                 was = next((c["was"] for c in reversed(store["conflicts"]) if c["id"] == aid), {})
@@ -440,10 +450,26 @@ def free_answers(json_path):
 
 def apply_free(json_path, md_path, free):
     """Свободные ответы → правки слов (freeform.plan) → transcript.apply_word_edits. -> отчёт для человека."""
+    from collections import Counter
     import freeform as F
     import transcript as T
     man = manifest(json_path)
     data = T.load(json_path)
+    missing, valid_free = [], dict(free)
+    if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
+        missing.extend(valid_free)
+        valid_free.clear()
+    times = Counter(round(w["s"], 2) for s in data["segments"] for w in s.get("words") or [])
+    for item in man["items"]:
+        aid = item["id"]
+        if aid not in valid_free or "word_ids" not in item:
+            continue
+        loc = T._find_span(data, item)
+        # Свободный разбор пока обращается к словам по времени. Одинаковое
+        # время разных слов делает такую операцию неоднозначной даже при ID.
+        if not loc or any(count > 1 for count in times.values()):
+            missing.append(aid)
+            valid_free.pop(aid)
     vocab_words = []
     try:
         import vocab as V
@@ -452,13 +478,17 @@ def apply_free(json_path, md_path, free):
         vocab_words = list(vd.get("terms") or []) + [p.get("name") for p in vd.get("participants") or [] if p.get("name")]
     except Exception:
         pass
-    edits, reports, closed, conflicts = F.plan(man, free, data, vocab_words)
+    edits, reports, closed, conflicts = F.plan(man, valid_free, data, vocab_words)
     conflict_ids = {cid for conflict in conflicts for cid in conflict.get("cards", [])}
     blocked = conflict_ids | {r["id"] for r in reports if r.get("human") or r.get("proposed_delete")}
     edits = [e for e in edits if e.get("card") not in blocked]
     closed = {rid: via for rid, via in closed.items() if via not in blocked}
-    _, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
-                                answers={k: v.get("text") for k, v in free.items()})
+    if edits or closed:
+        _, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
+                                    answers={k: v.get("text") for k, v in valid_free.items()})
+    else:
+        rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
+               "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
     human = []
     for r in reports:
@@ -482,7 +512,7 @@ def apply_free(json_path, md_path, free):
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
                                and not r.get("human")
                                and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
-            "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"],
+            "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"] + missing,
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
             "vocab_suggestions": [v for v in T.load(json_path).get("vocab_suggestions") or [] if v.get("card")],
             "conspects": rep.get("conspects")}

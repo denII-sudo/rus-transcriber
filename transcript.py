@@ -277,13 +277,27 @@ def _refresh_conspects(json_path):
 # ---------- разбор сомнительных мест ----------
 def _find_span(data, it):
     """Находит место по времени слов (индексы сдвигаются после правок)."""
+    if "word_ids" in it:
+        target = it["word_ids"]
+        if not isinstance(target, list) or not target or not all(isinstance(x, str) and x for x in target) \
+                or len(target) != len(set(target)):
+            return None
+        for si, seg in enumerate(data["segments"]):
+            ws = seg.get("words") or []
+            ids = [w.get("word_id") for w in ws]
+            for start in range(len(ids) - len(target) + 1):
+                if ids[start:start + len(target)] == target:
+                    return si, start, start + len(target)
+        return None
     t1, t2 = it.get("t1", it["t"]), it.get("t2", it["t"])
+    found = []
     for si, seg in enumerate(data["segments"]):
         ws = seg.get("words") or []
         idx = [k for k, w in enumerate(ws) if t1 - 0.01 <= w["s"] <= t2 + 0.01]
         if idx:
-            return si, idx[0], idx[-1] + 1
-    return None
+            found.append((si, idx[0], idx[-1] + 1))
+    return next((loc for loc in found if data["segments"][loc[0]].get("speaker") == it.get("speaker")),
+                found[0] if found else None)
 
 
 def _ctx_text(seg, w1, w2):
@@ -814,7 +828,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             it["status"], it["note"] = "human", d.get("note") or it.get("note")
             report["human"] += 1
             continue
-        loc = _find_span(data, it)
+        target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
+        loc = _find_span(data, target)
         if loc is None:
             report.setdefault("not_found", []).append(it["id"])     # место исчезло (перекрыто другой правкой)
             continue
