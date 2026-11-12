@@ -103,7 +103,6 @@ audio{width:100%;height:36px}
   const NUM = ["1", "2", "3", "4"];
   let man = null, answers = {}, live = {}, showAll = false, api = null;
   const editing = new Set();          // карточки с применённым ответом, которые сейчас меняют
-  const justAnswered = new Set();     // только что отвеченные карточки остаются в списке «без ответа»
   // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
   const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
   const pending = (a) => !!(man.applied && a && (a.ts || "") > (man.applied_at || ""));
@@ -231,7 +230,6 @@ audio{width:100%;height:36px}
       const r = await api.answer({id: it.id, version: man.version, ...a});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
-      if (!rejected) justAnswered.add(it.id);          // карточка с ответом остаётся на месте
       render();
       if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
       else flash(it.id, acc && acc.answer ? "Принято: " + acc.answer : "Ответ записан");
@@ -337,7 +335,7 @@ audio{width:100%;height:36px}
     const done = man.items.filter(it => answers[it.id]).length;
     $("count").textContent = `${done} / ${man.items.length}`;
     $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
-    const show = man.items.filter(it => showAll || man.applied || !answers[it.id] || justAnswered.has(it.id));
+    const show = man.items.filter(it => showAll || !answers[it.id]);
     const active = document.activeElement && document.activeElement.id;
     list.replaceChildren(...(show.length ? show.map(card) : [Object.assign(document.createElement("div"),
       {className: "empty", textContent: "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
