@@ -66,7 +66,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.12.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.12.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -380,14 +380,8 @@ async def conspect_link_selected(job_id: str, conspect_text: str, selections: di
     """
     try:
         snapshot, report = core.prepare_selected_conspect(job_id, name, conspect_text, selections)
-        lines = [f"Новый конспект: {name}", f"Задача: {job_id}, ревизия: {snapshot['source_revision']}"]
-        for entry in report["candidates"]:
-            selection = selections.get(str(entry["quote_index"]))
-            if selection:
-                option = next(x for x in entry["candidates"] if x["word_ids"] == selection["word_ids"])
-                lines.append(f"Цитата «{entry['quote'][:80]}»: {option['speaker']}, {option['t1']}–{option['t2']} с")
-        lines.append("Создать новый конспект с этими выбранными местами?")
-    except (core.CoreError, KeyError, StopIteration) as ex:
+        lines = core.selected_conspect_confirmation_lines(job_id, name, snapshot, report, selections)
+    except core.CoreError as ex:
         return f"Ошибка: {ex}"
     return await _gated("Выбор мест цитат", snapshot, lambda: lines,
                         lambda: core.save_selected_conspect(snapshot, conspect_text, selections))

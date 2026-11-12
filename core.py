@@ -374,6 +374,59 @@ def preview_conspect_candidates(job_id, text):
         raise CoreError("не удалось подготовить кандидатов цитат") from ex
 
 
+MAX_CONSPECT_SELECTIONS = 3
+
+
+def selected_conspect_confirmation_lines(job_id, name, snapshot, report, selections):
+    """Полный ограниченный текст для человека; обрезка важной информации запрещена."""
+    import math
+
+    def visible(value, limit):
+        if not isinstance(value, str) or not value or len(value) > limit or not value.isprintable():
+            raise CoreError("выбор нельзя полностью и безопасно показать человеку")
+        return value
+
+    def time_text(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 864000:
+            raise CoreError("недопустимое время выбранного места")
+        return str(value)
+
+    visible(job_id, 80)
+    visible(name, 80)
+    revision = snapshot.get("source_revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or not 0 <= revision <= 2**53:
+        raise CoreError("недопустимая ревизия источника")
+    lines = [f"Новый конспект: {name}", f"Задача: {job_id}, ревизия: {revision}"]
+    shown = set()
+    for entry in report.get("candidates") or []:
+        key = str(entry["quote_index"])
+        selection = selections.get(key)
+        if selection is None:
+            continue
+        try:
+            option = next(x for x in entry["candidates"] if x["word_ids"] == selection["word_ids"])
+            quote = visible(entry["quote"], 120)
+            speaker = visible(option["speaker"], 50)
+            start, end = time_text(option["t1"]), time_text(option["t2"])
+            if len(key) > 8 or not key.isascii() or not key.isdecimal():
+                raise CoreError("недопустимый номер цитаты")
+            label = (speaker, start, end)
+            if entry.get("truncated") or sum(
+                    (visible(x["speaker"], 50), time_text(x["t1"]), time_text(x["t2"])) == label
+                    for x in entry["candidates"]) != 1:
+                raise CoreError("кандидатов нельзя однозначно различить по отображаемым данным")
+            lines.append(f"Цитата {key} «{quote}»: {speaker}, {start}–{end} с")
+            shown.add(key)
+        except (KeyError, TypeError, StopIteration) as ex:
+            raise CoreError("выбранный кандидат отсутствует") from ex
+    if shown != set(selections):
+        raise CoreError("не все выбранные цитаты можно показать человеку")
+    lines.append("Создать новый конспект с этими выбранными местами?")
+    if any(len(line) > 220 for line in lines) or len("\n".join(lines)) > 1200:
+        raise CoreError("список выбора слишком длинный для подтверждения")
+    return lines
+
+
 def prepare_selected_conspect(job_id, name, text, selections):
     import hashlib
     import conspect
@@ -381,25 +434,19 @@ def prepare_selected_conspect(job_id, name, text, selections):
     cj, cm = conspect.path_for(jp, name)
     if cj.exists() or cm.exists():
         raise CoreError("конспект с таким названием уже существует; выберите другое название")
-    if not isinstance(selections, dict) or len(selections) != 1:
-        raise CoreError("за одно подтверждение выберите ровно одну цитату")
+    if not isinstance(selections, dict) or not 1 <= len(selections) <= MAX_CONSPECT_SELECTIONS:
+        raise CoreError(f"за одно подтверждение выберите от 1 до {MAX_CONSPECT_SELECTIONS} цитат")
     try:
         source = jp.read_bytes()
         data = json.loads(source)
         obj, report = conspect.link(text, data, selections=selections)
         if len(selections) > report["linked"]:
             raise ValueError("не все выбранные цитаты связаны")
-        for entry in report["candidates"]:
-            selection = selections.get(str(entry["quote_index"]))
-            if selection:
-                option = next(x for x in entry["candidates"] if x["word_ids"] == selection["word_ids"])
-                if sum((x["speaker"], x["t1"], x["t2"]) == (option["speaker"], option["t1"], option["t2"])
-                       for x in entry["candidates"]) != 1 or entry.get("truncated"):
-                    raise ValueError("кандидатов нельзя однозначно различить по отображаемым данным")
         payload = json.dumps({"text": text, "selections": selections}, ensure_ascii=False, sort_keys=True).encode("utf-8")
         snapshot = {"job_id": job_id, "name": name, "source_hash": hashlib.sha256(source).hexdigest(),
                     "request_hash": hashlib.sha256(payload).hexdigest(), "recording_id": data.get("recording_id"),
                     "source_revision": data.get("source_revision")}
+        selected_conspect_confirmation_lines(job_id, name, snapshot, report, selections)
         return snapshot, report
     except (OSError, ValueError, TypeError, StopIteration, KeyError) as ex:
         raise CoreError("выбранные цитаты устарели или недействительны") from ex

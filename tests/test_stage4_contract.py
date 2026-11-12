@@ -222,3 +222,80 @@ class Stage4IdentityContract(unittest.TestCase):
                 core.confirm_conspect_analysis(verified)
                 obj = json.loads(Path(result["conspect_json"]).read_text(encoding="utf-8"))
                 self.assertEqual(obj["analysis_revision"], data["source_revision"])
+
+    def test_two_ambiguous_quotes_can_be_selected_for_one_conspect(self):
+        """Желаемый сценарий: выбрать несколько мест, не перезаписывая уже созданный файл."""
+        data = recording(segment("Анна", "альфа бета", 0.0), segment("Борис", "альфа бета", 5.0),
+                         segment("Анна", "гамма дельта", 10.0), segment("Борис", "гамма дельта", 15.0))
+        text = "«альфа бета» и «гамма дельта»"
+        _, report = conspect.link(text, data)
+        selections = {str(entry["quote_index"]): {"recording_id": data["recording_id"],
+                      "source_revision": data["source_revision"], "word_ids": entry["candidates"][1]["word_ids"]}
+                      for entry in report["candidates"]}
+        self.assertEqual(len(selections), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            jp = Path(directory) / "demo.transcript.json"
+            jp.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(core, "_done_json", return_value={"json": str(jp)}):
+                snapshot, preview = core.prepare_selected_conspect("demo", "selected", text, selections)
+                self.assertEqual(preview["linked"], 2)
+                lines = core.selected_conspect_confirmation_lines("demo", "selected", snapshot, preview, selections)
+                self.assertTrue(any("альфа бета" in line and "Борис" in line for line in lines))
+                self.assertTrue(any("гамма дельта" in line and "Борис" in line for line in lines))
+                import confirm
+                body = "Выбор мест цитат\n\n" + "\n".join(lines)
+                self.assertEqual(confirm.clean(body), body)
+                result = core.save_selected_conspect(snapshot, text, selections)
+                obj = json.loads(Path(result["conspect_json"]).read_text(encoding="utf-8"))
+                self.assertEqual(len(obj["quotes"]), 2)
+
+    def test_confirmation_lines_reject_truncation_and_indistinguishable_options(self):
+        snapshot = {"source_revision": 1}
+        selection = {"1": {"word_ids": ["w1"]}}
+        report = {"candidates": [{"quote_index": 1, "quote": "а" * 121, "candidates": [
+            {"word_ids": ["w1"], "speaker": "Анна", "t1": 1, "t2": 2},
+            {"word_ids": ["w2"], "speaker": "Борис", "t1": 3, "t2": 4}]}]}
+        with self.assertRaises(core.CoreError):
+            core.selected_conspect_confirmation_lines("demo", "selected", snapshot, report, selection)
+        report["candidates"][0]["quote"] = "альфа бета"
+        report["candidates"][0]["candidates"][1].update(speaker="Анна", t1=1, t2=2)
+        with self.assertRaises(core.CoreError):
+            core.selected_conspect_confirmation_lines("demo", "selected", snapshot, report, selection)
+
+    def test_three_long_choices_are_fully_visible(self):
+        import confirm
+        selections, candidates = {}, []
+        for n in range(1, 4):
+            selections[str(n)] = {"word_ids": [f"w{n}"]}
+            candidates.append({"quote_index": n, "quote": "а" * 120, "candidates": [
+                {"word_ids": [f"w{n}"], "speaker": "Б" * 50, "t1": n, "t2": n + 1}]})
+        lines = core.selected_conspect_confirmation_lines("demo", "selected", {"source_revision": 1},
+                                                           {"candidates": candidates}, selections)
+        text = "Выбор мест цитат\n\n" + "\n".join(lines)
+        self.assertEqual(confirm.clean(text), text)
+        self.assertEqual(sum("а" * 120 in line for line in lines), 3)
+
+    def test_selection_limit_rejects_four_before_reading_or_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jp = Path(directory) / "demo.transcript.json"
+            with patch.object(core, "_done_json", return_value={"json": str(jp)}):
+                with self.assertRaises(core.CoreError):
+                    core.prepare_selected_conspect("demo", "selected", "текст", {str(n): {} for n in range(4)})
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_one_stale_choice_blocks_entire_multi_selection(self):
+        data = recording(segment("Анна", "альфа бета", 0.0), segment("Борис", "альфа бета", 5.0),
+                         segment("Анна", "гамма дельта", 10.0), segment("Борис", "гамма дельта", 15.0))
+        text = "«альфа бета» и «гамма дельта»"
+        _, report = conspect.link(text, data)
+        selections = {str(entry["quote_index"]): {"recording_id": data["recording_id"],
+                      "source_revision": data["source_revision"], "word_ids": entry["candidates"][1]["word_ids"]}
+                      for entry in report["candidates"]}
+        selections["2"]["source_revision"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            jp = Path(directory) / "demo.transcript.json"
+            jp.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(core, "_done_json", return_value={"json": str(jp)}):
+                with self.assertRaises(core.CoreError):
+                    core.prepare_selected_conspect("demo", "selected", text, selections)
+            self.assertFalse(conspect.path_for(jp, "selected")[0].exists())

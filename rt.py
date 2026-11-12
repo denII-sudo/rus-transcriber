@@ -163,12 +163,7 @@ def run(a):
         text = Path(a.text_file).read_text(encoding="utf-8-sig")
         selections = json.loads(Path(a.selection_file).read_text(encoding="utf-8-sig"))
         snapshot, report = core.prepare_selected_conspect(a.job, a.name, text, selections)
-        lines = [f"Новый конспект: {a.name}", f"Задача: {a.job}, ревизия: {snapshot['source_revision']}"]
-        for entry in report["candidates"]:
-            selected = selections.get(str(entry["quote_index"]))
-            if selected:
-                option = next(x for x in entry["candidates"] if x["word_ids"] == selected["word_ids"])
-                lines.append(f"Цитата «{entry['quote'][:80]}»: {option['speaker']}, {option['t1']}–{option['t2']} с")
+        lines = core.selected_conspect_confirmation_lines(a.job, a.name, snapshot, report, selections)
         return gated("Выбор места цитаты", lines, lambda: core.save_selected_conspect(snapshot, text, selections))
     elif c == "edit-span":
         out(core.edit_span(a.job, a.t1, a.t2, a.text, a.speaker, a.note, a.by))

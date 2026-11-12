@@ -210,6 +210,23 @@ class ServerGateTests(unittest.TestCase):
             self.assertEqual(self.call(self.server.conspect_link_selected, "demo", "текст", selection), "нет")
             write.assert_not_called()
 
+    def test_selected_multiple_quotes_all_shown_before_refusal(self):
+        snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}
+        report = {"candidates": [
+            {"quote_index": 1, "quote": "альфа бета", "candidates": [
+                {"word_ids": ["w1"], "speaker": "Анна", "t1": 1, "t2": 2}]},
+            {"quote_index": 2, "quote": "гамма дельта", "candidates": [
+                {"word_ids": ["w2"], "speaker": "Борис", "t1": 5, "t2": 6}]}]}
+        selection = {"1": {"word_ids": ["w1"]}, "2": {"word_ids": ["w2"]}}
+        with mock.patch.object(core, "prepare_selected_conspect", return_value=(snapshot, report)), \
+             mock.patch.object(core, "save_selected_conspect") as write, \
+             mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as ask:
+            self.assertEqual(self.call(self.server.conspect_link_selected, "demo", "текст", selection), "нет")
+            write.assert_not_called()
+            lines = ask.call_args.args[2]
+            self.assertTrue(any("альфа бета" in line and "Анна" in line for line in lines))
+            self.assertTrue(any("гамма дельта" in line and "Борис" in line for line in lines))
+
     def test_delete_with_human_yes_works_and_dialog_text_comes_from_program(self):
         gd = put_group("lay-gate")
         seen = {}
