@@ -3,7 +3,7 @@
 Командной строки здесь нет: она одна на всё — rt.py (`python rt.py export|import|delete-group|cleanup|audit`),
 а решение человека для опасных действий принимают rt.py (терминал) и confirm.py (MCP).
 
-Архив: manifest.json (schema_version, дата, группы, контрольные суммы) + groups/<группа>/{vocab,voices}.json
+Архив: manifest.json (schema_version, дата, группы, контрольные суммы) + groups/<группа>/{vocab,voices,voice-settings}.json
 (+ jobs/*.json). Абсолютные пути заменяются именем файла. Архив содержит голосовые отпечатки — это биометрия:
 хранить и пересылать как личные данные. Карантин профиля (голоса «тёзок», ждущие решения) не переносится.
 """
@@ -18,11 +18,12 @@ import zipfile
 from pathlib import Path
 
 import paths
+import settings
 
 SCHEMA = paths.DATA_SCHEMA
 APP = "rus-transcriber"
 _ABS = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
-_MEMBER = re.compile(r"^(?:manifest\.json|groups/[^/\\]+/(?:vocab|voices)\.json|jobs/[^/\\]+\.json)$")
+_MEMBER = re.compile(r"^(?:manifest\.json|groups/[^/\\]+/(?:vocab|voices|voice-settings)\.json|jobs/[^/\\]+\.json)$")
 MAX_UNPACKED = 1 << 30
 
 
@@ -62,6 +63,16 @@ def _speaker_seconds(voices):
             for n, s in (voices.get("speakers") or {}).items()}
 
 
+def _voice_settings(data):
+    """Переносим только настройки, не произвольные дополнительные данные."""
+    if not isinstance(data, dict) or type(data.get("auto_learn")) is not bool:
+        raise RuntimeError("Недопустимые настройки автопополнения голосов в архиве")
+    reason = data.get("reason", "manual")
+    if reason not in ("default", "manual", "sufficient"):
+        raise RuntimeError("Недопустимая причина настройки автопополнения голосов")
+    return {"auto_learn": data["auto_learn"], "reason": reason}
+
+
 # ---------- экспорт ----------
 def export_data(dest_dir=None, group=None, with_jobs=False):
     groups = [paths.safe_group(group)] if group else paths.list_groups()
@@ -88,6 +99,13 @@ def export_data(dest_dir=None, group=None, with_jobs=False):
             rel = f"groups/{g}/{fn}"
             files[rel] = _dump(data) if fn == "voices.json" else p.read_bytes()
             info["files"].append(rel)
+        try:
+            policy = _voice_settings(settings.group_voice_settings(g))
+        except (ValueError, OSError) as ex:
+            raise RuntimeError("Не удалось прочитать настройки голосов группы") from ex
+        rel = f"groups/{g}/voice-settings.json"
+        files[rel] = _dump(policy)
+        info["files"].append(rel)
         ginfo.append(info)
     if with_jobs:
         for p in sorted(paths.JOBS.glob("*.json")):
@@ -129,6 +147,9 @@ def _read_archive(zip_path):
         raise RuntimeError("Архив не от rus-transcriber")
     if int(man.get("schema_version", 0)) > SCHEMA:
         raise RuntimeError(f"Архив новее программы (schema_version {man.get('schema_version')} > {SCHEMA}): обновите программу")
+    for info in infos:
+        if info.filename.endswith("/voice-settings.json") and info.filename not in man.get("files", {}):
+            raise RuntimeError("Настройки голосов отсутствуют в манифесте архива")
     blobs = {}
     for rel, meta in man.get("files", {}).items():
         if not _MEMBER.match(rel):
@@ -180,6 +201,17 @@ def import_data(zip_path, mode="merge", apply=False):
     if mode not in ("merge", "replace"):
         raise RuntimeError('mode: "merge" или "replace"')
     man, blobs = _read_archive(zip_path)
+    policies = {}
+    for entry in man.get("groups", []):
+        g = entry["name"]
+        if not g or paths.safe_group(g) != g:
+            raise RuntimeError(f"Недопустимое имя группы: {g!r}")
+        key = f"groups/{g}/voice-settings.json"
+        if key in blobs:
+            try:
+                policies[g] = _voice_settings(json.loads(blobs[key]))
+            except (ValueError, UnicodeDecodeError) as ex:
+                raise RuntimeError("Не удалось прочитать настройки голосов из архива") from ex
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = paths.DATA_DIR / f"_backup-import-{stamp}"
     result = {"mode": mode, "applied": bool(apply), "archive_created": man.get("created"), "groups": {},
@@ -191,12 +223,24 @@ def import_data(zip_path, mode="merge", apply=False):
         gd = paths.group_dir(g)
         vk, ok = f"groups/{g}/voices.json", f"groups/{g}/vocab.json"
         im_voices = json.loads(blobs[vk]) if vk in blobs else None
-        existed = gd.is_dir() and any((gd / f).exists() for f in ("vocab.json", "voices.json"))
+        existed = gd.is_dir() and any((gd / f).exists() for f in ("vocab.json", "voices.json", "voice-settings.json"))
         rep["action"] = "новая группа" if not existed else ("замена" if mode == "replace" else "слияние")
         if existed and mode == "replace" and apply:
             (backup / "groups").mkdir(parents=True, exist_ok=True)
             shutil.copytree(gd, backup / "groups" / g)
             result["backup"] = str(backup)
+        # Настройка новой группы берётся из архива или из текущего общего умолчания.
+        # При слиянии существующую настройку не перезаписываем, при замене старым архивом тоже сохраняем.
+        if g in policies and (not existed or mode == "replace"):
+            rep["voice_settings"] = "восстановлены из архива"
+            if apply:
+                settings.save_group_voice_settings(g, policies[g])
+        elif existed:
+            rep["voice_settings"] = "оставлены существующие"
+        else:
+            rep["voice_settings"] = "умолчание для новых групп (старый архив)"
+            if apply:
+                settings.group_voice_settings(g, initialize=True)
         # словарь
         if ok in blobs:
             vp = gd / "vocab.json"

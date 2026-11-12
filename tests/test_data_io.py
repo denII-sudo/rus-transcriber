@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+from unittest.mock import patch
 from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="rt-data-")
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_io  # noqa: E402
 import paths  # noqa: E402
 import voices  # noqa: E402
+import settings  # noqa: E402
 if _OLD_ENV is None:                  # paths уже прочитал переменную; другие тесты видят прежнюю
     os.environ.pop("RUS_TRANSCRIBER_DATA", None)
 else:
@@ -90,6 +92,95 @@ class T(unittest.TestCase):
         put_group("demo", {"Глеб": 5})
         rep = data_io.import_data(z, "replace", apply=True)
         self.assertTrue(Path(rep["backup"], "groups", "demo", "voices.json").exists())
+
+    def test_voice_settings_roundtrip_merge_replace_and_preview(self):
+        put_group("demo", {"Анна": 100})
+        settings.save_group_voice_settings("demo", {"auto_learn": False, "reason": "sufficient"})
+        archive = data_io.export_data()["zip"]
+        with zipfile.ZipFile(archive) as z:
+            manifest = json.loads(z.read("manifest.json"))
+            member = "groups/demo/voice-settings.json"
+            self.assertEqual(json.loads(z.read(member)), {"auto_learn": False, "reason": "sufficient"})
+            self.assertIn(member, manifest["files"])
+        settings.save_group_voice_settings("demo", {"auto_learn": True, "reason": "manual"})
+        data_io.import_data(archive, "replace", apply=False)
+        self.assertTrue(settings.group_voice_settings("demo")["auto_learn"])
+        data_io.import_data(archive, "merge", apply=True)
+        self.assertTrue(settings.group_voice_settings("demo")["auto_learn"])
+        with patch.object(data_io.time, "strftime", return_value="voice-settings-test"):
+            result = data_io.import_data(archive, "replace", apply=True)
+        self.assertFalse(settings.group_voice_settings("demo")["auto_learn"])
+        backup = Path(result["backup"], "groups", "demo", "voice-settings.json")
+        self.assertTrue(json.loads(backup.read_text(encoding="utf-8"))["auto_learn"])
+        data_io.delete_group("demo", "demo")
+        data_io.import_data(archive, apply=True)
+        self.assertFalse(settings.group_voice_settings("demo")["auto_learn"])
+
+    def test_old_archive_new_group_uses_global_default(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        old = Path(_TMP) / "old-archive.zip"
+        member = "groups/demo/voice-settings.json"
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(old, "w") as dst:
+            manifest = json.loads(src.read("manifest.json"))
+            del manifest["files"][member]
+            manifest["groups"][0]["files"].remove(member)
+            dst.writestr("manifest.json", json.dumps(manifest))
+            for name in src.namelist():
+                if name not in ("manifest.json", member):
+                    dst.writestr(name, src.read(name))
+        data_io.delete_group("demo", "demo")
+        with patch.object(settings, "load_config", return_value={"voice_auto_learn_default": False}):
+            data_io.import_data(old, apply=True)
+        self.assertFalse(settings.group_voice_settings("demo")["auto_learn"])
+        settings.save_group_voice_settings("demo", {"auto_learn": True, "reason": "manual"})
+        with patch.object(data_io.time, "strftime", return_value="old-archive-test"):
+            data_io.import_data(old, mode="replace", apply=True)
+        self.assertTrue(settings.group_voice_settings("demo")["auto_learn"])
+
+    def test_modified_voice_settings_fails_checksum(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        target = Path(_TMP) / "bad-settings.zip"
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+            for name in src.namelist():
+                blob = src.read(name)
+                dst.writestr(name, blob + b" " if name.endswith("voice-settings.json") else blob)
+        with self.assertRaises(RuntimeError):
+            data_io.import_data(target, apply=True)
+
+    def test_invalid_voice_settings_rejected_even_with_valid_checksum(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        target = Path(_TMP) / "invalid-settings.zip"
+        member = "groups/demo/voice-settings.json"
+        blob = b'{"auto_learn":"false"}'
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+            manifest = json.loads(src.read("manifest.json"))
+            manifest["files"][member] = {"sha256": data_io._sha(blob), "size": len(blob)}
+            dst.writestr("manifest.json", json.dumps(manifest))
+            for name in src.namelist():
+                if name != "manifest.json":
+                    dst.writestr(name, blob if name == member else src.read(name))
+        before = (paths.group_dir("demo") / "voices.json").read_bytes()
+        with self.assertRaises(RuntimeError):
+            data_io.import_data(target, mode="replace", apply=True)
+        self.assertEqual(before, (paths.group_dir("demo") / "voices.json").read_bytes())
+
+    def test_unlisted_voice_settings_rejected(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        target = Path(_TMP) / "unlisted-settings.zip"
+        member = "groups/demo/voice-settings.json"
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+            manifest = json.loads(src.read("manifest.json"))
+            del manifest["files"][member]
+            dst.writestr("manifest.json", json.dumps(manifest))
+            for name in src.namelist():
+                if name != "manifest.json":
+                    dst.writestr(name, src.read(name))
+        with self.assertRaises(RuntimeError):
+            data_io.import_data(target, apply=True)
 
     def test_bad_archives_rejected(self):
         put_group("demo", {"Анна": 100})
