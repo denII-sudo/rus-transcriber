@@ -38,6 +38,28 @@ function Step($n, $msg) { Write-Host "`n[$n] $msg" -ForegroundColor Cyan }
 function HasNonAscii($s) { return $s -match '[^\x00-\x7F]' }
 function WriteUtf8NoBom($path, $text) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false)) }
 
+# Добавляет в PATH текущего окна пути, появившиеся после установки winget-пакетов
+# (реестр Machine/User и папка ссылок на portable-пакеты). Позволяет не требовать
+# перезапуска PowerShell посреди установки.
+function Update-SessionPath {
+    $current = $env:PATH
+    $existing = @($current -split ";" | Where-Object { $_ })
+    $extra = @()
+    foreach ($scope in @("Machine", "User")) {
+        $p = [Environment]::GetEnvironmentVariable("Path", $scope)
+        if ($p) { $extra += ($p -split ";" | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }) }
+    }
+    $links = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
+    if (Test-Path $links) { $extra += $links }
+    foreach ($x in $extra) {
+        if ($existing -notcontains $x) { $current = $current.TrimEnd(";") + ";" + $x; $existing += $x }
+    }
+    $env:PATH = $current
+}
+function Invoke-RerunHint {
+    return "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+}
+
 # ---------- где лежит конфиг Claude Desktop (обычная установка или из Microsoft Store) ----------
 function Find-ClaudeConfig {
     # Claude Desktop из Microsoft Store (с версии ~3.1623) читает настройки из
@@ -180,7 +202,8 @@ if ($found) {
 if (-not $usable) {
     $vers = ($found | ForEach-Object { $_.ver } | Sort-Object -Unique) -join ", "
     if ($vers) { Write-Host "  есть Python $vers, но нужна версия 3.11–3.13 (для версий ниже 3.11 и для 3.14 нет всех нужных библиотек)" -ForegroundColor Yellow }
-    Fail "Установите Python 3.12: winget install Python.Python.3.12 --scope machine`n(затем перезапустите PowerShell)"
+    Fail ("Установите Python 3.12: winget install Python.Python.3.12 --scope machine`n" +
+          "затем перезапустите PowerShell и запустите снова:`n" + (Invoke-RerunHint))
 }
 $basePyExe = ($usable | Select-Object -First 1).exe
 $basePy = ($usable | Select-Object -First 1).prefix
@@ -192,8 +215,23 @@ if (HasNonAscii $basePy) {
 }
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Host "  ffmpeg не найден, ставлю через winget..." -ForegroundColor Yellow
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Fail ("winget недоступен, поставьте ffmpeg вручную (https://www.gyan.dev/ffmpeg/builds/)`n" +
+              "и добавьте папку с ffmpeg.exe в PATH, затем запустите снова:`n" + (Invoke-RerunHint))
+    }
     winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
-    Fail "ffmpeg установлен. Перезапустите PowerShell и запустите этот скрипт ещё раз."
+    if ($LASTEXITCODE -ne 0) {
+        Fail ("winget не смог установить ffmpeg (код $LASTEXITCODE).`n" +
+              "Проверьте вручную: winget install --id Gyan.FFmpeg -e`n" +
+              "Затем запустите снова:`n" + (Invoke-RerunHint))
+    }
+    # winget дописывает PATH в реестр; подхватываем его в текущем окне, чтобы не требовать перезапуска
+    Update-SessionPath
+    if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+        Fail ("ffmpeg установлен, но не виден в этом окне PowerShell.`n" +
+              "Перезапустите PowerShell и запустите снова:`n" + (Invoke-RerunHint))
+    }
+    Write-Host "  ffmpeg готов" -ForegroundColor Green
 }
 
 Step "3/9" "Папка программы и права доступа"
