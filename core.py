@@ -463,6 +463,15 @@ def apply_answers_files(jp, md):
     import transcript
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
+    preflight = P.preflight_answers(jp, md, decisions, free)
+    blocked = {aid for conflict in preflight for aid in conflict["cards"]}
+    blocked_free = {aid: answer for aid, answer in free.items() if aid in blocked}
+    decisions = [d for d in decisions if d.get("id") not in blocked]
+    free = {aid: answer for aid, answer in free.items() if aid not in blocked}
+    if preflight:
+        rep["preflight_conflicts"] = preflight
+        rep["human"] = list(dict.fromkeys((rep.get("human") or []) + sorted(blocked)))
+        rep["changed"] = [aid for aid in rep.get("changed") or [] if aid not in blocked]
     undo = [d for d in decisions if "_undo_snapshot" in d]
     decisions = [d for d in decisions if "_undo_snapshot" not in d]
     undone, undo_failed = [], set()
@@ -510,23 +519,24 @@ def apply_answers_files(jp, md):
             aid = decision.get("id")
             if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
                 remember_snapshot(aid, before, after)
+    free_items = []
+    if blocked_free:
+        free_items.append({"conflicts": preflight,
+                           "left_to_human": [{"id": aid, "why": "конфликт с другой карточкой до применения",
+                                              "answer": answer.get("text")} for aid, answer in blocked_free.items()]})
     if free:
         # Свободные ответы нередко затрагивают одни и те же слова. Применяем их
         # отдельно, чтобы у каждого успешного ответа был обратимый структурный
         # снимок; это снимает консервативный отказ от пакетной отмены.
-        free_items = []
         order = {it["id"]: it.get("t1", 0) for it in (P.manifest(jp) or {}).get("items") or []}
         for aid in sorted(free, key=lambda x: -order.get(x, 0)):
             before = transcript.load(jp)
             part = P.apply_free(jp, md, {aid: free[aid]})
-            if len(free) > 1:
-                free_items.append(part)
-            else:
-                rep["free_text"] = part
+            free_items.append(part)
             if aid in part.get("successful_ids", []):
                 remember_snapshot(aid, before, transcript.load(jp))
-        if free_items:
-            rep["free_text"] = _merge_free_reports(free_items)
+    if free_items:
+        rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
     successful.difference_update(rep.get("human", []))

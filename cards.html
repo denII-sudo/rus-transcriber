@@ -366,6 +366,7 @@ audio{width:100%;height:36px}
       const preview = document.createElement("button"); preview.type = "button"; preview.className = "btn"; preview.textContent = "Предпросмотр";
       preview.onclick = async () => { if (!inp.value.trim()) return; state.textContent = "Проверяю без записи…";
         try { const r = await api.preview(it.id, inp.value.trim()); const one = (r.cards || [])[0];
+          if ((r.preflight_conflicts || []).length) { state.textContent = "Предпросмотр не применим: конфликт с другой сохранённой карточкой. Требуется проверка человеком."; return; }
           state.textContent = "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
             ((r.left_to_human || []).length ? "; требуется проверка человеком" : "") + ((r.not_found || []).length ? "; место не найдено" : "") + ". Результат может измениться при последующих правках.";
         } catch (e) { state.textContent = "Предпросмотр недоступен: " + e.message; } };
@@ -399,6 +400,7 @@ audio{width:100%;height:36px}
       add("Применено", rep.review && rep.review.successful_ids); add("Отменено", rep.reverted);
       add("Без изменений", rep.unchanged); add("Требует проверки", rep.human);
       add("Конфликт отмены", rep.undo_conflicts); add("Отмена недоступна", rep.undo_unavailable);
+      add("Конфликт карточек до применения", (rep.preflight_conflicts || []).map(c => ({id: (c.cards || []).join(", "), why: c.why})));
       add("Не найдено", rep.review && rep.review.not_found); add("Свободный ответ применён", rep.free_text && rep.free_text.successful_ids);
       add("Свободный ответ требует проверки", rep.free_text && rep.free_text.left_to_human); add("Не найдено", rep.free_text && rep.free_text.not_found);
       add("Конфликт применения", rep.review && rep.review.conflicts); add("Конфликт свободных ответов", rep.free_text && rep.free_text.conflicts);

@@ -629,6 +629,96 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(set(result["successful_ids"]), {"r1", "r2"})
         self.assertEqual([s["text"] for s in T.load(c.json)["segments"]], ["первое", "второе"])
 
+    def test_conflicting_free_answers_are_preflighted_before_any_application(self):
+        """Противоречивые ответы на один word_id нужно обнаружить до первой записи."""
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("слово", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "слово"), item("r2", 0.0, 0.0, "Анна", "слово")])
+        before = T.load(c.json)
+        wid = before["segments"][0]["words"][0]["word_id"]
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "recording_id": before["recording_id"],
+                 "items": [dict(r, options=[], word_ids=[wid]) for r in before["review"]]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {
+            rid: {"id": rid, "version": "v1", "kind": "free", "text": text,
+                  "source": "local", "ts": "2026-01-01"}
+            for rid, text in (("r1", "первое"), ("r2", "второе"))}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            result = core.apply_answers("demo")
+        self.assertTrue(result["free_text"]["conflicts"])
+        self.assertEqual(T.load(c.json)["segments"], before["segments"])
+
+    def test_free_option_conflict_blocks_both_but_independent_answer_applies(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("альфа бета", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "альфа"), item("r2", 0.0, 0.0, "Анна", "альфа"),
+                  item("r3", 0.3, 0.3, "Анна", "бета")])
+        before = T.load(c.json)
+        words = before["segments"][0]["words"]
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        items = [dict(r, word_ids=[words[0 if n < 2 else 1]["word_id"]],
+                      options=[{"label": "изменить", "decision": {"text": "другое"}}])
+                 for n, r in enumerate(before["review"])]
+        P._write(pd / "manifest.json", {"version": "v1", "recording_id": before["recording_id"], "items": items})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {
+            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "local", "ts": "2026-01-01"},
+            "r2": {"id": "r2", "kind": "option", "option": 0, "source": "local", "ts": "2026-01-01"},
+            "r3": {"id": "r3", "kind": "free", "text": "третье", "source": "local", "ts": "2026-01-01"}}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            result = core.apply_answers("demo")
+        self.assertEqual(result["preflight_conflicts"][0]["cards"], ["r1", "r2"])
+        self.assertEqual(result["free_text"]["successful_ids"], ["r3"])
+        self.assertEqual(T.load(c.json)["segments"][0]["text"], "альфа третье")
+        self.assertEqual(set(P._read(pd / "answers.json", {})["applied_answers"]), {"r3"})
+
+    def test_conflict_preflight_is_read_only(self):
+        import review_pack as P
+        c, P, before = self._overlap_free_case()
+        # Одна и та же цель, даже если результаты ещё не записаны.
+        man = P.manifest(c.json)
+        man["items"][1]["word_ids"] = man["items"][0]["word_ids"]
+        P._write(P.pack_dir(c.json) / "manifest.json", man)
+        before_json, before_md = c.json.read_bytes(), c.md.read_bytes()
+        result = P.preflight_answers(c.json, c.md, [], {"r1": {"text": "первое"}, "r2": {"text": "второе"}})
+        self.assertEqual(result[0]["cards"], ["r1", "r2"])
+        self.assertEqual(c.json.read_bytes(), before_json)
+        self.assertEqual(c.md.read_bytes(), before_md)
+
+    def test_conflict_blocks_undo_of_previously_applied_answer(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("альфа", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "альфа"), item("r2", 0.0, 0.0, "Анна", "альфа")])
+        data = T.load(c.json)
+        wid = data["segments"][0]["words"][0]["word_id"]
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        opts = [{"label": "первое", "decision": {"text": "первое"}},
+                {"label": "второе", "decision": {"text": "второе"}}]
+        P._write(pd / "manifest.json", {"version": "v1", "recording_id": data["recording_id"],
+                 "items": [dict(r, word_ids=[wid], options=opts) for r in data["review"]]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
+            "id": "r1", "kind": "option", "option": 0, "source": "local", "ts": "2026-01-01"}}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            self.assertEqual(core.apply_answers("demo")["review"]["successful_ids"], ["r1"])
+            previous = T.load(c.json)
+            store = P._read(pd / "answers.json", {})
+            store["answers"]["r1"].update(option=1, ts="2026-01-02")
+            store["answers"]["r2"] = {"id": "r2", "kind": "free", "text": "третье",
+                                      "source": "local", "ts": "2026-01-02"}
+            P._write(pd / "answers.json", store)
+            result = core.apply_answers("demo")
+        self.assertTrue(result["preflight_conflicts"])
+        self.assertEqual(T.load(c.json), previous)
+        self.assertEqual(P._read(pd / "answers.json", {})["applied_answers"]["r1"], ["option", 0, None])
+
     def test_free_duplicate_id_is_rejected_without_retargeting(self):
         c, P, original = self._overlap_free_case()
         altered = T.load(c.json)

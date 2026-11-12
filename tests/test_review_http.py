@@ -172,6 +172,37 @@ class ReviewHTTP(unittest.TestCase):
         self.assertEqual(result["reverted"], ["r1"])
         self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["review"][0]["status"], "open")
 
+    def test_preview_refuses_conflicting_saved_answer_without_writing(self):
+        root = Path(self.tmp.name)
+        jp, md = root / "demo.transcript.json", root / "demo.transcript.md"
+        mf, af = self.pack / "manifest.json", self.pack / "answers.json"
+        files = (jp, md, mf, af)
+        saved = {p: p.read_bytes() if p.exists() else None for p in files}
+        try:
+            reviews = [{"id": rid, "t": 0.0, "t1": 0.0, "t2": 0.0, "speaker": "Участник",
+                        "text": "да", "status": "open", "reasons": []} for rid in ("r1", "r2")]
+            jp.write_text(json.dumps({"file": "demo.wav", "duration": "00:00:01", "recording_id": "demo",
+                "speakers": ["Участник"], "segments": [{"speaker": "Участник", "label": "Участник",
+                "start": 0.0, "end": 0.2, "text": "да", "words": [{"w": "да", "s": 0.0, "e": 0.2,
+                "c": 0.9, "word_id": "w1"}]}], "review": reviews, "edits": []}), encoding="utf-8")
+            md.write_text("demo", encoding="utf-8")
+            mf.write_text(json.dumps({"version": "v1", "recording_id": "demo", "items": [
+                dict(r, word_ids=["w1"], options=[{"label": "да", "decision": {}}]) for r in reviews]}), encoding="utf-8")
+            af.write_text(json.dumps({"version": "v1", "answers": {"r2": {"id": "r2", "version": "v1",
+                "kind": "free", "text": "второе", "source": "local", "ts": "2026-01-01"}}}), encoding="utf-8")
+            before = {p: p.read_bytes() for p in files}
+            payload = json.dumps({"id": "r1", "version": "v1", "text": "первое"}).encode()
+            status, body, _ = self.post("api/preview", payload, **{"Content-Type": "application/json"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["preflight_conflicts"][0]["cards"], ["r1", "r2"])
+            self.assertEqual({p: p.read_bytes() for p in files}, before)
+        finally:
+            for p, original in saved.items():
+                if original is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_bytes(original)
+
 
 if __name__ == "__main__":
     unittest.main()

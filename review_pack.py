@@ -487,6 +487,11 @@ def apply_free(json_path, md_path, free, dry_run=False):
     except Exception:
         pass
     edits, reports, closed, conflicts = F.plan(man, valid_free, data, vocab_words)
+    targets = {}
+    for edit in edits:
+        ids = list(edit.get("word_ids") or [])
+        ids.extend(edit[k] for k in ("word_id", "after_id", "before_id") if edit.get(k))
+        targets.setdefault(edit.get("card"), set()).update(ids)
     conflict_ids = {cid for conflict in conflicts for cid in conflict.get("cards", [])}
     blocked = conflict_ids | {r["id"] for r in reports if r.get("human") or r.get("proposed_delete")}
     edits = [e for e in edits if e.get("card") not in blocked]
@@ -513,7 +518,8 @@ def apply_free(json_path, md_path, free, dry_run=False):
     if human and not dry_run:                     # не понятые ответы — человеку, с текстом ответа
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
                                              "note": f"{h['why']}: «{h['answer']}»"} for h in human], by="human")
-    return {"cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
+    return {**({"target_ids": {aid: sorted(ids) for aid, ids in targets.items()}} if dry_run else {}),
+            "cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
@@ -527,6 +533,46 @@ def apply_free(json_path, md_path, free, dry_run=False):
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
             "vocab_suggestions": [v for v in (result_data if dry_run else T.load(json_path)).get("vocab_suggestions") or [] if v.get("card")],
             "conspects": rep.get("conspects")}
+
+
+def preflight_answers(json_path, md_path, decisions_, free):
+    """Найти пересекающиеся цели разных ответов до каких-либо изменений файлов."""
+    import transcript as T
+    ids = {d.get("id") for d in decisions_ if d.get("id")} | set(free)
+    if len(ids) < 2:
+        return []
+    man = manifest(json_path) or {}
+    items = {it["id"]: it for it in man.get("items") or []}
+    data = T.load(json_path)
+    # Планируем по одной карточке на одной исходной стенограмме: общий F.plan
+    # может дедуплицировать правки и скрыть часть заявленных целей.
+    planned = {}
+    for aid, answer in free.items():
+        preview = apply_free(json_path, md_path, {aid: answer}, dry_run=True)
+        planned.update(preview.get("target_ids") or {})
+    claims = {}
+    for aid in ids:
+        it = items.get(aid) or {}
+        target = set(it.get("word_ids") or []) | set(planned.get(aid) or [])
+        t1, t2 = it.get("t1"), it.get("t2")
+        if not target and t1 is not None and t2 is not None:
+            # Старые карточки адресуются временем: берём все слова в диапазоне,
+            # а не выбранный эвристикой первый сегмент.
+            target = {w.get("word_id") for s in data.get("segments") or [] for w in s.get("words") or []
+                      if t1 - 0.01 <= w["s"] <= t2 + 0.01 and w.get("word_id")}
+        claims[aid] = {"ids": target, "legacy": not bool(it.get("word_ids")), "t1": t1, "t2": t2}
+    conflicts = []
+    ordered = sorted(ids)
+    for i, a in enumerate(ordered):
+        for b in ordered[i + 1:]:
+            x, y = claims[a], claims[b]
+            shared = x["ids"] & y["ids"]
+            legacy_overlap = (x["legacy"] or y["legacy"]) and all(
+                v is not None for v in (x["t1"], x["t2"], y["t1"], y["t2"])) and \
+                x["t1"] <= y["t2"] + 0.01 and y["t1"] <= x["t2"] + 0.01
+            if shared or legacy_overlap:
+                conflicts.append({"cards": [a, b], "why": "ответы затрагивают общие слова или неоднозначный старый диапазон"})
+    return conflicts
 
 
 def cloud_bundle(json_path, artifact_url=None):

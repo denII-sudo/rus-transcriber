@@ -125,7 +125,17 @@ def main():
                             it.get("id") == obj.get("id") for it in man.get("items", [])) or not isinstance(obj.get("text"), str) or not obj["text"].strip():
                         return self._send(400, {"error": "неверная карточка, версия или текст"})
                     with lock:
-                        result = P.apply_free(a.json_path, a.markdown, {obj["id"]: {"text": obj["text"]}}, dry_run=True)
+                        aid = obj["id"]
+                        free = P.free_answers(a.json_path)
+                        free[aid] = {"text": obj["text"]}
+                        decisions, _ = P.decisions(a.json_path)
+                        decisions = [d for d in decisions if d.get("id") != aid]
+                        conflicts = [c for c in P.preflight_answers(a.json_path, a.markdown, decisions, free)
+                                     if aid in c["cards"]]
+                        if conflicts:
+                            result = {"cards": [], "preflight_conflicts": conflicts}
+                        else:
+                            result = P.apply_free(a.json_path, a.markdown, {aid: free[aid]}, dry_run=True)
                     return self._send(200, result)
                 if u == "api/apply":
                     obj = json.loads(body.decode("utf-8"))
