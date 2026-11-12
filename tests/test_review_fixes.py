@@ -250,6 +250,44 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_reverted_edit_is_not_a_human_confirmation(self):
+        import voices
+        word = {"w": "одно", "s": 0.0, "e": 1.0, "by": "human"}
+        data = {"names_confirmed": True, "segments": [seg("Анна", [word])],
+                "edits": [{"id": "r1", "by": "human", "reverted": True,
+                           "before": {"speaker": "Борис"}, "after": {"speaker": "Анна"},
+                           "pairs": [["Борис", "Анна"]]}]}
+        self.assertEqual(voices._spans(data, True)[0][3], True)
+        self.assertEqual(voices._human_pairs(data), {})
+        self.assertFalse(voices.has_human_edits(data))
+        data["edits"][0].pop("reverted")
+        self.assertTrue(voices.has_human_edits(data))
+
+    def test_batch_free_answers_get_individual_undo(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("одно два", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "одно"), item("r2", 0.3, 0.3, "Анна", "два")])
+        before = T.load(c.json)
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [dict(x) for x in before["review"]]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {
+            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "test", "ts": "2026-01-01"},
+            "r2": {"id": "r2", "kind": "free", "text": "второе", "source": "test", "ts": "2026-01-01"}}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            result = core.apply_answers("demo")
+            self.assertEqual(sorted(result["free_text"]["successful_ids"]), ["r1", "r2"])
+            for rid in ("r1", "r2"):
+                store = P._read(pd / "answers.json", {})
+                store["answers"][rid].update(kind="revert", ts="2026-01-02")
+                P._write(pd / "answers.json", store)
+                self.assertEqual(core.apply_answers("demo")["reverted"], [rid])
+        after = T.load(c.json)
+        self.assertEqual(after["segments"], before["segments"])
+        self.assertFalse(any(w.get("by") == "human" for s in after["segments"] for w in s["words"]))
+
     def test_text_speaker_and_order_have_separate_provenance(self):
         c = Case([seg("Анна", W("одно два три", 0.0))],
                  [item("r1", 0.0, 0.0, "Анна", "одно"), item("r2", 0.3, 0.3, "Анна", "два"),

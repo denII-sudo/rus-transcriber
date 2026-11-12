@@ -375,11 +375,25 @@ def apply_answers(job_id):
             if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
                 remember_snapshot(aid, before, after)
     if free:
-        before_free = transcript.load(jp) if len(free) == 1 else None
-        rep["free_text"] = P.apply_free(jp, md, free)
-        free_success = rep["free_text"].get("successful_ids", [])
-        if before_free is not None and len(free_success) == 1:
-            remember_snapshot(free_success[0], before_free, transcript.load(jp))
+        # Свободные ответы нередко затрагивают одни и те же слова. Применяем их
+        # отдельно, чтобы у каждого успешного ответа был обратимый структурный
+        # снимок; это снимает консервативный отказ от пакетной отмены.
+        free_items = []
+        order = {it["id"]: it.get("t1", 0) for it in (P.manifest(jp) or {}).get("items") or []}
+        for aid in sorted(free, key=lambda x: -order.get(x, 0)):
+            before = transcript.load(jp)
+            part = P.apply_free(jp, md, {aid: free[aid]})
+            if len(free) > 1:
+                free_items.append(part)
+            else:
+                rep["free_text"] = part
+            if aid in part.get("successful_ids", []):
+                remember_snapshot(aid, before, transcript.load(jp))
+        if free_items:
+            rep["free_text"] = {**free_items[0],
+                                "successful_ids": [x for part in free_items for x in part["successful_ids"]],
+                                "not_found": [x for part in free_items for x in part["not_found"]],
+                                "cards": [x for part in free_items for x in part["cards"]]}
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
     successful.difference_update(rep.get("human", []))

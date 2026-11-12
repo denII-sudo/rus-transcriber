@@ -184,9 +184,17 @@ def group_of(data, _cache={}):
     return _cache[vp]
 
 
+def _word_human(word):
+    """Действующее человеческое подтверждение слова по новым полям, с откатом к старому `by`."""
+    if word.get("by") == "human":
+        return True
+    return any(isinstance(v, dict) and v.get("by") == "human"
+               for v in (word.get("provenance") or {}).values())
+
+
 def _spans(data, confirmed):
     """Отрезки «говорящий — время» для профиля: (имя, начало, конец, человек?).
-    Человек: слова, подписанные или исправленные человеком (by=human), кроме наложений.
+    Человек: слова, подписанные или исправленные человеком, кроме наложений.
     Модель: только в подтверждённых расшифровках и только слова без пометок сомнения."""
     out = []
     for seg in data["segments"]:
@@ -196,8 +204,8 @@ def _spans(data, confirmed):
         run, kind = [], None
         for w in (seg.get("words") or []) + [None]:
             if w is not None:
-                human = w.get("by") == "human" and "overlap" not in (w.get("flags") or [])
-                auto = confirmed and not w.get("flags") and w.get("by") != "human" and not w.get("inserted")
+                human = _word_human(w) and "overlap" not in (w.get("flags") or [])
+                auto = confirmed and not w.get("flags") and not _word_human(w) and not w.get("inserted")
                 k = "h" if human else ("a" if auto else None)
             else:
                 k = None
@@ -214,11 +222,17 @@ def _spans(data, confirmed):
     return out
 
 
+def has_human_edits(data):
+    """Есть ли в журнале действующая (не отменённая) человеческая правка."""
+    return any(ed.get("by") == "human" and not ed.get("reverted")
+               for ed in data.get("edits") or [])
+
+
 def _human_pairs(data):
     """Поправки человека «профиль/модель сказали A — это B» из журнала правок. -> {(A, B): n}."""
     out = {}
     for ed in data.get("edits") or []:
-        if ed.get("by") != "human":
+        if ed.get("by") != "human" or ed.get("reverted"):
             continue
         a, b = (ed.get("before") or {}).get("speaker"), (ed.get("after") or {}).get("speaker")
         if a and b and a != b and "," not in a and "," not in b:
@@ -268,7 +282,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             continue
         if data.get("no_profile"):           # общий словарь без group: в профили групп не идёт
             continue
-        has_human = any(ed.get("by") == "human" for ed in data.get("edits") or [])
+        has_human = has_human_edits(data)
         if not (_confirmed(data) or has_human):
             continue
         src = Path(data.get("file", ""))
