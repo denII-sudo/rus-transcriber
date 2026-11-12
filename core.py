@@ -349,8 +349,8 @@ def apply_answers(job_id):
         nonlocal snapshot_bytes
         snapshot = transcript.answer_snapshot(before, after)
         size = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
-        # Полные снимки больших стенограмм нельзя неограниченно умножать на
-        # число карточек. Ответ без снимка останется применённым, но его
+        # Даже компактные снимки крупных изменений могут быть большими.
+        # Ответ без снимка останется применённым, но его
         # автоматическая отмена будет недоступна и об этом сообщается.
         if snapshot_bytes + size > 16 * 1024 * 1024:
             rep.setdefault("undo_unavailable", []).append(aid)

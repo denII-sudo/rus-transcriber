@@ -201,11 +201,37 @@ def _undo_fingerprint(data):
 
 
 def answer_snapshot(before, after):
-    """Снимок структуры для осторожной отмены одного ответа, без разбора текста отображения."""
-    return {"segments": copy.deepcopy(before.get("segments") or []),
-            "review": copy.deepcopy(before.get("review") or []),
+    """Сохранить только структурные участки, изменённые ответом."""
+    from difflib import SequenceMatcher
+
+    def patches(key):
+        old, new = before.get(key) or [], after.get(key) or []
+        encode = lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        matcher = SequenceMatcher(None, [encode(x) for x in old], [encode(x) for x in new], autojunk=False)
+        return [{"start": j1, "remove": j2 - j1, "restore": copy.deepcopy(old[i1:i2])}
+                for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
+
+    return {"format": 2, "segment_patches": patches("segments"), "review_patches": patches("review"),
             "edits_before": len(before.get("edits") or []),
             "after": _undo_fingerprint(after)}
+
+
+def _restore_patches(rows, patches):
+    if not isinstance(patches, list):
+        raise ValueError("неверный формат снимка")
+    end = 0
+    for p in patches:
+        if not isinstance(p, dict):
+            raise ValueError("неверный участок снимка")
+        start, remove, restore = p.get("start"), p.get("remove"), p.get("restore")
+        if type(start) is not int or type(remove) is not int or not isinstance(restore, list) \
+                or start < end or remove < 0 or start + remove > len(rows):
+            raise ValueError("неверные границы снимка")
+        end = start + remove
+    result = copy.deepcopy(rows)
+    for p in reversed(patches):
+        result[p["start"]:p["start"] + p["remove"]] = copy.deepcopy(p["restore"])
+    return result
 
 
 def undo_answer(json_path, md_path, aid, snapshot):
@@ -217,8 +243,18 @@ def undo_answer(json_path, md_path, aid, snapshot):
     n = snapshot.get("edits_before")
     if not isinstance(n, int) or not 0 <= n <= len(edits):
         return {"id": aid, "conflict": "повреждён снимок журнала"}
-    data["segments"] = copy.deepcopy(snapshot["segments"])
-    data["review"] = copy.deepcopy(snapshot["review"])
+    try:
+        if snapshot.get("format") == 2:
+            segments = _restore_patches(data.get("segments") or [], snapshot.get("segment_patches"))
+            review = _restore_patches(data.get("review") or [], snapshot.get("review_patches"))
+        elif "format" not in snapshot and isinstance(snapshot.get("segments"), list) \
+                and isinstance(snapshot.get("review"), list):
+            segments, review = copy.deepcopy(snapshot["segments"]), copy.deepcopy(snapshot["review"])
+        else:
+            raise ValueError("неизвестный формат снимка")
+    except (ValueError, TypeError):
+        return {"id": aid, "conflict": "повреждён структурный снимок"}
+    data["segments"], data["review"] = segments, review
     for edit in edits[n:]:
         if edit.get("by") == "human":
             edit["original_by"] = edit["by"]

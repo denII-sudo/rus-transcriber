@@ -250,6 +250,38 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_snapshot_keeps_only_changed_segments(self):
+        segments = [seg("Анна", W(f"слово{i}", float(i * 2))) for i in range(200)]
+        c = Case(segments, [item("r1", 200.0, 200.0, "Анна", "слово100")])
+        before = T.load(c.json)
+        after, _ = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        snapshot = T.answer_snapshot(before, after)
+        self.assertEqual(snapshot["format"], 2)
+        self.assertEqual(len(snapshot["segment_patches"]), 1)
+        self.assertLess(len(json.dumps(snapshot, ensure_ascii=False)),
+                        len(json.dumps(before["segments"], ensure_ascii=False)) // 4)
+        result = T.undo_answer(c.json, c.md, "r1", snapshot)
+        self.assertTrue(result.get("reverted"))
+        self.assertEqual(T.load(c.json)["segments"], before["segments"])
+
+    def test_legacy_full_snapshot_still_restores(self):
+        c = Case([seg("Анна", W("одно два", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        before = T.load(c.json)
+        after, _ = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        old = {"segments": before["segments"], "review": before["review"],
+               "edits_before": len(before["edits"]), "after": T._undo_fingerprint(after)}
+        self.assertTrue(T.undo_answer(c.json, c.md, "r1", old).get("reverted"))
+        self.assertEqual(T.load(c.json)["segments"], before["segments"])
+
+    def test_damaged_compact_snapshot_is_not_applied(self):
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        before = T.load(c.json)
+        after, _ = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        snapshot = T.answer_snapshot(before, after)
+        snapshot["segment_patches"][0]["start"] = 10000
+        self.assertIn("conflict", T.undo_answer(c.json, c.md, "r1", snapshot))
+        self.assertEqual(T.load(c.json), after)
+
     def test_batch_options_can_be_undone_in_reverse_order(self):
         from unittest.mock import patch
         import core
