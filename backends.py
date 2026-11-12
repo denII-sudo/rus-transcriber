@@ -10,6 +10,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -130,6 +131,71 @@ def _as_text(res):
     return str(res)
 
 
+def _observed_recognize(model, pieces, batches, *, pad=None, kwargs=None, progress=None,
+                        timestamped=False):
+    """Распознавание с протоколом попыток; повторяем только технические ошибки по одному разу.
+
+    Индексы относятся к исходному списку, даже если пакеты отсортированы по длине.
+    Аудио и текст в диагностике не сохраняются; сообщения исключений могут содержать личные данные.
+    """
+    kwargs = kwargs or {}
+    prepare = pad or (lambda x: x.astype(np.float32))
+    output = [None if timestamped else ""] * len(pieces)
+    records = [{"index": i, "samples": len(p), "attempts": [], "state": "not_attempted"}
+               for i, p in enumerate(pieces)]
+    done = 0
+
+    def attempt(indices, retry=False):
+        start = time.monotonic()
+        inputs = []
+        try:
+            inputs = [prepare(pieces[i]) for i in indices]
+            result = model.recognize(inputs, sample_rate=SR, **kwargs)
+            if not isinstance(result, (list, tuple)) or len(result) != len(indices):
+                raise TypeError("неверный формат или количество результатов пакета")
+            if timestamped:
+                for r in result:
+                    if r is None or not all(hasattr(r, k) for k in ("tokens", "timestamps", "logprobs")):
+                        raise TypeError("неверный формат результата со временем")
+                values = result
+            else:
+                if any(r is None or not (isinstance(r, str) or hasattr(r, "text") or
+                                         hasattr(r, "transcription") or
+                                         isinstance(r, dict) and ("text" in r or "transcription" in r))
+                       for r in result):
+                    raise TypeError("неверный формат текстового результата")
+                values = [_as_text(r).strip() for r in result]
+            elapsed = round(time.monotonic() - start, 4)
+            for i, value in zip(indices, values):
+                output[i] = value
+                empty = not (getattr(value, "tokens", None) if timestamped else value)
+                records[i]["attempts"].append({"result": "empty" if empty else "ok", "retry": retry,
+                                               "batch": list(indices), "input_samples": len(inputs[indices.index(i)]),
+                                               "elapsed_sec": elapsed})
+                records[i]["state"] = "empty_unknown" if empty else "ok"
+            return True
+        except Exception as ex:
+            elapsed = round(time.monotonic() - start, 4)
+            for pos, i in enumerate(indices):
+                records[i]["attempts"].append({"result": "error", "error_type": type(ex).__name__,
+                                               "retry": retry, "batch": list(indices),
+                                               "input_samples": len(inputs[pos]) if pos < len(inputs) else None,
+                                               "elapsed_sec": elapsed})
+                records[i]["state"] = "error"
+            print(f"[asr] ошибка попытки ({type(ex).__name__}); фрагментов: {len(indices)}",
+                  file=sys.stderr, flush=True)
+            return False
+
+    for indices in batches:
+        if not attempt(indices):
+            for i in indices:
+                attempt([i], retry=True)
+        done += len(indices)
+        if progress:
+            progress(done, len(pieces))
+    return output, records
+
+
 class OnnxASR:
     def __init__(self, model="v3_e2e_rnnt", device="CPU", provider="openvino", pad_to=0.0, batch=1,
                  quant=None, language=None, allow_npu=False):
@@ -234,9 +300,17 @@ class OnnxASR:
         return out
 
 
-    def transcribe_timestamped(self, pieces, progress=None):
+    def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
         """Как transcribe_many, но возвращает TimestampedResult (токены, времена, вероятности)."""
         model = self.model.with_timestamps()
+        if diagnostics is not None:
+            order = sorted(range(len(pieces)), key=lambda i: len(pieces[i]))
+            bs = max(1, min(self.batch, 16))
+            batches = [order[g:g + bs] for g in range(0, len(order), bs)]
+            result, records = _observed_recognize(model, pieces, batches, pad=self._pad,
+                                                  progress=progress, timestamped=True)
+            diagnostics.extend(records)
+            return result
         out = [None] * len(pieces)
         order = sorted(range(len(pieces)), key=lambda i: len(pieces[i]))
         bs = max(1, min(self.batch, 16))  # как в тесте скорости: пакет ограничен, чтобы не раздувать память
@@ -268,9 +342,15 @@ class OnnxASR:
         return out
 
 
-    def transcribe_texts(self, pieces, progress=None):
+    def transcribe_texts(self, pieces, progress=None, diagnostics=None):
         """Только текст (для Whisper: времён слов он не отдаёт). Язык — self.language."""
         kw = {"language": self.language} if self.language else {}
+        if diagnostics is not None:
+            bs = max(1, min(self.batch, 4))
+            batches = [list(range(g, min(g + bs, len(pieces)))) for g in range(0, len(pieces), bs)]
+            result, records = _observed_recognize(self.model, pieces, batches, kwargs=kw, progress=progress)
+            diagnostics.extend(records)
+            return result
         out = [""] * len(pieces)
         bs = max(1, min(self.batch, 4))
         for g in range(0, len(pieces), bs):
@@ -384,8 +464,14 @@ class WhisperOV:
 
         asr._encode = _encode     # декодер onnx-asr берёт выход кодировщика как OrtValue на процессоре
 
-    def transcribe_texts(self, pieces, progress=None):
+    def transcribe_texts(self, pieces, progress=None, diagnostics=None):
         kw = {"language": self.language} if self.language else {}
+        if diagnostics is not None:
+            batches = [list(range(g, min(g + self.batch, len(pieces))))
+                       for g in range(0, len(pieces), self.batch)]
+            result, records = _observed_recognize(self.adapter, pieces, batches, kwargs=kw, progress=progress)
+            diagnostics.extend(records)
+            return result
         out = [""] * len(pieces)
         for g in range(0, len(pieces), self.batch):
             idx = list(range(g, min(g + self.batch, len(pieces))))

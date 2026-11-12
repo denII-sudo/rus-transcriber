@@ -139,17 +139,31 @@ def result_words(res, offset):
     return words
 
 
-def transcribe(asr, audio, chunks, progress=None):
+def transcribe(asr, audio, chunks, progress=None, diagnostics=None):
     pieces = [audio[int(c["a"] * SR):int(c["b"] * SR)] for c in chunks]
-    results = asr.transcribe_timestamped(pieces, progress=progress)
+    if diagnostics is None:
+        results = asr.transcribe_timestamped(pieces, progress=progress)
+    else:
+        results = asr.transcribe_timestamped(pieces, progress=progress, diagnostics=diagnostics)
     words = []
-    for c, r in zip(chunks, results):
+    for index, (c, r) in enumerate(zip(chunks, results)):
+        rec = diagnostics[index] if diagnostics is not None else None
+        if rec is not None:
+            rec.update(audio_span=[c["a"], c["b"]], own_span=list(c["own"]))
         if r is None:
             continue
         s, e = c["own"]
-        for w in result_words(r, c["a"]):
+        decoded = result_words(r, c["a"])
+        if rec is not None:
+            rec["result_has_text"] = bool(str(getattr(r, "text", "") or "").strip())
+            rec["token_count"] = len(r.tokens or [])
+        accepted = 0
+        for w in decoded:
             if s - 1e-3 <= w["s"] < e + 1e-3:
                 words.append(w)
+                accepted += 1
+        if rec is not None:
+            rec.update(decoded_words=len(decoded), owned_words=accepted)
     words.sort(key=lambda w: w["s"])
     # нахлёст: одно и то же слово на стыке двух кусков
     out = []

@@ -378,7 +378,11 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         return f
 
     st.set(stage="распознавание", progress=38, asr_backend=asr.name, asr_fallbacks=asr_errors or None)
-    words = W.transcribe(asr, audio, chunks, progress=prog(38, 62, "распознавание"))
+    asr_diag = quality.setdefault("asr_diagnostics", {})
+    primary_diag = []
+    asr_diag["primary"] = {"backend": asr.name, "chunks": primary_diag}
+    words = W.transcribe(asr, audio, chunks, progress=prog(38, 62, "распознавание"),
+                         diagnostics=primary_diag)
     timing.update(asr_sec=round(time.time() - t1), asr_chunks=len(chunks), asr_backend=asr.name,
                   asr_model=getattr(asr, "model_name", cfg.get("asr_model")))
     pieces = [audio[int(c["a"] * SR):int(c["b"] * SR)] for c in chunks]
@@ -400,7 +404,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                           "asr_device": sec_dev,
                           "asr_batch": int(cfg.get("asr_second_batch") or cfg.get("asr_batch", 1))}
             asr2, _ = make_asr(second_cfg)
-            alt = W.transcribe(asr2, audio, chunks, progress=prog(62, 68, "второй проход распознавания (CTC)"))
+            second_diag = []
+            asr_diag["second"] = {"backend": asr2.name, "chunks": second_diag}
+            alt = W.transcribe(asr2, audio, chunks, progress=prog(62, 68, "второй проход распознавания (CTC)"),
+                               diagnostics=second_diag)
             del asr2
             timing.update(asr2_sec=round(time.time() - t2), asr2_model=second)
         except Exception as ex:
@@ -446,13 +453,23 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                 t_load = time.time() - t3
                 asr3_meta = type("M", (), {"compile_sec": getattr(asr3, "compile_sec", None),
                                            "name": getattr(asr3, "name", None)})
-                texts = asr3.transcribe_texts(wpieces, progress=prog(68, 74, f"третья модель (Whisper, {device})"))
+                whisper_diag = []
+                asr_diag["whisper"] = {"backend": asr3.name, "chunks": whisper_diag}
+                texts = asr3.transcribe_texts(wpieces, progress=prog(68, 74, f"третья модель (Whisper, {device})"),
+                                              diagnostics=whisper_diag)
                 del asr3
                 by_k = dict(zip(selected, texts))
+                diag_by_k = dict(zip(selected, whisper_diag))
                 wh_words, removed = [], 0
                 for k, c in enumerate(wchunks):
                     if k in by_k:
                         tx, n = W.clean_whisper(by_k[k], wrep)
+                        rec = diag_by_k[k]
+                        rec.update(chunk_index=k, audio_span=[c["a"], c["b"]], own_span=list(c["own"]),
+                                   raw_words=len(by_k[k].split()), cleaned_words=len(tx.split()),
+                                   removed_words=n)
+                        if by_k[k].strip() and not tx.strip():
+                            rec["filtered_all"] = True
                         removed += n
                         wh_words += tx.split()
                     else:            # RNN-T и CTC здесь согласны: Whisper голосования не изменил бы
@@ -487,6 +504,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                 prev = None
     elif alt is not None:
         W.mark_alt(words, alt)
+
+    failed = sum(1 for stage in asr_diag.values() for item in stage["chunks"] if item["state"] == "error")
+    if failed:
+        quality["asr_incomplete_chunks"] = failed
 
     # словарь — по словам, исходное слово сохраняется
     if vocab:
@@ -835,6 +856,7 @@ def main():
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
                                            "review_items": len(data.get("review", [])),
+                                           "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                            "emotions_error": quality.get("emotions_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),
                                            "vocab_fixes": sum(len(v["fixes"]) for v in quality["vocab_fixes"]),
