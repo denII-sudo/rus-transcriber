@@ -127,6 +127,7 @@ def build(json_path, items, base_url_note=None):
     body = json.dumps(out, ensure_ascii=False, sort_keys=True)
     version = time.strftime("%Y%m%d%H%M%S-") + hashlib.sha1(body.encode()).hexdigest()[:6]
     man = {"version": version, "job_json": str(json_path), "audio": src.name,
+           "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(), "items": out}
     _write(pd / "manifest.json", man)
     ans = _read(pd / "answers.json", {})

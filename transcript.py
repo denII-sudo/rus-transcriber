@@ -6,6 +6,7 @@
 """
 import json
 import re
+import uuid
 from pathlib import Path
 
 REASON_RU = {"asr": "модели распознали по-разному", "conf": "модель не уверена в слове",
@@ -166,6 +167,21 @@ def render_md(data, text_only=False):
 
 
 def save(data, json_path, md_path):
+    # Идентификаторы не зависят от времени слова или его позиции в отображении.
+    # Старые файлы получают их при первом сохранении; дубликаты после разрезания
+    # реплик получают новые ID. Это не межпроцессная блокировка.
+    data.setdefault("recording_id", uuid.uuid4().hex)
+    for field, objects in (("segment_id", data.get("segments") or []),
+                           ("word_id", [w for seg in data.get("segments") or []
+                                        for w in seg.get("words") or []])):
+        seen = set()
+        for obj in objects:
+            ident = obj.get(field)
+            if not isinstance(ident, str) or not ident or ident in seen:
+                ident = uuid.uuid4().hex
+                obj[field] = ident
+            seen.add(ident)
+    data["source_revision"] = data.get("source_revision", 0) + 1
     Path(json_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     Path(md_path).write_text(render_md(data), encoding="utf-8")
 
@@ -377,8 +393,11 @@ def _diff_words(old, new_text, item_id):
     out, conflicts = [], []
 
     def mk(text, src, s, e):
-        return {"w": text, "s": s, "e": e, "c": 1.0, "edited": item_id,
-                "model": " ".join(w.get("model", w.get("raw", w["w"])) for w in src) if src else ""}
+        result = {"w": text, "s": s, "e": e, "c": 1.0, "edited": item_id,
+                  "model": " ".join(w.get("model", w.get("raw", w["w"])) for w in src) if src else ""}
+        if len(src) == 1 and src[0].get("word_id"):
+            result["word_id"] = src[0]["word_id"]
+        return result
 
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         src = old[i1:i2]

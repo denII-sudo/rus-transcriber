@@ -250,6 +250,17 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_word_identity_and_revision_survive_simple_edit(self):
+        c = Case([seg("Анна", W("одно два", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        before = T.load(c.json)
+        first = before["segments"][0]["words"][0]["word_id"]
+        second = before["segments"][0]["words"][1]["word_id"]
+        T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
+        after = T.load(c.json)
+        self.assertEqual(after["recording_id"], before["recording_id"])
+        self.assertEqual(after["source_revision"], before["source_revision"] + 1)
+        self.assertEqual([w["word_id"] for w in after["segments"][0]["words"]], [first, second])
+
     def test_missing_target_is_not_successful(self):
         c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 9.0, 9.0, "Анна", "нет")])
         data, report = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
