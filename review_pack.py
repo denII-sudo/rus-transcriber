@@ -376,6 +376,9 @@ def decisions(json_path):
             rep["unchanged"].append(aid)
             continue
         if aid in applied:
+            if a.get("kind") == "revert" and (store.get("undo_snapshots") or {}).get(aid):
+                out.append({"id": aid, "_undo_snapshot": store["undo_snapshots"][aid]})
+                continue
             rep.setdefault("undo_conflicts", []).append({"id": aid, "why":
                 "для безопасной отмены нет проверенного структурного снимка"})
             continue
@@ -525,7 +528,7 @@ def cloud_bundle(json_path, artifact_url=None):
             "applied": out["applied"], "answered": len(out["answers"]), "items": len(man["items"])}
 
 
-def mark_applied(json_path, ids=None):
+def mark_applied(json_path, ids=None, snapshots=None):
     """Запоминает, какие ответы применены (подпись ответа на каждое место) и когда."""
     pd = pack_dir(json_path)
     store = _read(pd / "answers.json", {"answers": {}})
@@ -534,8 +537,11 @@ def mark_applied(json_path, ids=None):
         if ids is None or aid in ids:
             if a.get("kind") == "revert":
                 m.pop(aid, None)
+                store.setdefault("undo_snapshots", {}).pop(aid, None)
             elif a.get("kind") != "skip":
                 m[aid] = _sig(a)
+                if snapshots and aid in snapshots:
+                    store.setdefault("undo_snapshots", {})[aid] = snapshots[aid]
     store["applied_answers"] = m
     store["applied_at"] = _now()
     _write(pd / "answers.json", store)

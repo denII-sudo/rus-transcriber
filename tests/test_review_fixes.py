@@ -250,6 +250,72 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def _answer_case(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("одно два", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [{"id": "r1", "t1": 0.0, "t2": 0.0,
+                 "options": [{"label": "сменить", "decision": {"speaker": "Борис"}}]}]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {"id": "r1", "kind": "option",
+                 "option": 0, "source": "test", "ts": "2026-01-01"}}})
+        def apply():
+            with patch.object(core, "job_json", return_value=(c.json, c.md)):
+                return core.apply_answers("demo")
+        return c, P, apply
+
+    def test_structural_undo_restores_speaker_and_provenance(self):
+        import voices
+        c, P, apply = self._answer_case()
+        before = T.load(c.json)
+        self.assertEqual(apply()["review"]["applied"], 1)
+        self.assertEqual(apply()["unchanged"], ["r1"])
+        store = P._read(P.pack_dir(c.json) / "answers.json", {})
+        store["answers"]["r1"].update(kind="revert", ts="2026-01-02")
+        P._write(P.pack_dir(c.json) / "answers.json", store)
+        self.assertEqual(apply()["reverted"], ["r1"])
+        after = T.load(c.json)
+        self.assertEqual(after["segments"], before["segments"])
+        self.assertEqual(after["review"][0]["status"], "open")
+        self.assertFalse(voices._human_pairs(after))
+        self.assertFalse(any(w.get("by") == "human" for s in after["segments"] for w in s["words"]))
+
+    def test_undo_conflicts_after_later_edit(self):
+        c, P, apply = self._answer_case()
+        apply()
+        T.edit_span(c.json, c.md, 0.3, 0.3, "новое", by="human")
+        later = T.load(c.json)
+        store = P._read(P.pack_dir(c.json) / "answers.json", {})
+        store["answers"]["r1"].update(kind="revert", ts="2026-01-02")
+        P._write(P.pack_dir(c.json) / "answers.json", store)
+        self.assertTrue(apply()["undo_conflicts"])
+        self.assertEqual(T.load(c.json), later)
+
+    def test_free_answer_undo_preserves_structural_order_and_audio_times(self):
+        from unittest.mock import patch
+        import core
+        import review_pack as P
+        c = Case([seg("Анна", W("и он", 0.0)), seg("Борис", W("Ну,", 0.55)),
+                  seg("Анна", W("у нас", 0.9))], [item("r1", 0.0, 1.2, "Анна", "и он Ну, у нас")])
+        before = T.load(c.json)
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "items": [dict(before["review"][0], options=[])]})
+        P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {"id": "r1", "kind": "free",
+                 "text": "Анна: и он у нас", "source": "test", "ts": "2026-01-01"}}})
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            result = core.apply_answers("demo")
+            self.assertEqual(result["free_text"]["successful_ids"], ["r1"])
+            store = P._read(pd / "answers.json", {})
+            store["answers"]["r1"].update(kind="revert", ts="2026-01-02")
+            P._write(pd / "answers.json", store)
+            self.assertEqual(core.apply_answers("demo")["reverted"], ["r1"])
+        after = T.load(c.json)
+        self.assertEqual(after["segments"], before["segments"])
+        self.assertNotIn("Анна:", " ".join(w["w"] for s in after["segments"] for w in s["words"]))
+
     def test_word_identity_and_revision_survive_simple_edit(self):
         c = Case([seg("Анна", W("одно два", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
         before = T.load(c.json)

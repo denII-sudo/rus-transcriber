@@ -4,6 +4,8 @@
 (edits — журнал: кто, что, было/стало). Правка не стирает слой модели: исходные слова остаются
 в поле model у исправленного места и в журнале.
 """
+import copy
+import hashlib
 import json
 import re
 import uuid
@@ -188,6 +190,45 @@ def save(data, json_path, md_path):
 
 def load(json_path):
     return json.loads(Path(json_path).read_text(encoding="utf-8"))
+
+
+def _undo_fingerprint(data):
+    state = {k: data.get(k) for k in ("segments", "review", "edits")}
+    raw = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def answer_snapshot(before, after):
+    """Снимок структуры для осторожной отмены одного ответа, без разбора текста отображения."""
+    return {"segments": copy.deepcopy(before.get("segments") or []),
+            "review": copy.deepcopy(before.get("review") or []),
+            "edits_before": len(before.get("edits") or []),
+            "after": _undo_fingerprint(after)}
+
+
+def undo_answer(json_path, md_path, aid, snapshot):
+    """Отменяет ответ только если состояние после него осталось неизменным."""
+    data = load(json_path)
+    if not snapshot or snapshot.get("after") != _undo_fingerprint(data):
+        return {"id": aid, "conflict": "нет снимка или после ответа появились изменения"}
+    edits = data.get("edits") or []
+    n = snapshot.get("edits_before")
+    if not isinstance(n, int) or not 0 <= n <= len(edits):
+        return {"id": aid, "conflict": "повреждён снимок журнала"}
+    data["segments"] = copy.deepcopy(snapshot["segments"])
+    data["review"] = copy.deepcopy(snapshot["review"])
+    for edit in edits[n:]:
+        if edit.get("by") == "human":
+            edit["original_by"] = edit["by"]
+            edit["by"] = "reverted"
+        edit["reverted"] = True
+    for item in data["review"]:
+        if item.get("id") == aid:
+            item["status"] = "open"
+            item.pop("note", None)
+    data["review_done"] = not any(i.get("status", "open") == "open" for i in data["review"])
+    save(data, json_path, md_path)
+    return {"id": aid, "reverted": True, "conspects": _refresh_conspects(json_path)}
 
 
 def rename(json_path, md_path, mapping):

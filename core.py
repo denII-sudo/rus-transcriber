@@ -331,16 +331,37 @@ def apply_answers(job_id):
     if not jp:
         raise CoreError("Расшифровка не найдена или ещё не готова")
     decisions, rep = P.decisions(jp)
-    _, report = transcript.apply_review(jp, md, decisions, by="human") if decisions else (None, {})
     free = P.free_answers(jp)
+    undo = [d for d in decisions if "_undo_snapshot" in d]
+    decisions = [d for d in decisions if "_undo_snapshot" not in d]
+    # Снимок назначается одному ответу; общую пакетную правку нельзя безопасно
+    # приписать отдельной карточке без дополнительной детализации журнала.
+    before = transcript.load(jp) if not undo and len(decisions) + len(free) == 1 else None
+    undone = []
+    for d in undo:
+        result = transcript.undo_answer(jp, md, d["id"], d["_undo_snapshot"])
+        if result.get("reverted"):
+            undone.append(d["id"])
+            rep["reverted"].append(d["id"])
+        else:
+            rep.setdefault("undo_conflicts", []).append(result)
+    _, report = transcript.apply_review(jp, md, decisions, by="human") if decisions else (None, {})
     if free:
         rep["free_text"] = P.apply_free(jp, md, free)
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
     successful.difference_update(rep.get("human", []))
     rep["applied_from_answers"] = sum(1 for d in decisions if d.get("id") in successful)
+    snapshots = {}
+    if before is not None and len(successful) == 1:
+        aid = next(iter(successful))
+        snapshots[aid] = transcript.answer_snapshot(before, transcript.load(jp))
+    successful.update(undone)
     if successful:
-        P.mark_applied(jp, successful)
+        if snapshots:
+            P.mark_applied(jp, successful, snapshots=snapshots)
+        else:
+            P.mark_applied(jp, successful)
     return {**rep, "review": report}
 
 
