@@ -357,6 +357,8 @@ def apply_answers(job_id):
             rep["reverted"].append(d["id"])
         else:
             rep.setdefault("undo_conflicts", []).append(result)
+    # Изменённый ответ тоже сначала отменяется, но в отчёте это изменение, а не отмена.
+    rep["reverted"] = [x for x in rep.get("reverted") or [] if x not in rep.get("changed", [])]
     snapshots, report = {}, {}
     snapshot_bytes = 0
 

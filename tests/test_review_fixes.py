@@ -333,6 +333,7 @@ class AnswerIntegrity(unittest.TestCase):
         P._write(pd / "answers.json", store)
         result = apply()
         self.assertEqual(result["changed"], ["r1"])
+        self.assertEqual(result["reverted"], [])
         after = T.load(c.json)
         self.assertEqual([s["speaker"] for s in after["segments"]], ["Анна"])
         self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["другое"])
@@ -360,9 +361,21 @@ class AnswerIntegrity(unittest.TestCase):
         result = apply()
         self.assertEqual(result["changed"], ["r1"])
         self.assertIn("r1", result["human"])
+        self.assertEqual(result["reverted"], [])
         after = T.load(c.json)
         self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["одно"])
         self.assertEqual(after["review"][0]["status"], "human")
+
+    def test_undo_removes_vocabulary_suggestion_of_answer(self):
+        c = Case([seg("Борис", W("это Kwartzline", 0.0))], [item("r1", 0.3, 0.3, "Борис", "Kwartzline")])
+        before = T.load(c.json)
+        T.apply_review(c.json, c.md, [{"id": "r1", "text": "Quartzline"}], by="human")
+        after = T.load(c.json)
+        self.assertTrue(any(v.get("card") == "r1" for v in after.get("vocab_suggestions") or []))
+        T.undo_answer(c.json, c.md, "r1", T.answer_snapshot(before, after))
+        restored = T.load(c.json)
+        self.assertEqual(restored["segments"], before["segments"])
+        self.assertFalse(any(v.get("to") == "Quartzline" for v in restored.get("vocab_suggestions") or []))
 
     def test_text_speaker_and_order_have_separate_provenance(self):
         c = Case([seg("Анна", W("одно два три", 0.0))],

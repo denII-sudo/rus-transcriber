@@ -264,6 +264,9 @@ def undo_answer(json_path, md_path, aid, snapshot):
         if item.get("id") == aid:
             item["status"] = "open"
             item.pop("note", None)
+    # Подсказки словаря, возникшие из отменённого ответа, больше не предлагаем.
+    data["vocab_suggestions"] = [v for v in data.get("vocab_suggestions") or []
+                                 if v.get("card") != aid]
     data["review_done"] = not any(i.get("status", "open") == "open" for i in data["review"])
     save(data, json_path, md_path)
     return {"id": aid, "reverted": True, "conspects": _refresh_conspects(json_path)}
@@ -951,7 +954,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             # одиночная замена слова на имя собственное — подсказка для словаря
             if len(model) == 1 and len(new_text.split()) == 1 and vocab_candidate(new_text, data) \
                     and re.sub(r"\W", "", new_text.lower()) != re.sub(r"\W", "", model[0].lower()):
-                sug = {"from": re.sub(r"[^\w-]", "", model[0]), "to": re.sub(r"[^\w-]", "", new_text)}
+                sug = {"from": re.sub(r"[^\w-]", "", model[0]), "to": re.sub(r"[^\w-]", "", new_text),
+                       "card": it["id"]}
                 if _common_word(sug["from"]):
                     sug["common"] = True
                     sug["note"] = (f"«{sug['from']}» — обычное слово: в словарь лучше заменой с условием "
