@@ -250,6 +250,36 @@ class SpanAndReopen(unittest.TestCase):
 
 
 class AnswerIntegrity(unittest.TestCase):
+    def test_text_speaker_and_order_have_separate_provenance(self):
+        c = Case([seg("Анна", W("одно два три", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "одно"), item("r2", 0.3, 0.3, "Анна", "два"),
+                  item("r3", 0.6, 0.6, "Анна", "три")])
+        data, _ = T.apply_word_edits(c.json, c.md, [
+            {"op": "replace", "t": 0.0, "w": "одно", "text": "первое", "card": "r1"},
+            {"op": "relabel", "t": 0.3, "w": "два", "speaker": "Борис", "card": "r2"},
+            {"op": "overlap_move", "t": 0.6, "w": "три", "after_t": 0.0, "card": "r3"}], by="human")
+        words = {w["w"]: w for s in data["segments"] for w in s["words"]}
+        self.assertEqual(set(words["первое"]["provenance"]), {"text"})
+        self.assertEqual(set(words["два"]["provenance"]), {"speaker"})
+        self.assertEqual(set(words["три"]["provenance"]), {"order"})
+        self.assertEqual((words["три"]["s"], words["три"]["e"]), (0.6, 0.85))
+
+    def test_model_cannot_override_human_text_or_speaker(self):
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        T.apply_review(c.json, c.md, [{"id": "r1", "speaker": "Борис"}], by="human")
+        before = T.load(c.json)
+        data, report = T.apply_review(c.json, c.md, [{"id": "r1", "speaker": "Анна", "text": "другое"}],
+                                      by="claude")
+        self.assertTrue(report.get("conflicts"))
+        self.assertEqual(data["segments"], before["segments"])
+
+    def test_word_edit_does_not_fall_back_to_different_word_at_same_time(self):
+        c = Case([seg("Анна", W("одно", 0.0))], [item("r1", 0.0, 0.0, "Анна", "одно")])
+        data, rep = T.apply_word_edits(c.json, c.md,
+            [{"op": "replace", "t": 0.0, "w": "исчезло", "text": "другое", "card": "r1"}], by="human")
+        self.assertIn("r1", rep["failed"])
+        self.assertEqual(data["segments"][0]["text"], "одно")
+
     def test_snapshot_keeps_only_changed_segments(self):
         segments = [seg("Анна", W(f"слово{i}", float(i * 2))) for i in range(200)]
         c = Case(segments, [item("r1", 200.0, 200.0, "Анна", "слово100")])

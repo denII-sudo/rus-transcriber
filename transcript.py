@@ -475,6 +475,12 @@ def _wkey(s):
     return re.sub(r"[^\w-]", "", s.lower().replace("ё", "е"))
 
 
+def _mark_provenance(word, dimension, by, edit):
+    provenance = copy.deepcopy(word.get("provenance") or {})
+    provenance[dimension] = {"by": by, "edit": edit}
+    word["provenance"] = provenance
+
+
 def _diff_words(old, new_text, item_id):
     """Правка текста места по словам: меняются только отличающиеся слова, у остальных сохраняются время,
     уверенность и прежние правки (на время слов опираются ссылки конспекта). Слово, уже исправленное
@@ -490,6 +496,8 @@ def _diff_words(old, new_text, item_id):
                   "model": " ".join(w.get("model", w.get("raw", w["w"])) for w in src) if src else ""}
         if len(src) == 1 and src[0].get("word_id"):
             result["word_id"] = src[0]["word_id"]
+        if len(src) == 1 and src[0].get("provenance"):
+            result["provenance"] = copy.deepcopy(src[0]["provenance"])
         return result
 
     for op, i1, i2, j1, j2 in sm.get_opcodes():
@@ -598,10 +606,11 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             by_t.setdefault(round(f["w"]["s"], 2), []).append(k)
     reindex()
 
-    def find(t, text=None):
+    def find(t, text=None, strict=False):
         ks = by_t.get(round(t, 2)) or []
         if text is not None:
-            ks = [k for k in ks if flat[k]["w"]["w"] == text] or ks
+            exact = [k for k in ks if flat[k]["w"]["w"] == text]
+            ks = exact if strict or exact else ks
         return ks[0] if ks else None
 
     log = data.setdefault("edits", [])
@@ -615,6 +624,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
 
     def check(eds):
         """Причина, по которой правки карточки нельзя применить целиком, или None."""
+        def protected(w):
+            return w.get("by") == "human" or any(
+                v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))
+
         for e in eds:
             op = e["op"]
             if op == "propose_delete":
@@ -624,11 +637,20 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     return f"не удалось определить говорящего вставки «{e.get('text')}»"
                 continue
             if op == "place_text":
-                if not any(e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01 for f in flat) and not e.get("speaker"):
+                current = [f["w"] for f in flat if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01]
+                if not current and not e.get("speaker"):
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
+                if by != "human" and any(protected(f["w"]) for f in flat
+                                          if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01):
+                    return "на отрезке есть подтверждённые человеком слова"
+                if current and _diff_words(current, e["text"], e.get("card", "?"))[1]:
+                    return "на отрезке есть конфликтующие прежние правки"
                 continue
-            if find(e["t"], e.get("w")) is None:
+            k = find(e["t"], e.get("w"), strict=True)
+            if k is None:
                 return f"слово «{e.get('w')}» ({e['t']} с) не найдено — стенограмма изменилась"
+            if by != "human" and protected(flat[k]["w"]):
+                return "слово подтверждено человеком"
         return None
 
     def put_after(t_anchor, card, item):
@@ -674,8 +696,14 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     continue
                 old = [flat[k]["w"] for k in ks]
                 new_ws, _ = _diff_words(old, e["text"], card)
+                old_text = {w.get("word_id"): w["w"] for w in old if w.get("word_id")}
+                speaker_changed = bool(e.get("speaker") and any(flat[k]["spk"] != e["speaker"] for k in ks))
                 for w in new_ws:
                     w["edited"], w["by"] = card, by
+                    if not w.get("word_id") or old_text.get(w["word_id"]) != w["w"]:
+                        _mark_provenance(w, "text", by, card)
+                    if speaker_changed:
+                        _mark_provenance(w, "speaker", by, card)
                 pos = ks[0]
                 spk, si = e.get("speaker") or flat[pos]["spk"], flat[pos]["seg"]
                 if spk != flat[pos]["spk"]:
@@ -702,6 +730,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     before_words.append(f["w"]["w"])
                     f["spk"] = e["speaker"]
                     f["w"]["by"], f["w"]["edited"] = by, card
+                    _mark_provenance(f["w"], "speaker", by, card)
                     rep["relabel"] += 1
             elif op == "replace":
                 if f["w"]["w"] != e["text"]:
@@ -709,6 +738,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     f["w"].setdefault("model", f["w"].get("raw", f["w"]["w"]))
                     f["w"]["w"] = e["text"]
                     f["w"]["by"], f["w"]["edited"], f["w"]["c"] = by, card, 1.0
+                    _mark_provenance(f["w"], "text", by, card)
                     if e.get("note"):
                         f["w"]["typo"] = e["note"]
                     after_words.append(e["text"])
@@ -717,6 +747,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         for e in sorted(inserts, key=lambda e: e["s"]):
             w = {"w": e["text"], "s": e["s"], "e": max(e["s"], e.get("e", e["s"])), "c": 1.0, "by": by,
                  "edited": card, "inserted": True}
+            for dimension in ("text", "speaker", "order"):
+                _mark_provenance(w, dimension, by, card)
             item = {"w": w, "spk": e["speaker"], "seg": -1}
             pos = put_after(e.get("after_t"), card, item)
             if pos is None and e.get("before_t") is not None and find(e["before_t"]) is not None:
@@ -742,6 +774,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             reindex()
             f["w"]["overlap"] = True
             f["w"]["by"] = f["w"].get("by") or "model"
+            _mark_provenance(f["w"], "order", by, card)
             if put_after(e.get("after_t"), card, f) is None:
                 flat.insert(k, f)
             reindex()
@@ -878,15 +911,28 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             if loc is not None and by == "human":           # человек подтвердил место как есть
                 for w in data["segments"][loc[0]]["words"][loc[1]:loc[2]]:
                     w["by"] = "human"
+                    _mark_provenance(w, "text", by, it["id"])
+                    _mark_provenance(w, "speaker", by, it["id"])
             report["successful_ids"].append(it["id"])
             continue
         si, w1, w2 = loc
         seg = data["segments"][si]
         ws = seg["words"]
         before = {"text": " ".join(w["w"] for w in ws[w1:w2]), "speaker": seg["speaker"]}
+        if by != "human" and ((d.get("text") and d["text"] != before["text"]) or
+                              (d.get("speaker") and d["speaker"] != before["speaker"])):
+            protected = [w for w in ws[w1:w2] if w.get("by") == "human" or any(
+                v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))]
+            if protected:
+                report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": ["human"]})
+                continue
         if (not d.get("text") or d["text"] == before["text"]) and d.get("speaker") in (None, seg["speaker"]):
             it["status"] = "resolved"
             report["kept"] += 1
+            if by == "human" and d.get("text"):
+                for w in ws[w1:w2]:
+                    w["by"] = "human"
+                    _mark_provenance(w, "text", by, it["id"])
             report["successful_ids"].append(it["id"])
             continue
         new_text = d.get("text")
@@ -896,6 +942,10 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             if conflicts:
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts})
                 continue
+            original_text = {w.get("word_id"): w["w"] for w in ws[w1:w2] if w.get("word_id")}
+            for w in new_ws:
+                if not w.get("word_id") or original_text.get(w["word_id"]) != w["w"]:
+                    _mark_provenance(w, "text", by, it["id"])
             ws[w1:w2] = new_ws
             w2 = w1 + len(new_ws)
             # одиночная замена слова на имя собственное — подсказка для словаря
@@ -911,6 +961,9 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                     sug["add"] = {"replace": {sug["from"]: sug["to"]}}
                 data.setdefault("vocab_suggestions", []).append(sug)
         new_spk = d.get("speaker") or seg["speaker"]
+        if new_spk != seg["speaker"]:
+            for w in ws[w1:w2]:
+                _mark_provenance(w, "speaker", by, it["id"])
         if by == "human":
             for w in ws[w1:w2]:
                 w["by"] = "human"
