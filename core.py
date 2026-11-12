@@ -292,6 +292,54 @@ def review_items(job_id, offset=0, limit=40, reasons="", min_sec=0.0, brief=Fals
     return transcript.review_list(s["json"], max(0, int(offset)), limit, want, float(min_sec or 0), bool(brief), status)
 
 
+def build_review_pack(job_id, items=None):
+    """Подготовка карточек без зависимости от MCP или конкретной модели."""
+    import review_pack as P
+    import transcript
+    jp = _done_json(job_id)["json"]
+    if items is None:
+        data = transcript.load(jp)
+        items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
+                  "options": [{"label": "Оставить как есть", "decision": {}}]}
+                 for it in data.get("review", []) if it.get("status", "open") in ("open", "human")]
+    return P.build(jp, items)
+
+
+def start_review_page(job_id, port=8765):
+    import review_pack as P
+    jp = _done_json(job_id)["json"]
+    if not P.manifest(jp):
+        raise CoreError("Сначала подготовьте карточки: review-build / build_review_pack")
+    if not 1 <= int(port) <= 65516:
+        raise CoreError("port: от 1 до 65516")
+    jid = launch("review_page.py", ["--port", str(int(port))], jp, "page")
+    for _ in range(40):
+        s = job_status(jid) or {}
+        if s.get("url"):
+            return {"job_id": jid, "url": s["url"], "hint": "Откройте адрес в браузере на этом компьютере"}
+        if s.get("state") == "error":
+            raise CoreError(s.get("error") or "Не удалось запустить страницу")
+        time.sleep(0.25)
+    raise CoreError(f"Страница ещё запускается; проверьте status {jid}")
+
+
+def apply_answers(job_id):
+    """Применить сохранённые ответы человека; аудио не удаляется."""
+    import review_pack as P
+    import transcript
+    jp, md = job_json(job_id)
+    if not jp:
+        raise CoreError("Расшифровка не найдена или ещё не готова")
+    decisions, rep = P.decisions(jp)
+    _, report = transcript.apply_review(jp, md, decisions, by="human") if decisions else (None, {})
+    free = P.free_answers(jp)
+    if free:
+        rep["free_text"] = P.apply_free(jp, md, free)
+    if decisions or rep.get("unchanged") or free:
+        P.mark_applied(jp)
+    return {**rep, "review": report}
+
+
 def edit_span(job_id, t1, t2, text, speaker="", note="", by="claude"):
     """Правка отрезка t1–t2 (с): текст и говорящий; без пересборки карточек."""
     import transcript

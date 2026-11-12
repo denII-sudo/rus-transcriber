@@ -107,6 +107,9 @@ def build():
     es = sub.add_parser("edit-span"); es.add_argument("job"); es.add_argument("t1", type=float); es.add_argument("t2", type=float)
     es.add_argument("text"); es.add_argument("--speaker", default=""); es.add_argument("--note", default="")
     es.add_argument("--by", default="human", choices=["human", "claude"])
+    rb = sub.add_parser("review-build"); rb.add_argument("job"); rb.add_argument("--items", help="JSON-файл с вопросами; без него — нейтральные карточки")
+    rp = sub.add_parser("review-page"); rp.add_argument("job"); rp.add_argument("--port", type=int, default=8765)
+    ra = sub.add_parser("review-apply"); ra.add_argument("job")
     ro = sub.add_parser("reopen"); ro.add_argument("job"); ro.add_argument("ids")
     c = sub.add_parser("cancel"); c.add_argument("job")
     sub.add_parser("settings"); sub.add_parser("profiles"); sub.add_parser("approve"); sub.add_parser("audit")
@@ -132,6 +135,18 @@ def run(a):
         print(core.read_transcript(a.job, a.fmt, a.offset, a.max_chars, a.extra))
     elif c == "review":
         out(core.review_items(a.job, a.offset, a.limit, a.reasons, a.min_sec, a.brief, a.status))
+    elif c == "review-build":
+        items = None
+        if a.items:
+            from pathlib import Path
+            items = json.loads(Path(a.items).read_text(encoding="utf-8-sig"))
+            if not isinstance(items, list):
+                raise core.CoreError("Файл вопросов должен содержать JSON-массив")
+        out(core.build_review_pack(a.job, items))
+    elif c == "review-page":
+        out(core.start_review_page(a.job, a.port))
+    elif c == "review-apply":
+        out(core.apply_answers(a.job))
     elif c == "edit-span":
         out(core.edit_span(a.job, a.t1, a.t2, a.text, a.speaker, a.note, a.by))
     elif c == "reopen":

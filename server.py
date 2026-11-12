@@ -48,8 +48,8 @@ rus-transcriber: расшифровка русской речи (в том чи�
    в цитаты и выводы без проверки не брать. Стенограмму не копируйте в разговор целиком и не переписывайте вручную:
    путь к файлу есть в transcription_status.
 4. Сомнительные места решает человек: review_items(job_id) → варианты (много мест — сначала brief=True и фильтры
-   reasons/min_sec); build_review_pack / карточки, где клиент
-   умеет показывать страницы, иначе локальный разбор (review_local в настройках) → import_answers → apply_answers;
+   reasons/min_sec); build_review_pack → start_review_page (обычный локальный браузер, Claude не нужен)
+   → apply_answers. Облачные карточки необязательны; их ответы сначала передаются через import_answers;
    прямые решения — apply_review. Приоритет: слово человека > голосовой профиль > распознавание > эвристики.
    Не выбирайте за человека, кто говорит в спорном месте. Остатки после разбора (слово вне места, неверное
    число) — edit_span(job_id, t1, t2, text, speaker) по словам человека; повторно решить место — reopen_review.
@@ -66,7 +66,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.11"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.12"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -471,8 +471,8 @@ async def cleanup_jobs(days: int = 30, apply: bool = False) -> str:
 
 
 def _local_voice_tool():
-    """Локальный голосовой разбор и страница на localhost выключены (разбор — карточками в облачном
-    артефакте). Включить: "review_local": true в config.json и перезапуск Claude Desktop."""
+    """Дополнительные голосовые инструменты: включить review_local и перезапустить MCP-клиент.
+    Локальная веб-страница доступна независимо от этой настройки."""
     on = False
     try:
         on = bool(settings.load_config().get("review_local"))
@@ -483,22 +483,21 @@ def _local_voice_tool():
 
 # ---------- пакет разбора: локальный и облачный режимы ----------
 @mcp.tool()
-def build_review_pack(job_id: str, items: list[dict]) -> str:
+def build_review_pack(job_id: str, items: list[dict] | None = None) -> str:
     """Собирает пакет разбора сомнительных мест: клипы (3,5 с до места, 1,5 с после) (mp3 моно 64 кбит/с) и manifest.json
     в папке <имя>.review рядом с расшифровкой. Целиком запись никуда не уходит.
 
-    items — вопросы Claude по местам из review_items:
+    items — вопросы клиента по местам из review_items; без items — нейтральные вопросы:
       [{"id": "r5", "question": "Кто говорит «…»?", "options": [
           {"label": "Анна", "decision": {"speaker": "Анна"}},
           {"label": "Вера",   "decision": {"speaker": "Вера"}},
           {"label": "как есть", "decision": {}}], "recommended": 0}]
     decision — то, что получит apply_review при выборе варианта (speaker / text / status, note).
     2–4 варианта. Пересборка меняет version: ответы на прежние вопросы не применятся."""
-    import review_pack
-    jp, _ = _job_json(job_id)
-    if not jp:
-        return "Расшифровка не найдена или ещё не готова"
-    return json.dumps(review_pack.build(jp, items), ensure_ascii=False, indent=1)
+    try:
+        return json.dumps(core.build_review_pack(job_id, items), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return str(ex)
 
 
 @mcp.tool()
@@ -526,22 +525,15 @@ def review_pack_info(job_id: str, include_manifest: bool = False) -> str:
     return json.dumps(out, ensure_ascii=False, indent=1)
 
 
-@_local_voice_tool()
+@mcp.tool()
 def start_review_page(job_id: str, port: int = 8765) -> str:
     """Открывает локальную страницу карточек разбора (http://127.0.0.1:<порт>/, только этот компьютер):
     клипы, варианты касанием, озвучка вопроса, голосовой ответ с микрофона (распознаётся GigaAM).
     Ответы — в answers.json пакета (source=local). Возвращает job_id; адрес — в transcription_status."""
-    jp, _ = _job_json(job_id)
-    if not jp:
-        return "Расшифровка не найдена или ещё не готова"
-    jid = _launch("review_page.py", ["--port", str(int(port))], jp, "page")
-    for _ in range(40):
-        s = _status(jid) or {}
-        if s.get("url") or s.get("state") == "error":
-            break
-        time.sleep(0.25)
-    return json.dumps({"job_id": jid, "url": (_status(jid) or {}).get("url"),
-                       "hint": "Откройте адрес в браузере на этом компьютере"}, ensure_ascii=False)
+    try:
+        return json.dumps(core.start_review_page(job_id, port), ensure_ascii=False)
+    except core.CoreError as ex:
+        return str(ex)
 
 
 @_local_voice_tool()
@@ -660,16 +652,10 @@ def apply_answers(job_id: str, drop_audio: bool = False) -> str:
     jp, md = _job_json(job_id)
     if not jp:
         return "Расшифровка не найдена или ещё не готова"
-    decisions, rep = P.decisions(jp)
-    _, report = transcript.apply_review(jp, md, decisions, by="human") if decisions else (None, {})
-    free = P.free_answers(jp)
-    if free:                       # свободные ответы — правки услышанного в клипе, по словам
-        rep["free_text"] = P.apply_free(jp, md, free)
-    if decisions or rep.get("unchanged") or free:
-        P.mark_applied(jp)
+    rep = core.apply_answers(job_id)
     if drop_audio:
         rep["audio_removed"] = P.drop_audio(jp)
-    return json.dumps({**rep, "review": report}, ensure_ascii=False, indent=1)
+    return json.dumps(rep, ensure_ascii=False, indent=1)
 
 
 def _speak(text):
