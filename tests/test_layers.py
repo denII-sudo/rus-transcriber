@@ -157,6 +157,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run_rt(["cleanup", "--days", "36500"])[0], 0)
         self.assertEqual(run_rt(["migrate"])[0], 0)
 
+    def test_conspect_confirmation_requires_terminal(self):
+        snapshot = {"source_revision": 3}
+        with mock.patch.object(core, "describe_conspect_confirmation", return_value=snapshot), \
+             mock.patch.object(core, "confirm_conspect_analysis") as write:
+            self.assertEqual(run_rt(["conspect-confirm", "demo"])[0], 2)
+            write.assert_not_called()
+
 
 class ServerGateTests(unittest.TestCase):
     @classmethod
@@ -182,6 +189,26 @@ class ServerGateTests(unittest.TestCase):
             r = self.call(self.server.delete_group, "lay-gate", "lay-gate", True)
         self.assertIn("не подтвердил", r)
         self.assertTrue(gd.is_dir())
+
+    def test_conspect_review_requires_person(self):
+        snapshot = {"source_revision": 3, "source_hash": "abc", "conspect_hash": "def"}
+        with mock.patch.object(core, "describe_conspect_confirmation", return_value=snapshot), \
+             mock.patch.object(core, "confirm_conspect_analysis") as write, \
+             mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as require:
+            self.assertEqual(self.call(self.server.conspect_mark_reviewed, "demo"), "нет")
+            write.assert_not_called()
+            self.assertEqual(require.call_args.args[1], snapshot)
+
+    def test_selected_quote_requires_person(self):
+        snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}
+        report = {"candidates": [{"quote_index": 1, "quote": "альфа бета", "candidates": [
+            {"word_ids": ["w1"], "speaker": "Анна", "t1": 1, "t2": 2}]}]}
+        selection = {"1": {"word_ids": ["w1"]}}
+        with mock.patch.object(core, "prepare_selected_conspect", return_value=(snapshot, report)), \
+             mock.patch.object(core, "save_selected_conspect") as write, \
+             mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")):
+            self.assertEqual(self.call(self.server.conspect_link_selected, "demo", "текст", selection), "нет")
+            write.assert_not_called()
 
     def test_delete_with_human_yes_works_and_dialog_text_comes_from_program(self):
         gd = put_group("lay-gate")

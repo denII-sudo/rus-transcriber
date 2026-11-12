@@ -578,6 +578,114 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(c.md.read_bytes(), before_md)
         self.assertFalse((pd / "answers.json").exists())
 
+    def _overlap_free_case(self, with_ids=True):
+        import review_pack as P
+        c = Case([seg("Анна", W("слово", 0.0)), seg("Борис", W("слово", 0.0))],
+                 [item("r1", 0.0, 0.0, "Анна", "слово"), item("r2", 0.0, 0.0, "Борис", "слово")])
+        data = T.load(c.json)
+        items = []
+        for n, review in enumerate(data["review"]):
+            it = dict(review, options=[])
+            if with_ids:
+                it["word_ids"] = [data["segments"][n]["words"][0]["word_id"]]
+            items.append(it)
+        pd = P.pack_dir(c.json)
+        pd.mkdir(parents=True, exist_ok=True)
+        P._write(pd / "manifest.json", {"version": "v1", "recording_id": data["recording_id"], "items": items})
+        return c, P, data
+
+    def test_free_id_targets_only_overlapping_word_and_undo(self):
+        from unittest.mock import patch
+        import core
+        c, P, original = self._overlap_free_case()
+        pd = P.pack_dir(c.json)
+        store = {"version": "v1", "answers": {"r2": {"id": "r2", "version": "v1", "kind": "free",
+                 "text": "новое", "source": "local", "ts": "2026-01-01"}}}
+        P._write(pd / "answers.json", store)
+        preview = P.apply_free(c.json, c.md, store["answers"], dry_run=True)
+        self.assertEqual(preview["successful_ids"], ["r2"])
+        self.assertEqual(T.load(c.json), original)
+        with patch.object(core, "job_json", return_value=(c.json, c.md)):
+            result = core.apply_answers("demo")
+            self.assertEqual(result["free_text"]["successful_ids"], ["r2"])
+            changed = T.load(c.json)
+            self.assertEqual([s["text"] for s in changed["segments"]], ["слово", "новое"])
+            store = P._read(pd / "answers.json", {})
+            store["answers"]["r2"].update(kind="revert", ts="2026-01-02")
+            P._write(pd / "answers.json", store)
+            self.assertEqual(core.apply_answers("demo")["reverted"], ["r2"])
+        self.assertEqual(T.load(c.json)["segments"], original["segments"])
+
+    def test_legacy_free_overlap_requires_person(self):
+        c, P, original = self._overlap_free_case(with_ids=False)
+        result = P.apply_free(c.json, c.md, {"r2": {"text": "новое"}})
+        self.assertEqual(result["successful_ids"], [])
+        self.assertTrue(result["left_to_human"])
+        self.assertEqual(T.load(c.json)["segments"], original["segments"])
+
+    def test_both_simultaneous_ids_can_be_edited_independently(self):
+        c, P, _ = self._overlap_free_case()
+        result = P.apply_free(c.json, c.md, {"r1": {"text": "первое"}, "r2": {"text": "второе"}})
+        self.assertEqual(set(result["successful_ids"]), {"r1", "r2"})
+        self.assertEqual([s["text"] for s in T.load(c.json)["segments"]], ["первое", "второе"])
+
+    def test_free_duplicate_id_is_rejected_without_retargeting(self):
+        c, P, original = self._overlap_free_case()
+        altered = T.load(c.json)
+        altered["segments"][0]["words"][0]["word_id"] = altered["segments"][1]["words"][0]["word_id"]
+        c.json.write_text(json.dumps(altered, ensure_ascii=False), encoding="utf-8")
+        result = P.apply_free(c.json, c.md, {"r2": {"text": "новое"}}, dry_run=True)
+        self.assertEqual(result["successful_ids"], [])
+        self.assertTrue(result["left_to_human"])
+        self.assertEqual(T.load(c.json), altered)
+
+    def test_moved_target_does_not_apply_to_old_time(self):
+        c, P, original = self._overlap_free_case()
+        altered = T.load(c.json)
+        altered["segments"][1]["words"][0].update(s=10.0, e=10.2)
+        altered["segments"][1].update(start=10.0, end=10.2)
+        c.json.write_text(json.dumps(altered, ensure_ascii=False), encoding="utf-8")
+        result = P.apply_free(c.json, c.md, {"r2": {"text": "новое"}}, dry_run=True)
+        self.assertEqual(result["successful_ids"], [])
+        self.assertTrue(result["left_to_human"])
+        self.assertEqual(T.load(c.json), altered)
+
+    def test_insert_anchor_uses_id_not_shared_time(self):
+        c, _, original = self._overlap_free_case()
+        anchor = original["segments"][1]["words"][0]["word_id"]
+        edits = [{"op": "insert", "card": "r2", "s": 0.1, "e": 0.15, "text": "новое",
+                  "speaker": "Борис", "after_t": 0.0, "after_id": anchor}]
+        out, result = T.apply_word_edits(c.json, c.md, edits)
+        self.assertFalse(result["failed"])
+        self.assertEqual([(s["speaker"], s["text"]) for s in out["segments"]],
+                         [("Анна", "слово"), ("Борис", "слово новое")])
+
+    def test_ambiguous_legacy_anchor_does_not_insert(self):
+        c, _, original = self._overlap_free_case()
+        edits = [{"op": "insert", "card": "r2", "s": 0.1, "e": 0.15, "text": "новое",
+                  "speaker": "Борис", "after_t": 0.0}]
+        out, result = T.apply_word_edits(c.json, c.md, edits)
+        self.assertIn("r2", result["failed"])
+        self.assertEqual(out["segments"], original["segments"])
+
+    def test_delete_targets_id_when_words_share_time(self):
+        c, _, original = self._overlap_free_case()
+        target = original["segments"][1]["words"][0]["word_id"]
+        out, report = T.apply_word_edits(c.json, c.md,
+            [{"op": "delete", "card": "r2", "t": 0.0, "w": "слово", "word_id": target}])
+        self.assertFalse(report["failed"])
+        self.assertEqual([(s["speaker"], s["text"]) for s in out["segments"]], [("Анна", "слово")])
+
+    def test_removed_anchor_blocks_whole_card(self):
+        c, _, original = self._overlap_free_case()
+        target = original["segments"][1]["words"][0]["word_id"]
+        out, report = T.apply_word_edits(c.json, c.md, [
+            {"op": "delete", "card": "r2", "t": 0.0, "w": "слово", "word_id": target},
+            {"op": "insert", "card": "r2", "s": 0.1, "text": "новое", "speaker": "Борис",
+             "after_t": 0.0, "after_id": target}])
+        self.assertIn("r2", report["failed"])
+        self.assertEqual(out["segments"], original["segments"])
+
     def test_free_answer_undo_preserves_structural_order_and_audio_times(self):
         from unittest.mock import patch
         import core

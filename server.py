@@ -66,7 +66,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.12"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.12.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -294,7 +294,7 @@ def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") 
     """Проверяет цитаты «…» конспекта по стенограмме задачи: дословны ли они и тот ли говорящий.
 
     conspect_text — текст конспекта (markdown или обычный), либо conspect_path — путь к .md/.txt на этом
-    компьютере. Говорящий проверяется у цитат вида «Имя: «…»». [Поправки в скобках] — допустимое отличие.
+    компьютере. Говорящий проверяется у цитат вида «Имя: «…»». Поправки и составные цитаты требуют проверки.
     Возвращает сводку и список цитат, которые не дословны или приписаны не тому."""
     import quotes
     import transcript
@@ -313,12 +313,12 @@ def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") 
 @mcp.tool()
 def conspect_link(job_id: str, conspect_text: str, name: str = "конспект") -> str:
     """Связывает конспект со стенограммой (единый источник): каждая цитата «…» заменяется ссылкой на место
-    стенограммы (время слов), текст цитаты дальше подставляется из стенограммы.
+    стенограммы по ID слов; связываются только однозначные точные цитаты.
 
     conspect_text — конспект в markdown (как он пойдёт в документ). name — название (несколько конспектов
     к одной записи различаются названием). Создаёт в папке результатов <имя>.<name>.conspect.json и .md.
     Возвращает, сколько цитат связано, какие не найдены, и проверку цитат собранного конспекта.
-    [Поправки в скобках] в цитатах сохраняются, пока место в стенограмме не меняется."""
+    Составные, приблизительные и неоднозначные цитаты остаются несвязанными."""
     import conspect
     s = _status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
@@ -341,6 +341,56 @@ def conspect_render(job_id: str, name: str = "конспект", include_markdow
             if isinstance(r, dict) and r.get("conspect_md"):
                 r["markdown"] = Path(r["conspect_md"]).read_text(encoding="utf-8")
     return json.dumps(rep, ensure_ascii=False, indent=1)
+
+
+@mcp.tool()
+async def conspect_mark_reviewed(job_id: str, name: str = "конспект") -> str:
+    """Подтвердить проверку смысла конспекта человеком на текущей ревизии источника.
+
+    Требуется отдельное подтверждение человека; после изменения данных разрешение недействительно.
+    Не повторять отказанный вызов без новой просьбы человека.
+    """
+    try:
+        snapshot = core.describe_conspect_confirmation(job_id, name)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+    return await _gated("Подтверждение проверки конспекта", snapshot,
+                        lambda: [f"Конспект: {name}", f"Задача: {job_id}",
+                                 f"Ревизия источника: {snapshot['source_revision']}",
+                                 "Подтвердите только если сами проверили смысл и цитаты по текущей стенограмме."],
+                        lambda: core.confirm_conspect_analysis(snapshot))
+
+
+@mcp.tool()
+def conspect_candidates(job_id: str, conspect_text: str) -> str:
+    """Без записи показать неоднозначные цитаты и возможные места с ID и ревизией."""
+    try:
+        return json.dumps(core.preview_conspect_candidates(job_id, conspect_text), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+async def conspect_link_selected(job_id: str, conspect_text: str, selections: dict,
+                                 name: str = "конспект") -> str:
+    """Создать новый конспект с выбранными человеком местами; нужно подтверждение человека.
+
+    selections: {номер цитаты: {recording_id, source_revision, word_ids}} из conspect_candidates.
+    Существующий конспект не перезаписывается; отказ без новой просьбы не повторять.
+    """
+    try:
+        snapshot, report = core.prepare_selected_conspect(job_id, name, conspect_text, selections)
+        lines = [f"Новый конспект: {name}", f"Задача: {job_id}, ревизия: {snapshot['source_revision']}"]
+        for entry in report["candidates"]:
+            selection = selections.get(str(entry["quote_index"]))
+            if selection:
+                option = next(x for x in entry["candidates"] if x["word_ids"] == selection["word_ids"])
+                lines.append(f"Цитата «{entry['quote'][:80]}»: {option['speaker']}, {option['t1']}–{option['t2']} с")
+        lines.append("Создать новый конспект с этими выбранными местами?")
+    except (core.CoreError, KeyError, StopIteration) as ex:
+        return f"Ошибка: {ex}"
+    return await _gated("Выбор мест цитат", snapshot, lambda: lines,
+                        lambda: core.save_selected_conspect(snapshot, conspect_text, selections))
 
 
 @mcp.tool()

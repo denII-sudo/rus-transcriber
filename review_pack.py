@@ -444,21 +444,40 @@ def apply_free(json_path, md_path, free, dry_run=False):
     import transcript as T
     man = manifest(json_path)
     data = T.load(json_path)
-    missing, valid_free = [], dict(free)
+    missing, valid_free, missing_reasons = [], dict(free), {}
     if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
         missing.extend(valid_free)
         valid_free.clear()
     times = Counter(round(w["s"], 2) for s in data["segments"] for w in s.get("words") or [])
     for item in man["items"]:
         aid = item["id"]
-        if aid not in valid_free or "word_ids" not in item:
+        if aid not in valid_free:
             continue
-        loc = T._find_span(data, item)
-        # Свободный разбор пока обращается к словам по времени. Одинаковое
-        # время разных слов делает такую операцию неоднозначной даже при ID.
-        if not loc or any(count > 1 for count in times.values()):
+        if "word_ids" in item:
+            ids = item["word_ids"]
+            all_words = [w for s in data["segments"] for w in s.get("words") or []]
+            all_ids = Counter(w.get("word_id") for w in all_words)
+            loc = T._find_span(data, item)
+            bad = not loc or any(all_ids[wid] != 1 for wid in ids or [])
+            if not bad:
+                selected = [w for w in all_words if w.get("word_id") in ids]
+                bad = any(not item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01 for w in selected)
+            if not bad:
+                # Совпадающие времена вне выбранного места могут стать неоднозначными опорами выравнивания.
+                window = F.window(all_words, item["t1"], item["t2"])
+                local_times = Counter(round(w["s"], 2) for w in window)
+                target_times = Counter(round(w["s"], 2) for w in selected)
+                bad = any(count > 1 and target_times[t] != 1 for t, count in local_times.items())
+            reason = "слова карточки отсутствуют, изменили время или их ID неоднозначны"
+        else:
+            words = [w for s in data["segments"] for w in s.get("words") or []]
+            local = F.window(words, item["t1"], item["t2"])
+            bad = any(times[round(w["s"], 2)] > 1 for w in local)
+            reason = "старый пакет без ID: слова в окне имеют одинаковое время"
+        if bad:
             missing.append(aid)
             valid_free.pop(aid)
+            missing_reasons[aid] = reason
     vocab_words = []
     try:
         import vocab as V
@@ -480,7 +499,8 @@ def apply_free(json_path, md_path, free, dry_run=False):
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
                "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
-    human = []
+    human = [{"id": aid, "why": reason, "answer": free[aid].get("text")}
+             for aid, reason in missing_reasons.items()]
     for r in reports:
         if r["id"] in conflict_ids:
             human.append({"id": r["id"], "why": "ответы на карточки конфликтуют", "answer": r["answer"]})

@@ -287,8 +287,16 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
     -> {"kind", "edits": [...], "covered": (t_from, t_to), "anchors", "report": {...}}"""
     text = answer.get("text") or ""
     cid = item["id"]
-    win = window(words, item["t1"], item["t2"])
-    place = [w for w in words if item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01]
+    target_ids = set(item.get("word_ids") or [])
+    place = ([w for w in words if w.get("word_id") in target_ids] if target_ids else
+             [w for w in words if item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01])
+    target_times = {round(w["s"], 2) for w in place} if target_ids else set()
+
+    def card_window(a, b):
+        return [w for w in window(words, a, b) if not target_ids or
+                round(w["s"], 2) not in target_times or w.get("word_id") in target_ids]
+
+    win = card_window(item["t1"], item["t2"])
     extra = " ".join(str(item.get(k) or "") for k in ("alt_ctc", "alt_whisper"))
     for w in place:                       # варианты моделей по месту — тоже опоры
         w["alt_place"] = extra
@@ -298,7 +306,7 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
     if c["kind"] == "agree":
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "name":
-        eds = [{"op": "relabel", "t": w["s"], "w": w["w"], "speaker": c["speaker"], "card": cid, "in_place": True}
+        eds = [{"op": "relabel", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "speaker": c["speaker"], "card": cid, "in_place": True}
                for w in place if w.get("_spk") != c["speaker"]]
         rep["applied"] = [f"{' '.join(w['w'] for w in place)} → {c['speaker']}"]
         span = (place[0]["s"], place[-1]["s"]) if place else None
@@ -332,6 +340,12 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
     ans = [norm(x) for x in ans_raw]
     if not ans:
         return {"kind": "skip", "edits": [], "covered": None, "report": rep}
+    def ambiguous_window(ws):
+        times = [round(w["s"], 2) for w in ws]
+        return len(times) != len(set(times))
+    if target_ids and ambiguous_window(win):
+        rep["human"] = "неоднозначные одновременные слова в окне выравнивания"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     pairs = align(ans, win)
     # ответ шире окна: слова ответа до (после) выровненного куска, а окно кончается у первой (последней) опоры —
     # окно расширяется, чтобы правка применялась ко всей фразе человека, а не только к месту разбора
@@ -347,7 +361,10 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             break
         grow_a += GROW if more_a else 0.0
         grow_b += GROW if more_b else 0.0
-        win = window(words, item["t1"] - grow_a, item["t2"] + grow_b)
+        win = card_window(item["t1"] - grow_a, item["t2"] + grow_b)
+        if target_ids and ambiguous_window(win):
+            rep["human"] = "неоднозначные одновременные слова в расширенном окне"
+            return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
         pairs = align(ans, win)
     anchors = sum(1 for i, j, k in pairs if k == "match")
     labelled = any(s for s, _ in replies)
@@ -357,15 +374,15 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         rep_of += [q] * len(ws)
     anchored_reps = {rep_of[i] for i, j, k in pairs if k == "match" and i is not None}
     countable = [i for i in range(len(ans)) if not (replies[rep_of[i]][0] and rep_of[i] not in anchored_reps)]
-    in_place_j = {k for k, w in enumerate(win) if item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01}
+    in_place_j = {k for k, w in enumerate(win) if (w.get("word_id") in target_ids if target_ids else
+                   item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01)}
     anchored_j = {j for i, j, k in pairs if k == "match"}
     near_place = {k for k in in_place_j} | {k - 1 for k in in_place_j} | {k + 1 for k in in_place_j}
     if not labelled and place and (not anchored_j or anchored_j <= near_place) and len(ans) <= len(place) + 4 \
             and not (grow_a or grow_b):
         # ответ без меток про само место — новый текст места; без опор — самого похожего его куска
         if anchored_j:
-            pids = [w["s"] for w in place]
-            idx = sorted(pids.index(win[j]["s"]) for j in anchored_j if win[j]["s"] in pids)
+            idx = sorted(k for k, word in enumerate(place) for j in anchored_j if word is win[j])
             a_, b_ = (idx[0], idx[-1] + 1) if idx else (0, len(place))
             if len(ans) > b_ - a_:          # слов в ответе больше, чем покрыто опорами, — до краёв места
                 a_, b_ = 0, len(place)
@@ -375,14 +392,15 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         rep["kind"] = "place_text"
         rep["applied"] = [f"«{' '.join(w['w'] for w in sub)}» → «{' '.join(ans_raw)}»"]
         return {"kind": "place_text", "edits": [{"op": "place_text", "card": cid, "t1": sub[0]["s"],
-                                                 "t2": sub[-1]["s"], "text": " ".join(ans_raw), "in_place": True}],
+                                                 "t2": sub[-1]["s"], "text": " ".join(ans_raw), "in_place": True,
+                                                 **({"word_ids": [w["word_id"] for w in sub]} if target_ids else {})}],
                 "covered": (sub[0]["s"], sub[-1]["s"]), "report": rep}
     if not countable or sum(1 for i, j, k in pairs if k == "match" and i in set(countable)) < MIN_ANCHORS * len(countable) \
             or not anchored_reps:
         rep["human"] = "не удалось сопоставить ответ со стенограммой"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     edits = []
-    in_place = lambda w: item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01
+    in_place = lambda w: w.get("word_id") in target_ids if target_ids else item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01
     js = [j for i, j, k in pairs if j is not None]
     covered = (win[js[0]]["s"], win[js[-1]]["s"]) if js else None
     # опоры: пары «слово ответа — слово стенограммы»; говорящий реплики ответа — метка человека, а без меток —
@@ -403,6 +421,10 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         same = [j for _, ii, j in anch if rep_of[ii] == rep_of[i] and rspk[ii] == rspk[i]]
         return win[max(same)]["s"] if same else None
 
+    def reply_end_id(i):
+        same = [j for _, ii, j in anch if rep_of[ii] == rep_of[i] and rspk[ii] == rspk[i]]
+        return win[max(same)].get("word_id") if same else None
+
     pending = []          # [(слово ответа, говорящий | None)]
     prev_j = None
 
@@ -421,7 +443,9 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             s = round(t_a + 0.01 * q, 3)
             edits.append({"op": "insert", "s": s, "e": s, "text": raw, "speaker": who, "card": cid,
                           "after_t": win[prev_j]["s"] if prev_j is not None else None,
-                          "before_t": win[next_j]["s"] if next_j is not None else None, "in_place": False})
+                          "before_t": win[next_j]["s"] if next_j is not None else None,
+                          "after_id": win[prev_j].get("word_id") if prev_j is not None else None,
+                          "before_id": win[next_j].get("word_id") if next_j is not None else None, "in_place": False})
             rep["inserted"].append(f"{who or '?'}: {raw}")
             # повтор: такое же слово модели того же говорящего рядом, ни с чем не сопоставленное, — правка его
             # покрывает, в аудио оно одно; слово модели удаляется
@@ -429,7 +453,7 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
                 if jj not in paired_j and norm(ww["w"]) == norm(raw) and len(norm(raw)) > 1 and \
                         ww["_spk"] == who and abs(ww["s"] - t_a) <= DUP_SEC:
                     paired_j.add(jj)
-                    edits.append({"op": "delete", "t": ww["s"], "w": ww["w"], "card": cid, "in_place": in_place(ww),
+                    edits.append({"op": "delete", "t": ww["s"], "w": ww["w"], "word_id": ww.get("word_id"), "card": cid, "in_place": in_place(ww),
                                   "note": "повтор: слово модели покрыто правкой человека"})
                     rep["deleted"].append(ww["w"])
                     break
@@ -447,32 +471,32 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             same_reply = rep_of[p[0]] == rep_of[q[0]] and rspk[p[0]] == rspk[q[0]]
             if same_reply and w["_spk"] == rspk[p[0]]:
                 # внутри реплики человека, тот же говорящий, в ответе слова нет — удаляется
-                edits.append({"op": "delete", "t": w["s"], "w": w["w"], "card": cid, "in_place": in_place(w),
+                edits.append({"op": "delete", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "card": cid, "in_place": in_place(w),
                               "note": "человек этого слова не назвал"})
                 rep["deleted"].append(w["w"])
             elif same_reply:
                 # чужое слово внутри реплики человека — наложение речи: после реплики целиком, с пометкой
-                edits.append({"op": "overlap_move", "t": w["s"], "w": w["w"], "card": cid,
-                              "after_t": reply_end_t(p[0]), "in_place": in_place(w)})
+                edits.append({"op": "overlap_move", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "card": cid,
+                              "after_t": reply_end_t(p[0]), "after_id": reply_end_id(p[0]), "in_place": in_place(w)})
                 rep["overlap"].append(f"{w['_spk']}: {w['w']}")
             else:
                 # на стыке реплик ответа — только предложение удалить (решает человек)
                 rep["proposed_delete"].append(w["w"])
-                edits.append({"op": "propose_delete", "t": w["s"], "w": w["w"], "card": cid,
+                edits.append({"op": "propose_delete", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "card": cid,
                               "in_place": in_place(w)})
             continue
         flush(j)
         w = win[j]
         spk = ans_spk[i]
         if k == "match" and norm(ans_raw[i]) != norm(w["w"]):          # совпало с вариантом другой модели
-            edits.append({"op": "replace", "t": w["s"], "w": w["w"], "text": ans_raw[i], "card": cid,
+            edits.append({"op": "replace", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "text": ans_raw[i], "card": cid,
                           "in_place": in_place(w), "note": "человек и вариант модели"})
             rep["applied"].append(f"«{w['w']}» → «{ans_raw[i]}» (как у другой модели)")
         elif k == "match":
             hl, wl = core_of(ans_raw[i]), core_of(w["w"])
             target = human_spelling(ans_raw[i], w["w"])
             if hl and wl and target != w["w"]:   # то же слово, иначе написано: регистр, «2.19.3», ё, знак после
-                edits.append({"op": "replace", "t": w["s"], "w": w["w"], "text": target,
+                edits.append({"op": "replace", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "text": target,
                               "card": cid, "in_place": in_place(w),
                               "note": "регистр" if hl.lower() == wl.lower() and hl != wl else "написание человека"})
                 rep["applied"].append(f"«{w['w']}» → «{target}»")
@@ -481,11 +505,11 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             if note:
                 rep["typos"].append(f"«{ans_raw[i]}» → «{new}»")
             if norm(new) != norm(w["w"]) or core_of(new) != core_of(w["w"]):
-                edits.append({"op": "replace", "t": w["s"], "w": w["w"], "text": new, "card": cid,
+                edits.append({"op": "replace", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "text": new, "card": cid,
                               "in_place": in_place(w), "note": note})
                 rep["applied"].append(f"«{w['w']}» → «{new}»")
         if spk and spk != w["_spk"]:
-            edits.append({"op": "relabel", "t": w["s"], "w": w["w"], "speaker": spk, "card": cid,
+            edits.append({"op": "relabel", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "speaker": spk, "card": cid,
                           "in_place": in_place(w)})
         prev_j = j
     flush(None)
@@ -529,7 +553,7 @@ def plan(manifest, answers, data, vocab_words=()):
         reports.append(r["report"])
         for e in r["edits"]:
             key = (e["op"] if e["op"] in ("insert", "place_text") else "w",
-                   round(e.get("t", e.get("s", e.get("t1", 0))), 2),
+                   e.get("word_id") or tuple(e.get("word_ids") or ()) or round(e.get("t", e.get("s", e.get("t1", 0))), 2),
                    e["op"] if e["op"] != "relabel" else "relabel")
             old = by_word.get(key)
             if old is None:
@@ -546,9 +570,21 @@ def plan(manifest, answers, data, vocab_words=()):
             if win_new:
                 by_word[key] = (e, a.get("ts") or "")
     edits = [e for e, _ in by_word.values()]
+    # Перекрывающиеся наборы word_ids могут иметь разные начала; сравнения
+    # только ключей операций недостаточно, чтобы заметить общий целевой ID.
+    claims = {}
+    for cid, result in results.items():
+        for edit in result["edits"]:
+            ids = edit.get("word_ids") or ([edit["word_id"]] if edit.get("word_id") else [])
+            for wid in ids:
+                prior = claims.setdefault(wid, cid)
+                if prior != cid and not any(set(c.get("cards", [])) == {prior, cid} for c in conflicts):
+                    conflicts.append({"word_id": wid, "cards": [prior, cid], "why": "общая цель правок"})
     # места других карточек и сомнительные места стенограммы, покрытые ответом, — закрыты человеком
     closed = {}
     for cid, r in results.items():
+        if any(it.get("id") == cid and it.get("word_ids") for it in items):
+            continue  # Временное покрытие не доказывает покрытие другой карточки по ID.
         if not r.get("covered"):
             continue
         t_a, t_b = r["covered"]

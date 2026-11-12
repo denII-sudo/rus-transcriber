@@ -342,6 +342,113 @@ def _merge_free_reports(parts):
     return merged
 
 
+def describe_conspect_confirmation(job_id, name):
+    """Снимок для подтверждения: хэши обоих файлов связывают разрешение с их содержимым."""
+    import hashlib
+    import conspect
+    jp = Path(_done_json(job_id)["json"])
+    cj, _ = conspect.path_for(jp, name)
+    try:
+        source_bytes, conspect_bytes = jp.read_bytes(), cj.read_bytes()
+        data, obj = json.loads(source_bytes), json.loads(conspect_bytes)
+        if not obj.get("recording_id") or obj.get("recording_id") != data.get("recording_id"):
+            raise CoreError("конспект относится к другой или неизвестной записи")
+        if data.get("source_revision") is None:
+            raise CoreError("ревизия источника неизвестна")
+        return {"job_id": job_id, "name": name, "recording_id": data["recording_id"],
+                "source_revision": data["source_revision"],
+                "source_hash": hashlib.sha256(source_bytes).hexdigest(),
+                "conspect_hash": hashlib.sha256(conspect_bytes).hexdigest()}
+    except (OSError, ValueError, KeyError) as ex:
+        raise CoreError("не удалось прочитать стенограмму или конспект") from ex
+
+
+def preview_conspect_candidates(job_id, text):
+    import conspect
+    jp = Path(_done_json(job_id)["json"])
+    try:
+        data = json.loads(jp.read_text(encoding="utf-8"))
+        _, report = conspect.link(text, data)
+        return report
+    except (OSError, ValueError) as ex:
+        raise CoreError("не удалось подготовить кандидатов цитат") from ex
+
+
+def prepare_selected_conspect(job_id, name, text, selections):
+    import hashlib
+    import conspect
+    jp = Path(_done_json(job_id)["json"])
+    cj, cm = conspect.path_for(jp, name)
+    if cj.exists() or cm.exists():
+        raise CoreError("конспект с таким названием уже существует; выберите другое название")
+    if not isinstance(selections, dict) or len(selections) != 1:
+        raise CoreError("за одно подтверждение выберите ровно одну цитату")
+    try:
+        source = jp.read_bytes()
+        data = json.loads(source)
+        obj, report = conspect.link(text, data, selections=selections)
+        if len(selections) > report["linked"]:
+            raise ValueError("не все выбранные цитаты связаны")
+        for entry in report["candidates"]:
+            selection = selections.get(str(entry["quote_index"]))
+            if selection:
+                option = next(x for x in entry["candidates"] if x["word_ids"] == selection["word_ids"])
+                if sum((x["speaker"], x["t1"], x["t2"]) == (option["speaker"], option["t1"], option["t2"])
+                       for x in entry["candidates"]) != 1 or entry.get("truncated"):
+                    raise ValueError("кандидатов нельзя однозначно различить по отображаемым данным")
+        payload = json.dumps({"text": text, "selections": selections}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        snapshot = {"job_id": job_id, "name": name, "source_hash": hashlib.sha256(source).hexdigest(),
+                    "request_hash": hashlib.sha256(payload).hexdigest(), "recording_id": data.get("recording_id"),
+                    "source_revision": data.get("source_revision")}
+        return snapshot, report
+    except (OSError, ValueError, TypeError, StopIteration, KeyError) as ex:
+        raise CoreError("выбранные цитаты устарели или недействительны") from ex
+
+
+def save_selected_conspect(snapshot, text, selections):
+    import conspect
+    current, _ = prepare_selected_conspect(snapshot["job_id"], snapshot["name"], text, selections)
+    if current != snapshot:
+        raise CoreError("стенограмма или выбор изменились после подтверждения")
+    jp = Path(_done_json(snapshot["job_id"])["json"])
+    data = json.loads(jp.read_text(encoding="utf-8"))
+    obj, report = conspect.link(text, data, selections=selections)
+    obj.update(name=snapshot["name"], job_json=str(jp))
+    md, render_report = conspect.render(obj, data)
+    if prepare_selected_conspect(snapshot["job_id"], snapshot["name"], text, selections)[0] != snapshot:
+        raise CoreError("стенограмма или выбор изменились после подтверждения")
+    cj, cm = conspect.path_for(jp, snapshot["name"])
+    try:
+        with cj.open("x", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+        with cm.open("x", encoding="utf-8") as f:
+            f.write(md)
+    except OSError as ex:
+        raise CoreError("не удалось полностью сохранить конспект; проверьте файлы результата") from ex
+    return {**report, "conspect_json": str(cj), "conspect_md": str(cm),
+            "analysis_needs_review": render_report["analysis_needs_review"]}
+
+
+def confirm_conspect_analysis(snapshot):
+    """Записать подтверждение только если файлы не изменились после показа человеку."""
+    import conspect
+    current = describe_conspect_confirmation(snapshot["job_id"], snapshot["name"])
+    if current != snapshot:
+        raise CoreError("конспект или стенограмма изменились после запроса подтверждения")
+    jp = Path(_done_json(snapshot["job_id"])["json"])
+    cj, _ = conspect.path_for(jp, snapshot["name"])
+    obj = json.loads(cj.read_text(encoding="utf-8"))
+    data = json.loads(jp.read_text(encoding="utf-8"))
+    conspect.confirm_analysis(obj, data)
+    # Перед заменой повторно проверяем снимок; общей межпроцессной блокировки пока нет.
+    if describe_conspect_confirmation(snapshot["job_id"], snapshot["name"]) != snapshot:
+        raise CoreError("конспект или стенограмма изменились после запроса подтверждения")
+    tmp = cj.with_name(cj.name + "." + uuid.uuid4().hex + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(cj)
+    return {"name": snapshot["name"], "source_revision": snapshot["source_revision"], "analysis_needs_review": False}
+
+
 def apply_answers(job_id):
     """Применить сохранённые ответы человека; аудио не удаляется."""
     jp, md = job_json(job_id)

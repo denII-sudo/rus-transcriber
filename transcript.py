@@ -587,7 +587,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             {"op": "insert", "s", "e", "text", "speaker", "after_t"?, "before_t"?} |
             {"op": "place_text", "t1", "t2", "text", "speaker"?} | {"op": "delete", "t", "w"} |
             {"op": "overlap_move", "t", "w", "after_t"} | {"op": "propose_delete", "t", "w"}, ... + "card", "note"?]
-    Слово ищется по времени начала. Вставка ставится сразу за словом after_t (или перед before_t), в порядке
+    При наличии word_id слово ищется по нему; старые временные ссылки допустимы только при однозначности.
+    Вставка ставится сразу за after_id/after_t (или перед before_id/before_t), в порядке
     ответа, а не по оценочному времени. overlap_move — чужое слово внутри реплики человека: переносится после
     реплики, помечается как одновременная речь. Правки одной карточки применяются целиком или никак: если
     какое-то слово не найдено или у вставки нет говорящего — карточка не применяется и идёт человеку с причиной.
@@ -609,12 +610,31 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             by_t.setdefault(round(f["w"]["s"], 2), []).append(k)
     reindex()
 
-    def find(t, text=None, strict=False):
-        ks = by_t.get(round(t, 2)) or []
+    def find(t, text=None, strict=False, word_id=None):
+        if word_id is not None:
+            ks = [k for k, f in enumerate(flat) if f["w"].get("word_id") == word_id]
+        else:
+            ks = by_t.get(round(t, 2)) or [] if t is not None else []
+            if len(ks) > 1:
+                return None
         if text is not None:
             exact = [k for k in ks if flat[k]["w"]["w"] == text]
             ks = exact if strict or exact else ks
-        return ks[0] if ks else None
+        return ks[0] if len(ks) == 1 else None
+
+    def place_indices(e):
+        ids = e.get("word_ids")
+        if ids is not None:
+            if not isinstance(ids, list) or not ids or len(ids) != len(set(ids)):
+                return None
+            indexes = [find(None, word_id=wid) for wid in ids]
+            if any(k is None for k in indexes) or indexes != list(range(indexes[0], indexes[0] + len(indexes))):
+                return None
+            return indexes
+        indexes = [k for k, f in enumerate(flat) if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01]
+        if any(len(by_t.get(round(flat[k]["w"]["s"], 2), [])) != 1 for k in indexes):
+            return None
+        return indexes
 
     log = data.setdefault("edits", [])
     pairs = {}
@@ -631,6 +651,15 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             return w.get("by") == "human" or any(
                 v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))
 
+        removed = set()
+        for e in eds:
+            if e["op"] == "delete":
+                k = find(e.get("t"), e.get("w"), strict=True, word_id=e.get("word_id"))
+                if k is not None:
+                    removed.add(k)
+            elif e["op"] == "place_text":
+                removed.update(place_indices(e) or [])
+
         for e in eds:
             op = e["op"]
             if op == "propose_delete":
@@ -638,27 +667,39 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             if op == "insert":
                 if not e.get("speaker"):
                     return f"не удалось определить говорящего вставки «{e.get('text')}»"
+                for prefix in ("after", "before"):
+                    anchor_id, anchor_t = e.get(prefix + "_id"), e.get(prefix + "_t")
+                    if anchor_id is not None or anchor_t is not None:
+                        anchor = find(anchor_t, word_id=anchor_id)
+                        if anchor is None or anchor in removed:
+                            return "опора вставки отсутствует, удаляется или неоднозначна"
                 continue
             if op == "place_text":
-                current = [f["w"] for f in flat if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01]
+                ks = place_indices(e)
+                if ks is None:
+                    return "слова места отсутствуют, неоднозначны или изменили порядок"
+                current = [flat[k]["w"] for k in ks]
                 if not current and not e.get("speaker"):
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
-                if by != "human" and any(protected(f["w"]) for f in flat
-                                          if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01):
+                if by != "human" and any(protected(flat[k]["w"]) for k in ks):
                     return "на отрезке есть подтверждённые человеком слова"
                 if current and _diff_words(current, e["text"], e.get("card", "?"))[1]:
                     return "на отрезке есть конфликтующие прежние правки"
                 continue
-            k = find(e["t"], e.get("w"), strict=True)
+            k = find(e["t"], e.get("w"), strict=True, word_id=e.get("word_id"))
             if k is None:
                 return f"слово «{e.get('w')}» ({e['t']} с) не найдено — стенограмма изменилась"
             if by != "human" and protected(flat[k]["w"]):
                 return "слово подтверждено человеком"
+            if op == "overlap_move" and (e.get("after_id") is not None or e.get("after_t") is not None):
+                anchor = find(e.get("after_t"), word_id=e.get("after_id"))
+                if anchor is None or anchor in removed or anchor == k:
+                    return "опора переноса отсутствует, удаляется или неоднозначна"
         return None
 
-    def put_after(t_anchor, card, item):
+    def put_after(t_anchor, card, item, anchor_id=None):
         """Позиция сразу за словом t_anchor и за уже вставленными этой карточкой словами после него."""
-        k = find(t_anchor) if t_anchor is not None else None
+        k = find(t_anchor, word_id=anchor_id) if t_anchor is not None or anchor_id is not None else None
         if k is None:
             return None
         k += 1
@@ -687,7 +728,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 moves.append(e)
                 continue
             if op == "place_text":
-                ks = [k for k, f in enumerate(flat) if e["t1"] - 0.01 <= f["w"]["s"] <= e["t2"] + 0.01]
+                ks = place_indices(e)
                 if not ks:                      # пустой отрезок: текст вставляется равномерно, говорящий задан
                     toks = e["text"].split()
                     step = (e["t2"] - e["t1"]) / (len(toks) + 1) if toks else 0
@@ -720,7 +761,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 after_words += [w["w"] for w in new_ws]
                 rep["replace"] += 1
                 continue
-            k = find(e["t"], e.get("w"))
+            k = find(e["t"], e.get("w"), word_id=e.get("word_id"))
             f = flat[k]
             if op == "delete":
                 before_words.append(f["w"]["w"])
@@ -753,9 +794,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             for dimension in ("text", "speaker", "order"):
                 _mark_provenance(w, dimension, by, card)
             item = {"w": w, "spk": e["speaker"], "seg": -1}
-            pos = put_after(e.get("after_t"), card, item)
-            if pos is None and e.get("before_t") is not None and find(e["before_t"]) is not None:
-                pos = find(e["before_t"])
+            pos = put_after(e.get("after_t"), card, item, e.get("after_id"))
+            if pos is None and (e.get("before_t") is not None or e.get("before_id") is not None):
+                pos = find(e.get("before_t"), word_id=e.get("before_id"))
                 while pos > 0 and flat[pos - 1]["w"].get("inserted") and flat[pos - 1]["w"].get("edited") == card:
                     pos -= 1
                 pos += sum(1 for x in inserts if x is not e and x.get("before_t") == e["before_t"]
@@ -772,13 +813,13 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             rep["insert"] += 1
         # наложение: чужое слово — после реплики человека целиком
         for e in moves:
-            k = find(e["t"], e.get("w"))
+            k = find(e["t"], e.get("w"), word_id=e.get("word_id"))
             f = flat.pop(k)
             reindex()
             f["w"]["overlap"] = True
             f["w"]["by"] = f["w"].get("by") or "model"
             _mark_provenance(f["w"], "order", by, card)
-            if put_after(e.get("after_t"), card, f) is None:
+            if put_after(e.get("after_t"), card, f, e.get("after_id")) is None:
                 flat.insert(k, f)
             reindex()
             rep["overlap"] += 1

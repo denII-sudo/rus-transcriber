@@ -5,8 +5,8 @@
 (так в конспекте отмечаются явные ошибки распознавания) и в счёт не идёт.
 Пометки ⟦…⟧ (нерешённые места стенограммы) словами не считаются; если цитата задевает нерешённое
 место, в строке отчёта "doubt": [id мест] — такую цитату надо проверить по клипу или дождаться разбора.
-Оценка: доля слов цитаты, найденных подряд в стенограмме (difflib), ≥ 0.9 — дословно, 0.6–0.9 —
-близко (пересказ или расхождение стенограммы), < 0.6 — не найдено.
+«Дословно» — точное совпадение нормализованных слов одной непрерывной части без неоднозначности;
+похожесть от 0.6 — «близко», ниже — «не найдено». Скобки и составные цитаты требуют проверки.
 """
 import difflib
 import re
@@ -57,6 +57,31 @@ def _best(part, seq, first_index):
     return best
 
 
+def candidates(part, toks, speaker=None, min_score=0.6):
+    """Лучшие различные совпадения в пределах одного говорящего, без выбора при равенстве."""
+    if not part:
+        return []
+    seq = [t[0] for t in toks]
+    scores = []
+    n = len(part)
+    for i in range(len(seq)):
+        if seq[i] not in part:
+            continue
+        for length in range(max(1, n - 1), n + 3):
+            span = toks[i:i + length]
+            if len(span) != length or len({t[1] for t in span}) != 1:
+                continue
+            if speaker and span[0][1] != speaker:
+                continue
+            score = difflib.SequenceMatcher(None, part, seq[i:i + length], autojunk=False).ratio()
+            if score >= min_score:
+                scores.append((score, i, length))
+    if not scores:
+        return []
+    best = max(x[0] for x in scores)
+    return [(s, i, n) for s, i, n in scores if abs(s - best) < 1e-9]
+
+
 def check(conspect_text, data, names=None):
     toks = _tokens(data)
     seq = [t[0] for t in toks]
@@ -68,7 +93,8 @@ def check(conspect_text, data, names=None):
     rows = []
     for m in QUOTE.finditer(flat):
         spk, q = m.group(1), m.group(2)
-        if spk and names and spk not in names:
+        unknown_speaker = spk if spk and names and spk not in names else None
+        if unknown_speaker:
             spk = None
         clean = re.sub(r"\[[^\]]*\]", "…", q)              # поправки в скобках — разрыв цитаты
         parts = [[_n(w) for w in WORD.findall(p)] for p in re.split(r"…|\.\.\.", clean)]
@@ -77,8 +103,15 @@ def check(conspect_text, data, names=None):
             continue
         tot = sum(len(p) for p in parts)
         score, where, spks, doubt = 0.0, None, Counter(), set()
+        ambiguous = False
         for p in parts:
-            r, i, L = _best(p, seq, first)
+            all_candidates = candidates(p, toks)
+            named = [x for x in all_candidates if toks[x[1]][1] == spk] if spk else all_candidates
+            matches = named or all_candidates
+            if not matches:
+                continue
+            ambiguous = ambiguous or len(matches) > 1
+            r, i, L = matches[0]
             score += r * len(p)
             if where is None or len(p) == max(len(x) for x in parts):
                 where = (i, L)
@@ -87,14 +120,15 @@ def check(conspect_text, data, names=None):
                 if t[3]:
                     doubt.add(t[3])
         score /= tot
-        i, L = where
+        i, L = where if where is not None else (0, 0)
         found_spk = spks.most_common(1)[0][0] if spks else None
         rows.append({"quote": q, "speaker": spk, "score": round(score, 2),
-                     "verdict": "дословно" if score >= 0.9 else ("близко" if score >= 0.6 else "не найдено"),
+                     "verdict": "дословно" if score == 1.0 and len(parts) == 1 and "[" not in q and not ambiguous else ("близко" if score >= 0.6 else "не найдено"),
                      "t": toks[i][2] if toks else 0, "transcript": " ".join(seq[max(0, i - 2):i + L + 2]),
                      "transcript_speaker": found_spk,
                      "speaker_ok": None if not spk else spk == found_spk,
-                     **({"doubt": sorted(doubt)} if doubt else {})})
+                     **({"doubt": sorted(doubt)} if doubt else {}), **({"ambiguous": True} if ambiguous else {}),
+                     **({"unknown_speaker": unknown_speaker} if unknown_speaker else {})})
     summary = {"quotes": len(rows),
                "verbatim": sum(r["verdict"] == "дословно" for r in rows),
                "close": sum(r["verdict"] == "близко" for r in rows),
@@ -102,5 +136,5 @@ def check(conspect_text, data, names=None):
                "with_speaker": sum(r["speaker"] is not None for r in rows),
                "speaker_mismatch": sum(r["speaker_ok"] is False for r in rows),
                "in_doubt": sum(bool(r.get("doubt")) for r in rows)}
-    problems = [r for r in rows if r["verdict"] != "дословно" or r["speaker_ok"] is False or r.get("doubt")]
+    problems = [r for r in rows if r["verdict"] != "дословно" or r["speaker_ok"] is False or r.get("doubt") or r.get("ambiguous") or r.get("unknown_speaker")]
     return {"summary": summary, "problems": problems}

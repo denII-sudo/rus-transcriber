@@ -25,6 +25,7 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import core
 import confirm
@@ -110,6 +111,9 @@ def build():
     rb = sub.add_parser("review-build"); rb.add_argument("job"); rb.add_argument("--items", help="JSON-файл с вопросами; без него — нейтральные карточки")
     rp = sub.add_parser("review-page"); rp.add_argument("job"); rp.add_argument("--port", type=int, default=8765)
     ra = sub.add_parser("review-apply"); ra.add_argument("job")
+    cc = sub.add_parser("conspect-confirm"); cc.add_argument("job"); cc.add_argument("--name", default="конспект")
+    cp = sub.add_parser("conspect-candidates"); cp.add_argument("job"); cp.add_argument("text_file")
+    cs = sub.add_parser("conspect-select"); cs.add_argument("job"); cs.add_argument("text_file"); cs.add_argument("selection_file"); cs.add_argument("--name", default="конспект")
     ro = sub.add_parser("reopen"); ro.add_argument("job"); ro.add_argument("ids")
     c = sub.add_parser("cancel"); c.add_argument("job")
     sub.add_parser("settings"); sub.add_parser("profiles"); sub.add_parser("approve"); sub.add_parser("audit")
@@ -147,6 +151,25 @@ def run(a):
         out(core.start_review_page(a.job, a.port))
     elif c == "review-apply":
         out(core.apply_answers(a.job))
+    elif c == "conspect-confirm":
+        snapshot = core.describe_conspect_confirmation(a.job, a.name)
+        return gated("Подтверждение проверки конспекта", [f"Конспект: {a.name}", f"Задача: {a.job}",
+                     f"Ревизия источника: {snapshot['source_revision']}",
+                     "Подтвердите только после самостоятельной проверки смысла и цитат."],
+                     lambda: core.confirm_conspect_analysis(snapshot))
+    elif c == "conspect-candidates":
+        out(core.preview_conspect_candidates(a.job, Path(a.text_file).read_text(encoding="utf-8-sig")))
+    elif c == "conspect-select":
+        text = Path(a.text_file).read_text(encoding="utf-8-sig")
+        selections = json.loads(Path(a.selection_file).read_text(encoding="utf-8-sig"))
+        snapshot, report = core.prepare_selected_conspect(a.job, a.name, text, selections)
+        lines = [f"Новый конспект: {a.name}", f"Задача: {a.job}, ревизия: {snapshot['source_revision']}"]
+        for entry in report["candidates"]:
+            selected = selections.get(str(entry["quote_index"]))
+            if selected:
+                option = next(x for x in entry["candidates"] if x["word_ids"] == selected["word_ids"])
+                lines.append(f"Цитата «{entry['quote'][:80]}»: {option['speaker']}, {option['t1']}–{option['t2']} с")
+        return gated("Выбор места цитаты", lines, lambda: core.save_selected_conspect(snapshot, text, selections))
     elif c == "edit-span":
         out(core.edit_span(a.job, a.t1, a.t2, a.text, a.speaker, a.note, a.by))
     elif c == "reopen":
