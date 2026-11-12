@@ -52,6 +52,19 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(d[0]["owned_words"], 1)
         self.assertNotIn("слово", str(d))
 
+    def test_word_dropped_by_own_filter_is_visible_in_diagnostics(self):
+        # Слово распознано, но его начало раньше own-интервала: результат обязан остаться прежним,
+        # а диагностика — показать, что слово не потерялось в модели, а отброшено фильтром.
+        audio = np.ones(32000, np.float32)
+        chunks = [{"a": 0, "b": 2, "own": (0.5, 2)}]
+        f = Fake(lambda xs, n: [result()])
+        plain = W.transcribe(backend(f), audio, chunks)
+        d = []
+        observed = W.transcribe(backend(f), audio, chunks, diagnostics=d)
+        self.assertEqual(plain, observed)
+        self.assertEqual(observed, [])
+        self.assertEqual((d[0]["decoded_words"], d[0]["owned_words"]), (1, 0))
+
     def test_batch_error_retry_only_affected_and_preserves_indices(self):
         def call(xs, n):
             if n == 1:
