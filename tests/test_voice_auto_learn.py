@@ -1,5 +1,6 @@
 """Изолированные проверки настроек и остановки пополнения голосов."""
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -132,3 +133,18 @@ class VoiceAutoLearn(unittest.TestCase):
         _, status = voices.auto_learn_group(data, "demo-group", ["Анна"], lambda: [], lambda: self.fail("save"))
         self.assertTrue(status["enabled"])
         self.assertEqual(data, before)
+
+    def test_voice_profiles_explains_legacy_and_verified_amounts(self):
+        import core
+        group = paths.group_dir("demo-group")
+        group.mkdir(parents=True)
+        data = profile()
+        parts = data["speakers"]["Анна"]["parts"]
+        for item in parts.values():
+            item["sec"] = item["auto_sec"]
+        parts["0"].pop("selection_version")
+        (group / "voices.json").write_text(json.dumps(data), encoding="utf-8")
+        report = core.voice_profiles()["profiles"][0]["sufficiency"]["speakers"]["Анна"]
+        self.assertEqual((report["verified_seconds"], report["verified_recordings"]), (60, 2))
+        self.assertEqual((report["legacy_seconds"], report["legacy_recordings"]), (30, 1))
+        self.assertFalse(report["sufficient"])
