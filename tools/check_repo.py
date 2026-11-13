@@ -99,8 +99,13 @@ def tracked(staged):
         files = []
         gi = [l.strip() for l in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
               if l.strip() and not l.startswith("#")] if (ROOT / ".gitignore").exists() else []
-        for p in ROOT.rglob("*"):
-            if p.is_file() and not any(part in (".git",) for part in p.parts):
+        # папка без git (например, установленная копия программы): окружение, кэши и личные данные
+        # не являются файлами исходников, а .gitignore там может отсутствовать — не заходим в них вовсе
+        skip_dirs = BAD_DIRS | {".git", "__pycache__"}
+        for dirpath, dirnames, filenames in os.walk(ROOT):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for name in filenames:
+                p = Path(dirpath) / name
                 rel = p.relative_to(ROOT).as_posix()
                 if any(fnmatch.fnmatch(rel, g.rstrip("/") + ("/*" if g.endswith("/") else "")) or
                        fnmatch.fnmatch(p.name, g.rstrip("/")) or
