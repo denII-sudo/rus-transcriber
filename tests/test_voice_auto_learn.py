@@ -60,6 +60,9 @@ class VoiceAutoLearn(unittest.TestCase):
         self.assertFalse(voices.profile_sufficiency(profile((30, 30, 29)), ["Анна"])["sufficient"])
         self.assertFalse(voices.profile_sufficiency(profile(), ["Анна", "Борис"])["sufficient"])
         self.assertFalse(voices.profile_sufficiency({"speakers": {}}, [])["sufficient"])
+        self.assertFalse(voices.profile_sufficiency(profile((86, 2, 2)), ["Анна"])["sufficient"])
+        self.assertTrue(voices.profile_sufficiency(profile((50, 20, 20)), ["Анна"])["sufficient"])
+        self.assertEqual(voices.profile_sufficiency(profile((100, 20, 20)), ["Анна"])["speakers"]["Анна"]["seconds"], 100)
 
     def test_sufficiency_stops_without_learning_and_stays_stopped(self):
         calls = []

@@ -199,6 +199,20 @@ class ServerGateTests(unittest.TestCase):
             write.assert_not_called()
             self.assertEqual(require.call_args.args[1], snapshot)
 
+    def test_voice_update_and_revocation_require_person(self):
+        snapshot = {"job_id": "demo", "json": "demo.json", "group": "demo-group",
+                    "source_hash": "abc", "profile_hash": "def", "audio_hash": "ghi",
+                    "report": {"existing_contributions": ["Анна"], "candidates": {}}}
+        with mock.patch.object(core, "prepare_voice_action", return_value=snapshot), \
+             mock.patch.object(core, "start_voice_update") as update, \
+             mock.patch.object(core, "revoke_voice_source") as revoke, \
+             mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as ask:
+            self.assertEqual(self.call(self.server.update_voice_profiles, "demo"), "нет")
+            self.assertEqual(self.call(self.server.revoke_voice_profiles, "demo"), "нет")
+            update.assert_not_called()
+            revoke.assert_not_called()
+            self.assertTrue(any("Анна" in line for line in ask.call_args.args[2]))
+
     def test_selected_quote_requires_person(self):
         snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}
         report = {"candidates": [{"quote_index": 1, "quote": "альфа бета", "candidates": [

@@ -67,7 +67,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.13.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.13.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -611,26 +611,44 @@ def review_pack_cloud(job_id: str, artifact_url: str = "") -> str:
 
 
 @mcp.tool()
+def preview_voice_profiles(job_id: str) -> str:
+    """Показать имеющиеся вклады и кандидатов по разметке, без модели и записи профиля."""
+    try:
+        return json.dumps(core.preview_voice_learning(job_id), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
 async def update_voice_profiles(job_id: str) -> str:
     """Пересчитывает голосовые профили по этой расшифровке после ответов человека (ответ человека главнее
     отпечатка): отрезки, подписанные человеком, идут в профиль с весом ×3 (кроме наложений и отрезков
-    короче 0,8 с), из подтверждённых расшифровок — только слова без пометок сомнения; прежний вклад этой
-    записи заменяется целиком, поэтому опровергнутое и отменённое уходит. Поправки «A → B» копятся как
+    короче 0,8 с), из подтверждённых расшифровок — только слова без пометок сомнения. Замена существующих
+    вкладов требует отдельного подтверждения после предварительного просмотра; создаётся резерв. Поправки «A → B» копятся как
     спутанные пары: на них сервер чаще ставит метку сомнения и склоняется к подтверждённому. Если профиль
     участника сильно изменился (сходство со старым < 0,8) — предупреждение. Защита от тёзок: профиль —
     той группы, с которой сделана расшифровка; вклад, непохожий на собранный голос имени, идёт в карантин
     (в ответе quarantine) до решения человека — resolve_voice. Возвращает job_id."""
-    jp, _ = _job_json(job_id)
-    if not jp:
-        return "Расшифровка не найдена или ещё не готова"
-    data = json.loads(Path(jp).read_text(encoding="utf-8"))
-    audio = data.get("file")
-    if not audio:
-        return "В расшифровке нет пути к записи"
-    return await _gated("Обновление голосового профиля", {"job_id": job_id, "json": jp},
-                        lambda: [f"Расшифровка: {jp}", "Пересчитать вклад записи в голосовой профиль?"],
-                        lambda: {"job_id": _launch("worker.py", ["--learn-only", jp], audio, "learn"),
-                                 "hint": "Ход — transcription_status(job_id)"})
+    try:
+        snapshot = await asyncio.to_thread(core.prepare_voice_action, job_id)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+    return await _gated("Обновление голосового профиля", snapshot,
+                        lambda: core.voice_action_lines(snapshot), lambda: core.start_voice_update(snapshot))
+
+
+@mcp.tool()
+async def revoke_voice_profiles(job_id: str) -> str:
+    """Отозвать вклады одного источника после просмотра и подтверждения человека, с резервной копией."""
+    try:
+        snapshot = await asyncio.to_thread(core.prepare_voice_action, job_id)
+        if not snapshot["report"]["existing_contributions"]:
+            return "Вкладов этой записи в профиле нет."
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+    return await _gated("Отзыв голосового вклада", snapshot,
+                        lambda: core.voice_action_lines(snapshot, revoke=True),
+                        lambda: core.revoke_voice_source(snapshot))
 
 
 @mcp.tool()
@@ -646,10 +664,9 @@ async def set_voice_auto_learn(enabled: bool, group: str = "") -> str:
 def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -> str:
     """Решение человека по тёзке из карантина профиля (см. voice_profiles → quarantine): голос с именем
     name в записи recording (имя файла расшифровки или записи, можно часть) не похож на собранный профиль.
-    decision: "same" — это тот же человек: вклад записи добавляется в профиль (запускается пересчёт);
+    decision: "same" — это тот же человек: решение сохраняется; обновление профиля запускается отдельно;
     "different" — другой человек с тем же именем: в этот профиль запись по этому имени больше не идёт.
-    profile — группа (имя из voice_profiles), если групп несколько. Возвращает job_id
-    пересчёта или итог."""
+    profile — группа (имя из voice_profiles), если групп несколько. Возвращает итог решения."""
     if decision not in ("same", "different"):
         return 'decision: "same" или "different"'
     g = profile.replace(".voices.json", "").strip() if profile else ""
@@ -693,8 +710,9 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
     if decision == "different":
         return json.dumps({"group": pf.parent.name, "name": name, "recording": akey,
                            "done": "в этот профиль запись по этому имени больше не идёт"}, ensure_ascii=False)
-    jid = _launch("worker.py", ["--learn-only", q["json"]], akey, "learn")
-    return json.dumps({"job_id": jid, "hint": "пересчёт профиля — transcription_status(job_id, wait_sec=50)"},
+    return json.dumps({"group": pf.parent.name, "name": name, "recording": akey,
+                       "done": "личность подтверждена; профиль пока не изменён",
+                       "hint": "Для пересчёта вызовите update_voice_profiles для задачи этой расшифровки и подтвердите план."},
                       ensure_ascii=False)
 
 

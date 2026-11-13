@@ -9,6 +9,8 @@
 подтверждены (переименованы через rename_speakers), и ещё не учтённые.
 """
 import json
+import bisect
+import copy
 import math
 import sys
 import time
@@ -163,6 +165,7 @@ HUMAN_WEIGHT = 3.0    # отрезок, подписанный человеко�
 HUMAN_MIN = 0.8       # отрезки человека — от 0,8 с чистой речи
 LEARN_MAX_GAP = 0.5   # экспериментальный предел паузы между словами в одном отрезке
 LEARN_CAP = 8.0       # окно обучения не пересекает границы отобранных слов
+SELECTION_VERSION = 2  # границы слов, разрыв пауз и исключение пересечений чужой речи
 DRIFT_MIN = 0.8       # сходство нового профиля со старым ниже — профиль «уплыл», показать человеку
 # защита от тёзок — разных людей с одним именем (другая группа, новый участник):
 SAME_MIN = 0.70       # вклад записи похож на профиль имени меньше — в карантин, а не в профиль
@@ -179,17 +182,20 @@ def profile_sufficiency(prof, expected_names):
         parts = prof.get("speakers", {}).get(name, {}).get("parts", {})
         seconds = 0.0
         records = 0
+        unverified_records = 0
         for part in parts.values():
             # Старый взвешенный sec не равен длительности речи; без раздельных полей не засчитываем.
             a, h = part.get("auto_sec"), part.get("human_sec")
             if not isinstance(a, (int, float)) or not isinstance(h, (int, float)):
                 continue
             duration = a + h
-            if math.isfinite(duration) and duration > 0 and a >= 0 and h >= 0:
-                seconds += duration
+            if math.isfinite(duration) and duration >= 20 and a >= 0 and h >= 0:
+                seconds += min(duration, 60.0)
                 records += 1
+                if part.get("selection_version") != SELECTION_VERSION:
+                    unverified_records += 1
         result[name] = {"seconds": round(seconds, 1), "recordings": records,
-                        "sufficient": seconds >= 90 and records >= 3}
+                        "unverified_records": unverified_records, "sufficient": seconds >= 90 and records >= 3}
     return {"sufficient": bool(result) and all(v["sufficient"] for v in result.values()), "speakers": result}
 
 
@@ -233,7 +239,7 @@ def group_of(data, _cache={}):
 def _word_human(word):
     """Человек подтвердил именно говорящего; старое общее `by` этого не доказывает."""
     speaker = (word.get("provenance") or {}).get("speaker")
-    return isinstance(speaker, dict) and speaker.get("by") == "human"
+    return isinstance(speaker, dict) and speaker.get("by") == "human" and not speaker.get("reverted")
 
 
 def _spans(data, confirmed, report=None):
@@ -245,6 +251,30 @@ def _spans(data, confirmed, report=None):
     def note(reason):
         if report is not None:
             report[reason] = report.get(reason, 0) + 1
+    foreign = {}
+    for seg in data["segments"]:
+        words = seg.get("words") or []
+        intervals = [(w.get("s"), w.get("e")) for w in words] if words else [(seg.get("start"), seg.get("end"))]
+        for s, e in intervals:
+            if isinstance(s, (int, float)) and isinstance(e, (int, float)) and math.isfinite(s) and math.isfinite(e) and s < e:
+                foreign.setdefault(seg.get("speaker"), []).append((s, e))
+    indexes = {}
+    for speaker, intervals in foreign.items():
+        intervals.sort()
+        starts, maxima = [], []
+        for start, end in intervals:
+            starts.append(start)
+            maxima.append(max(end, maxima[-1] if maxima else end))
+        indexes[speaker] = (starts, maxima)
+
+    def intersects_foreign(name, start, end):
+        for speaker, (starts, maxima) in indexes.items():
+            if speaker == name:
+                continue
+            index = bisect.bisect_left(starts, end)
+            if index and maxima[index - 1] > start:
+                return True
+        return False
     for seg in data["segments"]:
         name = seg["speaker"]
         if str(name).startswith("Спикер"):
@@ -277,7 +307,9 @@ def _spans(data, confirmed, report=None):
                 note("gap_or_order")
             if run and (k != kind or separated):
                 s, e = run[0]["s"], max(x["e"] for x in run)
-                if (kind == "h" and e - s >= HUMAN_MIN) or (kind == "a" and e - s >= LEARN_MIN):
+                if intersects_foreign(name, s, e):
+                    note("foreign_overlap")
+                elif (kind == "h" and e - s >= HUMAN_MIN) or (kind == "a" and e - s >= LEARN_MIN):
                     out.append((name, s, e, kind == "h"))
                     note("accepted_human" if kind == "h" else "accepted_auto")
                 else:
@@ -325,10 +357,10 @@ def confusions(prof, exclude_audio=None):
 
 
 def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
-          stop_when=None):
+          stop_when=None, allow_replace=False):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
-    Вклад каждой записи хранится отдельно (ключ — путь к аудио) и при каждом учёте пересчитывается из
-    текущей стенограммы: отменённый ответ человека уходит из профиля сам. На одну запись берётся самая
+    Вклад каждой записи хранится отдельно (ключ — путь к аудио). До реализации подтверждаемого
+    предпросмотра существующий вклад не заменяется и не отзывается автоматически. На одну запись берётся самая
     свежая расшифровка, в которой есть подтверждённые имена или правки человека.
     В профиль идут: отрезки, подписанные человеком (вес ×3), и — в подтверждённых расшифровках — слова
     без пометок сомнения. Поправки «A → B» человеком копятся как спутанные пары (confusions).
@@ -338,6 +370,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     собранный голос этого имени (SAME_MIN, SAME_MARGIN), в профиль не идёт, а ждёт решения человека
     в prof["quarantine"] (resolve_voice: тот же человек или другой)."""
     learned = []
+    def note(reason):
+        if selection_report is not None:
+            selection_report[reason] = selection_report.get(reason, 0) + 1
     files = sorted(set(Path(folder).glob("*.transcript.json")) | set(Path(folder).glob("*.rus-transcriber/*.transcript.json")))
     if only:
         files = [Path(p) for p in only]
@@ -346,17 +381,22 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         try:
             data = json.loads(jp.read_text(encoding="utf-8"))
         except Exception:
+            note("unreadable_transcript")
             continue
         g = group_of(data)
         if group and g and g != group:       # расшифровка другой группы: её «Анна» — не наша
+            note("other_group")
             continue
         if data.get("no_profile"):           # общий словарь без group: в профили групп не идёт
+            note("profile_disabled")
             continue
         has_human = has_human_edits(data)
         if not (_confirmed(data) or has_human):
+            note("unconfirmed_source")
             continue
         src = Path(data.get("file", ""))
         if not src.exists():
+            note("missing_audio")
             continue
         akey = str(src.resolve())
         mt = jp.stat().st_mtime
@@ -364,7 +404,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             best[akey] = (jp, mt, data, src)
         if _confirmed(data) and (akey not in conf_best or mt > conf_best[akey][1]):
             conf_best[akey] = (jp, mt, data)
-    if only:      # подтверждённые расшифровки той же записи из её папки — для слов модели
+    if only and not allow_replace:  # при подтверждённом пересчёте используются только показанные данные
         for jp in sorted(set(Path(files[0]).parent.glob("*.transcript.json")) |
                          set(Path(files[0]).parent.parent.glob("*.transcript.json"))) if files else []:
             try:
@@ -384,8 +424,14 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             break
         key = str(jp.resolve())
         if prof["sources"].get(key) == mt and not only:
+            note("already_processed")
             continue
+        before_update = copy.deepcopy(prof)
         try:
+            existing = any(akey in s.get("parts", {}) for s in prof["speakers"].values())
+            if existing and not allow_replace:
+                note("existing_requires_preview")
+                continue
             confirmed = _confirmed(data)
             spans = _spans(data, confirmed, selection_report)
             if not confirmed and akey in conf_best:
@@ -406,18 +452,19 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                     if v is not None:
                         sec = min(e - s, LEARN_CAP)
                         per.setdefault(name, []).append((sec * (HUMAN_WEIGHT if human else 1.0), v, human, sec))
-            # вклад этой записи заменяется целиком (в том числе убираются прежние ошибки)
-            for name, s in prof["speakers"].items():
-                s.get("parts", {}).pop(akey, None)
+            if not per:
+                note("no_usable_vectors")
+                continue
             ident = prof.setdefault("identity", {}).get(akey, {})
             quar = prof.setdefault("quarantine", {})
-            quar.pop(akey, None)
-            others = voice_vectors(prof)          # своя запись уже убрана
-            other_sec = {n: sum(pt["sec"] for pt in sp.get("parts", {}).values())
+            others = voice_vectors(prof, exclude_audio=src)
+            other_sec = {n: sum(pt["sec"] for source, pt in sp.get("parts", {}).items() if source.lower() != akey.lower())
                          for n, sp in prof["speakers"].items()}
             same_sims = {}
+            changed_names, quarantined_names = [], []
             for name, items in per.items():
                 if ident.get(name) == "different":
+                    note("identity_different")
                     continue                       # человек решил: в этой записи другой человек с этим именем
                 c = _norm(sum(w * v for w, v, _, _ in items))
                 good = [it for it in items if it[2] or float(it[1] @ c) >= 0.3] or items
@@ -431,6 +478,8 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                     same_sims[name] = round(sim, 3)
                     near = max(((float(c @ v), n) for n, v in others.items() if n != name), default=(-1.0, None))
                     if sim < SAME_MIN or near[0] - sim >= SAME_MARGIN:
+                        note("quarantined")
+                        quarantined_names.append(name)
                         quar.setdefault(akey, {})[name] = {
                             "similarity": round(sim, 3), "closest_other": near[1],
                             "closest_other_sim": round(near[0], 3), "sec": round(part_sec, 1),
@@ -442,12 +491,23 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                                      + (f" (ближе к «{near[1]}»)" if near[0] - sim >= SAME_MARGIN else "")
                                      + " — тёзка или ошибка подписи; в профиль не добавлено, решение — resolve_voice")})
                         continue
+                was_present = akey in prof["speakers"].get(name, {}).get("parts", {})
                 prof["speakers"].setdefault(name, {"parts": {}})["parts"][akey] = {
                     "vec": c, "sec": round(sum(sec for _, _, h, sec in good if not h)
                                            + HUMAN_WEIGHT * sum(sec for _, _, h, sec in good if h), 1),
                     "human_sec": round(sum(sec for _, _, h, sec in good if h), 1),
                     "auto_sec": round(sum(sec for _, _, h, sec in good if not h), 1),
-                    "from": jp.name, "confirmed": confirmed}
+                    "from": jp.name, "confirmed": confirmed, "selection_version": SELECTION_VERSION,
+                    "source_revision": data.get("source_revision")}
+                note("replaced" if was_present else "added")
+                changed_names.append(name)
+                if akey in quar:
+                    quar[akey].pop(name, None)
+                    if not quar[akey]:
+                        quar.pop(akey)
+            if not changed_names and not quarantined_names:
+                note("no_profile_change")
+                continue
             pairs = _human_pairs(data)
             prof["confusions"][akey] = {f"{a}|{b}": n for (a, b), n in pairs.items()}
             after = voice_vectors(prof)
@@ -463,7 +523,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             prof["history"].append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "from": jp.name,
                                     "speakers": {n: {"human_sec": prof["speakers"][n]["parts"][akey]["human_sec"],
                                                      "auto_sec": prof["speakers"][n]["parts"][akey]["auto_sec"]}
-                                                 for n in per if akey in prof["speakers"].get(n, {}).get("parts", {})},
+                                                 for n in changed_names},
                                     "drift": drift, "pairs": {f"{a}|{b}": n for (a, b), n in pairs.items()},
                                     "same_sim": same_sims,
                                     **({"quarantine": sorted(quar[akey])} if quar.get(akey) else {})})
@@ -474,6 +534,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             _log(f"профиль пополнен из {jp.name}: {sorted(per)} за {time.time() - t0:.1f} с")
             prof["sources"][key] = mt
         except Exception as ex:
+            prof.clear()
+            prof.update(before_update)
+            note("processing_error")
             _log(f"{jp.name} пропущен: {type(ex).__name__}: {ex}")
     return learned
 

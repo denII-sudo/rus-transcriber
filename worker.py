@@ -630,7 +630,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
 
 
 def learn_only(a, st, cfg, src):
-    """Пересчёт профилей голосов по одной расшифровке (после ответов человека): вклад записи заменяется."""
+    """Обучение по одной расшифровке; существующий вклад пока защищён от замены."""
     try:
         if json.loads(Path(a.learn_only).read_text(encoding="utf-8")).get("no_profile"):
             st.set(state="done", stage="готово", progress=100, kind="learn", learned=0,
@@ -660,14 +660,27 @@ def learn_only(a, st, cfg, src):
             allowed = []                           # участники словаря — другой группы: не ограничиваем
         ppath = voices.profile_path(group)
         with settings.group_voice_lock(group):
+            authorized = bool(a.voice_source_hash and a.voice_profile_hash and a.voice_audio_hash and a.voice_group)
+            if authorized:
+                import core
+                if group != a.voice_group or core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
+                    raise RuntimeError("стенограмма или профиль изменились после подтверждения; нужен новый просмотр")
             prof = voices.load_profile(ppath)
             st.set(stage="профили: пересчёт по ответам человека", progress=40)
+            selection_report = {}
             learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
-                                   only=[a.learn_only], group=group)
-            voices.save_profile(ppath, prof)
+                                   only=[a.learn_only], group=group, selection_report=selection_report,
+                                   allow_replace=authorized)
+            backup = None
+            if learned:
+                if authorized:
+                    if core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
+                        raise RuntimeError("стенограмма или профиль изменились во время пересчёта; запись отменена")
+                    backup = core.backup_voice_profile(ppath)
+                voices.save_profile(ppath, prof)
         last = prof.get("history", [])[-1] if learned else None
         st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
-               revision=prof.get("revision"), last=last,
+               revision=prof.get("revision"), last=last, selection_report=selection_report, backup=backup,
                quarantine={n: q for qa in (prof.get("quarantine") or {}).values() for n, q in qa.items()
                            if last and q.get("from") == last.get("from")},
                warnings=[w for w in prof.get("warnings", []) if last and w.get("from") == last.get("from")])
@@ -689,6 +702,9 @@ def main():
     ap.add_argument("--no-voices", action="store_true", help="без голосовых профилей и проверки голосов")
     ap.add_argument("--names", default="", help="имена участников записи через запятую: голоса только среди них")
     ap.add_argument("--learn-only", default="", help="только пересчитать профили голосов по этой расшифровке")
+    ap.add_argument("--voice-source-hash", default=""); ap.add_argument("--voice-profile-hash", default="")
+    ap.add_argument("--voice-audio-hash", default="")
+    ap.add_argument("--voice-group", default="")
     ap.add_argument("--whisper", default="", choices=["", "all", "doubt", "off"],
                     help="третья модель Whisper: all — вся запись, doubt — только куски, где GigaAM RNN-T и CTC "
                          "расходятся, off — без неё")
@@ -772,11 +788,14 @@ def main():
                     ppath = voices.profile_path(group)
                     with settings.group_voice_lock(group):
                         prof = voices.load_profile(ppath)
+                        selection_report = {}
                         learned, quality["voice_auto_learn"] = voices.auto_learn_group(
                             prof, group, all_names,
                             lambda: voices.learn(prof, src.parent, emb, load_audio, names=all_names or None, group=group,
+                                                 selection_report=selection_report,
                                                  stop_when=lambda: voices.profile_sufficiency(prof, all_names)["sufficient"]),
                             lambda: voices.save_profile(ppath, prof))
+                        quality["voice_selection_report"] = selection_report
                 st.set(stage="голоса: проверка реплик", progress=33)
                 embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
                 if cfg.get("voices_debug"):   # отпечатки реплик для подбора порогов (биометрия: только локально)

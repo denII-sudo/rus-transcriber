@@ -9,6 +9,7 @@ rt.py (командная строка) — только вызывают эти
 получает слой управления (confirm.py для MCP, ввод в терминале для rt.py).
 """
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -627,6 +628,162 @@ def settings_info():
     return {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
             "overrides": settings.load_overrides(), "effective": settings.load_config(),
             "groups": paths.list_groups()}
+
+
+def preview_voice_learning(job_id):
+    """Предварительная оценка по разметке, без моделей, биометрических векторов и изменения файлов."""
+    import voices
+    jp, _ = job_json(job_id)
+    if not jp:
+        raise CoreError("готовая расшифровка не найдена")
+    try:
+        data = json.loads(Path(jp).read_text(encoding="utf-8"))
+        if data.get("no_profile"):
+            raise CoreError("для этой расшифровки профили групп отключены")
+        group = voices.group_of(data)
+        if not group:
+            raise CoreError("группа расшифровки неизвестна; предварительный просмотр невозможен")
+        path = paths.voices_path(group)
+        profile = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"speakers": {}}
+        audio = data.get("file")
+        if not audio:
+            raise CoreError("в расшифровке не указан исходный аудиофайл")
+        key = str(Path(audio).resolve())
+        existing = sorted(name for name, speaker in profile.get("speakers", {}).items()
+                          if key in speaker.get("parts", {}))
+        report = {}
+        eligible = voices._confirmed(data) or voices.has_human_edits(data)
+        spans = voices._spans(data, voices._confirmed(data), report) if eligible else []
+        if not eligible:
+            report["unconfirmed_source"] = 1
+        candidates = {}
+        for name, start, end, human in spans:
+            item = candidates.setdefault(name, {"windows": 0, "seconds": 0.0, "human_windows": 0})
+            item["windows"] += 1
+            item["seconds"] += end - start
+            item["human_windows"] += int(human)
+        for item in candidates.values():
+            item["seconds"] = round(item["seconds"], 2)
+        return {"group": group, "existing_contributions": existing, "candidates": candidates,
+                "selection_report": report, "audio_available": Path(audio).is_file(),
+                "replacement_available": True,
+                "note": "Только разметка; модель, качество голоса и карантин не проверялись. "
+                        "Окончательный результат обновления зависит от модели и карантина."}
+    except (OSError, ValueError, KeyError, TypeError) as ex:
+        raise CoreError(f"не удалось построить предварительный просмотр: {ex}") from ex
+
+
+def _voice_hash(path):
+    p = Path(path)
+    if not p.is_file():
+        return "absent"
+    digest = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepare_voice_action(job_id):
+    """Снимок предварительного плана для привязки подтверждения к конкретным файлам."""
+    jp, _ = job_json(job_id)
+    if not jp:
+        raise CoreError("готовая расшифровка не найдена")
+    try:
+        before = _voice_hash(jp)
+        report = preview_voice_learning(job_id)
+        group = report["group"]
+        if paths.safe_group(group) != group:
+            raise CoreError("недопустимое имя группы")
+        with settings.group_voice_lock(group):
+            profile = paths.voices_path(group)
+            profile_hash = _voice_hash(profile)
+            source_data = json.loads(Path(jp).read_text(encoding="utf-8"))
+            audio = source_data.get("file")
+            audio_hash = _voice_hash(audio) if audio else "absent"
+            report = preview_voice_learning(job_id)
+            if before != _voice_hash(jp) or report["group"] != group or profile_hash != _voice_hash(profile):
+                raise CoreError("исходные файлы изменились; повторите предварительный просмотр")
+        snapshot = {"job_id": job_id, "json": str(Path(jp).resolve()), "group": group,
+                    "source_hash": before, "profile_hash": profile_hash, "audio_hash": audio_hash, "report": report}
+        if any(len(line) > 200 for line in voice_action_lines(snapshot)) or len("\n".join(voice_action_lines(snapshot))) > 1100:
+            raise CoreError("список участников слишком длинный для безопасного подтверждения; действие не запущено")
+        return snapshot
+    except (OSError, ValueError) as ex:
+        raise CoreError(f"не удалось подготовить подтверждение: {ex}") from ex
+
+
+def voice_action_lines(snapshot, revoke=False):
+    report = snapshot["report"]
+    candidates = report["candidates"]
+    return [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
+            "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
+            "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет"),
+            ("Удалить перечисленные вклады источника; другие источники не меняются." if revoke else
+             "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
+            "Будет создана резервная копия профиля. Подтвердите только после проверки."]
+
+
+def backup_voice_profile(path):
+    """Сохранить точную копию биометрического файла до изменения, не заменяя старые копии."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    folder = path.parent / "voice-backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / ("voices-" + uuid.uuid4().hex + ".json")
+    with target.open("xb") as f:
+        f.write(path.read_bytes())
+    return str(target)
+
+
+def start_voice_update(snapshot):
+    group, jp = snapshot["group"], Path(snapshot["json"])
+    with settings.group_voice_lock(group):
+        if _voice_hash(jp) != snapshot["source_hash"] or _voice_hash(paths.voices_path(group)) != snapshot["profile_hash"]:
+            raise CoreError("стенограмма или профиль изменились; повторите просмотр и подтверждение")
+        data = json.loads(jp.read_text(encoding="utf-8"))
+        audio = data.get("file")
+        if not audio or not Path(audio).is_file():
+            raise CoreError("аудиофайл недоступен")
+        if _voice_hash(audio) != snapshot["audio_hash"]:
+            raise CoreError("аудиофайл изменился; повторите просмотр и подтверждение")
+        args = ["--learn-only", str(jp), "--voice-source-hash", snapshot["source_hash"],
+                "--voice-profile-hash", snapshot["profile_hash"], "--voice-audio-hash", snapshot["audio_hash"],
+                "--voice-group", group]
+        return {"job_id": launch("worker.py", args, audio, "learn"),
+                "hint": "Ход — transcription_status(job_id)"}
+
+
+def revoke_voice_source(snapshot):
+    """Отозвать вклад источника после подтверждения; другие записи не затрагиваются."""
+    group, jp = snapshot["group"], Path(snapshot["json"])
+    path = paths.voices_path(group)
+    with settings.group_voice_lock(group):
+        if _voice_hash(jp) != snapshot["source_hash"] or _voice_hash(path) != snapshot["profile_hash"]:
+            raise CoreError("стенограмма или профиль изменились; повторите предварительный просмотр и подтверждение")
+        if not path.exists():
+            raise CoreError("профиль отсутствует")
+        data = json.loads(jp.read_text(encoding="utf-8"))
+        key = str(Path(data["file"]).resolve())
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        names = sorted(n for n, s in profile.get("speakers", {}).items() if key in s.get("parts", {}))
+        if not names or names != snapshot["report"]["existing_contributions"]:
+            raise CoreError("вклады изменились или отсутствуют; повторите просмотр")
+        backup = backup_voice_profile(path)
+        for name in names:
+            profile["speakers"][name]["parts"].pop(key)
+        profile.get("confusions", {}).pop(key, None)
+        profile.get("sources", {}).pop(str(jp.resolve()), None)
+        profile["revision"] = int(profile.get("revision", 0)) + 1
+        profile.setdefault("history", []).append({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                   "from": jp.name, "kind": "source_revoked", "speakers": names})
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+            json.dump(profile, f, ensure_ascii=False)
+            tmp = f.name
+        os.replace(tmp, path)
+        return {"group": group, "revoked": names, "revision": profile["revision"], "backup": backup}
 
 
 def set_voice_auto_learn(enabled, group=""):
