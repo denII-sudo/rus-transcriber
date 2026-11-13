@@ -202,7 +202,8 @@ class ServerGateTests(unittest.TestCase):
     def test_voice_update_and_revocation_require_person(self):
         snapshot = {"job_id": "demo", "json": "demo.json", "group": "demo-group",
                     "source_hash": "abc", "profile_hash": "def", "audio_hash": "ghi",
-                    "report": {"existing_contributions": ["Анна"], "candidates": {}}}
+                    "report": {"existing_contributions": ["Анна"], "candidates": {},
+                               "selection_explanation": [{"description": "Окно пропущено: наложение", "count": 2}]}}
         with mock.patch.object(core, "prepare_voice_action", return_value=snapshot), \
              mock.patch.object(core, "start_voice_update") as update, \
              mock.patch.object(core, "revoke_voice_source") as revoke, \
@@ -212,6 +213,7 @@ class ServerGateTests(unittest.TestCase):
             update.assert_not_called()
             revoke.assert_not_called()
             self.assertTrue(any("Анна" in line for line in ask.call_args.args[2]))
+            self.assertTrue(any("наложение: 2" in line for line in ask.call_args.args[2]))
 
     def test_selected_quote_requires_person(self):
         snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}

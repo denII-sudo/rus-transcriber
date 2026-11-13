@@ -174,6 +174,41 @@ GATE_MIN_SEC = 20.0   # проверка — когда у имени уже е�
 GATE_PART_SEC = 4.0   # и вклад записи не короче (короткие отрезки слишком шумные для вывода)
 
 
+SELECTION_REASONS = {
+    "unknown_speaker": "Реплика пропущена: участник не определён",
+    "overlap": "Слово пропущено: отмечено наложение голосов",
+    "foreign_overlap": "Окно пропущено: пересекается со временем другого говорящего",
+    "unconfirmed_or_flagged": "Слово пропущено: автор не подтверждён или есть пометка сомнения",
+    "invalid_time": "Слово пропущено: некорректные границы времени",
+    "word_too_long": "Слово пропущено: длительность больше максимального окна",
+    "gap_or_order": "Участок разделён из-за паузы, порядка или предельной длины",
+    "accepted_human": "Кандидат принят: говорящий подтверждён человеком",
+    "accepted_auto": "Кандидат принят: слово без пометок в подтверждённой расшифровке",
+    "too_short": "Окно пропущено: слишком короткое",
+    "legacy_without_word_times": "Реплика пропущена: нет времён отдельных слов",
+    "unreadable_transcript": "Расшифровка пропущена: файл не прочитан",
+    "other_group": "Расшифровка пропущена: другая группа",
+    "profile_disabled": "Расшифровка пропущена: профили для неё отключены",
+    "unconfirmed_source": "Расшифровка пропущена: нет подтверждённых имён или действующих правок",
+    "missing_audio": "Расшифровка пропущена: исходное аудио недоступно",
+    "already_processed": "Расшифровка пропущена: эта версия уже учтена",
+    "existing_requires_preview": "Вклад сохранён без изменений: требуется отдельное подтверждение обновления",
+    "no_usable_vectors": "Новый вклад не создан: нет подходящих фрагментов или пригодных отпечатков",
+    "identity_different": "Кандидат пропущен: человек указал другого участника с тем же именем",
+    "quarantined": "Новый вклад помещён в карантин; прежний, если был, сохранён",
+    "replaced": "Вклад записи заменён после подтверждения",
+    "added": "Добавлен вклад записи",
+    "no_profile_change": "Изменений вклада нет",
+    "processing_error": "Источник пропущен из-за ошибки; изменения этого источника отменены",
+}
+
+
+def explain_selection_report(report):
+    """Читаемые описания счётчиков; единицы разных причин могут различаться."""
+    return [{"code": key, "description": SELECTION_REASONS.get(key, "Неизвестная причина"), "count": count}
+            for key, count in sorted(report.items())]
+
+
 def profile_sufficiency(prof, expected_names):
     """Оценка полноты, не оценка точности: 90 с и три записи для каждого известного участника."""
     names = set(expected_names or ()) | set(prof.get("speakers", {}))
@@ -427,6 +462,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             note("already_processed")
             continue
         before_update = copy.deepcopy(prof)
+        before_report = dict(selection_report) if selection_report is not None else None
         try:
             existing = any(akey in s.get("parts", {}) for s in prof["speakers"].values())
             if existing and not allow_replace:
@@ -536,6 +572,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         except Exception as ex:
             prof.clear()
             prof.update(before_update)
+            if selection_report is not None:
+                selection_report.clear()
+                selection_report.update(before_report)
             note("processing_error")
             _log(f"{jp.name} пропущен: {type(ex).__name__}: {ex}")
     return learned

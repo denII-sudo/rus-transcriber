@@ -665,7 +665,8 @@ def preview_voice_learning(job_id):
         for item in candidates.values():
             item["seconds"] = round(item["seconds"], 2)
         return {"group": group, "existing_contributions": existing, "candidates": candidates,
-                "selection_report": report, "audio_available": Path(audio).is_file(),
+                "selection_report": report, "selection_explanation": voices.explain_selection_report(report),
+                "audio_available": Path(audio).is_file(),
                 "replacement_available": True,
                 "note": "Только разметка; модель, качество голоса и карантин не проверялись. "
                         "Окончательный результат обновления зависит от модели и карантина."}
@@ -716,12 +717,16 @@ def prepare_voice_action(job_id):
 def voice_action_lines(snapshot, revoke=False):
     report = snapshot["report"]
     candidates = report["candidates"]
-    return [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
-            "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
-            "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет"),
-            ("Удалить перечисленные вклады источника; другие источники не меняются." if revoke else
-             "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
-            "Будет создана резервная копия профиля. Подтвердите только после проверки."]
+    lines = [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
+             "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
+             "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
+    if report.get("selection_explanation"):
+        lines.append("Предварительный отбор (результат модели может отличаться):")
+        lines.extend(f"{item['description']}: {item['count']}" for item in report["selection_explanation"])
+    lines.extend([("Удалить перечисленные вклады источника; другие источники не меняются." if revoke else
+                   "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
+                  "Будет создана резервная копия профиля. Подтвердите только после проверки."])
+    return lines
 
 
 def backup_voice_profile(path):

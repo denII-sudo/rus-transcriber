@@ -680,7 +680,8 @@ def learn_only(a, st, cfg, src):
                 voices.save_profile(ppath, prof)
         last = prof.get("history", [])[-1] if learned else None
         st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
-               revision=prof.get("revision"), last=last, selection_report=selection_report, backup=backup,
+               revision=prof.get("revision"), last=last, selection_report=selection_report,
+               selection_explanation=voices.explain_selection_report(selection_report), backup=backup,
                quarantine={n: q for qa in (prof.get("quarantine") or {}).values() for n, q in qa.items()
                            if last and q.get("from") == last.get("from")},
                warnings=[w for w in prof.get("warnings", []) if last and w.get("from") == last.get("from")])
@@ -796,6 +797,7 @@ def main():
                                                  stop_when=lambda: voices.profile_sufficiency(prof, all_names)["sufficient"]),
                             lambda: voices.save_profile(ppath, prof))
                         quality["voice_selection_report"] = selection_report
+                        quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
                 st.set(stage="голоса: проверка реплик", progress=33)
                 embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
                 if cfg.get("voices_debug"):   # отпечатки реплик для подбора порогов (биометрия: только локально)

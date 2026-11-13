@@ -185,6 +185,29 @@ class VoiceOverlapSelection(unittest.TestCase):
             self.assertIn("Борис", profile["quarantine"][key])
             self.assertEqual(report["identity_different"], 1)
 
+    def test_failure_after_update_rolls_back_profile_and_success_counters(self):
+        class FakeEmbedder:
+            def spans(self, audio, spans, cap):
+                return [np.array([1.0, 0.0])] * len(spans)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "demo.wav"
+            audio.touch()
+            data = recording({"s": 0.0, "e": 3.0})
+            data.update({"file": str(audio), "names_confirmed": True})
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            profile = {"speakers": {}, "sources": {}}
+            report = {}
+            with patch.object(voices, "voice_vectors", side_effect=[{}, {}, RuntimeError("synthetic failure")]):
+                result = voices.learn(profile, root, FakeEmbedder(), lambda _: np.zeros(48000), selection_report=report)
+            self.assertEqual(result, [])
+            self.assertEqual(profile["speakers"], {})
+            self.assertNotIn("revision", profile)
+            self.assertEqual(report, {"processing_error": 1})
+            self.assertEqual(voices.explain_selection_report(report)[0]["description"],
+                             "Источник пропущен из-за ошибки; изменения этого источника отменены")
+
     def test_preview_is_read_only_and_does_not_return_vectors(self):
         import core
         import paths
