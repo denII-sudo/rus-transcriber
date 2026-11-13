@@ -308,3 +308,29 @@ class VoiceOverlapSelection(unittest.TestCase):
                 with self.assertRaises(core.CoreError):
                     core.start_voice_update(snapshot)
                 launch.assert_not_called()
+
+    def test_changed_profile_blocks_revocation_and_preserves_newer_profile(self):
+        import core
+        import paths
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            audio = root / "demo.wav"
+            audio.touch()
+            data = recording({"s": 0.0, "e": 3.0})
+            data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            profile = {"speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1]}}}}}
+            target = group / "voices.json"
+            target.write_text(json.dumps(profile), encoding="utf-8")
+            with patch.object(core, "job_json", return_value=(str(source), None)), patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs):
+                snapshot = core.prepare_voice_action("demo")
+                target.write_text(json.dumps({**profile, "revision": 2}), encoding="utf-8")
+                newer = target.read_bytes()
+                with self.assertRaises(core.CoreError):
+                    core.revoke_voice_source(snapshot)
+            self.assertEqual(target.read_bytes(), newer)
+            self.assertFalse((group / "voice-backups").exists())

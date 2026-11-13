@@ -23,8 +23,8 @@ class Status:
 
 class VoiceWorkerUpdate(unittest.TestCase):
     def test_confirmed_update_and_source_conflict(self):
-        for change_source in (False, True):
-            with self.subTest(change_source=change_source), tempfile.TemporaryDirectory() as directory:
+        for change in ("none", "source", "audio"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 groups, jobs = root / "groups", root / "jobs"
                 group = groups / "demo-group"
@@ -50,8 +50,10 @@ class VoiceWorkerUpdate(unittest.TestCase):
                         pass
 
                     def spans(self, audio_data, spans, cap):
-                        if change_source:
+                        if change == "source":
                             source.write_text(json.dumps({**data, "source_revision": 2}), encoding="utf-8")
+                        elif change == "audio":
+                            audio.write_bytes(b"changed synthetic audio")
                         return [np.array([1.0, 0.0])] * len(spans)
 
                 fake_audio = types.ModuleType("pyannote.audio")
@@ -62,12 +64,12 @@ class VoiceWorkerUpdate(unittest.TestCase):
                      patch.object(worker, "resolve_vocab", return_value=(None, {}, "demo-group")), \
                      patch.object(worker, "load_audio", return_value=np.zeros(48000)), \
                      patch.object(voices, "Embedder", FakeEmbedder):
-                    if change_source:
+                    if change != "none":
                         with self.assertRaises(RuntimeError):
                             worker.learn_only(args, status, {}, audio)
                     else:
                         worker.learn_only(args, status, {}, audio)
-                if change_source:
+                if change != "none":
                     self.assertEqual(target.read_bytes(), before)
                     self.assertFalse((group / "voice-backups").exists())
                     self.assertEqual(status.data["state"], "error")
