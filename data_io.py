@@ -202,10 +202,18 @@ def import_data(zip_path, mode="merge", apply=False):
         raise RuntimeError('mode: "merge" или "replace"')
     man, blobs = _read_archive(zip_path)
     policies = {}
+    imported_profiles = {}
+    import voices
     for entry in man.get("groups", []):
         g = entry["name"]
         if not g or paths.safe_group(g) != g:
             raise RuntimeError(f"Недопустимое имя группы: {g!r}")
+        voice_key = f"groups/{g}/voices.json"
+        if voice_key in blobs:
+            try:
+                imported_profiles[g] = voices.validate_profile(json.loads(blobs[voice_key]), convert=False)
+            except (ValueError, UnicodeError) as ex:
+                raise RuntimeError(f"Голосовой профиль группы {g} в архиве недоступен для импорта: {ex}") from ex
         key = f"groups/{g}/voice-settings.json"
         if key in blobs:
             try:
@@ -223,7 +231,7 @@ def import_data(zip_path, mode="merge", apply=False):
         rep = {}
         gd = paths.group_dir(g)
         vk, ok = f"groups/{g}/voices.json", f"groups/{g}/vocab.json"
-        im_voices = json.loads(blobs[vk]) if vk in blobs else None
+        im_voices = imported_profiles.get(g)
         existed = gd.is_dir() and any((gd / f).exists() for f in ("vocab.json", "voices.json", "voice-settings.json"))
         rep["action"] = "новая группа" if not existed else ("замена" if mode == "replace" else "слияние")
         if existed and mode == "replace" and apply:
@@ -278,6 +286,12 @@ def import_data(zip_path, mode="merge", apply=False):
                     extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
                 else:
                     merged = _merge_voices(ex, im_voices, rep)
+                    if rep.get("voices") == "слито":
+                        try:
+                            voices.validate_profile(merged, convert=False)
+                        except voices.VoiceProfileError as ex_err:
+                            rep["voices"] = f"пропущено: результат слияния несовместим ({ex_err})"
+                            extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
                     if apply and rep.get("voices") == "слито":
                         _write_json(pp, merged)
         result["groups"][g] = rep

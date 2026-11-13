@@ -167,6 +167,66 @@ class T(unittest.TestCase):
             data_io.import_data(target, mode="replace", apply=True)
         self.assertEqual(before, (paths.group_dir("demo") / "voices.json").read_bytes())
 
+    def test_invalid_archived_voice_profiles_fail_before_any_changes(self):
+        put_group("demo", {"Анна": 100})
+        put_group("other", {"Борис": 20})
+        source = data_io.export_data()["zip"]
+        gd = paths.group_dir("demo")
+        before = {p.relative_to(paths.GROUPS): p.read_bytes() for p in paths.GROUPS.rglob("*") if p.is_file()}
+        valid = make_voices({"Вера": 20})
+        old = {**valid, "version": voices.PROFILE_VERSION - 1}
+        missing_vector = make_voices({"Вера": 20})
+        next(iter(missing_vector["speakers"]["Вера"]["parts"].values())).pop("vec")
+        for index, blob in enumerate((json.dumps(old).encode(), json.dumps(missing_vector).encode(), b"{invalid")):
+            target = Path(_TMP) / f"invalid-profile-{index}.zip"
+            member = "groups/other/voices.json"
+            with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+                manifest = json.loads(src.read("manifest.json"))
+                manifest["files"][member] = {"sha256": data_io._sha(blob), "size": len(blob)}
+                dst.writestr("manifest.json", json.dumps(manifest))
+                for name in src.namelist():
+                    if name != "manifest.json":
+                        dst.writestr(name, blob if name == member else src.read(name))
+            for mode in ("merge", "replace"):
+                for apply in (False, True):
+                    with self.subTest(index=index, mode=mode, apply=apply):
+                        with self.assertRaisesRegex(RuntimeError, "голосовой профиль|Голосовой профиль"):
+                            data_io.import_data(target, mode=mode, apply=apply)
+                        after = {p.relative_to(paths.GROUPS): p.read_bytes() for p in paths.GROUPS.rglob("*") if p.is_file()}
+                        self.assertEqual(before, after)
+        self.assertTrue(gd.exists())
+
+    def test_import_rejects_invalid_profile_for_new_group(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        target = Path(_TMP) / "invalid-new.zip"
+        member = "groups/demo/voices.json"
+        blob = json.dumps({"version": voices.PROFILE_VERSION - 1, "speakers": {}, "sources": {}}).encode()
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+            manifest = json.loads(src.read("manifest.json"))
+            manifest["files"][member] = {"sha256": data_io._sha(blob), "size": len(blob)}
+            dst.writestr("manifest.json", json.dumps(manifest))
+            for name in src.namelist():
+                if name != "manifest.json":
+                    dst.writestr(name, blob if name == member else src.read(name))
+        data_io.delete_group("demo", "demo")
+        for mode in ("merge", "replace"):
+            with self.assertRaises(RuntimeError):
+                data_io.import_data(target, mode=mode, apply=True)
+            self.assertFalse(paths.group_dir("demo").exists())
+
+    def test_merge_rejects_incompatible_combined_vector_dimensions(self):
+        put_group("demo", {"Анна": 100})
+        source = data_io.export_data()["zip"]
+        local = make_voices({"Борис": 20})
+        next(iter(local["speakers"]["Борис"]["parts"].values()))["vec"] = [1.0]
+        path = paths.group_dir("demo") / "voices.json"
+        path.write_text(json.dumps(local), encoding="utf-8")
+        before = path.read_bytes()
+        result = data_io.import_data(source, mode="merge", apply=True)
+        self.assertIn("пропущено", result["groups"]["demo"]["voices"])
+        self.assertEqual(before, path.read_bytes())
+
     def test_unlisted_voice_settings_rejected(self):
         put_group("demo", {"Анна": 100})
         source = data_io.export_data()["zip"]

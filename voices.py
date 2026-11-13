@@ -118,20 +118,9 @@ def empty_profile():
     return {"version": PROFILE_VERSION, "model": "wespeaker-resnet34 (pyannote community-1)", "speakers": {}, "sources": {}}
 
 
-def load_profile(path, convert=True):
-    """Прочитать профиль. Отсутствующий файл даёт пустой профиль; несовместимый или повреждённый — ошибку.
-    convert=False сохраняет исходные списки векторов для последующей записи без потери формата."""
-    p = Path(path)
+def validate_profile(d, convert=True):
+    """Проверить структуру и отпечатки; convert=False сохраняет списки для записи JSON."""
     try:
-        text = p.read_text(encoding="utf-8")
-    except FileNotFoundError as ex:
-        if p.is_symlink():
-            raise VoiceProfileError("ссылка на голосовой профиль недоступна; сохранение запрещено") from ex
-        return empty_profile()
-    except (OSError, UnicodeError) as ex:
-        raise VoiceProfileError("голосовой профиль не прочитан; сохранение запрещено") from ex
-    try:
-        d = json.loads(text)
         if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION:
             raise VoiceProfileError("неподдерживаемая версия голосового профиля; сохранение запрещено")
         if not isinstance(d.get("speakers"), dict) or not isinstance(d.get("sources"), dict):
@@ -158,6 +147,24 @@ def load_profile(path, convert=True):
         raise
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as ex:
         raise VoiceProfileError("голосовой профиль повреждён; сохранение запрещено") from ex
+
+
+def load_profile(path, convert=True):
+    """Прочитать профиль; пустой создаётся только для отсутствующего файла."""
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError as ex:
+        if p.is_symlink():
+            raise VoiceProfileError("ссылка на голосовой профиль недоступна; сохранение запрещено") from ex
+        return empty_profile()
+    except (OSError, UnicodeError) as ex:
+        raise VoiceProfileError("голосовой профиль не прочитан; сохранение запрещено") from ex
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeError) as ex:
+        raise VoiceProfileError("голосовой профиль повреждён; сохранение запрещено") from ex
+    return validate_profile(data, convert=convert)
 
 
 def save_profile(path, prof):

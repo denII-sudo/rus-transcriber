@@ -32,7 +32,7 @@ def put_group(name):
     gd = paths.group_dir(name)
     gd.mkdir(parents=True, exist_ok=True)
     (gd / "vocab.json").write_text(json.dumps({"group": name}), encoding="utf-8")
-    (gd / "voices.json").write_text(json.dumps({"speakers": {}, "version": 3}), encoding="utf-8")
+    (gd / "voices.json").write_text(json.dumps({"speakers": {}, "sources": {}, "version": 3}), encoding="utf-8")
     return gd
 
 
