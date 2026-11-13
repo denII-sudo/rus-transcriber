@@ -23,7 +23,7 @@ def recording(*segments):
             "segments": list(segments), "review": []}
 
 
-class Stage4IdentityContract(unittest.TestCase):
+class Stage6IdentityContract(unittest.TestCase):
     def test_explicit_speaker_selects_matching_occurrence(self):
         data = recording(segment("Анна", "один два три четыре", 0.0),
                          segment("Борис", "один два три четыре", 5.0))
