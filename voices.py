@@ -154,6 +154,32 @@ def voice_vectors(prof, exclude_audio=None):
     return out
 
 
+def voice_weight_diagnostics(prof):
+    """Доли численных весов частей без векторов; не измерение влияния или качества узнавания."""
+    result = {}
+    for name, speaker in (prof.get("speakers") or {}).items():
+        parts = speaker.get("parts") or {}
+        values = []
+        invalid = False
+        for source, part in sorted(parts.items()):
+            weight = part.get("sec")
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
+                invalid = True
+                break
+            values.append((source, float(weight)))
+        total = sum(weight for _, weight in values)
+        if invalid or not math.isfinite(total):
+            result[name] = {"available": False, "reason": "некорректный вес записи", "records": len(parts)}
+        elif not total:
+            result[name] = {"available": False, "reason": "сумма весов равна нулю", "records": len(parts)}
+        else:
+            result[name] = {"available": True, "total_weight": round(total, 2), "records": len(parts),
+                            "parts": [{"recording_index": i, "recording": Path(source).name,
+                                       "weight": round(weight, 2), "weight_share_percent": round(100 * weight / total, 2)}
+                                      for i, (source, weight) in enumerate(values, 1)]}
+    return result
+
+
 def _confirmed(data):
     """Имена в расшифровке подтверждены (rename_speakers), а не угаданы по голосу."""
     if data.get("names_confirmed"):

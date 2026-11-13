@@ -148,3 +148,36 @@ class VoiceAutoLearn(unittest.TestCase):
         self.assertEqual((report["verified_seconds"], report["verified_recordings"]), (60, 2))
         self.assertEqual((report["legacy_seconds"], report["legacy_recordings"]), (30, 1))
         self.assertFalse(report["sufficient"])
+
+    def test_weight_diagnostics_shows_weights_without_vectors_or_absolute_paths(self):
+        import core
+        group = paths.group_dir("demo-group")
+        group.mkdir(parents=True)
+        data = {"speakers": {"Анна": {"parts": {
+            "folder-a/demo-a.wav": {"sec": 60, "auto_sec": 60, "human_sec": 0, "vec": [0.1, 0.2]},
+            "folder-b/demo-b.wav": {"sec": 30, "auto_sec": 10, "human_sec": 7, "vec": [0.3, 0.4]}}}}}
+        path = group / "voices.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        before = path.read_bytes()
+        report = core.voice_profiles()["profiles"][0]["weight_diagnostics"]["Анна"]
+        self.assertTrue(report["available"])
+        self.assertEqual(report["total_weight"], 90)
+        self.assertEqual([p["weight_share_percent"] for p in report["parts"]], [66.67, 33.33])
+        self.assertEqual([p["recording"] for p in report["parts"]], ["demo-a.wav", "demo-b.wav"])
+        self.assertNotIn("vec", json.dumps(report))
+        self.assertNotIn("folder-a", json.dumps(report))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_weight_diagnostics_fails_closed_for_invalid_or_zero_weights(self):
+        for weight in (None, -1, float("nan"), float("inf"), True, 0):
+            with self.subTest(weight=weight):
+                data = {"speakers": {"Анна": {"parts": {"demo.wav": {"sec": weight}}}}}
+                report = voices.voice_weight_diagnostics(data)["Анна"]
+                self.assertFalse(report["available"])
+                self.assertNotIn("parts", report)
+
+    def test_weight_diagnostics_disambiguates_duplicate_basenames(self):
+        data = {"speakers": {"Анна": {"parts": {"a/demo.wav": {"sec": 1}, "b/demo.wav": {"sec": 1}}}}}
+        parts = voices.voice_weight_diagnostics(data)["Анна"]["parts"]
+        self.assertEqual([p["recording_index"] for p in parts], [1, 2])
+        self.assertEqual([p["weight_share_percent"] for p in parts], [50, 50])

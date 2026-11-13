@@ -839,6 +839,7 @@ def voice_profiles():
             expected = []
         out.append({"group": p.parent.name, "revision": d.get("revision"),
                     "auto_learn": policy, "sufficiency": voices.profile_sufficiency(d, expected),
+                    "weight_diagnostics": voices.voice_weight_diagnostics(d),
                     "speakers": {n: {"records": len(s.get("parts", {})),
                                      "seconds": round(sum(pt.get("auto_sec", pt["sec"]) + pt.get("human_sec", 0)
                                                           for pt in s.get("parts", {}).values())),
