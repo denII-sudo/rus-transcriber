@@ -110,21 +110,51 @@ def profile_path(group):
     return paths.voices_path(group)
 
 
+class VoiceProfileError(ValueError):
+    """Существующий профиль несовместим или недоступен; перезаписывать его нельзя."""
+
+
+def empty_profile():
+    return {"version": PROFILE_VERSION, "model": "wespeaker-resnet34 (pyannote community-1)", "speakers": {}, "sources": {}}
+
+
 def load_profile(path):
     p = Path(path)
-    if p.exists():
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-            if d.get("version") != PROFILE_VERSION:
-                _log(f"профиль {p.name} старой версии {d.get('version')} — собираю заново")
-                raise ValueError("old version")
-            for name, s in d.get("speakers", {}).items():
-                for part in s.get("parts", {}).values():
-                    part["vec"] = np.asarray(part["vec"], dtype=np.float32)
-            return d
-        except Exception as ex:
-            _log(f"профиль {p} не прочитан: {ex}")
-    return {"version": PROFILE_VERSION, "model": "wespeaker-resnet34 (pyannote community-1)", "speakers": {}, "sources": {}}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError as ex:
+        if p.is_symlink():
+            raise VoiceProfileError("ссылка на голосовой профиль недоступна; сохранение запрещено") from ex
+        return empty_profile()
+    except (OSError, UnicodeError) as ex:
+        raise VoiceProfileError("голосовой профиль не прочитан; сохранение запрещено") from ex
+    try:
+        d = json.loads(text)
+        if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION:
+            raise VoiceProfileError("неподдерживаемая версия голосового профиля; сохранение запрещено")
+        if not isinstance(d.get("speakers"), dict) or not isinstance(d.get("sources"), dict):
+            raise ValueError("неверная структура")
+        dimension = None
+        for speaker in d["speakers"].values():
+            if not isinstance(speaker, dict) or not isinstance(speaker.get("parts"), dict):
+                raise ValueError("неверные вклады")
+            for part in speaker["parts"].values():
+                vec = np.asarray(part["vec"], dtype=np.float32)
+                weight = part["sec"]
+                if (vec.ndim != 1 or not vec.size or not np.all(np.isfinite(vec))
+                        or not np.any(vec)
+                        or isinstance(weight, bool) or not isinstance(weight, (int, float))
+                        or not math.isfinite(weight) or weight < 0):
+                    raise ValueError("неверный отпечаток или вес")
+                if dimension is not None and vec.size != dimension:
+                    raise ValueError("различающиеся размеры отпечатков")
+                dimension = vec.size
+                part["vec"] = vec
+        return d
+    except VoiceProfileError:
+        raise
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as ex:
+        raise VoiceProfileError("голосовой профиль повреждён; сохранение запрещено") from ex
 
 
 def save_profile(path, prof):

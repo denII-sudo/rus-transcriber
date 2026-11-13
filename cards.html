@@ -409,6 +409,7 @@ audio{width:100%;height:36px}
         (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${c.id}: ${c.was_now}`); });
       }
       if (rep.source_conflict) lines.push("Конфликт источника: " + rep.source_conflict);
+      if (rep.voice_profile_warning && rep.voice_profile_warning.message) lines.push(rep.voice_profile_warning.message);
       box.textContent = lines.length ? lines.join(" · ") : "Новых изменений нет. Проверьте сохранённые ответы."; showAll = true; render(); }
     catch (e) { box.textContent = "Не удалось применить: " + e.message; }
     finally { $("apply").disabled = false; }

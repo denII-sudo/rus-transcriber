@@ -166,10 +166,13 @@ class ReviewHTTP(unittest.TestCase):
         post("api/answer", {"id": "r1", "version": "v1", "option": 0})
         result = post("api/apply", {"version": "v1"})
         self.assertEqual(result["review"]["successful_ids"], ["r1"])
+        self.assertNotIn("voice_profile_warning", result)
         self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["review"][0]["status"], "resolved")
         post("api/answer", {"id": "r1", "version": "v1", "kind": "revert"})
         result = post("api/apply", {"version": "v1"})
         self.assertEqual(result["reverted"], ["r1"])
+        self.assertEqual(result["voice_profile_warning"]["answer_ids"], ["r1"])
+        self.assertIn("мог остаться", result["voice_profile_warning"]["message"])
         self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["review"][0]["status"], "open")
 
     def test_preview_refuses_conflicting_saved_answer_without_writing(self):

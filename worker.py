@@ -629,6 +629,37 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     return data
 
 
+def load_group_profile_for_recognition(path, quality):
+    """Использовать диаризацию без профиля, если существующий файл небезопасен для чтения."""
+    import voices
+    try:
+        return voices.load_profile(path), True
+    except voices.VoiceProfileError as ex:
+        quality["voices_error"] = str(ex)
+        quality["voice_auto_learn"] = {"enabled": False, "reason": "invalid_profile"}
+        return voices.empty_profile(), False
+
+
+def prepare_group_voice_profile(group, src, embedder, names, quality):
+    """Подготовить профиль и безопасно выполнить разрешённое автоматическое пополнение."""
+    import voices
+    ppath = voices.profile_path(group)
+    with settings.group_voice_lock(group):
+        prof, profile_ok = load_group_profile_for_recognition(ppath, quality)
+        selection_report = {}
+        learned = []
+        if profile_ok:
+            learned, quality["voice_auto_learn"] = voices.auto_learn_group(
+                prof, group, names,
+                lambda: voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
+                                     selection_report=selection_report,
+                                     stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"]),
+                lambda: voices.save_profile(ppath, prof))
+        quality["voice_selection_report"] = selection_report
+        quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
+    return ppath, prof, learned
+
+
 def learn_only(a, st, cfg, src):
     """Обучение по одной расшифровке; существующий вклад пока защищён от замены."""
     try:
@@ -781,23 +812,12 @@ def main():
                 emb = voices.Embedder(pipe)
                 if no_profile:
                     group, ppath, learned = None, None, 0
-                    prof = voices.load_profile(paths.DATA_DIR / "__no_profile__.json")     # пустой, не сохраняется
+                    prof = voices.empty_profile()     # пустой, не сохраняется
                     quality["voices_off"] = ("общий словарь без поля group: профили голосов групп не применяются "
                                              "и не пополняются (имена — rename_speakers)")
                 else:
                     group = vgroup or "default"
-                    ppath = voices.profile_path(group)
-                    with settings.group_voice_lock(group):
-                        prof = voices.load_profile(ppath)
-                        selection_report = {}
-                        learned, quality["voice_auto_learn"] = voices.auto_learn_group(
-                            prof, group, all_names,
-                            lambda: voices.learn(prof, src.parent, emb, load_audio, names=all_names or None, group=group,
-                                                 selection_report=selection_report,
-                                                 stop_when=lambda: voices.profile_sufficiency(prof, all_names)["sufficient"]),
-                            lambda: voices.save_profile(ppath, prof))
-                        quality["voice_selection_report"] = selection_report
-                        quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
+                    ppath, prof, learned = prepare_group_voice_profile(group, src, emb, all_names, quality)
                 st.set(stage="голоса: проверка реплик", progress=33)
                 embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
                 if cfg.get("voices_debug"):   # отпечатки реплик для подбора порогов (биометрия: только локально)

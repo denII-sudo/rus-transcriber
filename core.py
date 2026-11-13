@@ -596,6 +596,13 @@ def apply_answers_files(jp, md):
             P.mark_applied(jp, successful, snapshots=snapshots)
         else:
             P.mark_applied(jp, successful)
+    if undone:
+        rep["voice_profile_warning"] = {
+            "answer_ids": undone,
+            "message": ("Если эта запись ранее пополнила голосовой профиль, её прежний вклад мог остаться. "
+                        "Профиль не изменён: проверьте вклад и при необходимости отдельно подтвердите "
+                        "его обновление или отзыв."),
+        }
     return {**rep, "review": report}
 
 
