@@ -651,7 +651,11 @@ def preview_voice_learning(job_id):
         if not group:
             raise CoreError("группа расшифровки неизвестна; предварительный просмотр невозможен")
         path = paths.voices_path(group)
-        profile = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"speakers": {}}
+        try:
+            profile = voices.load_profile(path, convert=False)
+        except voices.VoiceProfileError as ex:
+            raise CoreError(f"голосовой профиль группы несовместим или повреждён: {ex}. "
+                            "Просмотр и изменение не выполняются; перенесите профиль отдельно.") from ex
         audio = data.get("file")
         if not audio:
             raise CoreError("в расшифровке не указан исходный аудиофайл")
@@ -778,7 +782,12 @@ def revoke_voice_source(snapshot):
             raise CoreError("профиль отсутствует")
         data = json.loads(jp.read_text(encoding="utf-8"))
         key = str(Path(data["file"]).resolve())
-        profile = json.loads(path.read_text(encoding="utf-8"))
+        import voices
+        try:
+            profile = voices.load_profile(path, convert=False)
+        except voices.VoiceProfileError as ex:
+            raise CoreError(f"голосовой профиль группы несовместим или повреждён: {ex}. "
+                            "Отзыв не выполнен; перенесите профиль отдельно.") from ex
         names = sorted(n for n, s in profile.get("speakers", {}).items() if key in s.get("parts", {}))
         if not names or names != snapshot["report"]["existing_contributions"]:
             raise CoreError("вклады изменились или отсутствуют; повторите просмотр")
@@ -822,12 +831,13 @@ def set_voice_auto_learn(enabled, group=""):
 
 def voice_profiles():
     """Сводка по голосовым профилям групп; сами отпечатки не выводятся."""
+    import voices
     out = []
     for p in sorted(paths.GROUPS.glob("*/voices.json")):
         try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except Exception as ex:
-            out.append({"group": p.parent.name, "error": str(ex)})
+            d = voices.load_profile(p, convert=False)
+        except voices.VoiceProfileError as ex:
+            out.append({"group": p.parent.name, "error": str(ex), "profile_error": str(ex)})
             continue
         conf = {}
         for pairs in (d.get("confusions") or {}).values():
@@ -837,7 +847,6 @@ def voice_profiles():
             policy = settings.group_voice_settings(p.parent.name)
         except ValueError:
             policy = {"auto_learn": False, "reason": "settings_error"}
-        import voices
         vocab_file = p.parent / "vocab.json"
         try:
             vocab = json.loads(vocab_file.read_text(encoding="utf-8"))

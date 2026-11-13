@@ -139,9 +139,11 @@ class VoiceAutoLearn(unittest.TestCase):
         group = paths.group_dir("demo-group")
         group.mkdir(parents=True)
         data = profile()
+        data.update(version=voices.PROFILE_VERSION, sources={})
         parts = data["speakers"]["Анна"]["parts"]
         for item in parts.values():
             item["sec"] = item["auto_sec"]
+            item["vec"] = [1.0, 0.0]
         parts["0"].pop("selection_version")
         (group / "voices.json").write_text(json.dumps(data), encoding="utf-8")
         report = core.voice_profiles()["profiles"][0]["sufficiency"]["speakers"]["Анна"]
@@ -153,7 +155,8 @@ class VoiceAutoLearn(unittest.TestCase):
         import core
         group = paths.group_dir("demo-group")
         group.mkdir(parents=True)
-        data = {"speakers": {"Анна": {"parts": {
+        data = {"version": voices.PROFILE_VERSION, "sources": {},
+                "speakers": {"Анна": {"parts": {
             "folder-a/demo-a.wav": {"sec": 60, "auto_sec": 60, "human_sec": 0, "vec": [0.1, 0.2]},
             "folder-b/demo-b.wav": {"sec": 30, "auto_sec": 10, "human_sec": 7, "vec": [0.3, 0.4]}}}}}
         path = group / "voices.json"

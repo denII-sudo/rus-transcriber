@@ -216,6 +216,7 @@ def import_data(zip_path, mode="merge", apply=False):
     backup = paths.DATA_DIR / f"_backup-import-{stamp}"
     result = {"mode": mode, "applied": bool(apply), "archive_created": man.get("created"), "groups": {},
               "jobs": "не импортируются" if man.get("with_jobs") else None, "backup": None}
+    extra_warnings = []
     for g in [x["name"] for x in man.get("groups", [])]:
         if paths.safe_group(g) != g:
             raise RuntimeError(f"Недопустимое имя группы: {g!r}")
@@ -262,18 +263,25 @@ def import_data(zip_path, mode="merge", apply=False):
         # голоса
         if im_voices is not None:
             pp = gd / "voices.json"
-            if not pp.exists() or mode == "replace":
+            if (not pp.exists() and not pp.is_symlink()) or mode == "replace":
                 rep["voices"] = "добавлены" if not pp.exists() else "заменены"
                 rep["added_speakers"] = sorted(im_voices.get("speakers") or {})
                 if apply:
                     _write_json(pp, im_voices)
             else:
-                ex = json.loads(pp.read_text(encoding="utf-8"))
-                merged = _merge_voices(ex, im_voices, rep)
-                if apply and rep.get("voices") == "слито":
-                    _write_json(pp, merged)
+                import voices
+                try:
+                    ex = voices.load_profile(pp, convert=False)
+                except voices.VoiceProfileError as ex_err:
+                    # Существующий профиль не изменяем: слияние смешало бы версии, а резерва здесь нет.
+                    rep["voices"] = f"пропущено: существующий профиль несовместим или повреждён ({ex_err})"
+                    extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
+                else:
+                    merged = _merge_voices(ex, im_voices, rep)
+                    if apply and rep.get("voices") == "слито":
+                        _write_json(pp, merged)
         result["groups"][g] = rep
-    result["warnings"] = man.get("warnings", [])
+    result["warnings"] = man.get("warnings", []) + extra_warnings
     return result
 
 

@@ -118,7 +118,9 @@ def empty_profile():
     return {"version": PROFILE_VERSION, "model": "wespeaker-resnet34 (pyannote community-1)", "speakers": {}, "sources": {}}
 
 
-def load_profile(path):
+def load_profile(path, convert=True):
+    """Прочитать профиль. Отсутствующий файл даёт пустой профиль; несовместимый или повреждённый — ошибку.
+    convert=False сохраняет исходные списки векторов для последующей записи без потери формата."""
     p = Path(path)
     try:
         text = p.read_text(encoding="utf-8")
@@ -149,7 +151,8 @@ def load_profile(path):
                 if dimension is not None and vec.size != dimension:
                     raise ValueError("различающиеся размеры отпечатков")
                 dimension = vec.size
-                part["vec"] = vec
+                if convert:
+                    part["vec"] = vec
         return d
     except VoiceProfileError:
         raise

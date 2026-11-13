@@ -253,7 +253,9 @@ class VoiceOverlapSelection(unittest.TestCase):
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
             source = root / "demo.transcript.json"
             source.write_text(json.dumps(data), encoding="utf-8")
-            profile = {"speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [0.1, 0.2]}}}}}
+            profile = {"version": voices.PROFILE_VERSION,
+                       "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [0.1, 0.2], "sec": 1}}}},
+                       "sources": {}}
             target = group / "voices.json"
             target.write_text(json.dumps(profile), encoding="utf-8")
             before = target.read_bytes()
@@ -280,7 +282,7 @@ class VoiceOverlapSelection(unittest.TestCase):
             source = root / "demo.transcript.json"
             source.write_text(json.dumps(data), encoding="utf-8")
             key = str(audio.resolve())
-            profile = {"speakers": {"Анна": {"parts": {key: {"vec": [1], "sec": 1},
+            profile = {"version": voices.PROFILE_VERSION, "speakers": {"Анна": {"parts": {key: {"vec": [1], "sec": 1},
                                                         "other": {"vec": [2], "sec": 2}}}},
                        "sources": {str(source.resolve()): 1}, "confusions": {key: {"a|b": 1}}, "revision": 1}
             target = group / "voices.json"
@@ -310,7 +312,8 @@ class VoiceOverlapSelection(unittest.TestCase):
             source = root / "demo.transcript.json"
             source.write_text(json.dumps(data), encoding="utf-8")
             target = group / "voices.json"
-            target.write_text(json.dumps({"speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1]}}}}}), encoding="utf-8")
+            target.write_text(json.dumps({"version": voices.PROFILE_VERSION,
+                "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1], "sec": 1}}}}, "sources": {}}), encoding="utf-8")
             before = target.read_bytes()
             with patch.object(core, "job_json", return_value=(str(source), None)), patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs):
                 snapshot = core.prepare_voice_action("demo")
@@ -354,7 +357,8 @@ class VoiceOverlapSelection(unittest.TestCase):
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
             source = root / "demo.transcript.json"
             source.write_text(json.dumps(data), encoding="utf-8")
-            profile = {"speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1]}}}}}
+            profile = {"version": voices.PROFILE_VERSION,
+                       "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1], "sec": 1}}}}, "sources": {}}
             target = group / "voices.json"
             target.write_text(json.dumps(profile), encoding="utf-8")
             with patch.object(core, "job_json", return_value=(str(source), None)), patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs):
