@@ -192,6 +192,7 @@ SELECTION_REASONS = {
     "unconfirmed_source": "Расшифровка пропущена: нет подтверждённых имён или действующих правок",
     "missing_audio": "Расшифровка пропущена: исходное аудио недоступно",
     "already_processed": "Расшифровка пропущена: эта версия уже учтена",
+    "source_needs_review": "Прежний источник не подтверждён текущими правилами отбора; требуется проверка",
     "existing_requires_preview": "Вклад сохранён без изменений: требуется отдельное подтверждение обновления",
     "no_usable_vectors": "Новый вклад не создан: нет подходящих фрагментов или пригодных отпечатков",
     "identity_different": "Кандидат пропущен: человек указал другого участника с тем же именем",
@@ -215,22 +216,36 @@ def profile_sufficiency(prof, expected_names):
     result = {}
     for name in sorted(names):
         parts = prof.get("speakers", {}).get(name, {}).get("parts", {})
-        seconds = 0.0
-        records = 0
+        verified_seconds = legacy_seconds = 0.0
+        verified_records = legacy_records = 0
         unverified_records = 0
+        legacy_unmeasured = 0
         for part in parts.values():
+            verified = part.get("selection_version") == SELECTION_VERSION
+            if not verified:
+                unverified_records += 1
             # Старый взвешенный sec не равен длительности речи; без раздельных полей не засчитываем.
             a, h = part.get("auto_sec"), part.get("human_sec")
             if not isinstance(a, (int, float)) or not isinstance(h, (int, float)):
+                if not verified:
+                    legacy_unmeasured += 1
                 continue
             duration = a + h
             if math.isfinite(duration) and duration >= 20 and a >= 0 and h >= 0:
-                seconds += min(duration, 60.0)
-                records += 1
-                if part.get("selection_version") != SELECTION_VERSION:
-                    unverified_records += 1
-        result[name] = {"seconds": round(seconds, 1), "recordings": records,
-                        "unverified_records": unverified_records, "sufficient": seconds >= 90 and records >= 3}
+                if verified:
+                    verified_seconds += min(duration, 60.0)
+                    verified_records += 1
+                else:
+                    legacy_seconds += min(duration, 60.0)
+                    legacy_records += 1
+            elif not verified and (not math.isfinite(duration) or a < 0 or h < 0):
+                legacy_unmeasured += 1
+        result[name] = {"seconds": round(verified_seconds + legacy_seconds, 1),
+                        "recordings": verified_records + legacy_records,
+                        "verified_seconds": round(verified_seconds, 1), "verified_recordings": verified_records,
+                        "legacy_seconds": round(legacy_seconds, 1), "legacy_recordings": legacy_records,
+                        "unverified_records": unverified_records, "legacy_unmeasured_records": legacy_unmeasured,
+                        "sufficient": verified_seconds >= 90 and verified_records >= 3}
     return {"sufficient": bool(result) and all(v["sufficient"] for v in result.values()), "speakers": result}
 
 
@@ -391,6 +406,15 @@ def confusions(prof, exclude_audio=None):
     return out
 
 
+def _source_needs_review(prof, audio_key):
+    for speaker in prof.get("speakers", {}).values():
+        for source, part in speaker.get("parts", {}).items():
+            if source.lower() == audio_key.lower() and part.get("selection_version") != SELECTION_VERSION:
+                return True
+    return any(source.lower() == audio_key.lower() and bool(items)
+               for source, items in (prof.get("quarantine") or {}).items())
+
+
 def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
           stop_when=None, allow_replace=False):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
@@ -459,7 +483,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             break
         key = str(jp.resolve())
         if prof["sources"].get(key) == mt and not only:
-            note("already_processed")
+            version = (prof.get("source_selection_versions") or {}).get(key)
+            note("already_processed" if version == SELECTION_VERSION and not _source_needs_review(prof, akey)
+                 else "source_needs_review")
             continue
         before_update = copy.deepcopy(prof)
         before_report = dict(selection_report) if selection_report is not None else None
@@ -569,6 +595,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             learned.append(jp.name)
             _log(f"профиль пополнен из {jp.name}: {sorted(per)} за {time.time() - t0:.1f} с")
             prof["sources"][key] = mt
+            prof.setdefault("source_selection_versions", {})[key] = SELECTION_VERSION
         except Exception as ex:
             prof.clear()
             prof.update(before_update)

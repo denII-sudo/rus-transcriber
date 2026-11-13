@@ -10,7 +10,7 @@ import voices
 
 
 def profile(seconds=(30, 30, 30)):
-    return {"speakers": {"Анна": {"parts": {str(i): {"auto_sec": n, "human_sec": 0}
+    return {"speakers": {"Анна": {"parts": {str(i): {"auto_sec": n, "human_sec": 0, "selection_version": voices.SELECTION_VERSION}
                                                 for i, n in enumerate(seconds)}}}}
 
 
@@ -98,3 +98,37 @@ class VoiceAutoLearn(unittest.TestCase):
     def test_old_weighted_seconds_not_counted(self):
         data = {"speakers": {"Анна": {"parts": {str(i): {"sec": 100} for i in range(3)}}}}
         self.assertFalse(voices.profile_sufficiency(data, ["Анна"])["sufficient"])
+
+    def test_legacy_and_verified_parts_are_counted_separately(self):
+        data = profile()
+        parts = data["speakers"]["Анна"]["parts"]
+        for part in parts.values():
+            part.pop("selection_version")
+        old = voices.profile_sufficiency(data, ["Анна"])["speakers"]["Анна"]
+        self.assertFalse(old["sufficient"])
+        self.assertEqual((old["verified_seconds"], old["verified_recordings"]), (0, 0))
+        self.assertEqual((old["legacy_seconds"], old["unverified_records"]), (90, 3))
+        parts["0"]["selection_version"] = voices.SELECTION_VERSION
+        mixed = voices.profile_sufficiency(data, ["Анна"])["speakers"]["Анна"]
+        self.assertFalse(mixed["sufficient"])
+        self.assertEqual((mixed["verified_seconds"], mixed["legacy_seconds"]), (30, 60))
+        for part in parts.values():
+            part["selection_version"] = voices.SELECTION_VERSION
+        self.assertTrue(voices.profile_sufficiency(data, ["Анна"])["sufficient"])
+
+    def test_unmeasured_legacy_part_is_visible_without_guessing_seconds(self):
+        data = {"speakers": {"Анна": {"parts": {"old": {"sec": 100}}}}}
+        report = voices.profile_sufficiency(data, ["Анна"])["speakers"]["Анна"]
+        self.assertEqual(report["legacy_unmeasured_records"], 1)
+        self.assertEqual(report["legacy_seconds"], 0)
+        self.assertFalse(report["sufficient"])
+
+    def test_legacy_alone_does_not_freeze_or_modify_profile(self):
+        import copy
+        data = profile()
+        for part in data["speakers"]["Анна"]["parts"].values():
+            part.pop("selection_version")
+        before = copy.deepcopy(data)
+        _, status = voices.auto_learn_group(data, "demo-group", ["Анна"], lambda: [], lambda: self.fail("save"))
+        self.assertTrue(status["enabled"])
+        self.assertEqual(data, before)

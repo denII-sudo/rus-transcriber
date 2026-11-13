@@ -105,6 +105,8 @@ class VoiceOverlapSelection(unittest.TestCase):
             voices.learn(profile, root, embedder, lambda _: np.zeros(160000), selection_report=report)
             self.assertEqual(embedder.received, [(0.0, 1.0), (9.0, 10.0)])
             self.assertEqual(report["gap_or_order"], 1)
+            source_key = str((root / "demo.transcript.json").resolve())
+            self.assertEqual(profile["source_selection_versions"][source_key], voices.SELECTION_VERSION)
             self.assertFalse((root / "voices.json").exists())
 
     def test_existing_contribution_is_preserved_until_preview_exists(self):
@@ -141,6 +143,35 @@ class VoiceOverlapSelection(unittest.TestCase):
                                           selection_report=report), [])
             self.assertNotIn("revision", profile)
             self.assertEqual(report["no_usable_vectors"], 1)
+
+    def test_unchanged_legacy_source_requires_review_not_automatic_learning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "demo.wav"
+            audio.touch()
+            data = recording({"s": 0.0, "e": 3.0})
+            data.update({"file": str(audio), "names_confirmed": True})
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            key, audio_key = str(source.resolve()), str(audio.resolve())
+            part = {"vec": np.array([1.0, 0.0]), "sec": 30.0}
+            profile = {"speakers": {"Анна": {"parts": {audio_key: part}}}, "sources": {key: source.stat().st_mtime}}
+            report = {}
+            self.assertEqual(voices.learn(profile, root, None, lambda _: self.fail("audio loaded"), selection_report=report), [])
+            self.assertEqual(report, {"source_needs_review": 1})
+            self.assertIs(profile["speakers"]["Анна"]["parts"][audio_key], part)
+            profile["source_selection_versions"] = {key: voices.SELECTION_VERSION}
+            report = {}
+            self.assertEqual(voices.learn(profile, root, None, lambda _: self.fail("audio loaded"), selection_report=report), [])
+            self.assertEqual(report, {"source_needs_review": 1})
+            part["selection_version"] = voices.SELECTION_VERSION
+            report = {}
+            self.assertEqual(voices.learn(profile, root, None, lambda _: self.fail("audio loaded"), selection_report=report), [])
+            self.assertEqual(report, {"already_processed": 1})
+            profile["quarantine"] = {audio_key: {"Анна": {"note": "synthetic"}}}
+            report = {}
+            voices.learn(profile, root, None, lambda _: self.fail("audio loaded"), selection_report=report)
+            self.assertEqual(report, {"source_needs_review": 1})
 
     def test_confirmed_replacement_keeps_names_without_candidates(self):
         class FakeEmbedder:

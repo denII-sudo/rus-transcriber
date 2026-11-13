@@ -780,6 +780,7 @@ def revoke_voice_source(snapshot):
             profile["speakers"][name]["parts"].pop(key)
         profile.get("confusions", {}).pop(key, None)
         profile.get("sources", {}).pop(str(jp.resolve()), None)
+        profile.get("source_selection_versions", {}).pop(str(jp.resolve()), None)
         profile["revision"] = int(profile.get("revision", 0)) + 1
         profile.setdefault("history", []).append({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
                                                    "from": jp.name, "kind": "source_revoked", "speakers": names})
