@@ -39,7 +39,7 @@ function Run($sb, [string[]]$extra, [string]$scriptPath = $Script) {
     $a = @{ Uninstall = $true; Target = $sb.t; DataDir = $sb.dd }
     foreach ($x in $extra) { $a[$x.TrimStart("-")] = $true }
     $o = "" | & $scriptPath @a *>&1 | Out-String
-    return @{ code = $LASTEXITCODE; out = $o }
+    return @{ code = $LASTEXITCODE; out = ($o -replace '\s+', ' ') }
 }
 $global:FakeProcs = @()
 
@@ -109,6 +109,7 @@ $s = New-Sandbox "i"; New-Item -ItemType Directory "$($s.t)/.git" | Out-Null
 $src = Join-Path $s.root "src"; New-Item -ItemType Directory $src | Out-Null; Copy-Item $Script "$src/install.ps1"
 $o = "" | & "$src/install.ps1" -Target $s.t -DataDir $s.dd -SkipClaudeConfig *>&1 | Out-String
 $code = $LASTEXITCODE
+$o = $o -replace '\s+', ' '      # консоль Windows переносит длинные строки — сравниваем без переносов
 Check "I install exit code 1" ($code -eq 1)
 Check "I install message about git working copy" ($o -match "рабочая копия разработки")
 Check "I install stopped before step 1" ($o -notmatch "Проверка места")
