@@ -18,9 +18,12 @@
       RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1 и пути внутри %LOCALAPPDATA%\Temp\opencode\stage6-acceptance.
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
-      убирает сервер из настроек приложения ИИ-агента (например, Claude Desktop);
-      отдельно спрашивает: удалить папку программы с моделями и кэшами
-      (по умолчанию да) и удалить личные данные (по умолчанию НЕТ)
+      сначала проверяет, что программа не работает, и показывает, что будет удалено;
+      затем спрашивает: удалить программу и убрать её из настроек приложения ИИ-агента
+      (по умолчанию да), удалить служебные данные (по умолчанию НЕТ), удалить резервные
+      копии настроек с токеном (по умолчанию НЕТ). Аудиозаписи, стенограммы, конспекты и
+      база state.sqlite3 не удаляются никогда.
+      Без вопросов (для ИИ-агента): -Yes и -RemoveData или -KeepData, по желанию -RemoveConfigBackups
 
 Повторный запуск безопасен: обновляет программу, не трогая данные пользователя (папка данных: профили, словари, config.json с результатом теста скорости).
 #>
@@ -30,7 +33,11 @@ param(
     [string]$Token = "",
     [switch]$SkipClaudeConfig,
     [switch]$AcceptanceCopyOnly,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Yes,
+    [switch]$RemoveData,
+    [switch]$KeepData,
+    [switch]$RemoveConfigBackups
 )
 $ErrorActionPreference = "Continue"
 # Windows PowerShell 5.1: без этого ConvertTo-Json пишет массивы как {"value":[...],"Count":n}
@@ -171,29 +178,237 @@ if ($AcceptanceCopyOnly) {
 
 # ================================ УДАЛЕНИЕ ================================
 if ($Uninstall) {
-    Write-Host "Удаление $Name из: $Target" -ForegroundColor Yellow
-    foreach ($cp in (Find-ClaudeConfig)) {
-        if (Test-Path $cp) {
-            Edit-ClaudeConfig $cp { param($s) $s.PSObject.Properties.Remove($Name) }
-            Write-Host "  убран из настроек приложения ИИ-агента: $cp"
-        }
+    # --- запуск из папки программы: продолжить из временной копии, чтобы не удалять работающий скрипт ---
+    if ($PSCommandPath -and $PSCommandPath.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
+        $copy = Join-Path $env:TEMP ("$Name-uninstall-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".ps1")
+        Copy-Item $PSCommandPath $copy -Force
+        $argsList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $copy, "-Uninstall",
+                      "-Target", $Target, "-DataDir", $DataDir)
+        if ($Yes) { $argsList += "-Yes" }
+        if ($RemoveData) { $argsList += "-RemoveData" }
+        if ($KeepData) { $argsList += "-KeepData" }
+        if ($RemoveConfigBackups) { $argsList += "-RemoveConfigBackups" }
+        $shell = (Get-Process -Id $PID).Path
+        & $shell @argsList
+        exit $LASTEXITCODE
     }
-    if (Test-Path (Join-Path $Target "server.py")) {
-        $ans = Read-Host "Удалить программу $Target со всеми моделями и кэшами? Данные и расшифровки рядом с аудио не затрагиваются. (Y/n)"
-        if (-not $ans -or $ans -match '^(y|д)') { Remove-Item $Target -Recurse -Force; Write-Host "  программа удалена" }
-        else { Write-Host "  программа оставлена" }
+    if ($RemoveData -and $KeepData) { Fail "Укажите что-то одно: -RemoveData или -KeepData." }
+    $nonInteractive = [Console]::IsInputRedirected
+
+    # Аудиозаписи, стенограммы, конспекты и базы с ними не удаляются никогда, даже внутри папок программы и данных.
+    $AudioExt = @(".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac", ".wma", ".webm",
+                  ".mp4", ".m4v", ".mkv", ".mov", ".avi", ".amr", ".3gp")
+    function Test-UserItem($item, [string[]]$extraNames) {
+        $n = $item.Name.ToLowerInvariant()
+        if ($item.PSIsContainer) {
+            if ($n.EndsWith(".rus-transcriber") -or $n.EndsWith(".review")) { return $true }
+        } else {
+            if ($AudioExt -contains $item.Extension.ToLowerInvariant()) { return $true }
+            foreach ($suffix in @(".transcript.md", ".transcript.json", ".conspect.md", ".conspect.json",
+                                  ".sqlite3", ".sqlite3-wal", ".sqlite3-shm")) {
+                if ($n.EndsWith($suffix)) { return $true }
+            }
+        }
+        foreach ($pattern in $extraNames) { if ($n -like $pattern) { return $true } }
+        return $false
+    }
+    # Ищет файлы пользователя под $root, не заходя в ссылки (junction/symlink) и в $skipTop (окружение, кэши).
+    function Find-UserItems($root, [string[]]$skipTop, [string[]]$extraTop) {
+        $found = New-Object System.Collections.ArrayList
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($root)
+        while ($stack.Count) {
+            $dir = $stack.Pop()
+            foreach ($item in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+                $top = ($dir -eq $root)
+                if ($top -and ($skipTop -contains $item.Name)) { continue }
+                $extra = @(); if ($top) { $extra = $extraTop }
+                if (Test-UserItem $item $extra) { [void]$found.Add($item.FullName); continue }
+                if ($item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $stack.Push($item.FullName)
+                }
+            }
+        }
+        return ,$found
+    }
+    # Удаляет дерево, не переходя по ссылкам: ссылка удаляется сама, её цель не трогается.
+    function Remove-Tree($path) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (-not $item) { return }
+        if (-not $item.PSIsContainer) {
+            $item.Attributes = $item.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+            [IO.File]::Delete($item.FullName); return
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { [IO.Directory]::Delete($item.FullName); return }
+        try { [IO.Directory]::Delete($item.FullName, $true); return } catch { }
+        foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { Remove-Tree $child.FullName }
+        [IO.Directory]::Delete($item.FullName)
+    }
+    # Удаляет содержимое $root, кроме найденных файлов пользователя; возвращает список сохранённого.
+    function Remove-ExceptUser($root, [string[]]$skipTop, [string[]]$extraTop) {
+        $keep = Find-UserItems $root $skipTop $extraTop
+        $failed = New-Object System.Collections.ArrayList
+        function Sweep($dir) {
+            foreach ($item in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+                $p = $item.FullName
+                if ($keep -contains $p) { continue }
+                $holdsUser = $false
+                foreach ($k in $keep) { if ($k.StartsWith($p + "\", [StringComparison]::OrdinalIgnoreCase)) { $holdsUser = $true; break } }
+                if ($holdsUser) { Sweep $p; continue }
+                try { Remove-Tree $p } catch { [void]$failed.Add($p) }
+            }
+            if ($dir -ne $root -and -not @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+                try { [IO.Directory]::Delete($dir) } catch { }
+            }
+        }
+        Sweep $root
+        if (-not $keep.Count -and -not $failed.Count) { try { [IO.Directory]::Delete($root) } catch { } }
+        return @{ kept = $keep; failed = $failed }
+    }
+    function Ask-YesNo($question, [bool]$defaultYes) {
+        $hint = "(y/N)"; if ($defaultYes) { $hint = "(Y/n)" }
+        $ans = Read-Host "$question $hint"
+        if (-not $ans) { return $defaultYes }
+        return ($ans -match '^(y|д)')
+    }
+    function Get-ProgramProcesses {
+        $chain = @($PID)
+        $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
+        while ($cur -and $cur.ParentProcessId -and $chain.Count -lt 10) {
+            $chain += [int]$cur.ParentProcessId
+            $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction SilentlyContinue
+        }
+        $prefix = $Target + "\"
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            ($chain -notcontains [int]$_.ProcessId) -and (
+                ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) -or
+                ($_.Name -match '^(python|pythonw|opencode)' -and $_.CommandLine -and
+                 $_.CommandLine.IndexOf($Target, [StringComparison]::OrdinalIgnoreCase) -ge 0))
+        })
+    }
+
+    $programFound = Test-Path (Join-Path $Target "server.py")
+    $configs = @(Find-ClaudeConfig | Where-Object { Test-Path $_ })
+    $withEntry = @(); $badConfigs = @()
+    foreach ($cp in $configs) {
+        try {
+            $c = Get-Content $cp -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($c.mcpServers -and ($c.mcpServers.PSObject.Properties.Name -contains $Name)) { $withEntry += $cp }
+        } catch { $badConfigs += $cp }
+    }
+    if ($badConfigs) {
+        Fail ("Не читается файл настроек ИИ-агента (ошибка в JSON): $($badConfigs -join ', ')`n" +
+              "Исправьте его или восстановите из резервной копии рядом (*.bak-*). Ничего не изменено.")
+    }
+    $backupsBefore = @($configs | ForEach-Object { Get-ChildItem "$_.bak-*" -ErrorAction SilentlyContinue })
+
+    Write-Host "Удаление $Name" -ForegroundColor Yellow
+    # --- 1. программа не должна работать: иначе файлы заняты и удаление пройдёт наполовину ---
+    while ($programFound) {
+        $running = Get-ProgramProcesses
+        if (-not $running) { break }
+        Write-Host "Программа сейчас работает (её запустило приложение ИИ-агента или идёт обработка записи):" -ForegroundColor Yellow
+        $running | ForEach-Object { Write-Host ("  {0} (PID {1})" -f $_.Name, $_.ProcessId) }
+        Write-Host "Полностью закройте приложение ИИ-агента (например, Claude Desktop: значок в трее → Quit) и дождитесь окончания обработки."
+        if ($nonInteractive) { Fail "Удаление не начато: программа работает. Ничего не изменено." }
+        $ans = Read-Host "Нажмите Enter, когда закроете, или введите q, чтобы выйти без изменений"
+        if ($ans -match '^(q|й)') { Write-Host "Удаление отменено, ничего не изменено."; exit 0 }
+    }
+
+    # --- 2. что будет сделано ---
+    Write-Host ""
+    Write-Host "Что будет удалено (с вашего подтверждения):" -ForegroundColor Cyan
+    if ($programFound) {
+        Write-Host "  • программа: $Target — код, окружение Python, модели и кэши"
+        foreach ($cp in $withEntry) { Write-Host "  • запись программы (и токен Hugging Face) в настройках ИИ-агента: $cp" }
+    } else {
+        Write-Host "  • программа в $Target не найдена — удалять нечего"
     }
     if (Test-Path $DataDir) {
-        Write-Host "Личные данные (голосовые профили, словари групп, настройки, задачи): $DataDir" -ForegroundColor Yellow
-        $ans = Read-Host "Удалить и их? Это нельзя отменить; расшифровки рядом с аудио не затрагиваются. (y/N)"
-        if ($ans -match '^(y|д)') { Remove-Item $DataDir -Recurse -Force; Write-Host "  данные удалены" }
-        else { Write-Host "  данные оставлены нетронутыми: $DataDir" }
+        Write-Host "  • служебные данные программы (спрошу отдельно): $DataDir"
+        Write-Host "    голосовые профили и словари групп, настройки и результаты теста скорости, журналы задач"
     }
-    Write-Host "Python и ffmpeg не удалялись (ими могут пользоваться другие программы)"
-    Write-Host "Перезапустите приложение ИИ-агента (например, Claude Desktop)."
+    if ($backupsBefore) {
+        Write-Host "  • резервные копии настроек ИИ-агента, сделанные установщиком (спрошу отдельно): $($backupsBefore.Count) шт.; в них есть токен Hugging Face"
+    }
+    Write-Host "Что не удаляется никогда:" -ForegroundColor Cyan
+    Write-Host "  • ваши аудиозаписи, стенограммы и конспекты — где бы они ни лежали, в том числе внутри папок программы и данных"
+    Write-Host "  • база state.sqlite3 в папке данных (в ней хранятся стенограммы и конспекты), резервные копии и архивы выгрузки"
+    Write-Host "  • Python и ffmpeg (ими могут пользоваться другие программы)"
+    Write-Host ""
+
+    $removed = @(); $kept = @(); $failed = @()
+    # --- 3. программа (по Enter — да) ---
+    if ($programFound) {
+        if ($Yes) { $doProgram = $true }
+        elseif ($nonInteractive) { Fail "Нужно подтверждение. Для удаления без вопросов: -Yes, данные: -RemoveData или -KeepData. Ничего не изменено." }
+        else { $doProgram = Ask-YesNo "Удалить программу и убрать её из настроек ИИ-агента?" $true }
+        if ($doProgram) {
+            foreach ($cp in $withEntry) {
+                Edit-ClaudeConfig $cp { param($s) $s.PSObject.Properties.Remove($Name) }
+                $removed += "запись в настройках ИИ-агента: $cp"
+            }
+            $r = Remove-ExceptUser $Target @(".venv", "cache") @()
+            $kept += $r.kept; $failed += $r.failed
+            $removed += "программа: $Target"
+        } else { Write-Host "  программа оставлена" }
+    }
+    # --- 4. служебные данные (по Enter — нет) ---
+    if (Test-Path $DataDir) {
+        if ($RemoveData) { $doData = $true }
+        elseif ($KeepData -or $nonInteractive) { $doData = $false }
+        else {
+            Write-Host "Служебные данные программы: $DataDir" -ForegroundColor Yellow
+            Write-Host "  голосовые профили участников, словари групп, настройки, журналы задач. Аудиозаписи, стенограммы,"
+            Write-Host "  конспекты, база state.sqlite3, резервные копии и архивы выгрузки останутся на месте."
+            $doData = Ask-YesNo "Удалить служебные данные? Это нельзя отменить." $false
+        }
+        if ($doData) {
+            $r = Remove-ExceptUser $DataDir @() @("exports", "_backup*", "_deleted")
+            $kept += $r.kept; $failed += $r.failed
+            $removed += "служебные данные: $DataDir"
+        } else { Write-Host "  служебные данные оставлены: $DataDir" }
+    }
+    # --- 5. резервные копии настроек ИИ-агента с токеном (по Enter — нет) ---
+    $backups = @($configs | ForEach-Object { Get-ChildItem "$_.bak-*" -ErrorAction SilentlyContinue })
+    if ($backups) {
+        if ($RemoveConfigBackups) { $doBackups = $true }
+        elseif ($nonInteractive) { $doBackups = $false }
+        else {
+            Write-Host "Резервные копии настроек ИИ-агента ($($backups.Count) шт.) содержат токен Hugging Face и прежние настройки:" -ForegroundColor Yellow
+            $backups | Select-Object -First 5 | ForEach-Object { Write-Host "  $($_.FullName)" }
+            $doBackups = Ask-YesNo "Удалить эти резервные копии?" $false
+        }
+        if ($doBackups) {
+            foreach ($b in $backups) {
+                try { Remove-Item -LiteralPath $b.FullName -Force -ErrorAction Stop; $removed += "резервная копия настроек: $($b.FullName)" }
+                catch { $failed += $b.FullName }
+            }
+        } else { Write-Host "  резервные копии настроек оставлены" }
+    }
+
+    # --- 6. итог ---
+    Write-Host ""
+    Write-Host "Итог удаления" -ForegroundColor Cyan
+    if ($removed) { $removed | ForEach-Object { Write-Host "  удалено: $_" } } else { Write-Host "  ничего не удалено" }
+    if ($kept) {
+        Write-Host "  сохранены ваши файлы ($($kept.Count)), папки вокруг них оставлены:" -ForegroundColor Green
+        $kept | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
+        if ($kept.Count -gt 20) { Write-Host "    … и ещё $($kept.Count - 20)" }
+    }
+    if ($failed) {
+        Write-Host "  не удалось удалить ($($failed.Count)) — файлы заняты или нет прав; удалите вручную после перезагрузки:" -ForegroundColor Red
+        $failed | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
+    }
+    Write-Host "  не затрагивались: аудиозаписи и результаты рядом с ними, Python, ffmpeg"
+    if ($removed -match "настройках ИИ-агента") { Write-Host "Перезапустите приложение ИИ-агента (например, Claude Desktop)." }
+    $tempPrefix = Join-Path $env:TEMP "$Name-uninstall-"
+    if ($PSCommandPath -and $PSCommandPath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($failed) { exit 1 }
     exit 0
 }
-
 # ================================ УСТАНОВКА ================================
 Write-Host "Установка $Name в: $Target" -ForegroundColor Green
 
