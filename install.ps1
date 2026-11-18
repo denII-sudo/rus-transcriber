@@ -193,6 +193,12 @@ if ($Uninstall) {
         exit $LASTEXITCODE
     }
     if ($RemoveData -and $KeepData) { Fail "Укажите что-то одно: -RemoveData или -KeepData." }
+    # Папка программы с .git — это рабочая копия разработки: удаление стёрло бы незакоммиченную работу.
+    if (Test-Path -LiteralPath (Join-Path $Target ".git")) {
+        Fail ("В папке программы есть .git: $Target — это рабочая копия разработки, а не только установка.`n" +
+              "Удаление не начато, ничего не изменено. Сначала перенесите разработку в отдельный клон " +
+              "и убедитесь, что вся работа закоммичена и отправлена; затем уберите .git из папки программы.")
+    }
     $nonInteractive = [Console]::IsInputRedirected
 
     # Аудиозаписи, стенограммы, конспекты и базы с ними не удаляются никогда, даже внутри папок программы и данных.
@@ -411,6 +417,12 @@ if ($Uninstall) {
 }
 # ================================ УСТАНОВКА ================================
 Write-Host "Установка $Name в: $Target" -ForegroundColor Green
+# Установка поверх чужой рабочей копии Git смешала бы программу и разработку (и перезаписала бы файлы клона).
+if ($Source -ne $Target -and (Test-Path -LiteralPath (Join-Path $Target ".git"))) {
+    Fail ("В папке установки есть .git: $Target — это рабочая копия разработки.`n" +
+          "Установка не начата. Держите разработку в отдельном клоне, а программу ставьте в папку без .git " +
+          "(подробности: docs/development-and-installation.md).")
+}
 
 $insideProfile = $Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)
 if ($AcceptanceCopyOnly) {
