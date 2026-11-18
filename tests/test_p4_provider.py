@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -104,6 +105,77 @@ class OpenCodeProviderTests(unittest.TestCase):
             proxy.shutdown()
             target.server_close()
             proxy.server_close()
+
+
+class OpenCodePortOwnershipTests(unittest.TestCase):
+    class FakeProcess:
+        pid = 111
+
+        def __init__(self):
+            self.stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            self.stopped = True
+
+        def wait(self, timeout=None):
+            return 0
+
+        kill = terminate
+
+    def start(self, owners):
+        procs = []
+
+        def popen(*args, **kwargs):
+            procs.append(self.FakeProcess())
+            return procs[-1]
+
+        def fake_close(this):
+            process, this.process = this.process, None
+            if process is not None:
+                process.terminate()
+
+        client = llm_provider.OpenCodeTextClient()
+        with mock.patch.object(llm_provider, "_opencode_executable", return_value="opencode"), \
+             mock.patch.object(llm_provider.subprocess, "Popen", side_effect=popen), \
+             mock.patch.object(llm_provider, "listener_pids", return_value=owners), \
+             mock.patch.object(llm_provider, "process_tree", return_value={111, 112}), \
+             mock.patch.object(llm_provider.OpenCodeTextClient, "close", fake_close), \
+             mock.patch.object(client, "_request", return_value={"version": "2.0.1"}) as request:
+            try:
+                result = client.__enter__()
+            except llm_provider.ProviderError as ex:
+                result = ex
+        return result, request, procs
+
+    def test_foreign_listener_gets_no_credentials_and_port_is_retried(self):
+        result, request, procs = self.start({999})
+        self.assertIsInstance(result, llm_provider.ProviderError)
+        self.assertEqual(result.code, "unavailable")
+        request.assert_not_called()
+        self.assertEqual(len(procs), llm_provider.START_ATTEMPTS)
+        self.assertTrue(all(p.stopped for p in procs))
+
+    def test_own_child_listener_is_accepted(self):
+        result, request, procs = self.start({112})
+        self.assertIsInstance(result, llm_provider.OpenCodeTextClient)
+        request.assert_called_once()
+        self.assertEqual(len(procs), 1)
+
+    def test_listener_pids_sees_own_socket(self):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            owners = llm_provider.listener_pids(port)
+            if owners is None:
+                self.skipTest("владелец порта не определяется на этой платформе")
+            self.assertIn(os.getpid(), owners)
+        tree = llm_provider.process_tree(os.getpid())
+        if tree is not None:
+            self.assertIn(os.getpid(), tree)
 
 
 class AutonomousWorkflowTests(unittest.TestCase):

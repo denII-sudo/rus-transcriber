@@ -57,13 +57,72 @@ def alive(pid):
         return False
 
 
-def pid_of(job_id):
+def process_start_time(pid):
+    """Метка запуска процесса (не зависит от часов), чтобы отличить его от процесса с тем же PID позже.
+
+    Windows: время создания из GetProcessTimes; Linux: starttime из /proc. None — узнать нельзя.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if not k.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            return (created.dwHighDateTime << 32) | created.dwLowDateTime
+        finally:
+            k.CloseHandle(h)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+        return int(stat[stat.rindex(")") + 2:].split()[19])   # поле 22: starttime
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pid_record(job_id):
+    """(pid, метка запуска или None) из PID-файла задачи; None, если файла нет."""
     if not _valid_job_id(job_id):
         return None
     try:
-        return int(_job_path(job_id, ".pid").read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        parts = _job_path(job_id, ".pid").read_text(encoding="utf-8").split()
+        pid = int(parts[0])
+        start = int(parts[1]) if len(parts) > 1 else None
+    except (OSError, ValueError, IndexError):
         return None
+    return pid, start
+
+
+def pid_of(job_id):
+    rec = _pid_record(job_id)
+    return rec[0] if rec else None
+
+
+def job_process_alive(job_id):
+    """True — процесс задачи жив и это именно он; False — его нет (или PID занят другим процессом);
+    None — процесс с этим PID жив, но принадлежность задаче подтвердить нельзя (старый PID-файл)."""
+    rec = _pid_record(job_id)
+    if not rec:
+        return False
+    pid, start = rec
+    if not alive(pid):
+        return False
+    if start is None:
+        return None
+    current = process_start_time(pid)
+    if current is None:
+        return None
+    return current == start
 
 
 def _valid_job_id(job_id):
@@ -97,8 +156,7 @@ def job_status(job_id):
     else:
         return {"state": "running", "stage": "обновляется"}
     if d.get("state") in ACTIVE:
-        pid = pid_of(job_id)
-        if pid and not alive(pid):
+        if pid_of(job_id) and job_process_alive(job_id) is False:
             time.sleep(0.5)          # процесс мог только что записать итог
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
@@ -136,7 +194,8 @@ def launch(script, args, src, kind, *, initial_state=None, job_id=None):
         with jobslots.file_lock(_job_path(job_id, ".status.lock")):
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=JOBS,
                                              prefix=job_id + ".", suffix=".pid.tmp", delete=False) as f:
-                f.write(str(proc.pid))
+                start = process_start_time(proc.pid)
+                f.write(str(proc.pid) if start is None else f"{proc.pid} {start}")
                 tmp = Path(f.name)
             try:
                 os.replace(tmp, pid_path)
@@ -163,7 +222,13 @@ def cancel_job(job_id):
         return {"job_id": job_id, "state": s.get("state"), "note": "задача уже не идёт"}
     pid = pid_of(job_id)
     killed = False
-    if pid and alive(pid):
+    owned = job_process_alive(job_id) if pid else False
+    if owned is None:
+        raise CoreError("Не удалось подтвердить, что процесс с PID из файла задачи — это её worker; "
+                        "процесс не завершён, статус задачи не изменён")
+    if owned is False:
+        pid = None          # процесса задачи нет; PID мог достаться другой программе — её не трогаем
+    if pid:
         if os.name == "nt":
             r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
                                creationflags=0x08000000)

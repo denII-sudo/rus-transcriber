@@ -10,9 +10,11 @@
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -169,11 +171,26 @@ def _read_archive(zip_path):
     return man, blobs
 
 
-def _write_json(path, obj):
+def _write_bytes(path, data):
+    """Атомарная запись: уникальный временный файл рядом и os.replace (без общего «.tmp»)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_json(path, obj):
+    _write_bytes(path, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
 def _merge_voices(ex, im, report):
@@ -203,6 +220,77 @@ def _merge_voices(ex, im, report):
                                          "speakers": sorted(im.get("speakers") or {})})
     ex["revision"] = int(ex.get("revision", 0)) + 1
     return ex
+
+
+def _import_group(g, man, blobs, policies, imported_profiles, mode, apply, backup, result, extra_warnings):
+    """Импорт одной группы; при apply вызывается под group_voice_lock(g)."""
+    rep = {}
+    gd = paths.group_dir(g)
+    vk, ok = f"groups/{g}/voices.json", f"groups/{g}/vocab.json"
+    im_voices = imported_profiles.get(g)
+    existed = gd.is_dir() and any((gd / f).exists() for f in ("vocab.json", "voices.json", "voice-settings.json"))
+    rep["action"] = "новая группа" if not existed else ("замена" if mode == "replace" else "слияние")
+    if existed and mode == "replace" and apply:
+        (backup / "groups").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(gd, backup / "groups" / g)
+        result["backup"] = str(backup)
+    # Настройка новой группы берётся из архива или из текущего общего умолчания.
+    # При слиянии существующую настройку не перезаписываем, при замене старым архивом тоже сохраняем.
+    if g in policies and (not existed or mode == "replace"):
+        rep["voice_settings"] = "восстановлены из архива"
+        if apply:
+            settings.save_group_voice_settings(g, policies[g])
+    elif existed:
+        rep["voice_settings"] = "оставлены существующие"
+    else:
+        rep["voice_settings"] = "умолчание для новых групп (старый архив)"
+        if apply:
+            settings.group_voice_settings(g, initialize=True)
+    # словарь
+    if ok in blobs:
+        vp = gd / "vocab.json"
+        if not vp.exists():
+            rep["vocab"] = "добавлен"
+            if apply:
+                vp.parent.mkdir(parents=True, exist_ok=True)
+                _write_bytes(vp, blobs[ok])
+        elif vp.read_bytes() == blobs[ok]:
+            rep["vocab"] = "совпадает"
+        elif mode == "replace":
+            rep["vocab"] = "заменён"
+            if apply:
+                _write_bytes(vp, blobs[ok])
+        else:
+            rep["vocab"] = "расходится: оставлен существующий (импортируемый — rus-transcriber.vocab.imported.json рядом)"
+            if apply:
+                _write_bytes(gd / "vocab.imported.json", blobs[ok])
+    # голоса
+    if im_voices is not None:
+        pp = gd / "voices.json"
+        if (not pp.exists() and not pp.is_symlink()) or mode == "replace":
+            rep["voices"] = "добавлены" if not pp.exists() else "заменены"
+            rep["added_speakers"] = sorted(im_voices.get("speakers") or {})
+            if apply:
+                _write_json(pp, im_voices)
+        else:
+            import voices
+            try:
+                ex = voices.load_profile(pp, convert=False)
+            except voices.VoiceProfileError as ex_err:
+                # Существующий профиль не изменяем: слияние смешало бы версии, а резерва здесь нет.
+                rep["voices"] = f"пропущено: существующий профиль несовместим или повреждён ({ex_err})"
+                extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
+            else:
+                merged = _merge_voices(ex, im_voices, rep)
+                if rep.get("voices") == "слито":
+                    try:
+                        voices.validate_profile(merged, convert=False)
+                    except voices.VoiceProfileError as ex_err:
+                        rep["voices"] = f"пропущено: результат слияния несовместим ({ex_err})"
+                        extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
+                if apply and rep.get("voices") == "слито":
+                    _write_json(pp, merged)
+    return rep
 
 
 def import_data(zip_path, mode="merge", apply=False):
@@ -239,76 +327,28 @@ def import_data(zip_path, mode="merge", apply=False):
     result = {"mode": mode, "applied": bool(apply), "archive_created": man.get("created"), "groups": {},
               "jobs": "не импортируются" if man.get("with_jobs") else None, "backup": None}
     extra_warnings = []
+    done = []
     for g in [x["name"] for x in man.get("groups", [])]:
         if paths.safe_group(g) != g:
             raise RuntimeError(f"Недопустимое имя группы: {g!r}")
-        rep = {}
-        gd = paths.group_dir(g)
-        vk, ok = f"groups/{g}/voices.json", f"groups/{g}/vocab.json"
-        im_voices = imported_profiles.get(g)
-        existed = gd.is_dir() and any((gd / f).exists() for f in ("vocab.json", "voices.json", "voice-settings.json"))
-        rep["action"] = "новая группа" if not existed else ("замена" if mode == "replace" else "слияние")
-        if existed and mode == "replace" and apply:
-            (backup / "groups").mkdir(parents=True, exist_ok=True)
-            shutil.copytree(gd, backup / "groups" / g)
-            result["backup"] = str(backup)
-        # Настройка новой группы берётся из архива или из текущего общего умолчания.
-        # При слиянии существующую настройку не перезаписываем, при замене старым архивом тоже сохраняем.
-        if g in policies and (not existed or mode == "replace"):
-            rep["voice_settings"] = "восстановлены из архива"
+        try:
             if apply:
-                settings.save_group_voice_settings(g, policies[g])
-        elif existed:
-            rep["voice_settings"] = "оставлены существующие"
-        else:
-            rep["voice_settings"] = "умолчание для новых групп (старый архив)"
+                # Общая блокировка с worker и голосовыми инструментами: импорт не пишет профиль
+                # группы одновременно с обновлением профиля после распознавания.
+                with settings.group_voice_lock(g):
+                    rep = _import_group(g, man, blobs, policies, imported_profiles, mode, apply,
+                                        backup, result, extra_warnings)
+            else:
+                rep = _import_group(g, man, blobs, policies, imported_profiles, mode, apply,
+                                    backup, result, extra_warnings)
+        except Exception as ex:
+            msg = f"Импорт остановлен на группе {g}: {ex}"
             if apply:
-                settings.group_voice_settings(g, initialize=True)
-        # словарь
-        if ok in blobs:
-            vp = gd / "vocab.json"
-            if not vp.exists():
-                rep["vocab"] = "добавлен"
-                if apply:
-                    vp.parent.mkdir(parents=True, exist_ok=True)
-                    vp.write_bytes(blobs[ok])
-            elif vp.read_bytes() == blobs[ok]:
-                rep["vocab"] = "совпадает"
-            elif mode == "replace":
-                rep["vocab"] = "заменён"
-                if apply:
-                    vp.write_bytes(blobs[ok])
-            else:
-                rep["vocab"] = "расходится: оставлен существующий (импортируемый — rus-transcriber.vocab.imported.json рядом)"
-                if apply:
-                    (gd / "vocab.imported.json").write_bytes(blobs[ok])
-        # голоса
-        if im_voices is not None:
-            pp = gd / "voices.json"
-            if (not pp.exists() and not pp.is_symlink()) or mode == "replace":
-                rep["voices"] = "добавлены" if not pp.exists() else "заменены"
-                rep["added_speakers"] = sorted(im_voices.get("speakers") or {})
-                if apply:
-                    _write_json(pp, im_voices)
-            else:
-                import voices
-                try:
-                    ex = voices.load_profile(pp, convert=False)
-                except voices.VoiceProfileError as ex_err:
-                    # Существующий профиль не изменяем: слияние смешало бы версии, а резерва здесь нет.
-                    rep["voices"] = f"пропущено: существующий профиль несовместим или повреждён ({ex_err})"
-                    extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
-                else:
-                    merged = _merge_voices(ex, im_voices, rep)
-                    if rep.get("voices") == "слито":
-                        try:
-                            voices.validate_profile(merged, convert=False)
-                        except voices.VoiceProfileError as ex_err:
-                            rep["voices"] = f"пропущено: результат слияния несовместим ({ex_err})"
-                            extra_warnings.append(f"{g}: голосовой профиль не изменён при слиянии — {ex_err}")
-                    if apply and rep.get("voices") == "слито":
-                        _write_json(pp, merged)
+                msg += (f". Уже применены группы: {', '.join(done) or 'нет'}"
+                        + (f"; резервная копия заменённых групп: {result['backup']}" if result["backup"] else ""))
+            raise RuntimeError(msg) from ex
         result["groups"][g] = rep
+        done.append(g)
     result["warnings"] = man.get("warnings", []) + extra_warnings
     return result
 
@@ -345,8 +385,8 @@ def cleanup_jobs(days=30, apply=False):
             status = json.loads((paths.JOBS / f"{job_id}.json").read_text(encoding="utf-8"))
             if status.get("state") not in ("queued", "running"):
                 return False
-            pid = int((paths.JOBS / f"{job_id}.pid").read_text(encoding="utf-8").strip())
-            return core.alive(pid)
+            # None (принадлежность не подтверждена) считаем живой задачей: лучше не удалить лишнего.
+            return core.job_process_alive(job_id) is not False
         except (OSError, ValueError, TypeError):
             return False
 

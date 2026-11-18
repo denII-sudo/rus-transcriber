@@ -312,6 +312,54 @@ class T(unittest.TestCase):
         put_group("demo", {"Анна": 1})
         self.assertTrue(data_io.audit()["files_with_absolute_paths"])
 
+    def test_import_apply_takes_group_lock_and_leaves_no_temp_files(self):
+        put_group("demo", {"Анна": 100})
+        z = data_io.export_data()["zip"]
+        put_group("demo", {"Глеб": 5})
+        real_lock, taken = settings.group_voice_lock, []
+
+        def recording_lock(group):
+            taken.append(group)
+            return real_lock(group)
+
+        with patch.object(settings, "group_voice_lock", recording_lock):
+            data_io.import_data(z, "replace", apply=False)
+            self.assertEqual(taken, [])                      # предпросмотр не ждёт блокировку
+            data_io.import_data(z, "replace", apply=True)
+        self.assertEqual(taken, ["demo"])
+        self.assertEqual(list(paths.group_dir("demo").glob("*.tmp")), [])
+
+    def test_import_failure_reports_applied_groups(self):
+        put_group("alpha", {"Анна": 100})
+        put_group("beta", {"Борис": 50})
+        z = data_io.export_data()["zip"]
+        put_group("alpha", {"Глеб": 5})
+        put_group("beta", {"Вера": 5})
+        real_write, calls = data_io._write_bytes, []
+
+        def failing_write(path, data):
+            calls.append(path)
+            if path.parent.name == "beta":
+                raise OSError("диск недоступен")
+            return real_write(path, data)
+
+        with patch.object(data_io, "_write_bytes", failing_write):
+            with self.assertRaises(RuntimeError) as cm:
+                data_io.import_data(z, "replace", apply=True)
+        message = str(cm.exception)
+        self.assertIn("beta", message)
+        self.assertIn("Уже применены группы: alpha", message)
+        self.assertIn("_backup-import-", message)
+
+    def test_atomic_write_keeps_old_file_on_failure(self):
+        target = Path(_TMP) / "atomic.json"
+        target.write_bytes(b"old")
+        with patch.object(data_io.os, "replace", side_effect=OSError("сбой")):
+            with self.assertRaises(OSError):
+                data_io._write_bytes(target, b"new")
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual(list(target.parent.glob("atomic.json.*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

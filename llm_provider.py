@@ -54,6 +54,145 @@ def _opencode_executable():
     return str(path)
 
 
+START_ATTEMPTS = 3
+
+
+def _windows_listener_pids(port):
+    import ctypes
+    from ctypes import wintypes
+    iphlpapi = ctypes.windll.iphlpapi
+    size = wintypes.DWORD(0)
+    # AF_INET=2, TCP_TABLE_OWNER_PID_LISTENER=3
+    iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 3, 0)
+    for _ in range(3):
+        buf = ctypes.create_string_buffer(size.value + 4096)
+        size = wintypes.DWORD(len(buf))
+        rc = iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 3, 0)
+        if rc == 0:
+            break
+        if rc != 122:          # ERROR_INSUFFICIENT_BUFFER — таблица выросла, пробуем ещё
+            return None
+    else:
+        return None
+    count = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
+    rows = ctypes.cast(ctypes.addressof(buf) + 4, ctypes.POINTER(wintypes.DWORD * 6))
+    pids = set()
+    for i in range(count):
+        state, local_addr, local_port, _ra, _rp, owner = rows[i]
+        if socket.ntohs(local_port & 0xFFFF) == port and local_addr in (0, 0x0100007F):
+            pids.add(int(owner))
+    return pids
+
+
+def _windows_parents():
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k = ctypes.windll.kernel32
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k.CreateToolhelp32Snapshot(2, 0)          # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        parents = {}
+        ok = k.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ok = k.Process32NextW(snap, ctypes.byref(entry))
+        return parents
+    finally:
+        k.CloseHandle(snap)
+
+
+def _linux_listener_pids(port):
+    inodes = set()
+    try:
+        lines = Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+    except OSError:
+        return None
+    for line in lines:
+        f = line.split()
+        if len(f) < 10 or f[3] != "0A":                 # 0A — LISTEN
+            continue
+        addr, port_hex = f[1].split(":")
+        if int(port_hex, 16) == port and addr in ("0100007F", "00000000"):
+            inodes.add(f[9])
+    if not inodes:
+        return set()
+    pids = set()
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                link = os.readlink(fd)
+                if link.startswith("socket:[") and link[8:-1] in inodes:
+                    pids.add(int(proc.name))
+                    break
+        except OSError:
+            continue
+    # Слушатель есть, но его владелец не виден (чужой пользователь) — это точно не наш процесс.
+    return pids or {-1}
+
+
+def _linux_parents():
+    parents = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            stat = (proc / "stat").read_text(encoding="ascii", errors="replace")
+            parents[int(proc.name)] = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return parents
+
+
+def listener_pids(port):
+    """PID процессов, слушающих 127.0.0.1:port (или все адреса); пустое множество — никто;
+    None — определить на этой платформе нельзя."""
+    try:
+        if os.name == "nt":
+            return _windows_listener_pids(port)
+        if Path("/proc/net/tcp").exists():
+            return _linux_listener_pids(port)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def process_tree(root_pid):
+    """Процесс и все его потомки (OpenCode может запускать дочерний процесс); None — неизвестно."""
+    try:
+        parents = _windows_parents() if os.name == "nt" else (
+            _linux_parents() if Path("/proc").is_dir() else None)
+    except (OSError, ValueError, AttributeError):
+        parents = None
+    if parents is None:
+        return None
+    tree, changed = {int(root_pid)}, True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in tree and pid not in tree:
+                tree.add(pid)
+                changed = True
+    return tree
+
+
+class _PortTaken(Exception):
+    """Порт слушает не запущенный нами OpenCode."""
+
+
 class OpenCodeTextClient:
     """Локальный, закрытый basic-auth сервер; Generate API не предоставляет model tools."""
 
@@ -64,6 +203,15 @@ class OpenCodeTextClient:
 
     def __enter__(self):
         executable = _opencode_executable()
+        last = None
+        for _ in range(START_ATTEMPTS):
+            try:
+                return self._start(executable)
+            except _PortTaken as ex:
+                last = ex          # порт занял чужой процесс — пароль ему не отправлен, берём новый порт
+        raise ProviderError("unavailable", "OpenCode API не удалось запустить на свободном локальном порту") from last
+
+    def _start(self, executable):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -86,10 +234,26 @@ class OpenCodeTextClient:
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         self.auth = "Basic " + token
         deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
+        verified = False
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.close()
+                if listener_pids(port):
+                    raise _PortTaken()
                 raise ProviderError("unavailable", "OpenCode API завершился при запуске")
+            if not verified:
+                # Между выбором порта и запуском его мог занять другой локальный процесс.
+                # Пароль и текст отправляем только процессу, который запустили сами (или его потомку).
+                owners = listener_pids(port)
+                if owners is not None:
+                    if not owners:
+                        time.sleep(0.1)
+                        continue
+                    tree = process_tree(self.process.pid)
+                    if tree is not None and not owners <= tree:
+                        self.close()
+                        raise _PortTaken()
+                verified = True
             try:
                 info = self._request("/api/info", None, timeout=1)
                 if not isinstance(info, dict) or not str(info.get("version", "")).startswith("2."):

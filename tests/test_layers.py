@@ -78,6 +78,55 @@ class CoreJobsTests(unittest.TestCase):
             s = core.job_status(j)
         self.assertEqual(s["state"], "error")
 
+    def test_reused_pid_is_not_killed_and_job_is_lost(self):
+        j = self.job("20261118-140000-t00003", "running", stage="расшифровка")
+        (core.JOBS / f"{j}.pid").write_text("4242 100", encoding="utf-8")
+        with mock.patch.object(core, "alive", return_value=True), \
+             mock.patch.object(core, "process_start_time", return_value=200), \
+             mock.patch.object(core.os, "kill") as kill, \
+             mock.patch.object(core.subprocess, "run") as run:
+            self.assertFalse(core.job_process_alive(j))
+            self.assertEqual(core.job_status(j)["state"], "error")
+            result = core.cancel_job(j)
+        kill.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(result["state"], "error")
+
+    def test_cancel_refuses_unverifiable_pid(self):
+        j = self.job("20261118-140000-t00004", "running", stage="расшифровка")
+        (core.JOBS / f"{j}.pid").write_text("4242", encoding="utf-8")       # старый формат без метки
+        with mock.patch.object(core, "alive", return_value=True), \
+             mock.patch.object(core.os, "kill") as kill, \
+             mock.patch.object(core.subprocess, "run") as run:
+            self.assertIsNone(core.job_process_alive(j))
+            self.assertEqual(core.job_status(j)["state"], "running")
+            with self.assertRaises(core.CoreError):
+                core.cancel_job(j)
+        kill.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(json.loads((core.JOBS / f"{j}.json").read_text(encoding="utf-8"))["state"], "running")
+
+    def test_cancel_with_reused_pid_marks_cancelled_without_kill(self):
+        j = self.job("20261118-140000-t00005", "queued", stage="в очереди")
+        (core.JOBS / f"{j}.pid").write_text("4242 100", encoding="utf-8")
+        with mock.patch.object(core, "job_status", return_value={"state": "queued", "stage": "в очереди"}), \
+             mock.patch.object(core, "alive", return_value=True), \
+             mock.patch.object(core, "process_start_time", return_value=999), \
+             mock.patch.object(core.os, "kill") as kill, \
+             mock.patch.object(core.subprocess, "run") as run:
+            result = core.cancel_job(j)
+        kill.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(result["state"], "cancelled")
+        self.assertFalse(result["process_killed"])
+
+    def test_process_start_time_identifies_current_process(self):
+        start = core.process_start_time(os.getpid())
+        if start is None:
+            self.skipTest("метка запуска процесса недоступна на этой платформе")
+        self.assertEqual(start, core.process_start_time(os.getpid()))
+        self.assertIsNone(core.process_start_time(-1))
+
     def test_status_live_fields_and_stage_key(self):
         j = self.job("20261118-140000-t00002", "running", stage="поиск речи 3/10",
                      started_ts=1.0, stage_started_ts=2.0)
