@@ -108,10 +108,17 @@ Check "H program, git, data, entry intact" ((Test-Path "$($s.t)/server.py") -and
 $s = New-Sandbox "i"; New-Item -ItemType Directory "$($s.t)/.git" | Out-Null
 $src = Join-Path $s.root "src"; New-Item -ItemType Directory $src | Out-Null; Copy-Item $Script "$src/install.ps1"
 $o = "" | & "$src/install.ps1" -Target $s.t -DataDir $s.dd -SkipClaudeConfig *>&1 | Out-String
-Check "I install refuses into git working copy" ($LASTEXITCODE -eq 1 -and $o -match "рабочая копия разработки" -and $o -notmatch "Проверка места")
+$code = $LASTEXITCODE
+Check "I install exit code 1" ($code -eq 1)
+Check "I install message about git working copy" ($o -match "рабочая копия разработки")
+Check "I install stopped before step 1" ($o -notmatch "Проверка места")
+if (-not ($code -eq 1 -and $o -match "рабочая копия разработки" -and $o -notmatch "Проверка места")) {
+    $global:Diag = "---- I: code=$code, output ----`n" + ($o.Substring([Math]::Max(0, $o.Length - 3000)))
+}
 Check "I target untouched" ((Test-Path "$($s.t)/core.py") -and -not (Test-Path "$($s.t)/install.ps1"))
 
 $results | Format-Table -AutoSize | Out-String -Width 200
+if ($global:Diag) { $global:Diag }
 $bad = @($results | Where-Object { -not $_.ok }).Count
 "FAILED: $bad"
 if ($bad) { exit 1 }
