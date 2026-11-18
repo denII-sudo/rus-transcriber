@@ -2,7 +2,8 @@
 
 DEFAULTS = {
     "require_conspect": False,
-    "allow_cloud_model": True,
+    # Облако только по явному согласию человека в конкретном запросе (решение владельца 18.11.2026).
+    "allow_cloud_model": False,
     "require_named_speakers": False,
     "require_human_verification": False,
     "question_budget": 0,

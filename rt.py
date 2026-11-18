@@ -168,7 +168,11 @@ def build():
     t.add_argument("--no-emotions", action="store_true"); t.add_argument("--no-voices", action="store_true")
     t.add_argument("--tag", default=""); t.add_argument("--vocab", default=""); t.add_argument("--whisper", default="")
     wf = sub.add_parser("workflow-start"); wf.add_argument("audio")
-    wf.add_argument("--conspect", action="store_true"); wf.add_argument("--no-cloud-model", action="store_true")
+    wf.add_argument("--conspect", action="store_true")
+    wf.add_argument("--cloud-model", action="store_true",
+                    help="согласие отправить текст стенограммы в облачную модель OpenAI для конспекта")
+    wf.add_argument("--no-cloud-model", action="store_true",
+                    help="облако запрещено (так и по умолчанию; ключ оставлен для совместимости)")
     wf.add_argument("--named-speakers", action="store_true")
     wf.add_argument("--human-verified", action="store_true")
     wf.add_argument("--participation", choices=["simple", "advanced", "developer"], default="simple")
@@ -239,7 +243,7 @@ def run(a):
     c = a.cmd
     if c == "workflow-start":
         out(core.start_workflow(a.audio, {"require_conspect": a.conspect,
-                                         "allow_cloud_model": not a.no_cloud_model,
+                                         "allow_cloud_model": bool(a.cloud_model and not a.no_cloud_model),
                                          "require_named_speakers": a.named_speakers,
                                          "require_human_verification": a.human_verified,
                                          "participation": a.participation, "goal": a.goal,

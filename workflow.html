@@ -20,10 +20,13 @@ pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overfl
   <label>Файл записи (полный путь):<input type="text" id="audio" placeholder="C:\записи\встреча.mp3"></label>
   <div class="bar"><button id="pick">Выбрать файл…</button></div>
   <div class="bar">
-    <label><input type="checkbox" id="conspect"> нужен конспект</label>
-    <label><input type="checkbox" id="cloud" checked> разрешить облачную модель для конспекта</label>
+    <label><input type="checkbox" id="conspect"> нужен конспект — согласен отправить текст в облако</label>
     <label>уточнений: <input type="number" id="budget" value="0" min="0" max="20" style="width:60px"></label>
   </div>
+  <p class="muted" id="cloud-note">Конспект готовит облачная модель OpenAI (через OpenCode). Отметка
+    «нужен конспект» означает согласие отправить ей текст стенограммы этой записи: только слова и цель.
+    Аудио, путь к файлу, голосовые профили и журналы не отправляются. Без отметки всё остаётся на этом
+    компьютере.</p>
   <label>Цель (необязательно):<input type="text" id="goal" placeholder="например: протокол встречи"></label>
   <button id="start">Запустить обработку</button>
 </section>
@@ -353,7 +356,7 @@ $("pick").onclick = async () => {
 $("start").onclick = async () => {
   try {
     const d = await post("api/start", {audio: $("audio").value, require_conspect: $("conspect").checked,
-      allow_cloud_model: $("cloud").checked, goal: $("goal").value, question_budget: Number($("budget").value)});
+      allow_cloud_model: $("conspect").checked, goal: $("goal").value, question_budget: Number($("budget").value)});
     say(`Запрос сохранён: ${d.request_id}. Обработка идёт в фоне; обновляйте состояние.`);
     openRequest(d.request_id); loadRequests();
   } catch (ex) { say(ex.message, true); }

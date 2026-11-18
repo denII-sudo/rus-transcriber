@@ -45,8 +45,9 @@ rus-transcriber: расшифровка речи на этом компьюте�
 биометрия, пути и журналы не передаются. Ответ остаётся модельным предложением и проходит локальную проверку;
 он не является подтверждением человека. Рабочий процесс:
 
-П3/P4: start_workflow → workflow_status. При заказанном конспекте и allow_cloud_model=true текст слов
-будет передан OpenAI согласно разрешению владельца. Облачный вызов можно запретить в политике запроса.
+П3/P4: start_workflow → workflow_status. Облако только по явному согласию человека: allow_cloud_model
+по умолчанию false; передавайте true, лишь если человек прямо согласился на отправку текста стенограммы
+в OpenAI для этого запроса. Без согласия заказанный конспект ждёт исполнителя и ничего не отправляется.
 Не пытайтесь заменять модельный ответ или подтверждать его от имени человека.
 П5: для человека есть локальный экран (rt.py screen); он же показывает историю, конфликты и резерв.
 Реальные и старые данные не подключать до отдельной миграции.
@@ -82,7 +83,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.18.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.18.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -138,10 +139,11 @@ def make_conspect(job_id: str, focus: str = "") -> str:
 
 @mcp.tool()
 def start_workflow(audio_path: str, require_conspect: bool = False,
-                   allow_cloud_model: bool = True,
+                   allow_cloud_model: bool = False,
                    require_named_speakers: bool = False, require_human_verification: bool = False,
                    participation: str = "simple", goal: str = "", question_budget: int = 0) -> str:
-    """Начать процесс на новой SQLite-схеме; заказанный конспект передаёт текст OpenAI, если облако разрешено."""
+    """Начать процесс на новой SQLite-схеме. allow_cloud_model=true — только при явном согласии человека
+    на отправку текста стенограммы (без аудио, путей и биометрии) в OpenAI для конспекта; по умолчанию false."""
     try:
         result = core.start_workflow(audio_path, {
             "require_conspect": require_conspect,
