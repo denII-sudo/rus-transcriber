@@ -179,7 +179,7 @@ if ($AcceptanceCopyOnly) {
 # ================================ УДАЛЕНИЕ ================================
 if ($Uninstall) {
     # --- запуск из папки программы: продолжить из временной копии, чтобы не удалять работающий скрипт ---
-    if ($PSCommandPath -and $PSCommandPath.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
+    if ($PSCommandPath -and $PSCommandPath.StartsWith($Target + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         $copy = Join-Path $env:TEMP ("$Name-uninstall-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".ps1")
         Copy-Item $PSCommandPath $copy -Force
         $argsList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $copy, "-Uninstall",
@@ -253,7 +253,7 @@ if ($Uninstall) {
                 $p = $item.FullName
                 if ($keep -contains $p) { continue }
                 $holdsUser = $false
-                foreach ($k in $keep) { if ($k.StartsWith($p + "\", [StringComparison]::OrdinalIgnoreCase)) { $holdsUser = $true; break } }
+                foreach ($k in $keep) { if ($k.StartsWith($p + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { $holdsUser = $true; break } }
                 if ($holdsUser) { Sweep $p; continue }
                 try { Remove-Tree $p } catch { [void]$failed.Add($p) }
             }
@@ -278,7 +278,7 @@ if ($Uninstall) {
             $chain += [int]$cur.ParentProcessId
             $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction SilentlyContinue
         }
-        $prefix = $Target + "\"
+        $prefix = $Target + [IO.Path]::DirectorySeparatorChar
         return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             ($chain -notcontains [int]$_.ProcessId) -and (
                 ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) -or
