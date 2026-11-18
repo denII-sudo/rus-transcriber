@@ -1,4 +1,4 @@
-# Синтетическая проверка удаления и защит install.ps1 (запускает tests/test_install_uninstall.py).
+﻿# Синтетическая проверка удаления и защит install.ps1 (запускает tests/test_install_uninstall.py).
 # Всё создаётся во временной папке; реальные настройки и данные не затрагиваются.
 param([string]$Script)
 $ErrorActionPreference = "Stop"
