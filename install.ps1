@@ -340,6 +340,7 @@ if ($Uninstall) {
     Write-Host "Что не удаляется никогда:" -ForegroundColor Cyan
     Write-Host "  • ваши аудиозаписи, стенограммы и конспекты — где бы они ни лежали, в том числе внутри папок программы и данных"
     Write-Host "  • база state.sqlite3 в папке данных (в ней хранятся стенограммы и конспекты), резервные копии и архивы выгрузки"
+    Write-Host "  • папки backup* и _backup* внутри папки программы"
     Write-Host "  • Python и ffmpeg (ими могут пользоваться другие программы)"
     Write-Host ""
 
@@ -354,7 +355,8 @@ if ($Uninstall) {
                 Edit-ClaudeConfig $cp { param($s) $s.PSObject.Properties.Remove($Name) }
                 $removed += "запись в настройках ИИ-агента: $cp"
             }
-            $r = Remove-ExceptUser $Target @(".venv", "cache") @()
+            # папки резервных копий (backup*, _backup*) в папке программы — тоже не удаляем
+        $r = Remove-ExceptUser $Target @(".venv", "cache") @("backup*", "_backup*")
             $kept += $r.kept; $failed += $r.failed
             $removed += "программа: $Target"
         } else { Write-Host "  программа оставлена" }
