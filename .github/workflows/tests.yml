@@ -26,7 +26,8 @@ jobs:
       - name: Prepare isolated Windows test directories
         shell: pwsh
         run: |
-          $testTemp = Join-Path $env:LOCALAPPDATA "Temp\opencode\stage6-acceptance"
+          # обычная временная папка без особых путей: тесты должны работать на любом компьютере
+          $testTemp = Join-Path $env:RUNNER_TEMP "rus-transcriber-temp"
           $testData = Join-Path $env:RUNNER_TEMP "rus-transcriber-data"
           New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
           New-Item -ItemType Directory -Path $testData -Force | Out-Null
@@ -49,3 +50,6 @@ jobs:
           --index-url https://download.pytorch.org/whl/cpu
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
+      # так же, как self_check у пользователя после обновления: свои временные папки и данные
+      - name: Run self-check like an installed copy
+        run: python -B selfcheck.py

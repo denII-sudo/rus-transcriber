@@ -12,10 +12,23 @@
       папка личных данных (голосовые профили, словари групп, настройки, задачи): по умолчанию
       %APPDATA%\rus-transcriber-data; путь записывается в настройки сервера (RUS_TRANSCRIBER_DATA)
 
+  Обновление уже стоящей программы — тот же запуск из папки новой версии. Перед изменениями
+  установщик показывает версии и коммит источника, проверяет, что программа не занята, и
+  сохраняет список пакетов (cache\pip-freeze) для отката; в конце запускает самопроверку.
+      -KeepSavedToken        не спрашивать токен Hugging Face: оставить сохранённый в настройках
+                             (без терминала вопрос не задаётся и так)
+      -AllowRunningServer    обновлять, пока работает только сервер программы (его запустило
+                             приложение ИИ-агента); идущая обработка записи всё равно останавливает
+      -AllowUnreviewedSource ставить из клона с незакоммиченными изменениями или из коммита,
+                             которого нет в origin/main и на котором нет тега
+      -SkipSelfCheck         не запускать самопроверку в конце
+
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptanceCopyOnly -Target <sandbox>\program
       -DataDir <sandbox>\data -SkipClaudeConfig
       только копирование runtime-файлов для локальной приёмки; требует
-      RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1 и пути внутри %LOCALAPPDATA%\Temp\opencode\stage6-acceptance.
+      RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1, а обе папки должны лежать внутри одной изолированной
+      папки с файлом-меткой rus-transcriber-acceptance.sandbox (её создаёт тест приёмки во временной
+      папке). Настоящие папки программы и данных, а также ссылки (junction/symlink) не принимаются.
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
       сначала проверяет, что программа не работает, и показывает, что будет удалено;
@@ -37,7 +50,11 @@ param(
     [switch]$Yes,
     [switch]$RemoveData,
     [switch]$KeepData,
-    [switch]$RemoveConfigBackups
+    [switch]$RemoveConfigBackups,
+    [switch]$KeepSavedToken,
+    [switch]$AllowRunningServer,
+    [switch]$AllowUnreviewedSource,
+    [switch]$SkipSelfCheck
 )
 $ErrorActionPreference = "Continue"
 # Windows PowerShell 5.1: без этого ConvertTo-Json пишет массивы как {"value":[...],"Count":n}
@@ -66,6 +83,96 @@ if ($AcceptanceCopyOnly) {
     if ($env:RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX -ne "1") {
         Fail "Для режима приёмки задайте RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1."
     }
+}
+if ($Token -and $KeepSavedToken) { Fail "Укажите что-то одно: -Token или -KeepSavedToken." }
+# без терминала (ИИ-агент, перенаправленный ввод) вопросы Read-Host не задаются
+$nonInteractive = [Console]::IsInputRedirected
+
+# ---------- помощники обновления (без побочных эффектов; проверяются tests/install_update_harness.ps1) ----------
+# Процессы программы из папки $root, кроме самого установщика и его родителей.
+function Get-ProgramProcesses([string]$root) {
+    $chain = @($PID)
+    $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
+    while ($cur -and $cur.ParentProcessId -and $chain.Count -lt 10) {
+        $chain += [int]$cur.ParentProcessId
+        $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction SilentlyContinue
+    }
+    $prefix = $root + [IO.Path]::DirectorySeparatorChar
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        ($chain -notcontains [int]$_.ProcessId) -and (
+            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) -or
+            ($_.Name -match '^(python|pythonw|opencode)' -and $_.CommandLine -and
+             $_.CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0))
+    })
+}
+# Делит процессы программы на задачи (расшифровка, обучение голосов, тест скорости) и остальное (сервер и др.).
+function Split-ProgramProcesses($procs) {
+    $jobs = @(); $other = @()
+    foreach ($p in @($procs)) {
+        if (-not $p) { continue }      # пустой результат PowerShell передаёт как $null
+        if ($p.CommandLine -and $p.CommandLine -match '(worker|bench)\.py') { $jobs += $p } else { $other += $p }
+    }
+    return @{ jobs = $jobs; other = $other }
+}
+# Версия программы (VERSION в server.py) в папке $dir или пустая строка.
+function Get-ServerVersion([string]$dir) {
+    $f = Join-Path $dir "server.py"
+    if (-not (Test-Path -LiteralPath $f)) { return "" }
+    $m = Select-String -LiteralPath $f -Pattern '^VERSION\s*=\s*"([^"]+)"' -Encoding UTF8 | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return ""
+}
+# Состояние источника установки: Git-клон или папка без Git. Сеть не используется:
+# сравнение с origin/main — по последнему git fetch.
+function Get-SourceState([string]$dir) {
+    $s = [ordered]@{ git = $false; gitTool = $false; commit = ""; branch = ""; dirty = @(); tag = ""; onMain = $false; reviewed = $true }
+    if (-not (Test-Path -LiteralPath (Join-Path $dir ".git"))) { return $s }
+    $s.git = $true
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { $s.reviewed = $false; return $s }
+    $s.gitTool = $true
+    $s.commit = [string](& git -C $dir rev-parse --short HEAD 2>$null)
+    $s.branch = [string](& git -C $dir rev-parse --abbrev-ref HEAD 2>$null)
+    $s.dirty = @(& git -C $dir status --porcelain 2>$null | Where-Object { $_ })
+    $s.tag = [string](& git -C $dir describe --tags --exact-match HEAD 2>$null)
+    & git -C $dir merge-base --is-ancestor HEAD origin/main 2>$null
+    $s.onMain = ($LASTEXITCODE -eq 0)
+    $s.reviewed = ($s.commit -and -not $s.dirty.Count -and ($s.onMain -or $s.tag))
+    return $s
+}
+# Что сделать с onnxruntime по установленным версиям: обычные сборки (onnxruntime, -directml, -gpu)
+# и onnxruntime-openvino дают один модуль; переставлять сборку с OpenVINO — только если нужно.
+function Get-OnnxPlan($versions, [string]$wanted) {
+    $remove = @(@("onnxruntime", "onnxruntime-directml", "onnxruntime-gpu") | Where-Object { $versions[$_] })
+    # удаление обычной сборки стирает общий модуль — после него сборку с OpenVINO ставим заново
+    $reinstall = ($remove.Count -gt 0) -or ($versions["onnxruntime-openvino"] -ne $wanted)
+    return @{ remove = $remove; reinstall = $reinstall }
+}
+# Как поступить с токеном Hugging Face: given (передан -Token), saved (оставить сохранённый),
+# none (пропустить), ask (спросить человека).
+function Get-TokenMode([string]$token, [bool]$keepSaved, [string]$saved, [bool]$noTerminal) {
+    if ($token) { return "given" }
+    if ($keepSaved -or $noTerminal) { if ($saved) { return "saved" } else { return "none" } }
+    return "ask"
+}
+# Разница двух списков pip freeze: какие пакеты добавлены, удалены или сменили версию.
+function Compare-PipFreeze([string[]]$before, [string[]]$after) {
+    function ToMap($lines) {
+        $m = @{}
+        foreach ($l in @($lines)) {
+            $l = ([string]$l).Trim()
+            if (-not $l -or $l.StartsWith("#")) { continue }
+            $n = ($l -split '(==| @ )', 2)[0].Trim().ToLowerInvariant().Replace("_", "-")
+            $m[$n] = $l
+        }
+        return $m
+    }
+    $b = ToMap $before; $a = ToMap $after; $changes = @()
+    foreach ($k in (@($b.Keys) + @($a.Keys) | Sort-Object -Unique)) {
+        if (-not $a.ContainsKey($k)) { $changes += "удалён: $($b[$k])" }
+        elseif (-not $b.ContainsKey($k)) { $changes += "добавлен: $($a[$k])" }
+        elseif ($a[$k] -ne $b[$k]) { $changes += "изменён: $($b[$k]) -> $($a[$k])" }
+    }
+    return ,$changes
 }
 
 # Добавляет в PATH текущего окна пути, появившиеся после установки winget-пакетов
@@ -105,8 +212,9 @@ function Find-ClaudeConfig {
 }
 
 # прошлая версия установщика могла по ошибке создать файл в корне Claude-Data — убираем, если там только наша запись
+# (в режиме приёмки настоящий профиль не трогаем)
 $stray = Join-Path $env:LOCALAPPDATA "Claude-Data\claude_desktop_config.json"
-if (Test-Path $stray) {
+if (-not $AcceptanceCopyOnly -and (Test-Path $stray)) {
     try {
         $j = Get-Content $stray -Raw -Encoding UTF8 | ConvertFrom-Json
         $keys = @($j.PSObject.Properties.Name)
@@ -156,19 +264,70 @@ if ($DataDir -eq $Target -or $DataDir.StartsWith($Target + "\", [StringCompariso
     Fail "Папка данных ($DataDir) не может лежать внутри папки программы ($Target): при обновлении она бы потерялась. Укажите другую через -DataDir."
 }
 if ($AcceptanceCopyOnly) {
-    $acceptanceRoot = [IO.Path]::GetFullPath(
-        (Join-Path $env:LOCALAPPDATA "Temp\opencode\stage6-acceptance")).TrimEnd("\")
-    $acceptancePrefix = $acceptanceRoot + "\"
+    # Режим приёмки работает только в изолированной папке, помеченной файлом-меткой. Фиксированного
+    # пути нет: такая папка создаётся во временной папке на любом компьютере (тест, self_check, CI).
+    $markerName = "rus-transcriber-acceptance.sandbox"
+    $Target = [IO.Path]::GetFullPath($Target).TrimEnd("\")
+    $DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd("\")
+    function Test-Inside([string]$path, [string]$root) {
+        return $path.StartsWith($root.TrimEnd("\") + "\", [StringComparison]::OrdinalIgnoreCase)
+    }
+    function Test-Overlap([string]$a, [string]$b) {
+        return ($a -ieq $b) -or (Test-Inside $a $b) -or (Test-Inside $b $a)
+    }
+    # ближайшая родительская папка Target, в которой лежит метка
+    $sandboxRoot = $null
+    $dir = Split-Path $Target -Parent
+    while ($dir) {
+        if (Test-Path -LiteralPath (Join-Path $dir $markerName)) { $sandboxRoot = $dir.TrimEnd("\"); break }
+        $parent = Split-Path $dir -Parent
+        if (-not $parent -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    if (-not $sandboxRoot) {
+        Fail "-AcceptanceCopyOnly разрешён только внутри изолированной папки с файлом-меткой $markerName (её создаёт тест приёмки)."
+    }
+    $markerItem = Get-Item -LiteralPath (Join-Path $sandboxRoot $markerName) -Force
+    if ($markerItem.PSIsContainer -or ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Fail "Метка $markerName должна быть обычным файлом: $($markerItem.FullName)"
+    }
+    if (-not (Test-Inside $DataDir $sandboxRoot)) {
+        Fail "-AcceptanceCopyOnly: папка данных должна лежать в той же изолированной папке ($sandboxRoot)."
+    }
+    # ни одна существующая папка на пути от метки до Target и DataDir не может быть ссылкой:
+    # иначе копирование ушло бы за пределы изолированной папки
     foreach ($path in @($Target, $DataDir)) {
-        if (-not $path.StartsWith($acceptancePrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            Fail "-AcceptanceCopyOnly разрешён только внутри $acceptanceRoot."
-        }
-        if (Test-Path $path -PathType Container) {
-            $item = Get-Item $path -Force
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                Fail "-AcceptanceCopyOnly не принимает ссылки/reparse-папки: $path"
+        $cur = $path
+        while ($true) {
+            if (Test-Path -LiteralPath $cur) {
+                if ((Get-Item -LiteralPath $cur -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    Fail "-AcceptanceCopyOnly не принимает ссылки/reparse-папки: $cur"
+                }
             }
+            if ($cur -ieq $sandboxRoot) { break }
+            $cur = Split-Path $cur -Parent
         }
+    }
+    # настоящая установка и данные не годятся для приёмки, даже если рядом оказалась метка
+    $protected = @((Join-Path $env:LOCALAPPDATA $Name), (Join-Path $env:APPDATA "$Name-data"), $Source)
+    foreach ($cp in (Find-ClaudeConfig)) {
+        if (Test-Path $cp) {
+            try {
+                $srv = (Get-Content $cp -Raw -Encoding UTF8 | ConvertFrom-Json).mcpServers.$Name
+                if ($srv -and $srv.args) { $protected += (Split-Path ([string]$srv.args[0])) }
+                if ($srv -and $srv.env -and $srv.env.RUS_TRANSCRIBER_DATA) { $protected += [string]$srv.env.RUS_TRANSCRIBER_DATA }
+            } catch { }
+        }
+    }
+    foreach ($p in $protected) {
+        if (-not $p) { continue }
+        $full = [IO.Path]::GetFullPath($p).TrimEnd("\")
+        foreach ($path in @($Target, $DataDir)) {
+            if (Test-Overlap $path $full) { Fail "-AcceptanceCopyOnly не работает с настоящей папкой программы, данных или исходников: $full" }
+        }
+    }
+    foreach ($bad in @(".git", ".venv")) {
+        if (Test-Path -LiteralPath (Join-Path $Target $bad)) { Fail "-AcceptanceCopyOnly: в $Target уже есть $bad — это не изолированная папка приёмки." }
     }
     if ($Target.StartsWith($DataDir + "\", [StringComparison]::OrdinalIgnoreCase) -or
         $DataDir.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -199,8 +358,6 @@ if ($Uninstall) {
               "Удаление не начато, ничего не изменено. Сначала перенесите разработку в отдельный клон " +
               "и убедитесь, что вся работа закоммичена и отправлена; затем уберите .git из папки программы.")
     }
-    $nonInteractive = [Console]::IsInputRedirected
-
     # Аудиозаписи, стенограммы, конспекты и базы с ними не удаляются никогда, даже внутри папок программы и данных.
     $AudioExt = @(".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac", ".wma", ".webm",
                   ".mp4", ".m4v", ".mkv", ".mov", ".avi", ".amr", ".3gp")
@@ -277,21 +434,6 @@ if ($Uninstall) {
         if (-not $ans) { return $defaultYes }
         return ($ans -match '^(y|д)')
     }
-    function Get-ProgramProcesses {
-        $chain = @($PID)
-        $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
-        while ($cur -and $cur.ParentProcessId -and $chain.Count -lt 10) {
-            $chain += [int]$cur.ParentProcessId
-            $cur = Get-CimInstance Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction SilentlyContinue
-        }
-        $prefix = $Target + [IO.Path]::DirectorySeparatorChar
-        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            ($chain -notcontains [int]$_.ProcessId) -and (
-                ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) -or
-                ($_.Name -match '^(python|pythonw|opencode)' -and $_.CommandLine -and
-                 $_.CommandLine.IndexOf($Target, [StringComparison]::OrdinalIgnoreCase) -ge 0))
-        })
-    }
 
     $programFound = Test-Path (Join-Path $Target "server.py")
     $configs = @(Find-ClaudeConfig | Where-Object { Test-Path $_ })
@@ -311,7 +453,7 @@ if ($Uninstall) {
     Write-Host "Удаление $Name" -ForegroundColor Yellow
     # --- 1. программа не должна работать: иначе файлы заняты и удаление пройдёт наполовину ---
     while ($programFound) {
-        $running = Get-ProgramProcesses
+        $running = Get-ProgramProcesses $Target
         if (-not $running) { break }
         Write-Host "Программа сейчас работает (её запустило приложение ИИ-агента или идёт обработка записи):" -ForegroundColor Yellow
         $running | ForEach-Object { Write-Host ("  {0} (PID {1})" -f $_.Name, $_.ProcessId) }
@@ -340,6 +482,7 @@ if ($Uninstall) {
     Write-Host "Что не удаляется никогда:" -ForegroundColor Cyan
     Write-Host "  • ваши аудиозаписи, стенограммы и конспекты — где бы они ни лежали, в том числе внутри папок программы и данных"
     Write-Host "  • база state.sqlite3 в папке данных (в ней хранятся стенограммы и конспекты), резервные копии и архивы выгрузки"
+    Write-Host "  • папки backup* и _backup* внутри папки программы"
     Write-Host "  • Python и ffmpeg (ими могут пользоваться другие программы)"
     Write-Host ""
 
@@ -354,7 +497,8 @@ if ($Uninstall) {
                 Edit-ClaudeConfig $cp { param($s) $s.PSObject.Properties.Remove($Name) }
                 $removed += "запись в настройках ИИ-агента: $cp"
             }
-            $r = Remove-ExceptUser $Target @(".venv", "cache") @()
+            # папки резервных копий (backup*, _backup*) в папке программы — тоже не удаляем
+        $r = Remove-ExceptUser $Target @(".venv", "cache") @("backup*", "_backup*")
             $kept += $r.kept; $failed += $r.failed
             $removed += "программа: $Target"
         } else { Write-Host "  программа оставлена" }
@@ -424,11 +568,73 @@ if ($Source -ne $Target -and (Test-Path -LiteralPath (Join-Path $Target ".git"))
           "(подробности: docs/development-and-installation.md).")
 }
 
-$insideProfile = $Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)
+# ---------- перед изменениями: что ставится и не занята ли программа ----------
+$isUpdate = Test-Path -LiteralPath (Join-Path $Target "server.py")
+if (-not $AcceptanceCopyOnly) {
+    $srcVer = Get-ServerVersion $Source
+    if ($Source -eq $Target) { $from = "запуск из папки программы" }
+    elseif ($isUpdate) { $from = "сейчас установлена " + $(if ($oldVer = Get-ServerVersion $Target) { $oldVer } else { "версия неизвестна" }) }
+    else { $from = "новая установка" }
+    Write-Host "  версия программы: $srcVer ($from)"
+    $src = Get-SourceState $Source
+    if (-not $src.git) {
+        Write-Host "  источник: папка без Git (архив или копия): $Source"
+    } elseif (-not $src.gitTool) {
+        Write-Host "  источник — клон Git, но команда git не найдена: проверить коммит и изменения нельзя" -ForegroundColor Yellow
+    } else {
+        $where = @()
+        if ($src.tag) { $where += "тег $($src.tag)" }
+        if ($src.onMain) { $where += "есть в origin/main (по последнему git fetch)" } else { $where += "нет в origin/main" }
+        Write-Host "  источник: клон Git $Source, ветка $($src.branch), коммит $($src.commit) — $($where -join ', ')"
+        if ($src.dirty.Count) {
+            Write-Host "  в клоне есть незакоммиченные изменения ($($src.dirty.Count)):" -ForegroundColor Yellow
+            $src.dirty | Select-Object -First 10 | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+        }
+    }
+    if (-not $src.reviewed) {
+        Write-Host "  Этот код не проверен: в main его нет, тега нет или есть незакоммиченные изменения." -ForegroundColor Yellow
+        if ($AllowUnreviewedSource) {
+            Write-Host "  продолжаю: указан -AllowUnreviewedSource" -ForegroundColor Yellow
+        } elseif ($nonInteractive) {
+            Fail ("Установка не начата, ничего не изменено. Ставьте из main или тега без незакоммиченных изменений; " +
+                  "если этот код ставится сознательно — добавьте -AllowUnreviewedSource.")
+        } else {
+            $ans = Read-Host "  Всё равно установить? (y/N)"
+            if (-not ($ans -match '^(y|д)')) { Write-Host "Установка отменена, ничего не изменено."; exit 0 }
+        }
+    }
+    # Работающая программа держит файлы и библиотеки: обновление пакетов прошло бы наполовину.
+    while ($isUpdate) {
+        $split = Split-ProgramProcesses (Get-ProgramProcesses $Target)
+        if (-not $split.jobs.Count -and -not $split.other.Count) { break }
+        if ($split.jobs.Count) {
+            Write-Host "Идёт обработка записи или тест скорости:" -ForegroundColor Yellow
+            $split.jobs | ForEach-Object { Write-Host ("  {0} (PID {1})" -f $_.Name, $_.ProcessId) }
+            Write-Host "Дождитесь окончания или отмените задачу (cancel_job), затем запустите установку снова."
+            if ($nonInteractive) { Fail "Обновление не начато: идёт обработка. Ничего не изменено." }
+        } else {
+            if ($AllowRunningServer) {
+                Write-Host "  сервер программы работает — продолжаю (-AllowRunningServer); после обновления перезапустите приложение ИИ-агента" -ForegroundColor Yellow
+                break
+            }
+            Write-Host "Программа сейчас работает (её запустило приложение ИИ-агента):" -ForegroundColor Yellow
+            $split.other | ForEach-Object { Write-Host ("  {0} (PID {1})" -f $_.Name, $_.ProcessId) }
+            Write-Host "Полностью закройте приложение ИИ-агента (например, Claude Desktop: значок в трее → Quit)."
+            if ($nonInteractive) {
+                Fail ("Обновление не начато: программа работает. Ничего не изменено. Закройте приложение ИИ-агента " +
+                      "или, если обработки нет и можно перезапустить его после обновления, добавьте -AllowRunningServer.")
+            }
+        }
+        $ans = Read-Host "Нажмите Enter, когда закроете, или введите q, чтобы выйти без изменений"
+        if ($ans -match '^(q|й)') { Write-Host "Обновление отменено, ничего не изменено."; exit 0 }
+    }
+}
+
+$insideProfile =$Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)
 if ($AcceptanceCopyOnly) {
     Write-Host "  режим приёмки: проверки места, Python и ffmpeg пропущены"
 } else {
-Step "1/9" "Проверка места установки"
+Step "1/10" "Проверка места установки"
 if (HasNonAscii $Target) {
     Fail ("В пути есть кириллица или другие не-латинские символы: $Target`n" +
           "Часть библиотек (OpenVINO, PyTorch) с такими путями работает ненадёжно.`n" +
@@ -444,7 +650,7 @@ $free = (Get-PSDrive ($drive.Substring(0,1))).Free / 1GB
 Write-Host ("  свободно на {0} {1:N1} ГБ (нужно около 8)" -f $drive, $free)
 if ($free -lt 8) { Fail "Мало места. Освободите диск или укажите -Target на другом диске." }
 
-Step "2/9" "Поиск установленного Python (подходят 3.11, 3.12, 3.13)"
+Step "2/10" "Поиск установленного Python (подходят 3.11, 3.12, 3.13)"
 # предпочтение: 3.12 (лучше всего с готовыми сборками библиотек), затем 3.11, затем 3.13
 function Get-PyInfo($cmd, $pre) {
     try {
@@ -508,7 +714,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 }
 }
 
-Step "3/9" "Папка программы и права доступа"
+Step "3/10" "Папка программы и права доступа"
 $isNew = -not (Test-Path $Target)
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
 if (-not $insideProfile) {
@@ -532,7 +738,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
     Write-Host "  данные: $DataDir (в вашем профиле)"
 }
 
-Step "4/9" "Копирование файлов программы"
+Step "4/10" "Копирование файлов программы"
 if ($Source -ne $Target) {
     foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "quotes.py", "conspect.py",
@@ -601,27 +807,59 @@ $env:TORCH_HOME    = Join-Path $Target "cache\torch"
 if ($AcceptanceCopyOnly) {
     Write-Host "  режим приёмки: venv, зависимости и HF-проверки пропущены"
 } else {
-Step "5/9" "Виртуальное окружение"
+Step "5/10" "Виртуальное окружение"
 $py = Join-Path $Target ".venv\Scripts\python.exe"
+# версии установленных пакетов (по имени дистрибутива; пустая строка — не установлен)
+function Get-PkgVersions([string[]]$names) {
+    $code = "import importlib.metadata as m,sys;d={(x.metadata['Name'] or '').lower().replace('_','-'):x.version for x in m.distributions()};[print(n+'='+d.get(n,'')) for n in sys.argv[1:]]"
+    $map = @{}
+    foreach ($line in @(& $py -c $code @names 2>$null)) {
+        $kv = ([string]$line).Split("=", 2)
+        if ($kv.Count -eq 2) { $map[$kv[0]] = $kv[1].Trim() }
+    }
+    return $map
+}
+function Get-PipFreeze { return @(& $py -m pip freeze --all 2>$null | ForEach-Object { [string]$_ }) }
+$freezeBefore = $null
 if (Test-Path $py) {
     $venvVer = (& $py -c "import sys; print('%d.%d' % sys.version_info[:2])").Trim()
     Write-Host "  окружение уже есть (Python $venvVer), обновляю библиотеки"
+    # снимок пакетов для отката: cache\pip-freeze, хранятся 10 последних
+    $freezeBefore = Get-PipFreeze
+    if ($freezeBefore.Count) {
+        $freezeDir = Join-Path $Target "cache\pip-freeze"
+        New-Item -ItemType Directory -Path $freezeDir -Force | Out-Null
+        $freezeFile = Join-Path $freezeDir ("before-update-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
+        WriteUtf8NoBom $freezeFile (($freezeBefore -join "`n") + "`n")
+        Write-Host "  список пакетов до обновления: $freezeFile"
+        Get-ChildItem -LiteralPath $freezeDir -Filter "before-update-*.txt" -File | Sort-Object Name -Descending |
+            Select-Object -Skip 10 | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
 } else {
     & $basePyExe -m venv (Join-Path $Target ".venv"); Check "venv"
 }
 & $py -m pip install --upgrade pip wheel; Check-Pip "pip"
 
-Step "6/9" "PyTorch (процессор), pyannote, GigaAM, MCP"
+Step "6/10" "PyTorch (процессор), pyannote, GigaAM, MCP"
 & $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu; Check-Pip "PyTorch"
-& $py -m pip install "pyannote.audio>=4.0" "pytorch-metric-learning==2.9.0" soundfile truststore "mcp[cli]" "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip"; Check-Pip "pyannote/GigaAM"
+$step6 = @("pyannote.audio>=4.0", "pytorch-metric-learning==2.9.0", "soundfile", "truststore", "mcp[cli]")
+# GigaAM ставится из архива ветки main и тянет обычный onnxruntime, который ниже всё равно заменяется:
+# если GigaAM уже стоит, не переустанавливаем (чтобы обновить GigaAM, удалите пакет и запустите установку)
+$gigaamVer = (Get-PkgVersions @("gigaam"))["gigaam"]
+if ($gigaamVer) { Write-Host "  GigaAM $gigaamVer уже установлен — не переустанавливаю" }
+else { $step6 += "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip" }
+& $py -m pip install @step6; Check-Pip "pyannote/GigaAM"
 # pytorch-metric-learning 3.x требует numpy>=2.5.3, а OpenVINO 2025.4.1 — numpy<2.4.0: держим совместимую 2.9.0
 
-Step "7/9" "OpenVINO для видеокарты Arc"
+Step "7/10" "OpenVINO для видеокарты Arc"
 & $py -m pip install "onnx-asr[hub]" "openvino==2025.4.1"; Check-Pip "onnx-asr/OpenVINO"
 # onnxruntime, onnxruntime-directml и onnxruntime-openvino дают один и тот же модуль:
-# убираем обычные сборки и ставим сборку с OpenVINO последней
-& $py -m pip uninstall -y onnxruntime onnxruntime-directml onnxruntime-gpu
-& $py -m pip install --force-reinstall --no-deps "onnxruntime-openvino==1.24.1"; Check-Pip "onnxruntime-openvino"
+# убираем обычные сборки и ставим сборку с OpenVINO последней — только если это нужно
+$onnx = Get-OnnxPlan (Get-PkgVersions @("onnxruntime", "onnxruntime-directml", "onnxruntime-gpu", "onnxruntime-openvino")) "1.24.1"
+if ($onnx.remove.Count) { & $py -m pip uninstall -y @($onnx.remove) }
+if ($onnx.reinstall) {
+    & $py -m pip install --force-reinstall --no-deps "onnxruntime-openvino==1.24.1"; Check-Pip "onnxruntime-openvino"
+} else { Write-Host "  onnxruntime-openvino 1.24.1 уже установлен, других сборок onnxruntime нет — не переустанавливаю" }
 # под Windows модуль OpenVINO в onnxruntime берёт библиотеки из пакета openvino — версии должны совпадать
 # (onnxruntime-openvino 1.24.x собран с OpenVINO 2025.4.1; с 2026.x — «ошибка 127» при загрузке)
 # проверяем именно версию: одной проверки «import openvino» мало, потому что любая версия импортируется
@@ -639,6 +877,16 @@ if ($ov -ne "2025.4.1") {
 # после смены версии OpenVINO сохранённые модели Whisper пересоберутся при первом запуске (это нормально)
 # словарь русского языка: свободные ответы в карточках — отличать опечатку от настоящего слова
 & $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check-Pip "pymorphy3"
+if ($freezeBefore) {
+    $changes = Compare-PipFreeze $freezeBefore (Get-PipFreeze)
+    if (-not $changes.Count) { Write-Host "  пакеты окружения не изменились" }
+    else {
+        Write-Host "  изменились пакеты окружения ($($changes.Count)):" -ForegroundColor Yellow
+        $changes | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
+        if ($changes.Count -gt 20) { Write-Host "    … и ещё $($changes.Count - 20)" }
+        Write-Host "  откат к прежним версиям: & '$py' -m pip install -r '$freezeFile' (вместе с прежней версией программы, см. docs/development-and-installation.md)" -ForegroundColor DarkGray
+    }
+}
 & $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
 Write-Host "  нужны CPU и OpenVINOExecutionProvider; GPU желателен на Intel Arc; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
 # OpenVINO GPU/NPU — плагины Intel: на графике AMD/NVIDIA их не будет, и это не ошибка.
@@ -652,7 +900,7 @@ if ($nonIntel) {
     Write-Host "  Задействовать видеокарту можно через DirectML (пакет onnxruntime-directml) — замена пакета по согласованию: bench.py --only dml-gpu,whisper-dml" -ForegroundColor DarkGray
 }
 
-Step "8/9" "Токен Hugging Face"
+Step "8/10" "Токен Hugging Face"
 # при обновлении приложение ИИ-агента уже хранит рабочий токен — второй раз вводить не нужно
 $savedToken = ""
 foreach ($cp in (Find-ClaudeConfig)) {
@@ -664,12 +912,13 @@ foreach ($cp in (Find-ClaudeConfig)) {
         } catch { }
     }
 }
-if (-not $Token) {
+$tokenMode = Get-TokenMode $Token ([bool]$KeepSavedToken) $savedToken $nonInteractive
+if ($tokenMode -eq "ask") {
     $hint = if ($savedToken) { "Enter — оставить сохранённый токен" } else { "Enter — пропустить" }
     $sec = Read-Host "Вставьте токен Hugging Face (hf_..., тип Read). $hint" -AsSecureString
-    $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+    if ($sec) { $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)) }
 }
-$Token = $Token.Trim()
+$Token = ([string]$Token).Trim()
 if ($Token) {
     $h = @{ Authorization = "Bearer $Token" }
     try {
@@ -691,10 +940,16 @@ if ($Token) {
 }
 }
 
-Step "9/9" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
-if ($SkipClaudeConfig) {
+Step "9/10" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
+if ($nonInteractive -and -not $SkipClaudeConfig -and (Get-Process -Name "Claude" -ErrorAction SilentlyContinue)) {
+    # без терминала некому закрыть приложение и нажать Enter: раньше здесь был бесконечный цикл
+    Write-Host ("  пропущено: приложение ИИ-агента запущено, а терминала нет. Если запись нужна — закройте приложение " +
+                "и запустите установщик ещё раз в терминале (или с -SkipClaudeConfig, если запись уже есть)") -ForegroundColor Yellow
+    $SkipClaudeConfig = $true
+} elseif ($SkipClaudeConfig) {
     Write-Host "  пропущено (-SkipClaudeConfig)"
-} else {
+}
+if (-not $SkipClaudeConfig) {
     # Приложение при выходе сохраняет настройки поверх файла и затирает нашу запись,
     # поэтому писать можно только при полностью закрытом приложении.
     while (Get-Process -Name "Claude" -ErrorAction SilentlyContinue) {
@@ -731,7 +986,42 @@ if ($old) {
     $old | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 }
 
+Step "10/10" "Самопроверка (тесты в отдельной временной папке, проверка файлов, морфология)"
+$selfCheckOk = $true
+if ($SkipSelfCheck) {
+    Write-Host "  пропущено (-SkipSelfCheck); запустить позже: & '$py' '$Target\selfcheck.py'"
+} else {
+    # selfcheck.py сам изолирует папку данных и TEMP для тестов; настоящие данные не трогаются
+    $prevEnc = [Console]::OutputEncoding
+    $prevUtf8 = $env:PYTHONUTF8; $prevIo = $env:PYTHONIOENCODING
+    try {
+        [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
+        $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
+        $raw = (& $py -B (Join-Path $Target "selfcheck.py") 2>$null) -join "`n"
+    } finally {
+        [Console]::OutputEncoding = $prevEnc; $env:PYTHONUTF8 = $prevUtf8; $env:PYTHONIOENCODING = $prevIo
+    }
+    $sc = $null
+    try { $sc = $raw | ConvertFrom-Json } catch { }
+    if (-not $sc) {
+        $selfCheckOk = $false
+        Write-Host "  самопроверка не дала результата; запустите вручную: & '$py' '$Target\selfcheck.py'" -ForegroundColor Yellow
+    } else {
+        $selfCheckOk = [bool]$sc.ok
+        $t = $sc.tests
+        $line = "  {0}: тестов {1}, падений {2}, ошибок {3}, пропусков {4}" -f $sc.summary, $t.ran, $t.failures, $t.errors, $t.skipped
+        if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
+        foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
+        if ($sc.check_repo -and $sc.check_repo.partial) { Write-Host "  проверка файлов частичная: $($sc.check_repo.note)" -ForegroundColor DarkGray }
+    }
+}
+
 Write-Host "`nГотово. Программа, модели и кэши: $Target" -ForegroundColor Green
 Write-Host "Личные данные: $DataDir (установщик их не трогает; перенос между компьютерами — export_group / import_group)" -ForegroundColor Green
 Write-Host "Дальше — тест скорости. Попросите ИИ-агента (например, Claude Desktop): «запусти тест скорости на C:\...\запись.mp3»,"
 Write-Host "или вручную:  `$env:HF_TOKEN='hf_...'; & '$py' '$Target\bench.py' 'C:\путь\к\записи.mp3'"
+if ($isUpdate) { Write-Host "После обновления перезапустите приложение ИИ-агента (например, Claude Desktop), чтобы сервер подхватил новые файлы." -ForegroundColor Yellow }
+if (-not $selfCheckOk) {
+    Write-Host "Установка завершена, но самопроверка нашла проблемы (см. шаг 10). Код выхода 2." -ForegroundColor Yellow
+    exit 2
+}

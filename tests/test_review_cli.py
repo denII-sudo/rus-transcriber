@@ -1,11 +1,15 @@
 """Независимый от клиента путь карточек; только синтетические данные."""
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import nullcontext
 from unittest.mock import patch
 
-os.environ.setdefault("RUS_TRANSCRIBER_DATA", tempfile.mkdtemp(prefix="review_cli_"))
+if "RUS_TRANSCRIBER_DATA" not in os.environ:
+    os.environ["RUS_TRANSCRIBER_DATA"] = tempfile.mkdtemp(prefix="review_cli_")
+    atexit.register(shutil.rmtree, os.environ["RUS_TRANSCRIBER_DATA"], ignore_errors=True)
 import core
 import rt
 

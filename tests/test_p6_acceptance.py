@@ -35,12 +35,17 @@ REQUIRED_RUNTIME = {
     "product_policy.py", "model_tasks.py", "llm_provider.py",
     "workflow_page.py", "workflow.html", "rt.py",
 }
+# файл-метка изолированной папки приёмки, без него install.ps1 -AcceptanceCopyOnly отказывает
+SANDBOX_MARKER = "rus-transcriber-acceptance.sandbox"
 
 
 class P6InstallUpdateTests(unittest.TestCase):
+    """Папки создаются только во временной папке (TEMP): тест не зависит от конкретного компьютера."""
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="p6-install-", dir=os.environ["TEMP"])
+        self.temp = tempfile.TemporaryDirectory(prefix="p6-install-")
         self.root = Path(self.temp.name)
+        (self.root / SANDBOX_MARKER).write_text("synthetic acceptance sandbox\n", encoding="utf-8")
         self.target = self.root / "program"
         self.data = self.root / "data"
         self.target.mkdir()
@@ -48,6 +53,17 @@ class P6InstallUpdateTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def unmarked_dir(self):
+        """Соседняя временная папка без метки: для проверок отказа."""
+        other = tempfile.TemporaryDirectory(prefix="p6-outside-")
+        self.addCleanup(other.cleanup)
+        return Path(other.name)
+
+    def assert_refused(self, result, *paths):
+        self.assertNotEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+        for path in paths:
+            self.assertFalse((path / "server.py").exists(), path)
 
     def run_copy_only_installer(self, *, enable_sandbox=True, target=None, data=None):
         executable = shutil.which("powershell.exe") or shutil.which("powershell")
@@ -81,13 +97,10 @@ class P6InstallUpdateTests(unittest.TestCase):
         marker.write_text("preserve", encoding="utf-8")
 
         refused = self.run_copy_only_installer(enable_sandbox=False)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertFalse((self.target / "server.py").exists())
-        outside = (Path(os.environ["LOCALAPPDATA"]) / "Temp" / "opencode" /
-                   "stage6-acceptance-outside" / uuid.uuid4().hex / "program")
+        self.assert_refused(refused, self.target)
+        outside = self.unmarked_dir() / "program"
         refused_outside = self.run_copy_only_installer(target=outside)
-        self.assertNotEqual(refused_outside.returncode, 0)
-        self.assertFalse((outside / "server.py").exists())
+        self.assert_refused(refused_outside, outside)
 
         installed = self.run_copy_only_installer()
         self.assertEqual(installed.returncode, 0, installed.stdout.decode("utf-8", "replace")
@@ -111,6 +124,37 @@ class P6InstallUpdateTests(unittest.TestCase):
         self.assertEqual(reopened.db.execute(
             "SELECT schema_version FROM store_meta").fetchone()[0], storage.SCHEMA_VERSION)
         reopened.close()
+
+    def test_copy_only_refuses_data_outside_marked_sandbox(self):
+        data = self.unmarked_dir() / "data"
+        data.mkdir()
+        self.assert_refused(self.run_copy_only_installer(data=data), self.target)
+
+    def test_copy_only_refuses_marker_that_is_not_a_file(self):
+        (self.root / SANDBOX_MARKER).unlink()
+        (self.root / SANDBOX_MARKER).mkdir()
+        self.assert_refused(self.run_copy_only_installer(), self.target)
+
+    def test_copy_only_refuses_target_with_git_or_venv(self):
+        for name in (".git", ".venv"):
+            with self.subTest(name=name):
+                (self.target / name).mkdir()
+                self.assert_refused(self.run_copy_only_installer(), self.target)
+                (self.target / name).rmdir()
+
+    def test_copy_only_refuses_junction_inside_sandbox(self):
+        if os.name != "nt":
+            self.skipTest("Windows junction only")
+        outside = self.unmarked_dir()
+        link = self.root / "link"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], capture_output=True)
+        if made.returncode != 0:
+            self.skipTest("creating junction unavailable")
+        try:
+            target = link / "program"
+            self.assert_refused(self.run_copy_only_installer(target=target), outside / "program", outside)
+        finally:
+            os.rmdir(link)
 
     def test_previous_schema_client_refuses_v4_without_changing_database(self):
         db_path = self.data / "state.sqlite3"

@@ -1,5 +1,7 @@
 """Покусковая диагностика и ограниченный повтор без реальных моделей и записей."""
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -10,6 +12,7 @@ import numpy as np
 
 if "paths" not in sys.modules:
     os.environ["RUS_TRANSCRIBER_DATA"] = tempfile.mkdtemp(prefix="rt-asr-data-")
+    atexit.register(shutil.rmtree, os.environ["RUS_TRANSCRIBER_DATA"], ignore_errors=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import backends as B
 import words as W

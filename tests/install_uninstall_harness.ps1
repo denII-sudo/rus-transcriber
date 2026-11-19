@@ -11,16 +11,18 @@ function global:Get-CimInstance { param([string]$ClassName, [string]$Filter, $Er
 
 function New-Sandbox($tag) {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("uninst-" + $tag + "-" + [guid]::NewGuid().ToString("N").Substring(0,6))
+    $global:Sandboxes += $root
     $env:LOCALAPPDATA = Join-Path $root "local"; $env:APPDATA = Join-Path $root "roaming"
     $env:TEMP = Join-Path $root "temp"; $env:USERPROFILE = $root
     foreach ($d in @($env:LOCALAPPDATA, $env:APPDATA, $env:TEMP)) { New-Item -ItemType Directory $d -Force | Out-Null }
     $t = Join-Path $root "program"; $dd = Join-Path $root "data"; $out = Join-Path $root "outside"
-    foreach ($d in @("$t/.venv/lib", "$t/cache/hf", "$t/tests", "$t/meeting.rus-transcriber", "$dd/groups/g", "$dd/jobs/r.review",
+    foreach ($d in @("$t/.venv/lib", "$t/cache/hf", "$t/tests", "$t/meeting.rus-transcriber", "$t/backup-2026-11-08", "$dd/groups/g", "$dd/jobs/r.review",
                      "$dd/exports", "$dd/_backup-import-1/groups", "$dd/bench", $out)) { New-Item -ItemType Directory $d -Force | Out-Null }
     Set-Content "$t/server.py" "x"; Set-Content "$t/core.py" "x"; Set-Content "$t/tests/t.py" "x"
     Set-Content "$t/.venv/lib/sample.wav" "pkg"; Set-Content "$t/cache/hf/model.bin" "m"
     Set-Content "$t/my-recording.mp3" "audio"; Set-Content "$t/my-recording.transcript.json" "{}"
     Set-Content "$t/meeting.rus-transcriber/meeting.md" "doc"
+    Set-Content "$t/backup-2026-11-08/old.py" "backup"
     Set-Content "$out/precious.txt" "keep"
     try { New-Item -ItemType SymbolicLink -Path "$t/link-out" -Target $out -ErrorAction Stop | Out-Null; $global:HasLink = $true }
     catch { $global:HasLink = $false }      # нет прав на ссылки — эту часть проверки пропускаем
@@ -39,9 +41,10 @@ function Run($sb, [string[]]$extra, [string]$scriptPath = $Script) {
     $a = @{ Uninstall = $true; Target = $sb.t; DataDir = $sb.dd }
     foreach ($x in $extra) { $a[$x.TrimStart("-")] = $true }
     $o = "" | & $scriptPath @a *>&1 | Out-String
-    return @{ code = $LASTEXITCODE; out = ($o -replace '\s+', ' ') }
+    return @{ code = $LASTEXITCODE; out = ($o -replace '\s+', '') }
 }
 $global:FakeProcs = @()
+$global:Sandboxes = @()
 
 # A: без ключей и без терминала — ничего не меняется
 $s = New-Sandbox "a"; $r = Run $s @()
@@ -66,6 +69,7 @@ Check "C venv and cache removed (incl. package wav)" (-not (Test-Path "$($s.t)/.
 Check "C user audio in program kept" (Test-Path "$($s.t)/my-recording.mp3")
 Check "C transcript in program kept" (Test-Path "$($s.t)/my-recording.transcript.json")
 Check "C sidecar folder kept" (Test-Path "$($s.t)/meeting.rus-transcriber/meeting.md")
+Check "C backup folder in program kept" (Test-Path "$($s.t)/backup-2026-11-08/old.py")
 Check "C link removed, target untouched" ((-not $global:HasLink) -or (-not (Test-Path "$($s.t)/link-out") -and (Test-Path "$($s.out)/precious.txt")))
 Check "C service data removed" (-not (Test-Path "$($s.dd)/groups") -and -not (Test-Path "$($s.dd)/config.json") -and -not (Test-Path "$($s.dd)/bench") -and -not (Test-Path "$($s.dd)/jobs/1.log"))
 Check "C db, exports, backups kept" ((Test-Path "$($s.dd)/state.sqlite3") -and (Test-Path "$($s.dd)/exports/e.zip") -and (Test-Path "$($s.dd)/_backup-import-1/groups/v.json"))
@@ -73,12 +77,13 @@ Check "C review clip in jobs kept" (Test-Path "$($s.dd)/jobs/r.review/clip.mp3")
 $c = Get-Content $s.cfg -Raw | ConvertFrom-Json
 Check "C entry removed, other server kept" (-not ($c.mcpServers.PSObject.Properties.Name -contains "rus-transcriber") -and ($c.mcpServers.PSObject.Properties.Name -contains "other"))
 Check "C config backups removed" (-not (Get-ChildItem "$($s.cfg).bak-*" -ErrorAction SilentlyContinue))
-Check "C report lists kept files" ($r.out -match "сохранены ваши файлы")
+Check "C report lists kept files" ($r.out -match "сохраненывашифайлы")
 
 # D: программа удаляется, данные и копии — нет
 $s = New-Sandbox "d"; $r = Run $s @("-Yes", "-KeepData")
 Check "D exit 0" ($r.code -eq 0)
 Check "D program removed" (-not (Test-Path "$($s.t)/server.py"))
+Check "D backup folder in program kept" (Test-Path "$($s.t)/backup-2026-11-08/old.py")
 Check "D data untouched" ((Test-Path "$($s.dd)/groups/g/voices.json") -and (Test-Path "$($s.dd)/config.json"))
 Check "D backups kept (incl. new one)" (@(Get-ChildItem "$($s.cfg).bak-*").Count -ge 2)
 
@@ -101,7 +106,7 @@ Check "G refuses on broken config" ($r.code -eq 1 -and (Test-Path "$($s.t)/serve
 # H: в папке программы есть .git — удаление отказывает, ничего не трогает
 $s = New-Sandbox "h"; New-Item -ItemType Directory "$($s.t)/.git" | Out-Null; Set-Content "$($s.t)/.git/HEAD" "ref"
 $r = Run $s @("-Yes", "-RemoveData", "-RemoveConfigBackups")
-Check "H uninstall refuses with .git (code 1)" ($r.code -eq 1 -and $r.out -match "рабочая копия")
+Check "H uninstall refuses with .git (code 1)" ($r.code -eq 1 -and $r.out -match "рабочаякопия")
 Check "H program, git, data, entry intact" ((Test-Path "$($s.t)/server.py") -and (Test-Path "$($s.t)/.git/HEAD") -and (Test-Path "$($s.dd)/config.json") -and ((Get-Content $s.cfg -Raw) -match "rus-transcriber"))
 
 # I: установка из другой папки в папку с .git — отказ до любых шагов
@@ -109,14 +114,19 @@ $s = New-Sandbox "i"; New-Item -ItemType Directory "$($s.t)/.git" | Out-Null
 $src = Join-Path $s.root "src"; New-Item -ItemType Directory $src | Out-Null; Copy-Item $Script "$src/install.ps1"
 $o = "" | & "$src/install.ps1" -Target $s.t -DataDir $s.dd -SkipClaudeConfig *>&1 | Out-String
 $code = $LASTEXITCODE
-$o = $o -replace '\s+', ' '      # консоль Windows переносит длинные строки — сравниваем без переносов
+$o = $o -replace '\s+', ''      # консоль Windows переносит длинные строки (даже посреди слова) — сравниваем без пробелов
 Check "I install exit code 1" ($code -eq 1)
-Check "I install message about git working copy" ($o -match "рабочая копия разработки")
-Check "I install stopped before step 1" ($o -notmatch "Проверка места")
-if (-not ($code -eq 1 -and $o -match "рабочая копия разработки" -and $o -notmatch "Проверка места")) {
+Check "I install message about git working copy" ($o -match "рабочаякопияразработки")
+Check "I install stopped before step 1" ($o -notmatch "Проверкаместа")
+if (-not ($code -eq 1 -and $o -match "рабочаякопияразработки" -and $o -notmatch "Проверкаместа")) {
     $global:Diag = "---- I: code=$code, output ----`n" + ($o.Substring([Math]::Max(0, $o.Length - 3000)))
 }
 Check "I target untouched" ((Test-Path "$($s.t)/core.py") -and -not (Test-Path "$($s.t)/install.ps1"))
+
+# временные папки сценариев больше не нужны; .NET удаляет ссылки, не переходя по ним
+foreach ($root in $global:Sandboxes) {
+    if (Test-Path -LiteralPath $root) { try { [IO.Directory]::Delete($root, $true) } catch { "не удалось удалить временную папку: $root" } }
+}
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 if ($global:Diag) { $global:Diag }

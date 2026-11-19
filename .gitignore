@@ -34,6 +34,8 @@ rus-transcriber.vocab.json
 forbidden_words.txt
 backup*/
 Claude outputs/
+# рабочие копии Git, которые создаёт Claude Code
+.claude/worktrees/
 
 # следы запуска MCP Inspector (npx)
 @modelcontextprotocol/
