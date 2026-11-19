@@ -322,5 +322,113 @@ class DefaultsTests(unittest.TestCase):
             self.assertIn(key, bench.CONFIG_KEYS, key)
 
 
+class ExperimentalVariantTests(unittest.TestCase):
+    """18.11.2026: среды исполнения v3 на CPU и GigaAM Multilingual — только по --only;
+    эксперименты (int8, Multilingual) измеряются, но не выбираются и не пишутся в config.json."""
+
+    def test_new_variants_are_not_in_default_run(self):
+        ids = [v["id"] for v in bench.select_variants("", npu=NPU_NEW, providers=[])]
+        for new in ("ov-cpu", "ctc-ov-cpu", "onnx-cpu-int8", "ctc-cpu-int8", "ml-cpu", "ml-large-cpu"):
+            self.assertNotIn(new, ids, new)
+
+    def test_groups_expand(self):
+        ids = [v["id"] for v in bench.select_variants("multilingual", npu=NPU_METEOR)]
+        self.assertIn("ml-large-cpu", ids)
+        self.assertIn("onnx-cpu", ids)      # эталон RNN-T для голосования
+        self.assertIn("ctc-cpu", ids)       # эталон CTC для голосования
+        ids = [v["id"] for v in bench.select_variants("cpu-runtime", npu=NPU_METEOR)]
+        self.assertEqual(set(ids), {"onnx-cpu", "ov-cpu", "onnx-cpu-int8",
+                                    "ctc-cpu", "ctc-ov-cpu", "ctc-cpu-int8"})
+
+    def test_group_variants_exist(self):
+        known = {v["id"] for v in bench.VARIANTS}
+        for name, group in bench.GROUPS.items():
+            for vid in group.split(","):
+                self.assertIn(vid, known, f"{name}: {vid}")
+
+    def test_multilingual_runs_after_whisper_on_cpu(self):
+        ids = [v["id"] for v in bench.select_variants("ml-large-cpu,whisper-ct2,onnx-cpu", npu=NPU_METEOR)]
+        self.assertEqual(ids, ["onnx-cpu", "whisper-ct2", "ml-large-cpu"])
+
+    def test_multilingual_models_have_onnx_names(self):
+        import backends
+        self.assertEqual(backends.ONNX_NAMES["multilingual_ctc"], "gigaam-multilingual-ctc")
+        self.assertEqual(backends.ONNX_NAMES["multilingual_large_ctc"], "gigaam-multilingual-large-ctc")
+
+    def test_experiment_is_never_chosen(self):
+        results = [
+            {"id": "onnx-cpu", "family": "rnnt", "device": "CPU", "rtfx": 30.0,
+             "similarity": 1.0, "text": "раз два"},
+            {"id": "onnx-cpu-int8", "family": "rnnt", "device": "CPU", "rtfx": 60.0,
+             "similarity": 1.0, "text": "раз два", "experimental": True},
+        ]
+        self.assertEqual(bench.best_of(results, "rnnt")["id"], "onnx-cpu")
+        self.assertEqual(bench.most_accurate(results, "rnnt")["id"], "onnx-cpu")
+        self.assertEqual(bench.choice_summary(results, "rnnt", 0.97)["fastest"]["id"], "onnx-cpu")
+
+    def test_openvino_cpu_can_be_chosen_and_saved(self):
+        v = next(x for x in bench.VARIANTS if x["id"] == "ov-cpu")
+        r = {"id": "ov-cpu", "family": "rnnt", "device": "CPU", "rtfx": 40.0,
+             "similarity": 1.0, "text": "раз два"}
+        best = bench.merge_variant(bench.best_of([r], "rnnt"), [v])
+        saved = bench.saved_settings(best)
+        self.assertEqual(saved["asr_backend"], "openvino")
+        self.assertEqual(saved["asr_device"], "CPU")
+        self.assertFalse(saved["asr_allow_npu"])
+
+    def test_multilingual_is_never_saved(self):
+        results = [{"id": "ml-large-cpu", "family": "multilingual", "device": "CPU", "rtfx": 20.0,
+                    "similarity": 0.9, "text": "раз два", "experimental": True}]
+        self.assertIsNone(bench.best_of(results, "multilingual", 0.0))
+        self.assertIsNone(bench.most_accurate(results, "multilingual"))
+        self.assertEqual(bench.saved_settings(None, None, None), {})
+
+    def test_multilingual_is_compared_to_main_pass(self):
+        results = [
+            {"id": "onnx-cpu", "family": "rnnt", "device": "CPU", "text": "раз два три"},
+            {"id": "onnx-cpu-int8", "family": "rnnt", "device": "CPU", "text": "раз два",
+             "experimental": True},
+            {"id": "ml-large-cpu", "family": "multilingual", "device": "CPU", "text": "раз два три",
+             "experimental": True},
+        ]
+        refs = bench.family_refs(results)
+        self.assertEqual(refs["multilingual"]["id"], "onnx-cpu")
+        self.assertEqual(refs["rnnt"]["id"], "onnx-cpu")
+
+    def test_reference_is_not_an_experiment(self):
+        # int8 идёт раньше fp32 в списке — эталоном всё равно должен стать fp32
+        results = [
+            {"id": "ctc-cpu-int8", "family": "ctc", "device": "CPU", "text": "раз", "experimental": True},
+            {"id": "ctc-cpu", "family": "ctc", "device": "CPU", "text": "раз два"},
+        ]
+        self.assertEqual(bench.family_refs(results)["ctc"]["id"], "ctc-cpu")
+
+
+class TiebreakTests(unittest.TestCase):
+    def test_third_model_sides_with_rnnt_or_ctc(self):
+        main = "мама мыла раму вчера вечером"
+        ctc = "мама мила раму вчера утром"
+        third = "мама мыла раму вчера утром"
+        vt = bench.tiebreak_stats(main, ctc, third)
+        self.assertEqual(vt["contested"], 2)    # «мыла» и «вечером»
+        self.assertEqual(vt["for_rnnt"], 1)     # «мыла» подтверждено
+        self.assertEqual(vt["for_ctc"], 1)      # «вечером» → «утром»
+        self.assertEqual(vt["unresolved"], 0)
+
+    def test_all_three_disagree(self):
+        vt = bench.tiebreak_stats("раз два три", "раз пять три", "раз шесть три")
+        self.assertEqual(vt, {"contested": 1, "for_rnnt": 0, "for_ctc": 0, "unresolved": 1,
+                              "inserted": 0})
+
+    def test_case_and_punctuation_do_not_matter(self):
+        # e2e-модели пишут с заглавной и знаками, Multilingual — строчными без знаков
+        vt = bench.tiebreak_stats("Раз, два.", "раз пять", "раз два")
+        self.assertEqual((vt["contested"], vt["for_rnnt"]), (1, 1))
+
+    def test_empty_texts(self):
+        vt = bench.tiebreak_stats("", "", "")
+        self.assertEqual(vt["contested"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

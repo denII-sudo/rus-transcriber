@@ -38,7 +38,9 @@ import download_hint  # noqa: E402
 SR = 16000
 
 RNNT, CTC, WHISPER, TORCH = "rnnt", "ctc", "whisper", "torch"
-RUN_ORDER = {TORCH: 0, RNNT: 1, CTC: 2, WHISPER: 3}
+# GigaAM Multilingual — кандидат в третью модель голосования; только измеряется, в config.json не пишется
+ML = "multilingual"
+RUN_ORDER = {TORCH: 0, RNNT: 1, CTC: 2, WHISPER: 3, ML: 4}
 DEVICE_ORDER = {"CPU": 0, "GPU": 1, "NPU": 2}
 
 VARIANTS = [
@@ -89,6 +91,45 @@ VARIANTS = [
      "label": "Whisper, faster-whisper (int8)"},
     {"id": "whisper-dml", "family": WHISPER, "device": "GPU", "asr_backend": "dml",
      "asr_quant": "int8", "label": "Whisper, DirectML (int8)"},
+
+    # Другие среды исполнения GigaAM v3 на процессоре. Только по --only (в DEFAULT_SET не входят).
+    # OpenVINO EP на CPU — путь по умолчанию при asr_backend=auto, но раньше тестом не измерялся;
+    # он может быть выбран и сохранён, как любой вариант своего семейства.
+    {"id": "ov-cpu", "family": RNNT, "device": "CPU", "asr_backend": "openvino", "asr_device": "CPU",
+     "label": "RNN-T, процессор через OpenVINO"},
+    {"id": "ctc-ov-cpu", "family": CTC, "device": "CPU", "asr_backend": "openvino", "asr_device": "CPU",
+     "asr_model": "v3_e2e_ctc", "label": "CTC, процессор через OpenVINO"},
+    # int8 — эксперимент: квантизация основного/второго прохода в config.json не сохраняется,
+    # поэтому такой вариант не выбирается, а только показывается рядом с fp32
+    {"id": "onnx-cpu-int8", "family": RNNT, "device": "CPU", "asr_backend": "onnx-cpu",
+     "quant": "int8", "experimental": True, "label": "RNN-T, процессор, int8 (эксперимент)"},
+    {"id": "ctc-cpu-int8", "family": CTC, "device": "CPU", "asr_backend": "onnx-cpu",
+     "asr_model": "v3_e2e_ctc", "quant": "int8", "experimental": True,
+     "label": "CTC, процессор, int8 (эксперимент)"},
+
+    # GigaAM Multilingual (CTC, без пунктуации) — кандидат в третью модель вместо Whisper.
+    # Сверяется с основным проходом, как Whisper; в config.json не пишется ни при каком результате.
+    {"id": "ml-cpu", "family": ML, "device": "CPU", "asr_backend": "onnx-cpu",
+     "asr_model": "multilingual_ctc", "experimental": True,
+     "label": "Multilingual 220M, процессор"},
+    {"id": "ml-cpu-int8", "family": ML, "device": "CPU", "asr_backend": "onnx-cpu",
+     "asr_model": "multilingual_ctc", "quant": "int8", "experimental": True,
+     "label": "Multilingual 220M, процессор, int8"},
+    {"id": "ml-large-cpu", "family": ML, "device": "CPU", "asr_backend": "onnx-cpu",
+     "asr_model": "multilingual_large_ctc", "experimental": True,
+     "label": "Multilingual large 600M, процессор"},
+    {"id": "ml-large-cpu-int8", "family": ML, "device": "CPU", "asr_backend": "onnx-cpu",
+     "asr_model": "multilingual_large_ctc", "quant": "int8", "experimental": True,
+     "label": "Multilingual large 600M, процессор, int8"},
+    {"id": "ml-large-ov-cpu", "family": ML, "device": "CPU", "asr_backend": "openvino", "asr_device": "CPU",
+     "asr_model": "multilingual_large_ctc", "experimental": True,
+     "label": "Multilingual large 600M, процессор через OpenVINO"},
+    {"id": "ml-large-gpu", "family": ML, "device": "GPU", "asr_backend": "openvino", "asr_device": "GPU",
+     "asr_model": "multilingual_large_ctc", "experimental": True,
+     "label": "Multilingual large 600M, видеокарта Arc"},
+    {"id": "ml-large-dml", "family": ML, "device": "GPU", "asr_backend": "dml",
+     "asr_model": "multilingual_large_ctc", "experimental": True,
+     "label": "Multilingual large 600M, DirectML"},
 ]
 
 DEFAULT_SET = ("torch-cpu,onnx-cpu,onnx-cpu-b8,onnx-cpu-b16,"
@@ -96,6 +137,14 @@ DEFAULT_SET = ("torch-cpu,onnx-cpu,onnx-cpu-b8,onnx-cpu-b16,"
                "ctc-cpu,ctc-cpu-b8,ctc-gpu,ctc-gpu-b8")
 DEFAULT_WHISPER = "whisper-gpu,whisper-cpu,whisper-ct2,whisper-dml"
 DEFAULT_NPU = "ov-npu-pad22,ctc-npu-pad22"
+# Наборы для --only: имя группы раскрывается в список вариантов. Эталоны (onnx-cpu, ctc-cpu)
+# включены, чтобы совпадение и голосование считались относительно обычного fp32-прохода.
+GROUPS = {
+    "cpu-runtime": "onnx-cpu,ov-cpu,onnx-cpu-int8,ctc-cpu,ctc-ov-cpu,ctc-cpu-int8",
+    "multilingual": "onnx-cpu,ctc-cpu,whisper-ct2,ml-cpu,ml-cpu-int8,ml-large-cpu,"
+                    "ml-large-cpu-int8,ml-large-ov-cpu",
+    "multilingual-gpu": "onnx-cpu,ctc-cpu,ml-large-cpu,ml-large-gpu,ml-large-dml",
+}
 
 CONFIG_KEYS = ("asr_backend", "asr_device", "pad_to_seconds", "asr_model", "asr_batch",
                "asr_allow_npu", "asr_second_backend", "asr_second_device", "asr_second_batch",
@@ -132,7 +181,10 @@ def select_variants(only="", npu=None, with_whisper=True, providers=None):
         from backends import available_providers as _ap
         providers = _ap()
     dml_ok = providers is None or "DmlExecutionProvider" in providers
-    ids = [x.strip() for x in (only or DEFAULT_SET).split(",") if x.strip()]
+    ids = []
+    for x in (only or DEFAULT_SET).split(","):
+        x = x.strip()
+        ids += [y.strip() for y in GROUPS[x].split(",")] if x in GROUPS else ([x] if x else [])
     if not only:
         if with_whisper:
             ids += [x.strip() for x in DEFAULT_WHISPER.split(",")]
@@ -214,7 +266,8 @@ def fmt_seconds(sec):
 def choice_summary(results, family, threshold):
     """Три ориентира для человека: точнее всего, быстрее всего в пределах порога, самое быстрое вообще."""
     usable = [r for r in results
-              if r.get("family") == family and r.get("rtfx") and r.get("text", "").strip()]
+              if r.get("family") == family and r.get("rtfx") and r.get("text", "").strip()
+              and not r.get("experimental")]
     if not usable:
         return {"accurate": None, "fast_ok": None, "fastest": None}
     accurate = max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"]))
@@ -263,6 +316,7 @@ def run_one(variant, npy, model, chunk_max):
         prov = {"onnx-cpu": "cpu"}.get(variant["asr_backend"], variant["asr_backend"])
         asr = OnnxASR(model, device=variant.get("asr_device", "CPU"), provider=prov,
                       pad_to=variant.get("pad_to_seconds", 0), batch=variant.get("asr_batch", 1),
+                      quant=variant.get("quant") or None,
                       allow_npu=bool(variant.get("allow_npu", False)))
     # прогрев: первая компиляция/загрузка не должна попадать в замер скорости
     t_first = time.time()
@@ -285,9 +339,10 @@ def run_one(variant, npy, model, chunk_max):
 
 
 def best_of(results, family, min_similarity=0.97):
+    """Самый быстрый вариант семейства в пределах порога; эксперименты не выбираются никогда."""
     ok = [r for r in results
           if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
-          and r.get("similarity", 1) >= min_similarity]
+          and r.get("similarity", 1) >= min_similarity and not r.get("experimental")]
     return max(ok, key=lambda r: r["rtfx"]) if ok else None
 
 
@@ -299,7 +354,8 @@ def most_accurate(results, family):
     или потерявший речь вариант проигрывает по этому же совпадению.
     """
     usable = [r for r in results
-              if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()]
+              if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
+              and not r.get("experimental")]
     return max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"])) if usable else None
 
 
@@ -325,16 +381,44 @@ def family_refs(results):
     первый вариант этого семейства на процессоре.
     """
     refs = {}
-    for fam in (RNNT, CTC, WHISPER):
+    for fam in (RNNT, CTC, WHISPER, ML):
         cands = [r for r in results if r.get("family") == fam and r.get("text", "").strip()]
-        cpu = [r for r in cands if str(r.get("device", "")).upper() == "CPU"]
-        refs[fam] = (cpu or cands)[0] if cands else None
+        # эталон семейства — обычный вариант (fp32), а не эксперимент: иначе int8 сверялся бы сам с собой
+        plain = [r for r in cands if not r.get("experimental")] or cands
+        cpu = [r for r in plain if str(r.get("device", "")).upper() == "CPU"]
+        refs[fam] = (cpu or plain)[0] if plain else None
     torch = [r for r in results if r.get("family") == TORCH and r.get("text", "").strip()]
     if torch:                      # PyTorch — исходная модель: лучший эталон точности для RNN-T
         refs[RNNT] = torch[0]
     if refs.get(RNNT):
         refs[WHISPER] = refs[RNNT]
+        refs[ML] = refs[RNNT]      # Multilingual — другая модель, как и Whisper: сверка с основным проходом
     return refs
+
+
+def tiebreak_stats(main_text, ctc_text, third_text):
+    """Чем третья модель помогла бы голосованию «два из трёх» (words.vote3) на этих текстах.
+
+    contested — слова RNN-T, с которыми CTC не согласен (только там третья модель что-то решает);
+    for_rnnt — из них третья модель согласна с RNN-T; for_ctc — согласна с CTC (vote3 заменил бы
+    слово); unresolved — разошлись все три (останется спорным для человека).
+    Это согласие моделей между собой, а не точность: эталонной расшифровки человеком здесь нет.
+    Числа e2e-моделей пишут цифрами, а Multilingual — словами, поэтому числа попадают в unresolved.
+    """
+    import copy
+    import words as W
+    main = [{"w": w, "s": 0.0, "e": 0.0} for w in (main_text or "").split()]
+    ctc = [{"w": w, "s": 0.0, "e": 0.0} for w in (ctc_text or "").split()]
+    third = (third_text or "").split()
+    a = [W.norm_word(w["w"]) for w in main]
+    ag_ctc, _ = W._ops(a, [W.norm_word(w["w"]) for w in ctc])
+    ag_third, _ = W._ops(a, [W.norm_word(w) for w in third])
+    contested = sum(1 for x in ag_ctc if not x)
+    for_rnnt = sum(1 for x, y in zip(ag_ctc, ag_third) if not x and y)
+    voted = copy.deepcopy(main)
+    st = W.vote3(voted, copy.deepcopy(ctc), third)
+    return {"contested": contested, "for_rnnt": for_rnnt, "for_ctc": st["replaced"],
+            "unresolved": st["disputed"], "inserted": st["inserted"]}
 
 
 
@@ -378,7 +462,8 @@ def main():
     ap.add_argument("audio", nargs="?")
     ap.add_argument("--seconds", type=int, default=180, help="сколько секунд записи взять для теста")
     ap.add_argument("--timeout", type=int, default=900, help="лимит на один вариант, с")
-    ap.add_argument("--only", default="", help="через запятую id вариантов")
+    ap.add_argument("--only", default="",
+                    help="через запятую id вариантов или группы: " + ", ".join(GROUPS))
     ap.add_argument("--no-write", action="store_true", help="не менять config.json")
     ap.add_argument("--no-whisper", action="store_true", help="не проверять Whisper")
     ap.add_argument("--no-npu", action="store_true", help="не проверять NPU, даже если он поддерживает FP32")
@@ -435,6 +520,8 @@ def main():
                    json.dumps(v, ensure_ascii=False), "--npy", str(npy), "--model", a.model,
                    "--chunk-max", str(a.chunk_max)]
             r = {"id": v["id"], "label": v["label"], "family": v["family"], "device": device_of(v)}
+            if v.get("experimental"):
+                r["experimental"] = True
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                    errors="replace", timeout=a.timeout, cwd=str(HERE))
@@ -464,6 +551,14 @@ def main():
                 {"words": len(norm(r["text"])), "missing": 0, "extra": 0, "changed": 0}
             r.update(stats)
             r["total_10min"] = time_for(r.get("load_sec"), r.get("rtfx"))
+        # польза кандидата в третью модель: считается, только если есть и RNN-T, и CTC
+        vote_ok = bool(refs.get(RNNT) and refs.get(CTC))
+        if vote_ok:
+            import words as W
+            for r in results:
+                if r.get("family") in (WHISPER, ML) and r.get("text", "").strip():
+                    third = W.clean_whisper(r["text"])[0] if r["family"] == WHISPER else r["text"]
+                    r["vote"] = tiebreak_stats(refs[RNNT]["text"], refs[CTC]["text"], third)
 
         main_family = CTC if "ctc" in str(a.model).lower() else RNNT
         best_main = best_of(results, main_family, threshold)
@@ -507,11 +602,39 @@ def main():
                 mark = "**выбран для CTC**"
             elif best_whisper is r:
                 mark = "**выбран для Whisper**"
-            if r.get("family") != WHISPER and r.get("similarity", 1) < threshold:
-                # порог — про точность GigaAM; у Whisper шкала другая, к нему он не применяется
+            if r.get("family") not in (WHISPER, ML) and r.get("similarity", 1) < threshold:
+                # порог — про точность GigaAM v3; у Whisper и Multilingual шкала другая
                 mark = f"ниже порога {threshold * 100:.0f}%"
+            if r.get("experimental"):
+                mark = (mark + "; " if mark else "") + "эксперимент, не сохраняется"
             lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
                          f"{sim} | {words} | {mark} |")
+
+        voters = [r for r in results if r.get("vote")]
+        if voters:
+            lines += ["", "## Третья модель в голосовании «два из трёх»",
+                      f"Спорные слова — где CTC (`{refs[CTC]['id']}`) не согласен с RNN-T "
+                      f"(`{refs[RNNT]['id']}`): только там третья модель что-то решает. «За RNN-T» — "
+                      "подтвердила слово основного прохода, «за CTC» — голосование заменило бы слово, "
+                      "«не решено» — разошлись все три, слово останется спорным для человека; «добавлено» — "
+                      "слова, которые RNN-T пропустил, а CTC и третья модель услышали одинаково. "
+                      "Это согласие моделей между собой, а не проверка точности по расшифровке человека. "
+                      "Числа e2e-модели пишут цифрами, Multilingual — словами: они попадают в «не решено».",
+                      "",
+                      "| Третья модель | Скорость | 10 мин записи | Совпадение с RNN-T | Спорных | "
+                      "За RNN-T | За CTC | Не решено | Добавлено |",
+                      "|---|---|---|---|---|---|---|---|---|"]
+            for r in voters:
+                vt = r["vote"]
+                n = max(vt["contested"], 1)
+                lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
+                             f"{r.get('similarity', 0) * 100:.1f}% | {vt['contested']} | "
+                             f"{vt['for_rnnt']} ({vt['for_rnnt'] * 100 / n:.0f}%) | "
+                             f"{vt['for_ctc']} ({vt['for_ctc'] * 100 / n:.0f}%) | "
+                             f"{vt['unresolved']} ({vt['unresolved'] * 100 / n:.0f}%) | {vt['inserted']} |")
+        elif any(r.get("family") == ML and r.get("text", "").strip() for r in results):
+            lines += ["", "Multilingual: голосование не оценено — нужны и RNN-T, и CTC "
+                          "(добавьте onnx-cpu,ctc-cpu в --only или используйте группу multilingual)."]
 
         if any(r.get("cert_error") for r in results):
             lines += ["", "**Ошибки сертификата:** сервер моделей не прошёл проверку TLS. "

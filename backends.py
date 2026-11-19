@@ -25,7 +25,30 @@ HERE = Path(__file__).resolve().parent
 
 # имена одной и той же модели в двух пакетах
 ONNX_NAMES = {"v3_e2e_rnnt": "gigaam-v3-e2e-rnnt", "v3_e2e_ctc": "gigaam-v3-e2e-ctc",
-              "v3_rnnt": "gigaam-v3-rnnt", "v3_ctc": "gigaam-v3-ctc"}
+              "v3_rnnt": "gigaam-v3-rnnt", "v3_ctc": "gigaam-v3-ctc",
+              # GigaAM Multilingual (onnx-asr >= 0.12): только CTC, текст строчными без пунктуации;
+              # пока используется только в тесте скорости как кандидат в третью модель голосования
+              "multilingual_ctc": "gigaam-multilingual-ctc",
+              "multilingual_large_ctc": "gigaam-multilingual-large-ctc"}
+
+# fp32-модели больше 2 ГБ хранят веса в отдельном файле *.onnx.data. В кэше Hugging Face он —
+# символическая ссылка в общую папку blobs, и ONNX Runtime 1.24 отказывается его читать
+# («External data path ... escapes model directory»). Такие модели скачиваются обычными файлами
+# в свою папку и загружаются оттуда. Имя onnx-asr -> (репозиторий, имя файла модели без .onnx).
+EXTERNAL_DATA_MODELS = {
+    "gigaam-multilingual-large-ctc": ("istupakov/gigaam-multilingual-large-ctc-onnx",
+                                      "multilingual_large_ctc"),
+}
+
+
+def _plain_model_dir(name):
+    """Папка с обычными (не ссылками) файлами fp32-модели; докачивает недостающее."""
+    from huggingface_hub import snapshot_download
+    repo, stem = EXTERNAL_DATA_MODELS[name]
+    target = paths.CACHE / "onnx-models" / name
+    snapshot_download(repo, local_dir=str(target),
+                      allow_patterns=["config.json", "*vocab*.txt", f"{stem}.onnx", f"{stem}.onnx.data"])
+    return target
 
 
 def _ort_windows_openvino_libs():
@@ -265,7 +288,10 @@ class OnnxASR:
             self.name += f":b{self.batch}"
         self.language = language
         kw = {"quantization": quant} if quant else {}
-        self.model = onnx_asr.load_model(ONNX_NAMES.get(model, model), providers=providers, **kw)
+        onnx_name = ONNX_NAMES.get(model, model)
+        if not quant and onnx_name in EXTERNAL_DATA_MODELS:
+            kw["path"] = _plain_model_dir(onnx_name)
+        self.model = onnx_asr.load_model(onnx_name, providers=providers, **kw)
         if provider == "openvino":
             # onnxruntime умеет молча выбросить OpenVINO EP и посчитать на CPU, не сообщив
             # об ошибке. Тогда «GPU» в статусе — неправда, и откат на следующий бэкенд

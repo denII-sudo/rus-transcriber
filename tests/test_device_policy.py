@@ -108,5 +108,39 @@ class NpuGuardTests(unittest.TestCase):
         self.assertEqual(backends.actual_providers(object()), [])
 
 
+class ExternalDataModelTests(unittest.TestCase):
+    """19.11.2026: fp32 Multilingual large (веса в *.onnx.data) из кэша Hugging Face со ссылками
+    ONNX Runtime 1.24 не загружает — такая модель берётся из папки с обычными файлами."""
+
+    def _load(self, model, quant=None):
+        calls = []
+        fake = mock.MagicMock()
+        fake.load_model.side_effect = lambda name, **kw: calls.append((name, kw)) or mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"onnx_asr": fake}), \
+                mock.patch.object(backends, "_ort_windows_openvino_libs"), \
+                mock.patch.object(backends, "available_providers", return_value=["CPUExecutionProvider"]), \
+                mock.patch.object(backends, "_plain_model_dir", return_value=Path("plain")) as plain:
+            backends.OnnxASR(model, provider="cpu", quant=quant)
+        return calls[0], plain.called
+
+    def test_fp32_large_uses_plain_folder(self):
+        (name, kw), plain = self._load("multilingual_large_ctc")
+        self.assertEqual(name, "gigaam-multilingual-large-ctc")
+        self.assertEqual(kw.get("path"), Path("plain"))
+        self.assertTrue(plain)
+
+    def test_int8_large_uses_hub_cache(self):
+        (name, kw), plain = self._load("multilingual_large_ctc", quant="int8")
+        self.assertNotIn("path", kw)
+        self.assertEqual(kw.get("quantization"), "int8")
+        self.assertFalse(plain)
+
+    def test_v3_is_unchanged(self):
+        (name, kw), plain = self._load("v3_e2e_rnnt")
+        self.assertEqual(name, "gigaam-v3-e2e-rnnt")
+        self.assertNotIn("path", kw)
+        self.assertFalse(plain)
+
+
 if __name__ == "__main__":
     unittest.main()
