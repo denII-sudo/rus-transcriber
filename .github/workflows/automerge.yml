@@ -31,10 +31,12 @@ jobs:
         shell: bash
         run: |
           prs="$(gh pr list --repo "$REPOSITORY" --state open --base main --limit 1000 \
-            --json number,headRefOid \
-            --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\") | .number")"
+            --json number,headRefOid,isDraft \
+            --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\" and .isDraft == false) | .number")"
           if [ -z "$prs" ]; then
-            echo "No open pull request for tested commit ${TESTED_SHA}."
+            # Draft PRs are left alone: GitHub refuses auto-merge for drafts.
+            # Marking a PR ready for review re-runs Tests, which queues it here.
+            echo "No open non-draft pull request for tested commit ${TESTED_SHA}."
             exit 0
           fi
           while IFS= read -r pr; do
