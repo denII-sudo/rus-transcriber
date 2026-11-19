@@ -15,7 +15,9 @@
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptanceCopyOnly -Target <sandbox>\program
       -DataDir <sandbox>\data -SkipClaudeConfig
       только копирование runtime-файлов для локальной приёмки; требует
-      RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1 и пути внутри %LOCALAPPDATA%\Temp\opencode\stage6-acceptance.
+      RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1, а обе папки должны лежать внутри одной изолированной
+      папки с файлом-меткой rus-transcriber-acceptance.sandbox (её создаёт тест приёмки во временной
+      папке). Настоящие папки программы и данных, а также ссылки (junction/symlink) не принимаются.
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
       сначала проверяет, что программа не работает, и показывает, что будет удалено;
@@ -156,19 +158,70 @@ if ($DataDir -eq $Target -or $DataDir.StartsWith($Target + "\", [StringCompariso
     Fail "Папка данных ($DataDir) не может лежать внутри папки программы ($Target): при обновлении она бы потерялась. Укажите другую через -DataDir."
 }
 if ($AcceptanceCopyOnly) {
-    $acceptanceRoot = [IO.Path]::GetFullPath(
-        (Join-Path $env:LOCALAPPDATA "Temp\opencode\stage6-acceptance")).TrimEnd("\")
-    $acceptancePrefix = $acceptanceRoot + "\"
+    # Режим приёмки работает только в изолированной папке, помеченной файлом-меткой. Фиксированного
+    # пути нет: такая папка создаётся во временной папке на любом компьютере (тест, self_check, CI).
+    $markerName = "rus-transcriber-acceptance.sandbox"
+    $Target = [IO.Path]::GetFullPath($Target).TrimEnd("\")
+    $DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd("\")
+    function Test-Inside([string]$path, [string]$root) {
+        return $path.StartsWith($root.TrimEnd("\") + "\", [StringComparison]::OrdinalIgnoreCase)
+    }
+    function Test-Overlap([string]$a, [string]$b) {
+        return ($a -ieq $b) -or (Test-Inside $a $b) -or (Test-Inside $b $a)
+    }
+    # ближайшая родительская папка Target, в которой лежит метка
+    $sandboxRoot = $null
+    $dir = Split-Path $Target -Parent
+    while ($dir) {
+        if (Test-Path -LiteralPath (Join-Path $dir $markerName)) { $sandboxRoot = $dir.TrimEnd("\"); break }
+        $parent = Split-Path $dir -Parent
+        if (-not $parent -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    if (-not $sandboxRoot) {
+        Fail "-AcceptanceCopyOnly разрешён только внутри изолированной папки с файлом-меткой $markerName (её создаёт тест приёмки)."
+    }
+    $markerItem = Get-Item -LiteralPath (Join-Path $sandboxRoot $markerName) -Force
+    if ($markerItem.PSIsContainer -or ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Fail "Метка $markerName должна быть обычным файлом: $($markerItem.FullName)"
+    }
+    if (-not (Test-Inside $DataDir $sandboxRoot)) {
+        Fail "-AcceptanceCopyOnly: папка данных должна лежать в той же изолированной папке ($sandboxRoot)."
+    }
+    # ни одна существующая папка на пути от метки до Target и DataDir не может быть ссылкой:
+    # иначе копирование ушло бы за пределы изолированной папки
     foreach ($path in @($Target, $DataDir)) {
-        if (-not $path.StartsWith($acceptancePrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            Fail "-AcceptanceCopyOnly разрешён только внутри $acceptanceRoot."
-        }
-        if (Test-Path $path -PathType Container) {
-            $item = Get-Item $path -Force
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                Fail "-AcceptanceCopyOnly не принимает ссылки/reparse-папки: $path"
+        $cur = $path
+        while ($true) {
+            if (Test-Path -LiteralPath $cur) {
+                if ((Get-Item -LiteralPath $cur -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    Fail "-AcceptanceCopyOnly не принимает ссылки/reparse-папки: $cur"
+                }
             }
+            if ($cur -ieq $sandboxRoot) { break }
+            $cur = Split-Path $cur -Parent
         }
+    }
+    # настоящая установка и данные не годятся для приёмки, даже если рядом оказалась метка
+    $protected = @((Join-Path $env:LOCALAPPDATA $Name), (Join-Path $env:APPDATA "$Name-data"), $Source)
+    foreach ($cp in (Find-ClaudeConfig)) {
+        if (Test-Path $cp) {
+            try {
+                $srv = (Get-Content $cp -Raw -Encoding UTF8 | ConvertFrom-Json).mcpServers.$Name
+                if ($srv -and $srv.args) { $protected += (Split-Path ([string]$srv.args[0])) }
+                if ($srv -and $srv.env -and $srv.env.RUS_TRANSCRIBER_DATA) { $protected += [string]$srv.env.RUS_TRANSCRIBER_DATA }
+            } catch { }
+        }
+    }
+    foreach ($p in $protected) {
+        if (-not $p) { continue }
+        $full = [IO.Path]::GetFullPath($p).TrimEnd("\")
+        foreach ($path in @($Target, $DataDir)) {
+            if (Test-Overlap $path $full) { Fail "-AcceptanceCopyOnly не работает с настоящей папкой программы, данных или исходников: $full" }
+        }
+    }
+    foreach ($bad in @(".git", ".venv")) {
+        if (Test-Path -LiteralPath (Join-Path $Target $bad)) { Fail "-AcceptanceCopyOnly: в $Target уже есть $bad — это не изолированная папка приёмки." }
     }
     if ($Target.StartsWith($DataDir + "\", [StringComparison]::OrdinalIgnoreCase) -or
         $DataDir.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
