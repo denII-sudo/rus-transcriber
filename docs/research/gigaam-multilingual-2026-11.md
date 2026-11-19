@@ -28,8 +28,9 @@ Multilingual хуже v3 без пунктуации. Распространён
 
 Условия: Linux, 4 ядра Intel Xeon (AVX-512, VNNI, AMX), onnx-asr 0.12.0,
 onnxruntime-openvino 1.24.1, OpenVINO 2025.4.1; публичные фрагменты Golos, 62 с.
-**Скорость на этом железе не переносится на Ryzen 5 6600H** (Zen 3+ без AVX-512 и VNNI):
-int8 здесь ускоряют VNNI и AMX.
+**Скорость на этом железе не переносится на проверенные машины проекта:** Intel Core Ultra 5
+125H (Meteor Lake: AVX2 и AVX-VNNI, без AVX-512 и AMX) и AMD Ryzen 5 6600H (Zen 3+: без
+AVX-512 и VNNI). Здесь int8 ускоряют AVX-512 VNNI и AMX.
 
 | Вариант | Скорость | Совпадение |
 |---|---|---|
