@@ -22,7 +22,8 @@ class InstallUninstallTests(unittest.TestCase):
         result = subprocess.run(
             [_shell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
              str(ROOT / "tests" / "install_uninstall_harness.ps1"), "-Script", str(ROOT / "install.ps1")],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=600)
         tail = (result.stdout + result.stderr)[-4000:]
         self.assertEqual(result.returncode, 0, tail)
         self.assertIn("FAILED: 0", result.stdout, tail)

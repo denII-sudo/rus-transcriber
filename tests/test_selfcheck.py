@@ -89,7 +89,7 @@ class SelfCheck(unittest.TestCase):
         seen = {}
 
         def run(cmd, *, cwd, env, **kwargs):
-            seen.update(cmd=cmd, cwd=cwd, env=env)
+            seen.update(cmd=cmd, cwd=cwd, env=env, stdin=kwargs.get("stdin"))
             return mock.Mock(returncode=0, stdout="", stderr="Ran 1 test in 0.01s\n\nOK\n")
 
         with mock.patch.object(selfcheck.subprocess, "run", side_effect=run):
@@ -97,6 +97,8 @@ class SelfCheck(unittest.TestCase):
         env = seen["env"]
         self.assertTrue(result["ok"])
         self.assertIn("-B", seen["cmd"])
+        # из терминала тест, ждущий ответа человека, зависал бы: ввод тестам закрыт
+        self.assertIs(seen["stdin"], selfcheck.subprocess.DEVNULL)
         self.assertEqual(env["TEMP"], env["TMP"])
         self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertTrue(Path(env["RUS_TRANSCRIBER_DATA"]).is_relative_to(Path(env["TEMP"]).parent))

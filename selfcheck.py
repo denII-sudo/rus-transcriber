@@ -66,7 +66,9 @@ def run_tests(timeout=TESTS_TIMEOUT):
             cmd = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"]
             if sys.version_info >= (3, 12):
                 cmd += ["--durations", "5"]                # самые медленные тесты — в ответ
-            r = subprocess.run(cmd, cwd=str(HERE), env=env,
+            # stdin=DEVNULL: тестам не нужен ввод; из терминала (например, шаг 10 установщика)
+            # тест, ждущий ответа человека, иначе зависал бы на скрытом вопросе
+            r = subprocess.run(cmd, cwd=str(HERE), env=env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                                creationflags=0x08000000 if os.name == "nt" else 0)
             res = parse_unittest(r.stderr + "\n" + r.stdout)
