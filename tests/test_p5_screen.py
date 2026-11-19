@@ -1,7 +1,9 @@
 """П5: локальный экран и эксплуатация — история, возврат ревизии, конфликты, резерв, HTTP-экран."""
+import gc
 import http.client
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -20,13 +22,21 @@ import rt
 import workflow_page
 
 
-def sandbox():
-    return Path(tempfile.mkdtemp(prefix="p5-", dir=os.environ["TEMP"]))
+def sandbox(case):
+    """Временная папка теста; удаляется после него."""
+    root = Path(tempfile.mkdtemp(prefix="p5-"))
+
+    def remove():
+        # соединения SQLite, оставшиеся у обработчиков страницы, держат файл базы в Windows
+        gc.collect()
+        shutil.rmtree(root, ignore_errors=True)
+    case.addCleanup(remove)
+    return root
 
 
 class P5ServiceTests(unittest.TestCase):
     def setUp(self):
-        self.base = sandbox()
+        self.base = sandbox(self)
         self.store = storage.initialize(self.base / "state.sqlite3", initial_display_name="Тест")
         self.source = self.base / "synthetic.wav"
         self.source.write_bytes(b"synthetic")
@@ -210,7 +220,7 @@ class P5ServiceTests(unittest.TestCase):
 
 class P5ScreenHTTPTests(unittest.TestCase):
     def setUp(self):
-        self.base = sandbox()
+        self.base = sandbox(self)
         self.patcher = mock.patch.object(paths, "STATE_DB", self.base / "state.sqlite3")
         self.patcher.start()
         self.addCleanup(self.patcher.stop)

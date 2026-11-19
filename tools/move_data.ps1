@@ -1,4 +1,4 @@
-<#
+﻿<#
 Переносит данные rus-transcriber из скрытых папок пакета Claude (Store) в обычную папку, по умолчанию
 %APPDATA%\rus-transcriber-data. Запускать при ЗАКРЫТОМ Claude Desktop, обычным PowerShell (не из Claude):
     powershell -ExecutionPolicy Bypass -File .\move_data.ps1 -DryRun

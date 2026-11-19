@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -16,6 +17,7 @@ import worker
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="p3-workflow-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.source = self.root / "synthetic.wav"
         self.source.write_bytes(b"synthetic")
         self.store = storage.initialize(self.root / "state.sqlite3", initial_display_name="Тест")

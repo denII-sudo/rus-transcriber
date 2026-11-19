@@ -11,6 +11,7 @@ function global:Get-CimInstance { param([string]$ClassName, [string]$Filter, $Er
 
 function New-Sandbox($tag) {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("uninst-" + $tag + "-" + [guid]::NewGuid().ToString("N").Substring(0,6))
+    $global:Sandboxes += $root
     $env:LOCALAPPDATA = Join-Path $root "local"; $env:APPDATA = Join-Path $root "roaming"
     $env:TEMP = Join-Path $root "temp"; $env:USERPROFILE = $root
     foreach ($d in @($env:LOCALAPPDATA, $env:APPDATA, $env:TEMP)) { New-Item -ItemType Directory $d -Force | Out-Null }
@@ -43,6 +44,7 @@ function Run($sb, [string[]]$extra, [string]$scriptPath = $Script) {
     return @{ code = $LASTEXITCODE; out = ($o -replace '\s+', '') }
 }
 $global:FakeProcs = @()
+$global:Sandboxes = @()
 
 # A: без ключей и без терминала — ничего не меняется
 $s = New-Sandbox "a"; $r = Run $s @()
@@ -120,6 +122,11 @@ if (-not ($code -eq 1 -and $o -match "рабочаякопияразработк
     $global:Diag = "---- I: code=$code, output ----`n" + ($o.Substring([Math]::Max(0, $o.Length - 3000)))
 }
 Check "I target untouched" ((Test-Path "$($s.t)/core.py") -and -not (Test-Path "$($s.t)/install.ps1"))
+
+# временные папки сценариев больше не нужны; .NET удаляет ссылки, не переходя по ним
+foreach ($root in $global:Sandboxes) {
+    if (Test-Path -LiteralPath $root) { try { [IO.Directory]::Delete($root, $true) } catch { "не удалось удалить временную папку: $root" } }
+}
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 if ($global:Diag) { $global:Diag }

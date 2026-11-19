@@ -2,6 +2,7 @@ import http.server
 import json
 import os
 import socket
+import shutil
 import tempfile
 import threading
 import unittest
@@ -181,6 +182,7 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
 class AutonomousWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="p4-workflow-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.source = self.root / "synthetic.wav"
         self.source.write_bytes(b"synthetic")
         self.store = storage.initialize(self.root / "state.sqlite3", initial_display_name="Тест")
