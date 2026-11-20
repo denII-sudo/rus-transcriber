@@ -133,14 +133,17 @@ def update(explicit=(), **kv):
     """Меняет отдельные настройки, остальные отличия сохраняются.
 
     explicit — что записать явно, даже если значение совпадает с умолчанием (выбор теста скорости).
+    Ключи, уже записанные в config.json, остаются в нём, даже если совпадают с умолчанием:
+    иначе выбор этой машины молча сменился бы вместе с умолчаниями новой версии программы.
     """
     invalid = [key for key, value in kv.items() if not _valid_config_value(key, value)]
     if invalid:
         raise ValueError("неверный тип настройки: " + ", ".join(sorted(invalid)))
     with _config_lock():
         cur = load_overrides()
+        keep = set(cur) | set(explicit)
         cur.update(kv)
-        return _save_overrides_locked(cur, explicit=explicit)
+        return _save_overrides_locked(cur, explicit=keep)
 
 
 def user_display_name(store):

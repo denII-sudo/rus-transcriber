@@ -14,6 +14,7 @@ import argparse
 import json
 import mimetypes
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -34,6 +35,21 @@ SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             '[hidden]{display:none!important}</style></head><body>{BODY}</body></html>')
 mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_BODY_BYTES = 64 * 1024
+
+
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    """Сервер, который не делит порт с другим процессом.
+
+    HTTPServer включает SO_REUSEADDR, а на Windows с ним второй экран молча занимает порт,
+    который уже слушает прежний: новый адрес выдаётся, но запросы уходят старому.
+    Без него и с SO_EXCLUSIVEADDRUSE занятый порт даёт OSError, и берётся следующий.
+    """
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def pick_audio_path():
@@ -257,7 +273,7 @@ def make_server(port):
     srv, port = None, port
     for port in range(port, port + 20):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+            srv = ExclusiveHTTPServer(("127.0.0.1", port), H)
             break
         except OSError:
             continue
