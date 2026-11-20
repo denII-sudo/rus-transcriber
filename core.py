@@ -1810,7 +1810,9 @@ def settings_info():
     import storage
     result = {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
               "overrides": settings.load_overrides(), "effective": settings.load_config(),
-              "recording_backend": settings.recording_backend(), "groups": paths.list_groups()}
+              "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
+              # старая раскладка данных переносится только явной командой migrate_data
+              "legacy_migration_pending": bool(migrate.pending())}
     if paths.STATE_DB.is_file():
         try:
             store = recordings.open_store()
