@@ -68,3 +68,52 @@ fp32-веса ML large занимают около 2,3 ГБ.
 - На Intel с Arc — группа `multilingual-gpu`. На AMD dml-варианты требуют замены пакета onnxruntime.
 - Модели int8 и Multilingual в `config.json` не пишутся. Включение Multilingual третьей
   моделью — отдельная задача после замера.
+
+## Дополнительно из исследования 18.11.2026
+
+Цифры ниже взяты из внешних источников и на машинах проекта не проверены.
+
+**Другие внешние замеры точности на русском.**
+- gigastt (int8, Golos Crowd / Golos Farfield): ML large — 4.44 / 5.70%, ML 220M — 6.15 / 8.28%.
+  Официальные цифры v3 на Golos Crowd: RNN-T — 2.4%, CTC — 2.8%. Наборы и обвязка разные,
+  поэтому сравнение ориентировочное.
+- Статья на Хабре «Голосовые в текст на одном ядре»: на одном ядре ML large тратит около 5,6 с
+  на минуту речи против 2,2 с у v3 RNN-T, память — 1138 МБ, точность близкая. Статья прочитана
+  только через пересказ поиска.
+
+**Скорость (onnx-asr, Ryzen 7 9800X3D, CPU).** ML 220M — 58,5×, ML large — 30,4×,
+v3 CTC — 58,5×, v3 RNN-T — 42,4×. Для 6600H, по соотношению с замером v3 CTC в
+`amd-bench-baseline-2026-11.md`, это оценочно около 38× и 20× — не измерение.
+
+**Ресурсы.**
+- Диск: int8 — 214 МиБ (220M) и 564 МиБ (large); fp32 — около 0,9 ГБ и 2,3 ГБ.
+- Память ML large int8 — 0,66–0,8 ГиБ (gigastt); для сравнения, Whisper large-v3 int8 — 2,5–3 ГиБ.
+- Новых пакетов не нужно: достаточно onnx-asr 0.12.0 или новее (`install.ps1` ставит последнюю).
+
+**Железо.**
+- CPU с AVX2 — работает.
+- Intel Arc через OpenVINO — ожидаемо как v3 CTC: архитектура та же. Не проверено.
+- NPU для Multilingual не проверялся: для GigaAM он отключён, включать только тестом скорости.
+- AMD Radeon — только DirectML после замены пакета onnxruntime.
+- NVIDIA CUDA/TensorRT — быстро, но это не целевая платформа.
+
+**Другие среды исполнения v3 на CPU с AVX2.**
+- OpenVINO EP на CPU — уже в пакете, проверяется группой `cpu-runtime`.
+- int8 через onnx-asr (`asr_quant_cpu`) — экономит память. На 9800X3D ускорения нет, на Zen 3
+  без VNNI маловероятно; на Intel с AVX-VNNI нужен замер.
+- OpenVINO напрямую (формат IR и квантизация NNCF) — много нового кода, выигрыш не доказан.
+- sherpa-onnx, gigastt (Rust) — внутри тот же ONNX Runtime, энкодер быстрее не станет.
+- PyTorch — медленнее onnx-asr (39× против 58× у v3 CTC на 9800X3D).
+- Пакеты по 8/16 на AMD уже измерены — медленнее поштучного распознавания.
+
+**Следующий шаг после замера на машине владельца.** Если Multilingual large в голосовании
+не хуже Whisper, можно сделать его выбираемым значением `asr_third_model`: отдельной
+настройкой в `config.json`, без изменения умолчаний `settings.py`. Нужно проверить
+нормализацию в `vote3` для чисел словами и английского кириллицей.
+
+**Источники.**
+[salute-developers/GigaAM](https://github.com/salute-developers/GigaAM) (README, `evaluation.md`),
+[istupakov/onnx-asr](https://github.com/istupakov/onnx-asr) (`docs/comparison.md`, `docs/benchmarks.md`),
+[ekhodzitsky/gigastt](https://github.com/ekhodzitsky/gigastt) (`docs/benchmarks.md`, `docs/models.md`),
+[статья arXiv 2607.10371](https://arxiv.org/abs/2607.10371),
+[Хабр, статья 1102072](https://habr.com/ru/articles/1102072/).
