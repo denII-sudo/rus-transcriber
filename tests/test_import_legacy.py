@@ -197,7 +197,7 @@ class ConversionTests(Fixture):
             "version": "old", "answers": {"r-time": {"id": "r-time", "version": "q1", "kind": "option", "option": 0},
                                            "r-ok": {"id": "r-ok", "version": "q1", "kind": "option", "option": 0}}},
             ensure_ascii=False), encoding="utf-8")
-        legacy, source, packs, _ = IL._read_variant(self.plan()["recordings"][0], self.plan()["recordings"][0]["variants"][0])
+        legacy, source, packs, _, _ = IL._read_variant(self.plan()["recordings"][0], self.plan()["recordings"][0]["variants"][0])
         self.assertEqual([p["name"] for p in packs],
                          ["встреча.v2.review", "встреча.v2.review/answers.20261108101950-aaaaaa.json"])
         _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "z"), metadata={},
@@ -300,6 +300,84 @@ class CheckAndApplyTests(Fixture):
         self.assertEqual(report[0]["status"], "ok", report)
         facts = IL.audio_facts(self.audio)
         self.assertEqual(facts, {"audio_available": False})
+
+
+class A1Tests(Fixture):
+    """recording_id, вопросы карточек, сверка MD, конфликт и комплект отчётов."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = self.root / "data" / "state.sqlite3"
+        self.db.parent.mkdir()
+        p = mock.patch.object(paths, "STATE_DB", self.db)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_recording_id_rules(self):
+        old = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(IL.recording_id_from({"recording_id": old}, self.tj, "x"),
+                         ("01234567-89ab-cdef-0123-456789abcdef", "сохранён старый recording_id"))
+        rid, rule = IL.recording_id_from({}, self.tj, "x")
+        self.assertEqual(rid, IL.recording_id_for(self.tj, "x"))
+        self.assertIn("uuid5", rule)
+        self.assertEqual(IL.recording_id_from({"recording_id": "не-uuid"}, self.tj, "x")[0], rid)
+
+    def test_questions_from_current_and_archived_manifests(self):
+        legacy = json.loads(self.tj.read_text(encoding="utf-8"))
+        manifests = [{"name": "p", "version": "v2", "items": [{"id": "r-time", "question": "Кто говорит?", "text": "три",
+                                                             "word_ids": ["нет-такого"]}]},
+                     {"name": "p/manifest.v1.json", "version": "v1", "items": [
+                         {"id": "r-time", "question": "старый вопрос"}, {"id": "r-ok", "question": "Так?", "text": "аренды"},
+                         {"id": "лишний", "question": "?"}]}]
+        _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "q"), metadata={},
+                                                 field_sources={}, variant={}, source={}, manifests=manifests)
+        qs = {q["id"]: q for q in review["questions"]}
+        self.assertEqual(set(qs), {"r-time", "r-ok"})
+        self.assertEqual(qs["r-time"]["question"], "Кто говорит?")
+        self.assertNotIn("word_ids", qs["r-time"])            # ссылка на несуществующее слово отброшена
+        self.assertEqual(qs["r-ok"]["origin"], "legacy_review_pack:p/manifest.v1.json")
+        self.assertEqual(stats["questions"], 2)
+
+    def test_md_check(self):
+        import transcript
+        legacy = json.loads(self.tj.read_text(encoding="utf-8"))
+        self.assertFalse(IL.md_check(self.tj, legacy)["same"])
+        (self.side / "встреча.v2.transcript.md").write_text(transcript.render_md(legacy), encoding="utf-8")
+        self.assertTrue(IL.md_check(self.tj, legacy)["same"])
+
+    def test_same_id_from_changed_source_is_conflict(self):
+        legacy = json.loads(self.tj.read_text(encoding="utf-8"))
+        legacy["recording_id"] = "0123456789abcdef0123456789abcdef"
+        self.tj.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        recordings.initialize_store(self.db, display_name="Владелец").close()
+        self.assertEqual(IL.run(self.plan(), "apply", ffprobe="нет")[0]["status"], "imported")
+        legacy["segments"][0]["text"] = "изменено после переноса"
+        self.tj.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        entry = IL.run(self.plan(), "apply", ffprobe="нет")[0]
+        self.assertEqual(entry["status"], "conflict")
+
+    def test_main_guards_data_dir_and_writes_verified_set(self):
+        plan_path = self.root / "plan.json"
+        plan_path.write_text(json.dumps(self.plan(), ensure_ascii=False), encoding="utf-8")
+        out = self.root / "reports"
+        self.assertEqual(IL.main(["apply", "--plan", str(plan_path), "--out", str(out)]), 2)
+        self.assertEqual(IL.main(["apply", "--plan", str(plan_path), "--out", str(out),
+                                  "--data-dir", str(self.root / "чужая")]), 2)
+        self.assertFalse(self.db.exists())
+        recordings.initialize_store(self.db, display_name="Владелец").close()
+        with mock.patch.object(IL, "audio_facts", return_value={"audio_available": True}):
+            code = IL.main(["apply", "--plan", str(plan_path), "--out", str(out), "--data-dir", str(paths.DATA_DIR)])
+        verification = json.loads((out / "verification.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, verification)
+        self.assertEqual(verification["status"], "verified_copy")
+        self.assertEqual(verification["activation"], "not_performed")
+        self.assertTrue(all(verification["checks"].values()), verification["checks"])
+        self.assertTrue(all(ok is not False for r in verification["records"] for ok in r["checks"].values()))
+        mapping = json.loads((out / "mapping.json").read_text(encoding="utf-8"))
+        self.assertEqual(mapping[0]["database_revision"], 1)
+        self.assertTrue((out / "rehearsal" / "state.sqlite3").is_file())
+        for name in ("inventory.json", "plan.json", "report.json", "report.md"):
+            self.assertTrue((out / name).is_file(), name)
 
 
 class MarkVoicesTests(unittest.TestCase):

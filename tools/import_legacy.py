@@ -4,11 +4,14 @@
 в файле плана, а не угадываются здесь. Старые файлы (`*.transcript.*`, конспекты,
 папки разбора) не изменяются: новые документы формируются в подпапке `v4` рядом.
 
-    python tools/import_legacy.py check --plan plan.json [--report отчёт.json]
-        проверка в памяти: ничего не пишет ни в БД, ни на диск (кроме отчёта)
-    python tools/import_legacy.py apply --plan plan.json [--report отчёт.json]
-        запись в БД текущей папки данных (RUS_TRANSCRIBER_DATA); БД создаётся заранее
-        штатной операцией initialize_recording_store; повторный запуск пропускает уже перенесённое
+    python tools/import_legacy.py check --plan plan.json [--out папка-отчётов]
+        проверка в памяти: ничего не пишет ни в БД, ни на диск (кроме отчётов)
+    python tools/import_legacy.py apply --plan plan.json --data-dir <папка данных> --out папка-отчётов
+        запись в БД папки данных программы (RUS_TRANSCRIBER_DATA; --data-dir должен с ней совпадать);
+        БД создаётся заранее штатной операцией initialize_recording_store; повторный запуск пропускает
+        уже перенесённое, а тот же recording_id из изменившейся стенограммы — конфликт, не перезапись.
+        После записи — проверка набора и комплект inventory/plan/mapping/verification/report
+        со статусом verified_copy или partial
     python tools/import_legacy.py mark-voices --plan plan.json [--apply]
         пометить, кем подтверждены фрагменты голосовых профилей; без --apply — только показать;
         перед изменением профиль копируется в voice-backups
@@ -59,6 +62,66 @@ def recording_id_for(source_path, source_sha):
     """Один и тот же исходный файл всегда даёт один и тот же recording_id (повтор безопасен)."""
     key = os.path.normcase(os.path.abspath(source_path)) + "|" + source_sha
     return str(uuid.uuid5(NAMESPACE, "legacy-recording:" + key))
+
+
+def recording_id_from(legacy, source_path, source_sha):
+    """recording_id записи: старый сохраняется (uuid4.hex → тот же UUID), иначе вычисляется.
+
+    -> (recording_id, правило). Правило попадает в таблицу соответствия mapping.json.
+    """
+    old = legacy.get("recording_id")
+    if isinstance(old, str) and old:
+        try:
+            return str(uuid.UUID(old)), "сохранён старый recording_id"
+        except ValueError:
+            pass
+    return recording_id_for(source_path, source_sha), "вычислен из пути и SHA-256 стенограммы (uuid5)"
+
+
+def import_questions(review, transcript, manifests):
+    """Вопросы карточек из манифестов папок разбора: новые версии первыми, один вопрос на сомнение.
+
+    Ссылки word_ids берутся, только если все такие слова есть в стенограмме.
+    """
+    ids = {item["id"] for item in review.get("review") or []}
+    word_ids = {w["word_id"] for s in transcript.get("segments") or [] for w in s.get("words") or []}
+    questions = review.setdefault("questions", [])
+    have = {q.get("id") for q in questions}
+    added = 0
+    for man in manifests:
+        for item in man.get("items") or []:
+            rid = item.get("id") if isinstance(item, dict) else None
+            if rid not in ids or rid in have:
+                continue
+            q = {"id": rid, "question": str(item.get("question") or ""), "text": str(item.get("text") or ""),
+                 "legacy_version": man.get("version"), "origin": "legacy_review_pack:" + man["name"]}
+            refs = item.get("word_ids")
+            if isinstance(refs, list) and refs and len(set(refs)) == len(refs) and set(refs) <= word_ids:
+                q["word_ids"] = list(refs)
+            questions.append(q)
+            have.add(rid)
+            added += 1
+    if not questions:
+        review.pop("questions", None)
+    return added
+
+
+def md_check(transcript_path, legacy):
+    """Совпадает ли старый .transcript.md с рендером его JSON. Расхождение — повод посмотреть человеку:
+    это может быть ручная правка MD или просто другая версия программы при рендере."""
+    import transcript as T
+    md = Path(str(transcript_path)[:-len(".json")] + ".md")
+    if not md.is_file():
+        return {"md": str(md), "exists": False}
+    current = md.read_bytes()
+    try:
+        rendered = T.render_md(copy.deepcopy(legacy)).encode("utf-8")
+    except Exception as ex:  # рендер старого файла может не поддерживаться — это сведения, не ошибка переноса
+        return {"md": str(md), "exists": True, "sha256": hashlib.sha256(current).hexdigest(),
+                "same": None, "note": f"рендер не выполнен: {type(ex).__name__}"}
+    same = current.replace(b"\r\n", b"\n") == rendered.replace(b"\r\n", b"\n")   # переносы строк не смысл
+    return {"md": str(md), "exists": True, "sha256": hashlib.sha256(current).hexdigest(),
+            "rendered_sha256": hashlib.sha256(rendered).hexdigest(), "same": same}
 
 
 def _norm_text(value):
@@ -245,7 +308,8 @@ def import_answers(review, pack_answers, pack_name):
     return imported, skipped, converted
 
 
-def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, source, answers_packs=()):
+def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, source, answers_packs=(),
+                    manifests=()):
     """Чистое преобразование старого JSON в пару снимков нового формата (без БД и диска)."""
     import recordings
     import storage
@@ -268,12 +332,16 @@ def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, s
                       "ts_note": "время ответов переведено из секунд с 1970 года в UTC «ГГГГ-ММ-ДДTЧЧ:ММ:СС», "
                                  "доли секунды отброшены" if converted else ""})
     stats["answers"] = packs
+    stats["questions"] = import_questions(review, transcript, manifests)
     quality = transcript.setdefault("quality", {})
     quality["migration"] = {
         "tool": TOOL, "source": {**source, **({"legacy_runtime": legacy_runtime} if legacy_runtime else {})},
+        "baseline": {"legacy_source_revision": legacy_runtime.get("source_revision"),
+                     "note": "первая ревизия базы — снимок стенограммы старого формата; прежняя история правок "
+                             "доступна только в журнале edits и старых файлах"},
         "field_sources": filled,
         "variant": {k: variant.get(k) for k in ("tag", "order", "main", "main_note", "history") if k in variant},
-        "review": stats["review"], "review_packs": packs,
+        "review": stats["review"], "review_packs": packs, "questions_imported": stats["questions"],
     }
     storage.validate_pair(transcript, review)
     return rid, transcript, review, stats
@@ -324,11 +392,20 @@ def _read_variant(rec, variant):
             ans = json.loads(f.read_text(encoding="utf-8-sig"))
             name = pd.name if f.name == "answers.json" else f"{pd.name}/{f.name}"
             packs.append({"name": name, "answers": ans.get("answers") or {}, "applied_at": ans.get("applied_at")})
+    manifests = []
+    for pack_dir in variant.get("review_packs", []):
+        pd = Path(pack_dir)
+        files = [pd / "manifest.json"] + sorted(pd.glob("manifest.*.json"), key=lambda p: p.name, reverse=True)
+        for f in files:
+            if f.is_file():
+                man = json.loads(f.read_text(encoding="utf-8-sig"))
+                man["name"] = pd.name if f.name == "manifest.json" else f"{pd.name}/{f.name}"
+                manifests.append(man)
     conspects = []
     for c in variant.get("conspects", []):
         cj = json.loads(Path(c).read_text(encoding="utf-8-sig"))
         conspects.append({"path": str(c), "name": cj.get("name"), "template": legacy_conspect_markdown(cj)})
-    return legacy, source, packs, conspects
+    return legacy, source, packs, conspects, manifests
 
 
 def _record_metadata(rec, facts):
@@ -353,12 +430,15 @@ def run(plan, mode, ffprobe=None):
             for variant in sorted(rec["variants"], key=lambda v: v.get("order", 0)):
                 entry = {"audio": rec["audio"], "transcript": variant["transcript"], "main": bool(variant.get("main"))}
                 try:
-                    legacy, source, packs, conspects = _read_variant(rec, variant)
-                    rid = recording_id_for(variant["transcript"], source["sha256"])
-                    entry["recording_id"] = rid
+                    legacy, source, packs, conspects, manifests = _read_variant(rec, variant)
+                    rid, rule = recording_id_from(legacy, variant["transcript"], source["sha256"])
+                    entry.update(recording_id=rid, recording_id_rule=rule, source_sha256=source["sha256"],
+                                 legacy_recording_id=legacy.get("recording_id"),
+                                 legacy_source_revision=legacy.get("source_revision"),
+                                 md=md_check(variant["transcript"], legacy))
                     _, transcript, review, stats = build_snapshots(
                         legacy, recording_id=rid, metadata=meta, field_sources=sources,
-                        variant=variant, source=source, answers_packs=packs)
+                        variant=variant, source=source, answers_packs=packs, manifests=manifests)
                     entry.update(stats)
                     entry["conspects"] = [{"name": c["name"], **conspect_link_preview(c["template"], transcript, review, rid)}
                                           for c in conspects]
@@ -378,9 +458,16 @@ def run(plan, mode, ffprobe=None):
 
 def _apply_one(store, rec, variant, legacy, transcript, review, rid, meta, sources, source, packs, conspects,
                documents, recordings):
+    """Запись одной стенограммы в БД и формирование её документов в подпапке v4."""
     import conspect
     if store.db.execute("SELECT 1 FROM recordings WHERE recording_id=?", (rid,)).fetchone():
-        return {"status": "skipped", "note": "уже перенесено ранее"}
+        stored = store.get_current(rid)["transcript"]["payload"]
+        stored_sha = ((stored.get("quality") or {}).get("migration") or {}).get("source", {}).get("sha256")
+        if stored_sha == source["sha256"]:
+            return {"status": "skipped", "note": "уже перенесено ранее"}
+        # тот же ID, другой вход: не перезаписывается молча
+        return {"status": "conflict", "note": "запись с этим recording_id уже есть, но перенесена из другой "
+                                              "версии стенограммы; повторный перенос не выполняется"}
     tag = basename_for(variant["transcript"])[len(Path(rec["audio"]).stem):].lstrip(".")
     root = recordings.document_layout(rec["audio"], tag)["root"]
     root.mkdir(exist_ok=True)
@@ -403,6 +490,134 @@ def _apply_one(store, rec, variant, legacy, transcript, review, rid, meta, sourc
         result["conspects_saved"].append({"source": c["path"], "conspect_json": saved.get("conspect_json"),
                                           "unlinked": len(saved.get("unlinked") or [])})
     return result
+
+
+# ---------------------------------------------------------------- проверка набора и отчёты
+
+def _compare(legacy, data):
+    """Перенесённое содержание против старого файла: текст, говорящие, сомнения, правки, имена."""
+    words = lambda d: [w.get("w") for s in d.get("segments") or [] for w in s.get("words") or []]  # noqa: E731
+    return {
+        "слова": words(legacy) == words(data),
+        "сегменты": [(s.get("speaker"), s.get("text")) for s in legacy.get("segments") or []] ==
+                    [(s.get("speaker"), s.get("text")) for s in data.get("segments") or []],
+        "сомнения": [(r.get("id"), r.get("status")) for r in legacy.get("review") or []] ==
+                    [(r.get("id"), r.get("status")) for r in data.get("review") or []],
+        "правки": legacy.get("edits") == data.get("edits"),
+        "имена": (legacy.get("speaker_names"), legacy.get("names_confirmed")) ==
+                 (data.get("speaker_names"), data.get("names_confirmed")),
+    }
+
+
+def verify_set(report, out_dir):
+    """Проверка записанного набора: целостность БД, документы, содержание, исходный снимок, резерв."""
+    import documents
+    import paths
+    import recordings
+    import storage
+    v = {"checks": {}, "records": []}
+    try:
+        storage.validate_copy(paths.STATE_DB)
+        v["checks"]["база: integrity_check и foreign_key_check"] = True
+    except Exception as ex:
+        v["checks"]["база: integrity_check и foreign_key_check"] = False
+        v["db_error"] = f"{type(ex).__name__}: {ex}"
+    store = storage.open_store_readonly(paths.STATE_DB)
+    try:
+        roots = store.db.execute("SELECT root_id, path FROM allowed_roots").fetchall()
+        bad_roots = [Path(p).name for rid_, p in roots if not documents.verify_files(store, rid_, p)["consistent"]]
+        v["checks"]["документы согласованы с базой (verify_files)"] = not bad_roots
+        if bad_roots:
+            v["inconsistent_roots"] = bad_roots
+    finally:
+        store.close()
+    store = recordings.open_store()
+    try:
+        for e in report:
+            if e.get("status") not in ("imported", "skipped"):
+                continue
+            legacy = json.loads(Path(e["transcript"]).read_text(encoding="utf-8-sig"))
+            data = recordings.load_recording(store, e["recording_id"])
+            checks = _compare(legacy, data)
+            baseline = store.get_revision(e["recording_id"], "transcript", 1)["payload"]
+            checks["исходный снимок = старый файл"] = (
+                ((baseline.get("quality") or {}).get("migration") or {}).get("source", {}).get("sha256") == e["source_sha256"])
+            docs = e.get("documents") or {}
+            readable = True
+            for kind, path in docs.items():
+                p = Path(path)
+                try:
+                    readable &= p.is_file() and (json.loads(p.read_text(encoding="utf-8")) is not None
+                                                  if kind in ("json", "manifest") else bool(p.read_text(encoding="utf-8").strip()))
+                except (OSError, ValueError):
+                    readable = False
+            checks["документы читаются без базы"] = readable if docs else None
+            v["records"].append({"transcript": Path(e["transcript"]).name, "recording_id": e["recording_id"],
+                                 "checks": checks})
+    finally:
+        store.close()
+    rehearsal = Path(out_dir) / "rehearsal" / "state.sqlite3"
+    rehearsal.parent.mkdir(parents=True, exist_ok=True)
+    store = recordings.open_store()
+    try:
+        store.backup(rehearsal)
+    finally:
+        store.close()
+    try:
+        storage.validate_copy(rehearsal)
+        v["checks"]["резервная копия набора создаётся и проходит проверку"] = True
+    except Exception as ex:
+        v["checks"]["резервная копия набора создаётся и проходит проверку"] = False
+        v["rehearsal_error"] = f"{type(ex).__name__}: {ex}"
+    v["checks"]["содержание всех записей совпадает со старыми файлами"] = all(
+        ok is not False for r in v["records"] for ok in r["checks"].values())
+    return v
+
+
+def _status(mode, report, verification):
+    if mode == "check":
+        return "checked"
+    if any(e.get("status") in ("error", "conflict") for e in report):
+        return "partial"
+    if verification and all(ok is not False for ok in verification["checks"].values()):
+        return "verified_copy"
+    return "partial"
+
+
+def write_artifacts(out_dir, plan, report, mode, verification=None):
+    """inventory / plan / mapping / verification / report — приватные пути, только на этом компьютере."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    inventory = []
+    for e in report:
+        inventory.append({"transcript": e["transcript"], "sha256": e.get("source_sha256"), "md": e.get("md"),
+                          "status": e.get("status")})
+    mapping = [{"transcript": e["transcript"], "source_sha256": e.get("source_sha256"),
+                "legacy_recording_id": e.get("legacy_recording_id"), "recording_id": e.get("recording_id"),
+                "rule": e.get("recording_id_rule"), "legacy_source_revision": e.get("legacy_source_revision"),
+                "database_revision": 1 if e.get("status") == "imported" else None} for e in report]
+    status = _status(mode, report, verification)
+    files = {"inventory.json": inventory, "plan.json": plan, "mapping.json": mapping, "report.json": report,
+             "verification.json": {"status": status, "activation": "not_performed", "mode": mode, "tool": TOOL,
+                                   **(verification or {})}}
+    for name, value in files.items():
+        (out / name).write_text(json.dumps(value, ensure_ascii=False, indent=1), encoding="utf-8")
+    counts = {}
+    for e in report:
+        counts[e.get("status")] = counts.get(e.get("status"), 0) + 1
+    md_diff = [Path(e["transcript"]).name for e in report if (e.get("md") or {}).get("same") is False]
+    lines = [f"# Перенос старых записей — {mode}", "", f"Статус: **{status}**; активация: не выполнялась.", "",
+             f"Стенограмм: {len(report)}; итоги: {counts}.", ""]
+    if verification:
+        lines += ["## Проверки", ""] + [f"- {k}: {'да' if ok else 'НЕТ'}" for k, ok in verification["checks"].items()] + [""]
+    if md_diff:
+        lines += ["## MD отличается от рендера JSON (посмотреть человеку)", ""] + [f"- {n}" for n in md_diff] + [""]
+    problems = [e for e in report if e.get("status") in ("error", "conflict")]
+    if problems:
+        lines += ["## Ошибки и конфликты", ""] + [f"- {Path(e['transcript']).name}: {e.get('error') or e.get('note')}"
+                                                 for e in problems] + [""]
+    (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    return status
 
 
 # ---------------------------------------------------------------- голосовые профили
@@ -455,7 +670,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("command", choices=["check", "apply", "mark-voices"])
     ap.add_argument("--plan", required=True)
-    ap.add_argument("--report")
+    ap.add_argument("--out", help="папка комплекта отчётов (inventory, plan, mapping, verification, report)")
+    ap.add_argument("--data-dir", help="для apply: папка данных, в которую идёт перенос; должна совпадать с рабочей")
     ap.add_argument("--apply", action="store_true", help="для mark-voices: записать изменения")
     a = ap.parse_args(argv)
     try:
@@ -467,15 +683,24 @@ def main(argv=None):
         result = mark_voices(plan, apply=a.apply)
         print(json.dumps(result, ensure_ascii=False, indent=1))
         return 0
+    if a.command == "apply":
+        import paths
+        if not a.data_dir or not a.out:
+            print("для apply нужны --data-dir и --out", file=sys.stderr)
+            return 2
+        if Path(a.data_dir).resolve() != paths.DATA_DIR.resolve():
+            print(f"--data-dir не совпадает с папкой данных программы: {paths.DATA_DIR}", file=sys.stderr)
+            return 2
     try:
         report = run(plan, a.command)
+        verification = verify_set(report, a.out) if a.command == "apply" else None
     except Exception as ex:
         print(f"окружение не готово: {type(ex).__name__}: {ex}", file=sys.stderr)
         return 2
-    if a.report:
-        Path(a.report).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    status = write_artifacts(a.out, plan, report, a.command, verification) if a.out else _status(a.command, report, None)
     print(_summary(report))
-    return 1 if any(e["status"] == "error" for e in report) else 0
+    print(f"статус: {status}")
+    return 0 if status in ("checked", "verified_copy") and not any(e["status"] == "error" for e in report) else 1
 
 
 if __name__ == "__main__":
