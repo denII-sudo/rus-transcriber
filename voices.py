@@ -359,6 +359,9 @@ SELECTION_REASONS = {
     "overlap": "Слово пропущено: отмечено наложение голосов",
     "foreign_overlap": "Окно пропущено: пересекается со временем другого говорящего",
     "unconfirmed_or_flagged": "Слово пропущено: автор не подтверждён или есть пометка сомнения",
+    # коротко: строка входит в окно подтверждения (core.prepare_voice_action ограничивает его длину)
+    "legacy_human_without_speaker": ("Пропущено: старая пометка «человек» без пословной отметки "
+                                     "(перенести — legacy_speaker_review)"),
     "invalid_time": "Слово пропущено: некорректные границы времени",
     "word_too_long": "Слово пропущено: длительность больше максимального окна",
     "gap_or_order": "Участок разделён из-за паузы, порядка или предельной длины",
@@ -477,6 +480,79 @@ def _word_human(word):
     return isinstance(speaker, dict) and speaker.get("by") == "human" and not speaker.get("reverted")
 
 
+def _legacy_human_only(word):
+    """Старое общее `by: human` без пословной отметки говорящего (до правил 13.11.2026)."""
+    return word.get("by") == "human" and not isinstance((word.get("provenance") or {}).get("speaker"), dict)
+
+
+def legacy_speaker_places(data):
+    """Места, где по старой истории правок видно решение человека о говорящем.
+
+    Только чтение. Основания: (1) правка человека, сменившая говорящего (before.speaker !=
+    after.speaker или pairs); (2) место разбора, принятое человеком как есть (слова с
+    `by: human` без ссылки на правку внутри [t1, t2]); (3) правка человеком только текста —
+    говорящего она не доказывает, поэтому место тоже предлагается подтвердить отдельно.
+    Слова, уже имеющие пословную отметку говорящего, пропускаются. Каждое место — непрерывный
+    участок одного сегмента; места короче HUMAN_MIN в отпечаток не попадут и не предлагаются.
+    """
+    review = {item.get("id"): item for item in data.get("review") or [] if item.get("id")}
+    edits = {}
+    for edit in data.get("edits") or []:
+        if edit.get("by") == "human" and edit.get("id") in review and not edit.get("reverted"):
+            edits[edit["id"]] = edit
+    places, skipped = [], {"too_short": 0, "already_confirmed": 0, "not_contiguous": 0, "no_words": 0}
+    for rid, item in review.items():
+        edit = edits.get(rid)
+        if edit is not None:
+            before, after = edit.get("before") or {}, edit.get("after") or {}
+            changed = isinstance(before, dict) and isinstance(after, dict) and before.get("speaker") != after.get("speaker")
+            evidence = ("смена говорящего правкой человека" if changed or edit.get("pairs") else
+                        "правка текста человеком (говорящий не менялся)")
+            def wanted(w, rid=rid):
+                return w.get("edited") == rid or (w.get("by") == "human" and not w.get("edited"))
+        elif item.get("status") == "resolved":
+            evidence = "место принято человеком как есть"
+            def wanted(w):
+                return w.get("by") == "human" and not w.get("edited")
+        else:
+            continue
+        t1, t2 = item.get("t1", item.get("t")), item.get("t2", item.get("t"))
+        if not isinstance(t1, (int, float)) or not isinstance(t2, (int, float)):
+            skipped["no_words"] += 1
+            continue
+        found = []
+        for si, seg in enumerate(data.get("segments") or []):
+            for wi, w in enumerate(seg.get("words") or []):
+                if (isinstance(w.get("s"), (int, float)) and t1 - 0.01 <= w["s"] <= t2 + 0.01
+                        and wanted(w)):
+                    found.append((si, wi))
+        if not found:
+            skipped["no_words"] += 1
+            continue
+        segs = {si for si, _ in found}
+        indexes = [wi for _, wi in found]
+        if len(segs) != 1 or indexes != list(range(indexes[0], indexes[-1] + 1)):
+            skipped["not_contiguous"] += 1
+            continue
+        si = segs.pop()
+        seg = data["segments"][si]
+        words = seg["words"][indexes[0]:indexes[-1] + 1]
+        if any(not _legacy_human_only(w) for w in words):
+            skipped["already_confirmed"] += 1
+            continue
+        if max(w["e"] for w in words) - words[0]["s"] < HUMAN_MIN:
+            skipped["too_short"] += 1
+            continue
+        places.append({"id": rid, "seg": si, "w1": indexes[0], "w2": indexes[-1] + 1,
+                       "t1": round(words[0]["s"], 2), "t2": round(max(w["e"] for w in words), 2),
+                       "speaker": seg.get("speaker"), "words": len(words),
+                       "seconds": round(sum(max(0.0, w["e"] - w["s"]) for w in words), 2),
+                       "evidence": evidence, "review_status": item.get("status")})
+    return {"places": places, "skipped": skipped,
+            "seconds_by_speaker": {name: round(sum(p["seconds"] for p in places if p["speaker"] == name), 2)
+                                   for name in sorted({p["speaker"] for p in places})}}
+
+
 def _spans(data, confirmed, report=None):
     """Отрезки «говорящий — время» для профиля: (имя, начало, конец, человек?).
     Человек: слова с подтверждённым автором, кроме наложений.
@@ -520,6 +596,8 @@ def _spans(data, confirmed, report=None):
             if w is not None:
                 overlap = seg.get("overlap") or w.get("overlap") or "overlap" in (w.get("flags") or [])
                 human = _word_human(w) and not overlap
+                if not human and not overlap and _legacy_human_only(w):
+                    note("legacy_human_without_speaker")
                 auto = confirmed and not overlap and not w.get("flags") and not human and not w.get("inserted")
                 k = "h" if human else ("a" if auto else None)
                 if overlap:

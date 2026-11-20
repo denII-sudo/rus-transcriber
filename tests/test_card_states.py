@@ -45,3 +45,20 @@ class CardStates(unittest.TestCase):
         '''
         result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_option_preview_hides_word_ids(self):
+        # длинный список ID слов без пробелов растягивал кнопку варианта, ответ сжимался в столбик
+        html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
+        fn = "function optionPreview" + html.split("  function optionPreview", 1)[1].split("\n  }\n", 1)[0] + "\n  }"
+        script = fn + r'''
+          const ids = ["06bce98f82c742068df0513adb17d321", "e3bd632f58744bbbb055f3efb2618c50"];
+          const yes = optionPreview({word_ids: ids}), no = optionPreview({speaker: "Б", word_ids: ids});
+          if (yes !== "подтвердить говорящего у слов места (2)") throw Error(yes);
+          if (no !== "говорящий → Б; подтвердить говорящего у слов места (2)") throw Error(no);
+          if (yes.includes(ids[0]) || no.includes("word_ids")) throw Error("ids shown");
+        '''
+        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".opt{display:flex;flex-wrap:wrap;", html)
+        self.assertRegex(html, r"\.opt small\{[^}]*overflow-wrap:anywhere")

@@ -13,7 +13,10 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # watches the queued PR (WATCH_MINUTES) and waits for approved Tests runs
+    timeout-minutes: 120
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     env:
@@ -25,30 +28,144 @@ jobs:
       # pull-request code. It only updates a behind PR branch or enables
       # GitHub's built-in auto-merge after confirming the open PR matches the
       # SHA whose Tests workflow just passed. An updated branch must pass Tests
-      # again before it can be queued. Branch protection remains responsible
+      # again before it can be merged. Branch protection remains responsible
       # for the code-owner approval requirement.
+      #
+      # The update commit is pushed by github-actions[bot]. Its pull_request
+      # run waits for manual approval ("first-time contributor" policy). For
+      # branches of this repository the update contains only main and the
+      # already tested branch, so this workflow approves that waiting run
+      # (actions: write) and enables auto-merge: GitHub merges only after the
+      # required "tests" check passes on the updated commit. (A workflow_dispatch
+      # run is not counted as the PR's required check, so it is not used.)
+      # Pull requests from forks keep the manual approval. Their branch update
+      # is refused when main changed files in .github/workflows (GITHUB_TOKEN
+      # has no "workflows" permission): then the PR gets one comment asking
+      # the author to merge main, and the job goes on with other PRs.
+      #
+      # A run approved here does not trigger this workflow again when it
+      # finishes (events caused by GITHUB_TOKEN start no workflows). So the job
+      # waits for the approved run itself. Merges done by auto-merge start no
+      # workflows either, so a queued PR that falls behind because another PR
+      # merged first would wait forever: the job keeps watching the queued PR
+      # until it is merged or closed (up to WATCH_MINUTES) and repeats the
+      # update whenever it is behind (up to MAX_ROUNDS times).
       - name: Update or queue the passing PR
         shell: bash
+        env:
+          MAX_ROUNDS: "5"
+          WATCH_MINUTES: "60"
         run: |
+          pr_field() { gh pr view "$1" --repo "$REPOSITORY" --json "$2" --jq ".$2"; }
+
+          # Update a behind PR branch of this repository, approve the waiting
+          # Tests run on the update and wait for it. Prints the result.
+          update_and_test() {
+            local pr="$1" old head run_id
+            old="$(pr_field "$pr" headRefOid)"
+            echo "PR #${pr} is behind main; requesting a branch update."
+            gh pr update-branch "$pr" --repo "$REPOSITORY" || return 1
+            # The update is asynchronous: wait for the new head commit.
+            head="$old"
+            for _ in $(seq 1 30); do
+              head="$(pr_field "$pr" headRefOid)"
+              [ "$head" != "$old" ] && break
+              sleep 5
+            done
+            if [ "$head" = "$old" ]; then
+              echo "PR #${pr}: branch update did not appear in time; leaving it as is."
+              return 1
+            fi
+            echo "PR #${pr} updated to ${head}; approving its waiting Tests run."
+            run_id=""
+            for _ in $(seq 1 30); do
+              run_id="$(gh run list --repo "$REPOSITORY" --workflow tests.yml --commit "$head" \
+                --event pull_request --json databaseId,status,conclusion \
+                --jq '[.[] | select(.status == "action_required" or .conclusion == "action_required")][0].databaseId // empty')"
+              [ -n "$run_id" ] && break
+              sleep 5
+            done
+            if [ -z "$run_id" ]; then
+              echo "PR #${pr}: no Tests run waiting for approval on ${head}."
+              return 1
+            fi
+            if ! gh api -X POST "repos/${REPOSITORY}/actions/runs/${run_id}/approve" > /dev/null; then
+              echo "PR #${pr}: could not approve Tests run ${run_id}; approve it in the Actions tab."
+              return 1
+            fi
+            gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+            if ! gh run watch "$run_id" --repo "$REPOSITORY" --exit-status > /dev/null; then
+              echo "PR #${pr}: Tests run ${run_id} did not succeed."
+              return 1
+            fi
+            echo "PR #${pr}: Tests passed on ${head}."
+          }
+
+          # A fork branch cannot be updated by this token when main changed
+          # .github/workflows: ask the author once, in a PR comment.
+          fork_update_refused() {
+            local pr="$1" marker="<!-- automerge: fork update refused -->" body
+            # count with --jq, not "| grep -q": with pipefail an early grep exit fails gh
+            if [ "$(gh pr view "$pr" --repo "$REPOSITORY" --json comments \
+                --jq "[.comments[].body | select(contains(\"${marker}\"))] | length")" != "0" ]; then
+              return 0
+            fi
+            body="${marker}"$'\n'"Автослияние не может подтянуть main в ветку этого PR: в main менялись файлы .github/workflows, а токену GitHub Actions менять их в ветке форка нельзя. Влейте, пожалуйста, свежий main в свою ветку (или нажмите «Update branch»): после проверок PR встанет в очередь как обычно."$'\n\n'"Auto-merge cannot update this branch: main changed files in .github/workflows, which the Actions token may not push to a fork. Please merge the latest main into your branch (or use Update branch)."
+            gh pr comment "$pr" --repo "$REPOSITORY" --body "$body"
+          }
+
           prs="$(gh pr list --repo "$REPOSITORY" --state open --base main --limit 1000 \
-            --json number,headRefOid \
-            --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\") | .number")"
+            --json number,headRefOid,isDraft \
+            --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\" and .isDraft == false) | .number")"
           if [ -z "$prs" ]; then
-            echo "No open pull request for tested commit ${TESTED_SHA}."
+            # Draft PRs are left alone: GitHub refuses auto-merge for drafts.
+            # Marking a PR ready for review re-runs Tests, which queues it here.
+            echo "No open non-draft pull request for tested commit ${TESTED_SHA}."
             exit 0
           fi
-          while IFS= read -r pr; do
+          # for, not while-read: commands inside the loop must not consume the list
+          for pr in $prs; do
             case "$pr" in
               ''|*[!0-9]*)
                 echo "Skipping unexpected pull-request number."
                 exit 1
                 ;;
             esac
-            merge_state="$(gh pr view "$pr" --repo "$REPOSITORY" --json mergeStateStatus --jq .mergeStateStatus)"
-            if [ "$merge_state" = "BEHIND" ]; then
-              echo "PR #${pr} is behind main; requesting a branch update."
-              gh pr update-branch "$pr" --repo "$REPOSITORY"
+            if [ "$(pr_field "$pr" isCrossRepository)" != "false" ]; then
+              if [ "$(pr_field "$pr" mergeStateStatus)" = "BEHIND" ]; then
+                echo "PR #${pr} comes from a fork; requesting a branch update."
+                if gh pr update-branch "$pr" --repo "$REPOSITORY"; then
+                  echo "Tests on the update needs manual approval."
+                else
+                  echo "::warning::PR #${pr}: fork branch update refused (main changed workflow files?)."
+                  fork_update_refused "$pr" || true
+                fi
+              else
+                gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+              fi
               continue
             fi
-            gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
-          done <<< "$prs"
+            if [ "$(pr_field "$pr" mergeStateStatus)" != "BEHIND" ]; then
+              gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+            fi
+            # Watch the PR until it is merged or closed.
+            rounds=0
+            deadline=$((SECONDS + WATCH_MINUTES * 60))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              state="$(pr_field "$pr" state)"
+              if [ "$state" != "OPEN" ]; then
+                echo "PR #${pr}: ${state}."
+                break
+              fi
+              if [ "$(pr_field "$pr" mergeStateStatus)" = "BEHIND" ]; then
+                rounds=$((rounds + 1))
+                if [ "$rounds" -gt "$MAX_ROUNDS" ]; then
+                  echo "PR #${pr}: still behind after ${MAX_ROUNDS} updates; leaving it as is."
+                  break
+                fi
+                update_and_test "$pr" || break
+                continue
+              fi
+              sleep 30
+            done
+          done

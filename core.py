@@ -1755,13 +1755,64 @@ def reopen_review(job_id, ids):
     return rep
 
 
+def legacy_speaker_review(job_id, build_pack=False):
+    """Перенос старых подтверждений говорящего: найти места или собрать по ним карточки.
+
+    По умолчанию только показывает места, где по истории правок видно решение человека
+    о говорящем (voices.legacy_speaker_places). build_pack=True собирает по этим местам
+    карточки разбора; подтверждение — ответ человека на локальной странице, применяемый
+    штатным apply_answers (он ставит пословную отметку provenance.speaker). Автоматически
+    ничего не подтверждается. Только для стенограмм старого файлового формата.
+    """
+    import recordings
+    import review_pack
+    import transcript
+    import voices
+    s = _done_json(job_id)
+    jp, md = s["json"], s["markdown"]
+    store, _ = recordings.open_for_document(jp)
+    if store is not None:
+        store.close()
+        raise CoreError("для записи в SQLite перенос старых подтверждений не применяется")
+    data = transcript.load(jp)
+    found = voices.legacy_speaker_places(data)
+    result = {"json": jp, **found, "pack": None}
+    if not build_pack or not found["places"]:
+        return result
+    # пословные ID: ответ найдёт место точно, даже если номера слов сдвинулись. Старый файл получает
+    # их при первом штатном сохранении (transcript.save присваивает постоянные ID всем словам)
+    added = sum(1 for seg in data["segments"] for word in seg.get("words") or [] if not word.get("word_id"))
+    if added:
+        transcript.save(data, jp, md)
+        data = transcript.load(jp)
+        found = voices.legacy_speaker_places(data)
+        result.update(found)
+    names = sorted({seg.get("speaker") for seg in data["segments"]
+                    if seg.get("speaker") and not str(seg["speaker"]).startswith("Спикер")})
+    items = []
+    for place in found["places"]:
+        ids = [w["word_id"] for w in data["segments"][place["seg"]]["words"][place["w1"]:place["w2"]]]
+        options = [{"label": f"Да, это говорит {place['speaker']}", "decision": {"word_ids": ids}}]
+        options += [{"label": f"Нет, это {name}", "decision": {"word_ids": ids, "speaker": name}}
+                    for name in names if name != place["speaker"]]
+        items.append({"id": place["id"],
+                      "question": (f"Подтвердите говорящего ({place['evidence']}). Ответ «да» войдёт в "
+                                   "голосовой профиль как подтверждение человека."),
+                      "options": options})
+    result["word_ids_added"] = added
+    result["pack"] = review_pack.build(jp, items)
+    return result
+
+
 # ---------- настройки, группы, профили ----------
 def settings_info():
     import recordings
     import storage
     result = {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
               "overrides": settings.load_overrides(), "effective": settings.load_config(),
-              "recording_backend": settings.recording_backend(), "groups": paths.list_groups()}
+              "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
+              # старая раскладка данных переносится только явной командой migrate_data
+              "legacy_migration_pending": bool(migrate.pending())}
     if paths.STATE_DB.is_file():
         try:
             store = recordings.open_store()
@@ -1862,14 +1913,28 @@ def preview_voice_learning(job_id, group_override=None):
         if allowed_names:
             spans = [item for item in spans if item[0] in allowed_names]
         candidates = {}
+        human_seconds = {}
         for name, start, end, human in spans:
             item = candidates.setdefault(name, {"windows": 0, "seconds": 0.0, "human_windows": 0})
             item["windows"] += 1
             item["seconds"] += end - start
             item["human_windows"] += int(human)
+            if human:
+                human_seconds[name] = human_seconds.get(name, 0.0) + (end - start)
         for item in candidates.values():
             item["seconds"] = round(item["seconds"], 2)
+        # «человеческие» секунды вклада этой записи: сейчас в профиле → после замены по текущей разметке
+        human_change, human_warnings = {}, []
+        for name in sorted(set(existing) | set(human_seconds)):
+            part = profile.get("speakers", {}).get(name, {}).get("parts", {}).get(key) or {}
+            before_h = round(float(part.get("human_sec") or 0.0), 2)
+            after_h = round(human_seconds.get(name, 0.0), 2)
+            if before_h or after_h:
+                human_change[name] = {"before": before_h, "after": after_h}
+            if before_h > 0 and after_h == 0:
+                human_warnings.append(name)
         return {"group": group, "existing_contributions": existing, "candidates": candidates,
+                "human_seconds_change": human_change, "human_seconds_lost": human_warnings,
                 "selection_report": report, "selection_explanation": voices.explain_selection_report(report),
                 "audio_available": Path(audio).is_file(),
                 "group_selection": {"group": group,
@@ -1943,6 +2008,13 @@ def voice_action_lines(snapshot, revoke=False):
     lines = [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
              "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
              "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
+    change = report.get("human_seconds_change") or {}
+    if change:
+        lines.append("Подтверждено человеком, с: " +
+                     ", ".join(f"{n} {v['before']} → {v['after']}" for n, v in change.items()))
+    if report.get("human_seconds_lost"):
+        lines.append("ВНИМАНИЕ: замена обнулит подтверждённое человеком у: " + ", ".join(report["human_seconds_lost"]) +
+                     ". Сначала перенесите старые подтверждения (legacy_speaker_review).")
     selection = report.get("group_selection") or {}
     if selection.get("method") == "manual_override":
         lines.append(f"Группа выбрана вручную: {snapshot['group']} (в расшифровке привязка отсутствует).")
