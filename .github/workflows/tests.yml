@@ -7,6 +7,8 @@ on:
     branches: [main]
     # ready_for_review: a draft marked ready runs Tests again, so automerge can queue it.
     types: [opened, synchronize, reopened, ready_for_review]
+  # Started by automerge.yml after it updates a branch that is behind main.
+  workflow_dispatch:
 
 permissions:
   contents: read

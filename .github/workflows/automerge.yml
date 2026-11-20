@@ -9,11 +9,14 @@ permissions: {}
 
 jobs:
   queue:
+    # workflow_dispatch: Tests started by this workflow after a branch update (see below).
     if: >-
-      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch') &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     env:
@@ -25,8 +28,15 @@ jobs:
       # pull-request code. It only updates a behind PR branch or enables
       # GitHub's built-in auto-merge after confirming the open PR matches the
       # SHA whose Tests workflow just passed. An updated branch must pass Tests
-      # again before it can be queued. Branch protection remains responsible
+      # again before it can be merged. Branch protection remains responsible
       # for the code-owner approval requirement.
+      #
+      # The update commit is pushed by github-actions[bot]. Its pull_request
+      # run waits for manual approval ("first-time contributor" policy), so
+      # for branches of this repository Tests is started here through
+      # workflow_dispatch, which needs no approval, and auto-merge is enabled:
+      # GitHub merges only after the required "tests" check passes on the
+      # updated commit. Pull requests from forks keep the manual approval.
       - name: Update or queue the passing PR
         shell: bash
         run: |
@@ -50,6 +60,26 @@ jobs:
             if [ "$merge_state" = "BEHIND" ]; then
               echo "PR #${pr} is behind main; requesting a branch update."
               gh pr update-branch "$pr" --repo "$REPOSITORY"
+              cross="$(gh pr view "$pr" --repo "$REPOSITORY" --json isCrossRepository --jq .isCrossRepository)"
+              if [ "$cross" != "false" ]; then
+                echo "PR #${pr} comes from a fork: Tests on the update needs manual approval."
+                continue
+              fi
+              # The update is asynchronous: wait for the new head commit.
+              head="$TESTED_SHA"
+              for _ in $(seq 1 30); do
+                head="$(gh pr view "$pr" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
+                [ "$head" != "$TESTED_SHA" ] && break
+                sleep 5
+              done
+              if [ "$head" = "$TESTED_SHA" ]; then
+                echo "PR #${pr}: branch update did not appear in time; leaving it as is."
+                continue
+              fi
+              ref="$(gh pr view "$pr" --repo "$REPOSITORY" --json headRefName --jq .headRefName)"
+              echo "PR #${pr} updated to ${head}; starting Tests on it."
+              gh workflow run tests.yml --repo "$REPOSITORY" --ref "$ref"
+              gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
               continue
             fi
             gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
