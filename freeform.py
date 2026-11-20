@@ -312,6 +312,16 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         span = (place[0]["s"], place[-1]["s"]) if place else None
         return {"kind": "name", "edits": eds, "covered": span, "report": rep}
     replies = split_replies(text, names)
+    if item.get("answer_mode") == "speaker":
+        # Карточка подтверждения говорящего: пояснение («Денис говорит только слово …») не должно
+        # молча стать текстом реплики. Слова принимаются лишь в явной форме «Имя: точные слова».
+        label = re.match(r"\s*([^\s:]+)\s*:", text)
+        known = {norm(n) for n in names}
+        if not (label and norm(label.group(1)) in known and replies and all(spk for spk, _ in replies)):
+            rep["kind"] = "speaker"
+            rep["human"] = ("на карточке подтверждения говорящего свой ответ не понят как решение "
+                            "о говорящем (нужно имя или «Имя: точные слова»)")
+            return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if "missed" in (item.get("reasons") or []) and replies:
         # пропущенная речь: слов модели нет — весь ответ вставляется в этот промежуток
         t_a, t_b = float(item["t1"]), float(item["t2"])

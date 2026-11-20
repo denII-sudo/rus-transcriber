@@ -11,6 +11,7 @@ import argparse
 import json
 import mimetypes
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -32,6 +33,31 @@ SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
 mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_ANSWER_BYTES = 64 * 1024
 MAX_VOICE_BYTES = 16 * 1024 * 1024
+
+
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    """Сервер, который не делит порт с другим процессом.
+
+    HTTPServer включает SO_REUSEADDR, а на Windows с ним второй сервер молча занимает порт,
+    который уже слушает прежняя страница: новый адрес «открыт», но запросы уходят старой.
+    Без него и с SO_EXCLUSIVEADDRUSE занятый порт даёт OSError, и main() берёт следующий.
+    """
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def bind_free_port(start, handler, attempts=20):
+    """Первый свободный порт начиная с start -> (сервер, порт) или (None, None)."""
+    for port in range(start, start + attempts):
+        try:
+            return ExclusiveHTTPServer(("127.0.0.1", port), handler), port
+        except OSError:
+            continue
+    return None, None
 
 
 def main():
@@ -187,13 +213,7 @@ def main():
                 return self._send(400, {"error": "не удалось обработать запрос"})
             self._send(404, {"error": "не найдено"})
 
-    srv, port = None, a.port
-    for port in range(a.port, a.port + 20):
-        try:
-            srv = ThreadingHTTPServer(("127.0.0.1", port), H)
-            break
-        except OSError:
-            continue
+    srv, port = bind_free_port(a.port, H)
     if srv is None:
         raise SystemExit("нет свободного порта")
     url = f"http://127.0.0.1:{port}{prefix}"

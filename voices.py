@@ -500,7 +500,8 @@ def legacy_speaker_places(data):
     for edit in data.get("edits") or []:
         if edit.get("by") == "human" and edit.get("id") in review and not edit.get("reverted"):
             edits[edit["id"]] = edit
-    places, skipped = [], {"too_short": 0, "already_confirmed": 0, "not_contiguous": 0, "no_words": 0}
+    places, skipped = [], {"too_short": 0, "already_confirmed": 0, "not_contiguous": 0, "no_words": 0,
+                           "merged": 0}
     for rid, item in review.items():
         edit = edits.get(rid)
         if edit is not None:
@@ -548,9 +549,35 @@ def legacy_speaker_places(data):
                        "speaker": seg.get("speaker"), "words": len(words),
                        "seconds": round(sum(max(0.0, w["e"] - w["s"]) for w in words), 2),
                        "evidence": evidence, "review_status": item.get("status")})
+    places = _merge_overlapping_places(data, places, skipped)
     return {"places": places, "skipped": skipped,
             "seconds_by_speaker": {name: round(sum(p["seconds"] for p in places if p["speaker"] == name), 2)
                                    for name in sorted({p["speaker"] for p in places})}}
+
+
+def _merge_overlapping_places(data, places, skipped):
+    """Места одного сегмента с общими словами — одна карточка.
+
+    Иначе ответы на вложенные места (r19: слова 0–2, r20: 0–3) затрагивают общие слова и
+    оба блокируются проверкой перед применением. Из пересекающихся остаётся место с бо́льшим
+    числом слов (для вложенных — внешнее): карточка адресует слова своего места разбора,
+    поэтому границы не расширяются. Поглощённые места перечислены в `covers`, их число —
+    в skipped["merged"]. При частичном пересечении слова поглощённого места вне оставшегося
+    в карточку не входят.
+    """
+    order = {id(place): n for n, place in enumerate(places)}
+    kept = []
+    for place in sorted(places, key=lambda p: (-p["words"], order[id(p)])):
+        host = next((k for k in kept if k["seg"] == place["seg"]
+                     and place["w1"] < k["w2"] and k["w1"] < place["w2"]), None)
+        if host is None:
+            kept.append(place)
+            continue
+        skipped["merged"] += 1
+        host.setdefault("covers", []).append(place["id"])
+        if place["evidence"] not in host["evidence"].split("; "):
+            host["evidence"] += "; " + place["evidence"]
+    return sorted(kept, key=lambda p: order[id(p)])
 
 
 def _spans(data, confirmed, report=None):

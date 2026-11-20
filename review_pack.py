@@ -107,7 +107,9 @@ def cut_clip(src, t1, t2, out):
 
 # ---------- сборка пакета ----------
 def build(json_path, items, base_url_note=None):
-    """items: [{id, question, options: [{label, decision}], recommended}] — вопросы Claude по местам review.
+    """items: [{id, question, options: [{label, decision}], recommended, answer_mode?}] — вопросы Claude
+    по местам review. answer_mode="speaker" — карточка подтверждения говорящего: свой ответ на ней
+    применяется только как решение о говорящем (имя или «Имя: точные слова»), иначе — человеку.
     -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся."""
     import transcript as T
     data = T.load(json_path)
@@ -166,6 +168,9 @@ def build(json_path, items, base_url_note=None):
             "question": question,
             "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
             "recommended": None if it.get("asr_problem") else q.get("recommended"), "note": q.get("note")}
+        if q.get("answer_mode") == "speaker" and not it.get("asr_problem"):
+            # подтверждение говорящего: свободный ответ не становится текстом реплики (freeform.card_edits)
+            manifest_item["answer_mode"] = "speaker"
         automation_diagnostic = _automation_diagnostic(data, it)
         if automation_diagnostic:
             manifest_item["diagnostic_id"] = automation_diagnostic["id"]

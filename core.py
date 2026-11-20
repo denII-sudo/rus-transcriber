@@ -1795,8 +1795,9 @@ def legacy_speaker_review(job_id, build_pack=False):
         options = [{"label": f"Да, это говорит {place['speaker']}", "decision": {"word_ids": ids}}]
         options += [{"label": f"Нет, это {name}", "decision": {"word_ids": ids, "speaker": name}}
                     for name in names if name != place["speaker"]]
-        items.append({"id": place["id"],
-                      "question": (f"Подтвердите говорящего ({place['evidence']}). Ответ «да» войдёт в "
+        # answer_mode: свой ответ на такой карточке — решение о говорящем, а не текст реплики
+        items.append({"id": place["id"], "answer_mode": "speaker",
+                      "question":(f"Подтвердите говорящего ({place['evidence']}). Ответ «да» войдёт в "
                                    "голосовой профиль как подтверждение человека."),
                       "options": options})
     result["word_ids_added"] = added
