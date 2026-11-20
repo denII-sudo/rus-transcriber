@@ -9,10 +9,8 @@ permissions: {}
 
 jobs:
   queue:
-    # workflow_dispatch: Tests started by this workflow after a branch update (see below).
     if: >-
-      (github.event.workflow_run.event == 'pull_request' ||
-       github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -32,11 +30,13 @@ jobs:
       # for the code-owner approval requirement.
       #
       # The update commit is pushed by github-actions[bot]. Its pull_request
-      # run waits for manual approval ("first-time contributor" policy), so
-      # for branches of this repository Tests is started here through
-      # workflow_dispatch, which needs no approval, and auto-merge is enabled:
-      # GitHub merges only after the required "tests" check passes on the
-      # updated commit. Pull requests from forks keep the manual approval.
+      # run waits for manual approval ("first-time contributor" policy). For
+      # branches of this repository the update contains only main and the
+      # already tested branch, so this workflow approves that waiting run
+      # (actions: write) and enables auto-merge: GitHub merges only after the
+      # required "tests" check passes on the updated commit. (A workflow_dispatch
+      # run is not counted as the PR's required check, so it is not used.)
+      # Pull requests from forks keep the manual approval.
       - name: Update or queue the passing PR
         shell: bash
         run: |
@@ -76,9 +76,18 @@ jobs:
                 echo "PR #${pr}: branch update did not appear in time; leaving it as is."
                 continue
               fi
-              ref="$(gh pr view "$pr" --repo "$REPOSITORY" --json headRefName --jq .headRefName)"
-              echo "PR #${pr} updated to ${head}; starting Tests on it."
-              gh workflow run tests.yml --repo "$REPOSITORY" --ref "$ref"
+              echo "PR #${pr} updated to ${head}; approving its waiting Tests run."
+              run_id=""
+              for _ in $(seq 1 30); do
+                run_id="$(gh run list --repo "$REPOSITORY" --workflow tests.yml --commit "$head"                   --event pull_request --json databaseId,status,conclusion                   --jq '[.[] | select(.status == "action_required" or .conclusion == "action_required")][0].databaseId // empty')"
+                [ -n "$run_id" ] && break
+                sleep 5
+              done
+              if [ -z "$run_id" ]; then
+                echo "PR #${pr}: no Tests run waiting for approval on ${head}."
+              elif ! gh api -X POST "repos/${REPOSITORY}/actions/runs/${run_id}/approve" > /dev/null; then
+                echo "PR #${pr}: could not approve Tests run ${run_id}; approve it in the Actions tab."
+              fi
               gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
               continue
             fi
