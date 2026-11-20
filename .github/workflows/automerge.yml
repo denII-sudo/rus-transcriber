@@ -13,8 +13,8 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    # waits for approved Tests runs (about 5 minutes each, up to MAX_ROUNDS)
-    timeout-minutes: 90
+    # watches the queued PR (WATCH_MINUTES) and waits for approved Tests runs
+    timeout-minutes: 120
     permissions:
       actions: write
       contents: write
@@ -42,12 +42,16 @@ jobs:
       #
       # A run approved here does not trigger this workflow again when it
       # finishes (events caused by GITHUB_TOKEN start no workflows). So the job
-      # waits for the approved run itself; if main moved meanwhile and the PR is
-      # behind again, it repeats the update (up to MAX_ROUNDS times).
+      # waits for the approved run itself. Merges done by auto-merge start no
+      # workflows either, so a queued PR that falls behind because another PR
+      # merged first would wait forever: the job keeps watching the queued PR
+      # until it is merged or closed (up to WATCH_MINUTES) and repeats the
+      # update whenever it is behind (up to MAX_ROUNDS times).
       - name: Update or queue the passing PR
         shell: bash
         env:
           MAX_ROUNDS: "5"
+          WATCH_MINUTES: "60"
         run: |
           pr_field() { gh pr view "$1" --repo "$REPOSITORY" --json "$2" --jq ".$2"; }
 
@@ -103,29 +107,45 @@ jobs:
             echo "No open non-draft pull request for tested commit ${TESTED_SHA}."
             exit 0
           fi
-          while IFS= read -r pr; do
+          # for, not while-read: commands inside the loop must not consume the list
+          for pr in $prs; do
             case "$pr" in
               ''|*[!0-9]*)
                 echo "Skipping unexpected pull-request number."
                 exit 1
                 ;;
             esac
+            if [ "$(pr_field "$pr" isCrossRepository)" != "false" ]; then
+              if [ "$(pr_field "$pr" mergeStateStatus)" = "BEHIND" ]; then
+                echo "PR #${pr} comes from a fork; requesting a branch update."
+                echo "Tests on the update needs manual approval."
+                gh pr update-branch "$pr" --repo "$REPOSITORY"
+              else
+                gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+              fi
+              continue
+            fi
             if [ "$(pr_field "$pr" mergeStateStatus)" != "BEHIND" ]; then
               gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
-              continue
             fi
-            if [ "$(pr_field "$pr" isCrossRepository)" != "false" ]; then
-              echo "PR #${pr} comes from a fork; requesting a branch update."
-              echo "Tests on the update needs manual approval."
-              gh pr update-branch "$pr" --repo "$REPOSITORY"
-              continue
-            fi
-            for round in $(seq 1 "$MAX_ROUNDS"); do
-              update_and_test "$pr" || break
-              sleep 10
+            # Watch the PR until it is merged or closed.
+            rounds=0
+            deadline=$((SECONDS + WATCH_MINUTES * 60))
+            while [ "$SECONDS" -lt "$deadline" ]; do
               state="$(pr_field "$pr" state)"
-              merge_state="$(pr_field "$pr" mergeStateStatus)"
-              echo "PR #${pr}: state ${state}, merge state ${merge_state} (round ${round})."
-              [ "$state" = "OPEN" ] && [ "$merge_state" = "BEHIND" ] || break
+              if [ "$state" != "OPEN" ]; then
+                echo "PR #${pr}: ${state}."
+                break
+              fi
+              if [ "$(pr_field "$pr" mergeStateStatus)" = "BEHIND" ]; then
+                rounds=$((rounds + 1))
+                if [ "$rounds" -gt "$MAX_ROUNDS" ]; then
+                  echo "PR #${pr}: still behind after ${MAX_ROUNDS} updates; leaving it as is."
+                  break
+                fi
+                update_and_test "$pr" || break
+                continue
+              fi
+              sleep 30
             done
-          done <<< "$prs"
+          done
