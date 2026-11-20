@@ -38,7 +38,10 @@ jobs:
       # (actions: write) and enables auto-merge: GitHub merges only after the
       # required "tests" check passes on the updated commit. (A workflow_dispatch
       # run is not counted as the PR's required check, so it is not used.)
-      # Pull requests from forks keep the manual approval.
+      # Pull requests from forks keep the manual approval. Their branch update
+      # is refused when main changed files in .github/workflows (GITHUB_TOKEN
+      # has no "workflows" permission): then the PR gets one comment asking
+      # the author to merge main, and the job goes on with other PRs.
       #
       # A run approved here does not trigger this workflow again when it
       # finishes (events caused by GITHUB_TOKEN start no workflows). So the job
@@ -98,6 +101,19 @@ jobs:
             echo "PR #${pr}: Tests passed on ${head}."
           }
 
+          # A fork branch cannot be updated by this token when main changed
+          # .github/workflows: ask the author once, in a PR comment.
+          fork_update_refused() {
+            local pr="$1" marker="<!-- automerge: fork update refused -->" body
+            # count with --jq, not "| grep -q": with pipefail an early grep exit fails gh
+            if [ "$(gh pr view "$pr" --repo "$REPOSITORY" --json comments \
+                --jq "[.comments[].body | select(contains(\"${marker}\"))] | length")" != "0" ]; then
+              return 0
+            fi
+            body="${marker}"$'\n'"Автослияние не может подтянуть main в ветку этого PR: в main менялись файлы .github/workflows, а токену GitHub Actions менять их в ветке форка нельзя. Влейте, пожалуйста, свежий main в свою ветку (или нажмите «Update branch»): после проверок PR встанет в очередь как обычно."$'\n\n'"Auto-merge cannot update this branch: main changed files in .github/workflows, which the Actions token may not push to a fork. Please merge the latest main into your branch (or use Update branch)."
+            gh pr comment "$pr" --repo "$REPOSITORY" --body "$body"
+          }
+
           prs="$(gh pr list --repo "$REPOSITORY" --state open --base main --limit 1000 \
             --json number,headRefOid,isDraft \
             --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\" and .isDraft == false) | .number")"
@@ -118,8 +134,12 @@ jobs:
             if [ "$(pr_field "$pr" isCrossRepository)" != "false" ]; then
               if [ "$(pr_field "$pr" mergeStateStatus)" = "BEHIND" ]; then
                 echo "PR #${pr} comes from a fork; requesting a branch update."
-                echo "Tests on the update needs manual approval."
-                gh pr update-branch "$pr" --repo "$REPOSITORY"
+                if gh pr update-branch "$pr" --repo "$REPOSITORY"; then
+                  echo "Tests on the update needs manual approval."
+                else
+                  echo "::warning::PR #${pr}: fork branch update refused (main changed workflow files?)."
+                  fork_update_refused "$pr" || true
+                fi
               else
                 gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
               fi
