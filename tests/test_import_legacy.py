@@ -176,6 +176,42 @@ class ConversionTests(Fixture):
         with self.assertRaises(ValueError):
             IL.legacy_conspect_markdown(broken)
 
+    def test_file_saved_by_current_program_keeps_ids_and_runtime_fields(self):
+        """После переноса подтверждений голосов старый файл сохранён штатно: есть recording_id и ID слов."""
+        import transcript
+        md = self.side / "встреча.v2.transcript.md"
+        with mock.patch.object(transcript, "_refresh_conspects", return_value=None):
+            transcript.save(json.loads(self.tj.read_text(encoding="utf-8")), self.tj, md)
+        saved = json.loads(self.tj.read_text(encoding="utf-8"))
+        self.assertIn("recording_id", saved)
+        ids = [w["word_id"] for s in saved["segments"] for w in s.get("words", [])]
+        _, transcript_snap, _, _ = IL.build_snapshots(saved, recording_id=IL.recording_id_for(self.tj, "y"),
+                                                      metadata={}, field_sources={}, variant={}, source={"path": "p"})
+        self.assertEqual([w["word_id"] for s in transcript_snap["segments"] for w in s.get("words", [])], ids)
+        runtime = transcript_snap["quality"]["migration"]["source"]["legacy_runtime"]
+        self.assertEqual(runtime["recording_id"], saved["recording_id"])
+        self.assertEqual(runtime["source_revision"], saved["source_revision"])
+
+    def test_archived_answers_are_imported_newest_first(self):
+        (self.pack / "answers.20261108101950-aaaaaa.json").write_text(json.dumps({
+            "version": "old", "answers": {"r-time": {"id": "r-time", "version": "q1", "kind": "option", "option": 0},
+                                           "r-ok": {"id": "r-ok", "version": "q1", "kind": "option", "option": 0}}},
+            ensure_ascii=False), encoding="utf-8")
+        legacy, source, packs, _ = IL._read_variant(self.plan()["recordings"][0], self.plan()["recordings"][0]["variants"][0])
+        self.assertEqual([p["name"] for p in packs],
+                         ["встреча.v2.review", "встреча.v2.review/answers.20261108101950-aaaaaa.json"])
+        _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "z"), metadata={},
+                                                 field_sources={}, variant={}, source=source, answers_packs=packs)
+        self.assertEqual(review["answers"]["r-time"]["legacy_version"], "q7")      # новый ответ победил
+        self.assertEqual(review["answers"]["r-ok"]["origin"],
+                         "legacy_review_pack:встреча.v2.review/answers.20261108101950-aaaaaa.json")
+
+    def test_human_page_answer_keeps_actor_without_legacy_label(self):
+        review = {"review": [{"id": "a"}], "answers": {}}
+        IL.import_answers(review, {"a": {"id": "a", "source": "local", "actor_kind": "human", "ts": "2026-11-21T10:00:00"}}, "p")
+        self.assertEqual(review["answers"]["a"]["actor_kind"], "human")
+        self.assertNotIn("legacy_author_label", review["answers"]["a"])
+
     def test_recording_id_is_stable(self):
         self.assertEqual(IL.recording_id_for(self.tj, "a"), IL.recording_id_for(self.tj, "a"))
         self.assertNotEqual(IL.recording_id_for(self.tj, "a"), IL.recording_id_for(self.tj, "b"))

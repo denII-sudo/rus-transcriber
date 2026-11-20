@@ -39,6 +39,8 @@ METADATA_FIELDS = ("title", "recorded_at", "recorded_timezone", "container", "co
                    "audio_sha256", "audio_available")
 TIME_EPS = 0.05
 ANSWER_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"     # как review_pack._now: UTC, сравнивается как строка
+LEGACY_RUNTIME_KEYS = ("recording_id", "source_revision", "review_revision", "document_revision",
+                       "document_sync")
 
 
 class PlanError(ValueError):
@@ -233,7 +235,7 @@ def import_answers(review, pack_answers, pack_name):
             # «ГГГГ-ММ-ДДTЧЧ:ММ:СС» в UTC (review_pack._now), поэтому — тот же вид, без долей секунды
             value["ts"] = time.strftime(ANSWER_TS_FORMAT, time.gmtime(value["ts"]))
             converted += 1
-        if isinstance(value.get("source"), str):
+        if isinstance(value.get("source"), str) and "actor_kind" not in value:
             # кто отвечал, в старом формате не записано: метка источника, не утверждение об авторе
             value["legacy_author_label"] = "старая страница разбора: " + value["source"]
         value["id"] = ident
@@ -248,6 +250,9 @@ def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, s
     import recordings
     import storage
     data = copy.deepcopy(legacy)
+    # служебные поля, которые ставит штатное сохранение старого файла (transcript.save): в новом
+    # формате их ведёт база; прежние значения сохраняются в сведениях о переносе
+    legacy_runtime = {key: data.pop(key) for key in LEGACY_RUNTIME_KEYS if key in data}
     filled = {}
     for key in METADATA_FIELDS:
         if key in metadata and metadata[key] is not None and key not in data:
@@ -265,7 +270,8 @@ def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, s
     stats["answers"] = packs
     quality = transcript.setdefault("quality", {})
     quality["migration"] = {
-        "tool": TOOL, "source": source, "field_sources": filled,
+        "tool": TOOL, "source": {**source, **({"legacy_runtime": legacy_runtime} if legacy_runtime else {})},
+        "field_sources": filled,
         "variant": {k: variant.get(k) for k in ("tag", "order", "main", "main_note", "history") if k in variant},
         "review": stats["review"], "review_packs": packs,
     }
@@ -309,8 +315,15 @@ def _read_variant(rec, variant):
     packs = []
     for pack_dir in variant.get("review_packs", []):
         pd = Path(pack_dir)
-        ans = json.loads((pd / "answers.json").read_text(encoding="utf-8-sig"))
-        packs.append({"name": pd.name, "answers": ans.get("answers") or {}, "applied_at": ans.get("applied_at")})
+        # текущие ответы и архив прежних версий карточек (answers.<версия>.json): новые — первыми,
+        # прежние добавляются только к сомнениям без более нового ответа
+        files = [pd / "answers.json"] + sorted(pd.glob("answers.*.json"), key=lambda p: p.name, reverse=True)
+        for f in files:
+            if not f.is_file():
+                continue
+            ans = json.loads(f.read_text(encoding="utf-8-sig"))
+            name = pd.name if f.name == "answers.json" else f"{pd.name}/{f.name}"
+            packs.append({"name": name, "answers": ans.get("answers") or {}, "applied_at": ans.get("applied_at")})
     conspects = []
     for c in variant.get("conspects", []):
         cj = json.loads(Path(c).read_text(encoding="utf-8-sig"))
