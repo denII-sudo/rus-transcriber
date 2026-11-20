@@ -795,7 +795,7 @@ if ($Source -ne $Target) {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает;
-    # старые profiles\, config.json, jobs\ из папки программы перенесёт migrate.py при первом запуске сервера
+    # старые profiles\, config.json, jobs\ из папки программы переносит явная команда migrate_data (или migrate.py)
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
 Set-Location $Target
 

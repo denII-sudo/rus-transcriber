@@ -23,7 +23,6 @@ sys.path.insert(0, str(HERE))
 import core  # noqa: E402  (импортирует paths первым: дочерние процессы унаследуют HF_HOME и др.)
 import paths  # noqa: E402
 import settings  # noqa: E402
-import migrate  # noqa: E402
 import confirm  # noqa: E402
 import storage  # noqa: E402
 
@@ -34,10 +33,8 @@ def _status(job_id):
     return core.job_status(job_id)
 _launch = core.launch
 _job_json = core.job_json
-try:
-    migrate.run()          # один раз: данные из папки программы -> DATA_DIR (с резервной копией)
-except Exception as _ex:   # старт сервера из-за этого не рвём
-    print(f"миграция данных не выполнена: {_ex}", file=sys.stderr)
+# Перенос старой раскладки данных при старте больше не выполняется: только явной командой
+# migrate_data (с отчётом без применения и подтверждением человека) или python migrate.py.
 
 INSTRUCTIONS = """\
 rus-transcriber: расшифровка речи на этом компьютере. При заказанном конспекте П4 автоматически отправляет
@@ -83,7 +80,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.18.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.20.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
