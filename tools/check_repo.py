@@ -6,13 +6,14 @@ r"""Проверка перед коммитом: в отслеживаемых 
 
 Что проверяется:
   1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, config.json, bench*, аудио,
-     *.transcript.*, cache/, .venv/;
+     *.transcript.*, cache/, hf-cache/, .venv/;
   2. абсолютные пути с настоящим именем пользователя: C:\Users\<имя>\ (допустимы <вы>, Иван, %USERNAME%, user …);
   3. запрещённые слова — имена участников, названия и термины групп. Откуда берутся (список хранится ВНЕ
      репозитория): все groups\*\vocab.json и voices.json из папки данных (RUS_TRANSCRIBER_DATA или
      %APPDATA%\rus-transcriber-data) + необязательный файл со своими словами (по одному в строке): путь в
      RUS_FORBIDDEN_WORDS или forbidden_words.txt в папке данных. Слова короче 3 букв пропускаются; общеупотребительные
-     слова, попавшие в список по ошибке, внесите в allow_words.txt рядом со списком.
+     слова, попавшие в список по ошибке, внесите в allow_words.txt рядом со списком. Имя общей группы «default»
+     личными данными не считается и в список не попадает.
 Код возврата: 0 — чисто, 1 — найдены нарушения, 2 — не удалось получить список слов (проверьте на компьютере с данными).
 """
 import fnmatch
@@ -27,7 +28,10 @@ ROOT = Path(__file__).resolve().parent.parent
 BAD_NAMES = ["*.voices.json", "voices.json", "config.json", "bench_*", "bench.json", "*.transcript.*",
              "*.mp3", "*.m4a", "*.wav", "*.ogg", "*.opus", "*.flac", "*.aac", "*.mp4", "*.mkv", "*.webm",
              "rus-transcriber.vocab.json"]
-BAD_DIRS = {"groups", "jobs", "cache", ".venv", "profiles", "exports", "_deleted"}
+BAD_DIRS = {"groups", "jobs", "cache", "hf-cache", ".venv", "profiles", "exports", "_deleted"}
+# Имена групп, которые не несут личных данных: «default» есть в любой установке и встречается
+# в исходниках как обычное слово, поэтому запрещённым словом оно быть не должно.
+GENERIC_GROUP_NAMES = {"default"}
 OK_USERS = {"иван", "user", "username", "you", "name", "вы", "<вы>", "ваше_имя", "someone", "public"}
 TEXT_MAX = 2_000_000
 USER_PATH = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+([^\\/\s\"'`<>%]+)", re.I)
@@ -63,7 +67,8 @@ def forbidden_words():
     dd = data_dir()
     if dd.is_dir():
         for g in (dd / "groups").glob("*") if (dd / "groups").is_dir() else []:
-            words.add(g.name)
+            if g.name.lower() not in GENERIC_GROUP_NAMES:
+                words.add(g.name)
             for fn in ("vocab.json", "voices.json"):
                 p = g / fn
                 if p.is_file():
