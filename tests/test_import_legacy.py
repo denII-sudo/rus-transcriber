@@ -166,7 +166,7 @@ class ConversionTests(Fixture):
         self.assertEqual(answer["origin"], "legacy_review_pack:p")
         self.assertIsNone(review.get("question_version"))
         review2 = {"review": [{"id": "a"}], "answers": {}}
-        self.assertEqual(IL.import_answers(review2, {"a": {}, "b": {}}, "p"), (1, 1))
+        self.assertEqual(IL.import_answers(review2, {"a": {}, "b": {}}, "p"), (1, 1, 0))
 
     def test_conspect_markdown_restored_from_placeholders(self):
         md = IL.legacy_conspect_markdown(legacy_conspect(self.tj))
@@ -239,8 +239,12 @@ class CheckAndApplyTests(Fixture):
                              hashlib.sha256(b"synthetic audio").hexdigest())
             answer = current["review"]["payload"]["answers"]["r-time"]
             self.assertEqual(answer["origin"], "legacy_review_pack:встреча.v2.review")
-            self.assertEqual(answer["legacy_ts"], 1794129404.7)
-            self.assertTrue(answer["ts"].startswith("2026-11-08T"))
+            # формат программы (review_pack._now): UTC «ГГГГ-ММ-ДДTЧЧ:ММ:СС», без дубля исходного числа
+            self.assertRegex(answer["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$")
+            self.assertNotIn("legacy_ts", answer)
+            self.assertLessEqual(answer["ts"], "2026-11-08T16:41:40")   # ответ раньше применения пакета
+            packs = current["transcript"]["payload"]["quality"]["migration"]["review_packs"]
+            self.assertEqual(packs[0]["ts_converted"], 1)
             self.assertNotIn("actor_kind", answer)
             self.assertEqual(len(store.list_conspects(entry["recording_id"])), 1)
             op = IL.uuid.uuid5(IL.NAMESPACE, "legacy-import:" + entry["recording_id"])

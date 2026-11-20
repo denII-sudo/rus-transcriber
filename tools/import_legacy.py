@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ PLAN_VERSION = 1
 METADATA_FIELDS = ("title", "recorded_at", "recorded_timezone", "container", "codec",
                    "audio_sha256", "audio_available")
 TIME_EPS = 0.05
+ANSWER_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"     # как review_pack._now: UTC, сравнивается как строка
 
 
 class PlanError(ValueError):
@@ -218,7 +220,7 @@ def import_answers(review, pack_answers, pack_name):
     """Ответы из папки разбора: только к существующим сомнениям, без подмены версии вопросов."""
     ids = {item["id"] for item in review.get("review") or []}
     answers = review.setdefault("answers", {})
-    imported, skipped = 0, 0
+    imported, skipped, converted = 0, 0, 0
     for ident, answer in (pack_answers or {}).items():
         if ident not in ids or not isinstance(answer, dict) or ident in answers:
             skipped += 1
@@ -227,8 +229,10 @@ def import_answers(review, pack_answers, pack_name):
         if "version" in value:
             value["legacy_version"] = value.pop("version")
         if isinstance(value.get("ts"), (int, float)) and not isinstance(value.get("ts"), bool):
-            value["legacy_ts"] = value["ts"]
-            value["ts"] = datetime.fromtimestamp(value["ts"], timezone.utc).isoformat()
+            # старый формат — секунды с 1970 года; программа пишет и сравнивает строки
+            # «ГГГГ-ММ-ДДTЧЧ:ММ:СС» в UTC (review_pack._now), поэтому — тот же вид, без долей секунды
+            value["ts"] = time.strftime(ANSWER_TS_FORMAT, time.gmtime(value["ts"]))
+            converted += 1
         if isinstance(value.get("source"), str):
             # кто отвечал, в старом формате не записано: метка источника, не утверждение об авторе
             value["legacy_author_label"] = "старая страница разбора: " + value["source"]
@@ -236,7 +240,7 @@ def import_answers(review, pack_answers, pack_name):
         value["origin"] = "legacy_review_pack:" + pack_name
         answers[ident] = value
         imported += 1
-    return imported, skipped
+    return imported, skipped, converted
 
 
 def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, source, answers_packs=()):
@@ -253,8 +257,11 @@ def build_snapshots(legacy, *, recording_id, metadata, field_sources, variant, s
     stats = {"review": anchor_review(transcript, review)}
     packs = []
     for pack in answers_packs:
-        n, skipped = import_answers(review, pack.get("answers"), pack["name"])
-        packs.append({"name": pack["name"], "imported": n, "skipped": skipped, "applied_at": pack.get("applied_at")})
+        n, skipped, converted = import_answers(review, pack.get("answers"), pack["name"])
+        packs.append({"name": pack["name"], "imported": n, "skipped": skipped, "applied_at": pack.get("applied_at"),
+                      "ts_converted": converted,
+                      "ts_note": "время ответов переведено из секунд с 1970 года в UTC «ГГГГ-ММ-ДДTЧЧ:ММ:СС», "
+                                 "доли секунды отброшены" if converted else ""})
     stats["answers"] = packs
     quality = transcript.setdefault("quality", {})
     quality["migration"] = {
