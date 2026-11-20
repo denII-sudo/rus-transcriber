@@ -171,13 +171,24 @@ def build(json_path, items, base_url_note=None):
             manifest_item["diagnostic_id"] = automation_diagnostic["id"]
             manifest_item["automation_diagnostic"] = automation_diagnostic
         out.append(manifest_item)
-    keep = {f"{r['id']}.mp3" for r in out}
+    body = json.dumps(out, ensure_ascii=False, sort_keys=True)
+    version = time.strftime("%Y%m%d%H%M%S-") + hashlib.sha1(body.encode()).hexdigest()[:6]
     if not sqlite_mode:
+        # прежние вопросы — часть истории ответов: manifest сохраняется рядом с архивом ответов,
+        # а фрагменты, на которые ссылаются сохранённые манифесты, не удаляются
+        old = _read(pd / "manifest.json", None)
+        if isinstance(old, dict) and old.get("version") and old.get("version") != version:
+            archived = pd / f"manifest.{old['version']}.json"
+            if not archived.exists():
+                _write(archived, old)
+        keep = {f"{r['id']}.mp3" for r in out}
+        for kept in pd.glob("manifest.*.json"):
+            for row in (_read(kept, {}) or {}).get("items") or []:
+                if isinstance(row, dict) and row.get("clip"):
+                    keep.add(Path(row["clip"]).name)
         for f in clips_dir.glob("*.mp3"):
             if f.name not in keep:
                 f.unlink()
-    body = json.dumps(out, ensure_ascii=False, sort_keys=True)
-    version = time.strftime("%Y%m%d%H%M%S-") + hashlib.sha1(body.encode()).hexdigest()[:6]
     man = {"version": version, "job_json": str(json_path), "audio": src.name,
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(), "items": out}
