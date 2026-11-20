@@ -33,6 +33,7 @@ def legacy_data(audio):
                        w("отмечено", 10.5, 11.0, by="human", provenance={"speaker": {"by": "human", "edit": "x"}})]},
             {"speaker": "Анна", "start": 13.0, "end": 13.5, "text": "раз", "words": [w("раз", 13.0, 13.4, by="human")]},
             {"speaker": "Борис", "start": 13.6, "end": 14.5, "text": "два", "words": [w("два", 13.7, 14.2, by="human")]},
+            {"speaker": "Борис", "start": 15.0, "end": 15.4, "text": "да", "words": [w("да", 15.0, 15.4, by="human")]},
         ],
         "review": [
             {"id": "r1", "t": 0.0, "t1": 0.0, "t2": 1.2, "speaker": "Анна", "text": "принято как есть", "status": "resolved"},
@@ -41,6 +42,7 @@ def legacy_data(audio):
             {"id": "r4", "t": 10.0, "t1": 10.0, "t2": 11.0, "speaker": "Борис", "text": "уже отмечено", "status": "resolved"},
             {"id": "r5", "t": 13.0, "t1": 13.0, "t2": 14.2, "speaker": "Анна", "text": "раз два", "status": "resolved"},
             {"id": "r6", "t": 1.3, "t1": 1.3, "t2": 1.6, "speaker": "Анна", "text": "тут"},
+            {"id": "r7", "t": 15.0, "t1": 15.0, "t2": 15.4, "speaker": "Борис", "text": "да", "status": "resolved"},
         ],
         "edits": [
             {"id": "r2", "t": 4.0, "by": "human", "before": {"text": "сменили говорящего", "speaker": "Анна"},
@@ -55,20 +57,22 @@ class PlacesTests(unittest.TestCase):
     def test_places_by_evidence_and_skips(self):
         found = voices.legacy_speaker_places(legacy_data("a.wav"))
         places = {p["id"]: p for p in found["places"]}
-        self.assertEqual(set(places), {"r1", "r2"})
+        self.assertEqual(set(places), {"r1", "r2", "r3"})
         self.assertEqual(places["r1"]["evidence"], "место принято человеком как есть")
         self.assertEqual((places["r1"]["seg"], places["r1"]["w1"], places["r1"]["w2"]), (0, 0, 3))
         self.assertEqual(places["r2"]["evidence"], "смена говорящего правкой человека")
         self.assertEqual(places["r2"]["speaker"], "Борис")
-        self.assertEqual(found["skipped"], {"text_only": 1, "already_confirmed": 1, "not_contiguous": 1, "no_words": 0})
-        self.assertEqual(found["seconds_by_speaker"], {"Анна": round(0.5 + 0.2 + 0.3, 2), "Борис": round(0.6 + 0.7, 2)})
+        self.assertEqual(places["r3"]["evidence"], "правка текста человеком (говорящий не менялся)")
+        # r7 короче HUMAN_MIN (0,8 с): в отпечаток не попадёт и не предлагается
+        self.assertEqual(found["skipped"], {"too_short": 1, "already_confirmed": 1, "not_contiguous": 1, "no_words": 0})
+        self.assertEqual(found["seconds_by_speaker"], {"Анна": round(0.5 + 0.2 + 0.3 + 0.4 + 0.5, 2), "Борис": round(0.6 + 0.7, 2)})
 
     def test_spans_report_counts_legacy_human_without_changing_selection(self):
         data = legacy_data("a.wav")
         report = {}
         spans = voices._spans(data, False, report)
         self.assertEqual(sum(1 for *_, human in spans if human), 1)          # только r4 с пословной отметкой
-        self.assertEqual(report["legacy_human_without_speaker"], 9)
+        self.assertEqual(report["legacy_human_without_speaker"], 10)
         self.assertIn("legacy_speaker_review",
                       voices.SELECTION_REASONS["legacy_human_without_speaker"])
 
@@ -98,16 +102,16 @@ class CommandTests(unittest.TestCase):
     def test_listing_does_not_change_files(self):
         before = self.jp.read_bytes()
         result = core.legacy_speaker_review("demo")
-        self.assertEqual([p["id"] for p in result["places"]], ["r1", "r2"])
+        self.assertEqual([p["id"] for p in result["places"]], ["r1", "r2", "r3"])
         self.assertIsNone(result["pack"])
         self.assertEqual(self.jp.read_bytes(), before)
 
     def test_pack_then_human_yes_sets_speaker_provenance_for_voice_learning(self):
         result = core.legacy_speaker_review("demo", build_pack=True)
-        self.assertEqual(result["word_ids_added"], 12)          # все слова получили постоянные ID
+        self.assertEqual(result["word_ids_added"], 13)          # все слова получили постоянные ID
         man = review_pack.manifest(self.jp)
         items = {i["id"]: i for i in man["items"]}
-        self.assertEqual(set(items), {"r1", "r2"})
+        self.assertEqual(set(items), {"r1", "r2", "r3"})
         yes = items["r1"]["options"][0]
         self.assertEqual(yes["label"], "Да, это говорит Анна")
         self.assertEqual(len(yes["decision"]["word_ids"]), 3)
@@ -124,7 +128,7 @@ class CommandTests(unittest.TestCase):
         humans = [span for span in voices._spans(data, False) if span[3]]
         self.assertEqual({span[0] for span in humans}, {"Анна", "Борис"})
         again = core.legacy_speaker_review("demo")
-        self.assertEqual(again["places"], [])
+        self.assertEqual([p["id"] for p in again["places"]], ["r3"])     # на r3 ещё не ответили
 
     def test_page_answers_applied_through_apply_answers(self):
         core.legacy_speaker_review("demo", build_pack=True)
@@ -134,7 +138,7 @@ class CommandTests(unittest.TestCase):
         with patch.object(core, "job_json", return_value=(str(self.jp), str(self.md))):
             core.apply_answers("demo")
         data = transcript.load(self.jp)
-        for rid in ("r1", "r2"):
+        for rid in ("r1", "r2", "r3"):
             place_words = [x for s in data["segments"] for x in s["words"]
                            if (x.get("provenance") or {}).get("speaker", {}).get("edit") == rid]
             self.assertTrue(place_words, rid)

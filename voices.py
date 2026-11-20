@@ -487,27 +487,26 @@ def _legacy_human_only(word):
 def legacy_speaker_places(data):
     """Места, где по старой истории правок видно решение человека о говорящем.
 
-    Только чтение. Доказательством считается: (1) правка человека, сменившая говорящего
-    (before.speaker != after.speaker или pairs), (2) место разбора, принятое человеком как
-    есть (слова с `by: human` без ссылки на правку внутри [t1, t2]). Правки только текста
-    говорящего не подтверждают и не берутся. Слова, уже имеющие пословную отметку говорящего,
-    пропускаются. Каждое место — непрерывный участок одного сегмента; иначе оно отклоняется.
+    Только чтение. Основания: (1) правка человека, сменившая говорящего (before.speaker !=
+    after.speaker или pairs); (2) место разбора, принятое человеком как есть (слова с
+    `by: human` без ссылки на правку внутри [t1, t2]); (3) правка человеком только текста —
+    говорящего она не доказывает, поэтому место тоже предлагается подтвердить отдельно.
+    Слова, уже имеющие пословную отметку говорящего, пропускаются. Каждое место — непрерывный
+    участок одного сегмента; места короче HUMAN_MIN в отпечаток не попадут и не предлагаются.
     """
     review = {item.get("id"): item for item in data.get("review") or [] if item.get("id")}
     edits = {}
     for edit in data.get("edits") or []:
         if edit.get("by") == "human" and edit.get("id") in review and not edit.get("reverted"):
             edits[edit["id"]] = edit
-    places, skipped = [], {"text_only": 0, "already_confirmed": 0, "not_contiguous": 0, "no_words": 0}
+    places, skipped = [], {"too_short": 0, "already_confirmed": 0, "not_contiguous": 0, "no_words": 0}
     for rid, item in review.items():
         edit = edits.get(rid)
         if edit is not None:
             before, after = edit.get("before") or {}, edit.get("after") or {}
             changed = isinstance(before, dict) and isinstance(after, dict) and before.get("speaker") != after.get("speaker")
-            if not changed and not edit.get("pairs"):
-                skipped["text_only"] += 1
-                continue
-            evidence = "смена говорящего правкой человека"
+            evidence = ("смена говорящего правкой человека" if changed or edit.get("pairs") else
+                        "правка текста человеком (говорящий не менялся)")
             def wanted(w, rid=rid):
                 return w.get("edited") == rid or (w.get("by") == "human" and not w.get("edited"))
         elif item.get("status") == "resolved":
@@ -539,6 +538,9 @@ def legacy_speaker_places(data):
         words = seg["words"][indexes[0]:indexes[-1] + 1]
         if any(not _legacy_human_only(w) for w in words):
             skipped["already_confirmed"] += 1
+            continue
+        if max(w["e"] for w in words) - words[0]["s"] < HUMAN_MIN:
+            skipped["too_short"] += 1
             continue
         places.append({"id": rid, "seg": si, "w1": indexes[0], "w2": indexes[-1] + 1,
                        "t1": round(words[0]["s"], 2), "t2": round(max(w["e"] for w in words), 2),
