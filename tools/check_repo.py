@@ -3,6 +3,7 @@ r"""Проверка перед коммитом: в отслеживаемых 
     python tools/check_repo.py              # отслеживаемые файлы (git ls-files) или, без git, все файлы папки
     python tools/check_repo.py --staged     # только то, что собираетесь закоммитить (для pre-commit)
     python tools/check_repo.py --list-words # показать, какие слова считаются запрещёнными (без привязки к файлам)
+    python tools/check_repo.py --hide-words # не показывать найденные слова и имена в путях (для публичного журнала CI)
 
 Что проверяется:
   1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, config.json, bench*, аудио,
@@ -120,7 +121,7 @@ def tracked(staged):
         return files, False
 
 
-def check(staged=False, require_words=True):
+def check(staged=False, require_words=True, hide_words=False):
     files, is_git = tracked(staged)
     problems = []
     for rel in files:
@@ -141,11 +142,13 @@ def check(staged=False, require_words=True):
         for ln, line in enumerate(text.splitlines(), 1):
             for m in USER_PATH.finditer(line):
                 if m.group(1).lower() not in OK_USERS and not m.group(1).startswith(("<", "%", "$")):
-                    problems.append((f"{rel}:{ln}", f"путь с именем пользователя: {m.group(0)}"))
+                    problems.append((f"{rel}:{ln}", "путь с именем пользователя (имя скрыто)" if hide_words
+                                     else f"путь с именем пользователя: {m.group(0)}"))
             if wrx:
                 m = wrx.search(line)
                 if m:
-                    problems.append((f"{rel}:{ln}", f"запрещённое слово «{m.group(1)}»"))
+                    problems.append((f"{rel}:{ln}", "запрещённое слово (скрыто)" if hide_words
+                                     else f"запрещённое слово «{m.group(1)}»"))
     return problems, words, is_git
 
 
@@ -154,7 +157,7 @@ def main():
         for w in forbidden_words():
             print(w)
         return 0
-    problems, words, is_git = check("--staged" in sys.argv)
+    problems, words, is_git = check("--staged" in sys.argv, hide_words="--hide-words" in sys.argv)
     if not words:
         print("ВНИМАНИЕ: список запрещённых слов пуст (нет данных в папке данных и forbidden_words.txt). "
               "Проверка слов не выполнена — запустите на компьютере с данными.", file=sys.stderr)

@@ -71,6 +71,36 @@ class T(unittest.TestCase):
         self.assertIn("Сосны", words)
         self.assertIn("Иван", words)
 
+    def test_hide_words_keeps_place_but_not_word(self):
+        """Режим --hide-words (публичный журнал CI): видно файл и строку, но не само слово и не имя в пути."""
+        with tempfile.TemporaryDirectory() as d:
+            root, data = Path(d) / "repo", Path(d) / "data"
+            root.mkdir()
+            data.mkdir()
+            (data / "forbidden_words.txt").write_text("Сосновка\n", encoding="utf-8")
+            user_path = "C:\\" + "Users\\Примеров\\x"  # собран по частям, чтобы не попасться проверке репозитория
+            (root / "notes.md").write_text(f"строка\nвстреча в Сосновка\n{user_path}\n", encoding="utf-8")
+            saved = {k: os.environ.get(k) for k in ("RUS_TRANSCRIBER_DATA", "RUS_FORBIDDEN_WORDS")}
+            os.environ["RUS_TRANSCRIBER_DATA"] = str(data)
+            os.environ.pop("RUS_FORBIDDEN_WORDS", None)
+            old = check_repo.ROOT
+            check_repo.ROOT = root
+            try:
+                hidden, _, _ = check_repo.check(hide_words=True)
+                shown, _, _ = check_repo.check()
+            finally:
+                check_repo.ROOT = old
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        self.assertEqual([w for w, _ in hidden], ["notes.md:2", "notes.md:3"])
+        text = " ".join(why for _, why in hidden)
+        self.assertNotIn("Сосновка", text)
+        self.assertNotIn("Примеров", text)
+        self.assertIn("Сосновка", " ".join(why for _, why in shown))
+
     def test_user_path_regex_allows_placeholders(self):
         rx = check_repo.USER_PATH
         self.assertEqual(rx.search(r"C:\Users\Иван\x").group(1), "Иван")

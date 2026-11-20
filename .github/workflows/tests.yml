@@ -55,3 +55,22 @@ jobs:
       # так же, как self_check у пользователя после обновления: свои временные папки и данные
       - name: Run self-check like an installed copy
         run: python -B selfcheck.py
+      # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,
+      # по одному в строке. Журнал публичный: --hide-words выводит только файл и строку, без слова.
+      # PR из форков секрет не получают — там проверка пропускается с пометкой.
+      - name: Check tracked files for private words
+        shell: pwsh
+        env:
+          FORBIDDEN_WORDS: ${{ secrets.RUS_FORBIDDEN_WORDS }}
+        run: |
+          if (-not $env:FORBIDDEN_WORDS) {
+            Write-Output "::notice::RUS_FORBIDDEN_WORDS is not available (fork PR or secret not set): private-word check skipped."
+            exit 0
+          }
+          $list = Join-Path $env:RUNNER_TEMP "forbidden-words.txt"
+          [IO.File]::WriteAllText($list, $env:FORBIDDEN_WORDS, (New-Object Text.UTF8Encoding $false))
+          $env:RUS_FORBIDDEN_WORDS = $list
+          python -B tools/check_repo.py --hide-words
+          $code = $LASTEXITCODE
+          Remove-Item $list -Force
+          exit $code
