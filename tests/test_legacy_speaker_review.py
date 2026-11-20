@@ -190,6 +190,23 @@ class PreviewTests(unittest.TestCase):
             self.assertTrue(any(line.startswith("ВНИМАНИЕ") and "Анна" in line for line in lines))
             self.assertTrue(any("4.2 → 0.0" in line for line in lines))
 
+    def test_confirmation_text_fits_with_legacy_reason(self):
+        # окно подтверждения обновления профиля ограничено 1100 знаками (core.prepare_voice_action);
+        # отчёт как у настоящей записи после переноса старых подтверждений не должен его превышать
+        counts = {"accepted_auto": 77, "accepted_human": 15, "foreign_overlap": 2, "gap_or_order": 32,
+                  "legacy_human_without_speaker": 16, "overlap": 33, "too_short": 106, "unconfirmed_or_flagged": 173}
+        report = {"existing_contributions": ["Мария", "Борис", "Ольга"],
+                  "candidates": {"Мария": {"seconds": 107.63}, "Борис": {"seconds": 179.44}, "Ольга": {"seconds": 100.53}},
+                  "human_seconds_change": {"Мария": {"before": 0.0, "after": 32.03}, "Ольга": {"before": 0.0, "after": 2.91}},
+                  "human_seconds_lost": [], "group_selection": {"method": "transcript_or_vocab"},
+                  "selection_explanation": [{"code": c, "description": voices.SELECTION_REASONS[c], "count": n}
+                                            for c, n in counts.items()]}
+        snapshot = {"group": "ip-demo-course-1", "json": "zapis1_2026-11-08_23-12-04.s2.transcript.json",
+                    "vocab_path": "rus-transcriber.vocab.json", "vocab_hash": "0" * 64, "report": report}
+        lines = core.voice_action_lines(snapshot)
+        self.assertLessEqual(len("\n".join(lines)), 1100)
+        self.assertTrue(all(len(line) <= 200 for line in lines))
+
 
 if __name__ == "__main__":
     unittest.main()
