@@ -13,6 +13,8 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # waits for approved Tests runs (about 5 minutes each, up to MAX_ROUNDS)
+    timeout-minutes: 90
     permissions:
       actions: write
       contents: write
@@ -37,9 +39,61 @@ jobs:
       # required "tests" check passes on the updated commit. (A workflow_dispatch
       # run is not counted as the PR's required check, so it is not used.)
       # Pull requests from forks keep the manual approval.
+      #
+      # A run approved here does not trigger this workflow again when it
+      # finishes (events caused by GITHUB_TOKEN start no workflows). So the job
+      # waits for the approved run itself; if main moved meanwhile and the PR is
+      # behind again, it repeats the update (up to MAX_ROUNDS times).
       - name: Update or queue the passing PR
         shell: bash
+        env:
+          MAX_ROUNDS: "5"
         run: |
+          pr_field() { gh pr view "$1" --repo "$REPOSITORY" --json "$2" --jq ".$2"; }
+
+          # Update a behind PR branch of this repository, approve the waiting
+          # Tests run on the update and wait for it. Prints the result.
+          update_and_test() {
+            local pr="$1" old head run_id
+            old="$(pr_field "$pr" headRefOid)"
+            echo "PR #${pr} is behind main; requesting a branch update."
+            gh pr update-branch "$pr" --repo "$REPOSITORY" || return 1
+            # The update is asynchronous: wait for the new head commit.
+            head="$old"
+            for _ in $(seq 1 30); do
+              head="$(pr_field "$pr" headRefOid)"
+              [ "$head" != "$old" ] && break
+              sleep 5
+            done
+            if [ "$head" = "$old" ]; then
+              echo "PR #${pr}: branch update did not appear in time; leaving it as is."
+              return 1
+            fi
+            echo "PR #${pr} updated to ${head}; approving its waiting Tests run."
+            run_id=""
+            for _ in $(seq 1 30); do
+              run_id="$(gh run list --repo "$REPOSITORY" --workflow tests.yml --commit "$head" \
+                --event pull_request --json databaseId,status,conclusion \
+                --jq '[.[] | select(.status == "action_required" or .conclusion == "action_required")][0].databaseId // empty')"
+              [ -n "$run_id" ] && break
+              sleep 5
+            done
+            if [ -z "$run_id" ]; then
+              echo "PR #${pr}: no Tests run waiting for approval on ${head}."
+              return 1
+            fi
+            if ! gh api -X POST "repos/${REPOSITORY}/actions/runs/${run_id}/approve" > /dev/null; then
+              echo "PR #${pr}: could not approve Tests run ${run_id}; approve it in the Actions tab."
+              return 1
+            fi
+            gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+            if ! gh run watch "$run_id" --repo "$REPOSITORY" --exit-status > /dev/null; then
+              echo "PR #${pr}: Tests run ${run_id} did not succeed."
+              return 1
+            fi
+            echo "PR #${pr}: Tests passed on ${head}."
+          }
+
           prs="$(gh pr list --repo "$REPOSITORY" --state open --base main --limit 1000 \
             --json number,headRefOid,isDraft \
             --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\" and .isDraft == false) | .number")"
@@ -56,40 +110,22 @@ jobs:
                 exit 1
                 ;;
             esac
-            merge_state="$(gh pr view "$pr" --repo "$REPOSITORY" --json mergeStateStatus --jq .mergeStateStatus)"
-            if [ "$merge_state" = "BEHIND" ]; then
-              echo "PR #${pr} is behind main; requesting a branch update."
-              gh pr update-branch "$pr" --repo "$REPOSITORY"
-              cross="$(gh pr view "$pr" --repo "$REPOSITORY" --json isCrossRepository --jq .isCrossRepository)"
-              if [ "$cross" != "false" ]; then
-                echo "PR #${pr} comes from a fork: Tests on the update needs manual approval."
-                continue
-              fi
-              # The update is asynchronous: wait for the new head commit.
-              head="$TESTED_SHA"
-              for _ in $(seq 1 30); do
-                head="$(gh pr view "$pr" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
-                [ "$head" != "$TESTED_SHA" ] && break
-                sleep 5
-              done
-              if [ "$head" = "$TESTED_SHA" ]; then
-                echo "PR #${pr}: branch update did not appear in time; leaving it as is."
-                continue
-              fi
-              echo "PR #${pr} updated to ${head}; approving its waiting Tests run."
-              run_id=""
-              for _ in $(seq 1 30); do
-                run_id="$(gh run list --repo "$REPOSITORY" --workflow tests.yml --commit "$head"                   --event pull_request --json databaseId,status,conclusion                   --jq '[.[] | select(.status == "action_required" or .conclusion == "action_required")][0].databaseId // empty')"
-                [ -n "$run_id" ] && break
-                sleep 5
-              done
-              if [ -z "$run_id" ]; then
-                echo "PR #${pr}: no Tests run waiting for approval on ${head}."
-              elif ! gh api -X POST "repos/${REPOSITORY}/actions/runs/${run_id}/approve" > /dev/null; then
-                echo "PR #${pr}: could not approve Tests run ${run_id}; approve it in the Actions tab."
-              fi
+            if [ "$(pr_field "$pr" mergeStateStatus)" != "BEHIND" ]; then
               gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
               continue
             fi
-            gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+            if [ "$(pr_field "$pr" isCrossRepository)" != "false" ]; then
+              echo "PR #${pr} comes from a fork; requesting a branch update."
+              echo "Tests on the update needs manual approval."
+              gh pr update-branch "$pr" --repo "$REPOSITORY"
+              continue
+            fi
+            for round in $(seq 1 "$MAX_ROUNDS"); do
+              update_and_test "$pr" || break
+              sleep 10
+              state="$(pr_field "$pr" state)"
+              merge_state="$(pr_field "$pr" mergeStateStatus)"
+              echo "PR #${pr}: state ${state}, merge state ${merge_state} (round ${round})."
+              [ "$state" = "OPEN" ] && [ "$merge_state" = "BEHIND" ] || break
+            done
           done <<< "$prs"
