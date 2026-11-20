@@ -1,0 +1,100 @@
+name: Clean up merged branches
+
+on:
+  schedule:
+    # twice a day, at 06:17 and 18:17 UTC
+    - cron: "17 6,18 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only list the branches that would be deleted"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: cleanup-branches
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      # GitHub does not delete the head branch when a pull request is merged
+      # by GitHub Actions (automerge.yml merges with GITHUB_TOKEN), and events
+      # caused by that token start no workflows, so a "pull_request: closed"
+      # workflow would not run either. This scheduled job removes such
+      # leftovers instead. It does not check out or run repository code.
+      #
+      # A branch is deleted only when all of these hold:
+      #   - it is the head of a merged pull request from this repository
+      #     (fork branches are never touched);
+      #   - it is not the default branch;
+      #   - it still points exactly at the head commit of that merged pull
+      #     request, so nothing was pushed to it after the merge (sessions
+      #     reuse branch names; new work must survive);
+      #   - no open pull request uses it.
+      - name: Delete head branches of merged pull requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${REPOSITORY}" --jq .default_branch)"
+          open_heads="$(gh pr list --repo "$REPOSITORY" --state open --limit 1000 \
+            --json headRefName,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository == false) | .headRefName')"
+          # a failed request stops the job here (set -e), instead of looking like "nothing to do"
+          merged_list="$(gh pr list --repo "$REPOSITORY" --state merged --limit 200 \
+            --json number,headRefName,headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository == false) | "\(.number) \(.headRefName) \(.headRefOid)"')"
+          merged=()
+          if [ -n "$merged_list" ]; then
+            mapfile -t merged <<< "$merged_list"
+          fi
+
+          declare -A decided=() moved=()
+          deleted=0
+          for line in "${merged[@]}"; do
+            read -r number branch head <<< "$line"
+            if [ -z "${branch:-}" ] || [ "$branch" = "$default_branch" ] || [ -n "${decided[$branch]:-}" ]; then
+              continue
+            fi
+            if grep -qxF -- "$branch" <<< "$open_heads"; then
+              decided[$branch]=1
+              echo "keep ${branch}: an open pull request uses it"
+              continue
+            fi
+            # on 404 gh prints the error body to stdout, so accept only a successful call with a commit SHA
+            if ! sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/${branch}" --jq .object.sha 2>/dev/null < /dev/null)" \
+                || ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              decided[$branch]=1   # already deleted
+              continue
+            fi
+            if [ "$sha" != "$head" ]; then
+              moved[$branch]=1     # another merged PR of this branch may still match
+              continue
+            fi
+            decided[$branch]=1
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete ${branch} (merged in PR #${number})"
+            elif gh api -X DELETE "repos/${REPOSITORY}/git/refs/heads/${branch}" > /dev/null < /dev/null; then
+              echo "deleted ${branch} (merged in PR #${number})"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::could not delete ${branch}"
+            fi
+          done
+          for branch in "${!moved[@]}"; do
+            if [ -z "${decided[$branch]:-}" ]; then
+              echo "keep ${branch}: it has commits that were not merged"
+            fi
+          done
+          echo "checked ${#merged[@]} merged pull requests; deleted ${deleted} branches (dry run: ${DRY_RUN})"
