@@ -510,6 +510,18 @@ finally:
         finally:
             restored.close()
 
+    def test_initialization_and_backup_leave_no_staged_service_files(self):
+        # После проверки копии только для чтения не должно остаться -wal/-shm временного имени.
+        self.assertEqual(sorted(p.name for p in self.base.glob("state.sqlite3.incomplete-*")), [])
+        self.create()
+        target = self.base / "copy.sqlite3"
+        self.store.backup(target)
+        self.assertTrue(target.is_file())
+        self.assertEqual(sorted(p.name for p in self.base.glob("*.incomplete-*")), [])
+        other = self.base / "other.sqlite3"
+        storage.initialize(other).close()
+        self.assertEqual(sorted(p.name for p in self.base.glob("*.incomplete-*")), [])
+
     def test_failed_initialization_and_backup_do_not_publish_partial_destination(self):
         self.create()
         target = self.base / "bad-backup.sqlite3"

@@ -404,6 +404,19 @@ class Settings(unittest.TestCase):
         settings.update(asr_batch=16)
         self.assertEqual(settings.load_overrides()["asr_backend"], "onnx-cpu")      # прежние отличия сохранены
 
+    def test_update_keeps_saved_values_equal_to_defaults(self):
+        # Выбор теста скорости, совпадающий с нынешними умолчаниями, не исчезает при записи
+        # другой настройки: иначе смена умолчаний молча поменяла бы поведение этой машины.
+        chosen = {"asr_batch": settings.DEFAULTS["asr_batch"], "asr_device": settings.DEFAULTS["asr_device"]}
+        settings.update(explicit=chosen.keys(), **chosen)
+        settings.update(default_group="example")
+        saved = settings.load_overrides()
+        self.assertEqual({k: saved.get(k) for k in chosen}, chosen)
+        self.assertEqual(saved["default_group"], "example")
+        settings.update(asr_batch=16)
+        settings.update(asr_batch=settings.DEFAULTS["asr_batch"])
+        self.assertEqual(settings.load_overrides()["asr_batch"], settings.DEFAULTS["asr_batch"])
+
     def test_broken_config_falls_back_to_defaults(self):
         paths.CONFIG_FILE.write_text("{oops", encoding="utf-8")
         self.assertEqual(settings.load_config(), settings.DEFAULTS)

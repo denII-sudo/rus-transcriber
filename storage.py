@@ -489,9 +489,25 @@ def initialize(path, *, initial_display_name=None):
     created = _initialize_at(staged, initial_display_name)
     created.close()
     validate_copy(staged)
+    _release_wal_files(staged)
     os.link(staged, path)
     staged.unlink()
     return open_store(path)
+
+
+def _release_wal_files(path):
+    """Убрать служебные -wal/-shm временного имени до публикации файла.
+
+    validate_copy открывает копию только для чтения; такое соединение создаёт -wal/-shm,
+    но при закрытии не может их удалить, и они остались бы рядом под временным именем.
+    Последнее закрываемое соединение для записи само переносит журнал в файл и удаляет их;
+    журнал SQLite открывает только при первом обращении к базе, поэтому нужно одно чтение.
+    """
+    db = _connect(path, "rw")
+    try:
+        db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    finally:
+        db.close()
 
 
 def _check_schema(db):
@@ -765,6 +781,7 @@ class Store:
         finally:
             target.close()
         report = validate_copy(staged)
+        _release_wal_files(staged)
         os.link(staged, destination)
         staged.unlink()
         return report
