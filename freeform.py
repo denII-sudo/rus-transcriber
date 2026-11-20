@@ -313,7 +313,7 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         return {"kind": "name", "edits": eds, "covered": span, "report": rep}
     replies = split_replies(text, names)
     if item.get("answer_mode") == "speaker":
-        # Карточка подтверждения говорящего: пояснение («Денис говорит только слово …») не должно
+        # Карточка подтверждения говорящего: пояснение («Вера говорит только слово …») не должно
         # молча стать текстом реплики. Слова принимаются лишь в явной форме «Имя: точные слова».
         label = re.match(r"\s*([^\s:]+)\s*:", text)
         known = {norm(n) for n in names}
