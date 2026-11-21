@@ -704,6 +704,19 @@ def read_recording_revision(recording_id, kind, revision):
         store.close()
 
 
+def _conspect_screen_sections(payload):
+    """Разделы конспекта для экрана. Прежнее поле `sections` отдаётся как есть; если его нет,
+    берутся тексты из `evidence` (так исполнитель свёртки сохраняет разделы), без номеров слов."""
+    sections = payload.get("sections")
+    if isinstance(sections, list):
+        return sections
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    return [{"text": item["text"]} for item in evidence
+            if isinstance(item, dict) and isinstance(item.get("text"), str)]
+
+
 def recording_conspects(recording_id):
     """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
     import recordings
@@ -719,11 +732,10 @@ def recording_conspects(recording_id):
                 (item["conspect_id"],)).fetchall()
             files = {loc["kind"]: str(Path(root["path"]) / loc["relative_path"])
                      for loc in locations} if root else {}
-            sections = item["payload"].get("sections")
             result.append({"conspect_id": item["conspect_id"], "name": item["name"],
                            "current_revision": item["current_revision"],
                            "source_revision": item["source_revision"],
-                           "sections": sections if isinstance(sections, list) else [],
+                           "sections": _conspect_screen_sections(item["payload"]),
                            "files": files})
         return result
     finally:
