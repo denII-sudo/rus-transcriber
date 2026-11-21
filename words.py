@@ -354,6 +354,70 @@ def vote3(main, ctc, whisper):
     return stats
 
 
+def combine_hypotheses(hypotheses, diagnostics):
+    """Сведение гипотез проходов моделей -> слова с пометками и решения.
+
+    hypotheses: {"primary": слова RNN-T со временами, "second": слова CTC или None,
+    "whisper": слова-строки Whisper или None}; None — проход не выполнялся или не удался.
+    diagnostics: сведения о кусках каждого прохода, {"primary"|"second"|"whisper": {"chunks": [...]}}.
+
+    Если все три гипотезы полны — голосование «два из трёх» (vote3); если неполна хоть одна
+    или Whisper нет — только сверка основной гипотезы со второй (mark_alt): голосование выравнивает
+    всю запись целиком и не умеет исключать отдельные куски. Слова основной гипотезы меняются на месте.
+
+    -> {"quality": {vote, asr_votes, vote3_skipped, asr_incomplete_chunks — что есть},
+        "evidence": {"whisper": [(начало, конец, причина, проходы со словами)],
+                     "other": [(начало, конец, проход, причина, проходы со словами)]}}
+    """
+    words, alt, wh_words = hypotheses["primary"], hypotheses.get("second"), hypotheses.get("whisper")
+    # Свидетельства других проходов фиксируем до изменения слов голосованием.
+    whisper_evidence = []
+    for rec in (diagnostics.get("whisper") or {}).get("chunks", []):
+        reason = "filtered" if rec.get("filtered_all") else rec.get("state")
+        if reason not in ("error", "empty_unknown", "filtered"):
+            continue
+        start, end = rec["own_span"]
+        sources = [name for name, ws in (("primary", words), ("second", alt or []))
+                   if any(start <= w["s"] < end for w in ws)]
+        whisper_evidence.append((start, end, reason, sources))
+    other_evidence = []
+    for name in ("primary", "second"):
+        for rec in (diagnostics.get(name) or {}).get("chunks", []):
+            if rec.get("state") not in ("error", "empty_unknown") or not rec.get("own_span"):
+                continue
+            start, end = rec["own_span"]
+            other = "second" if name == "primary" else "primary"
+            other_words = (alt or []) if name == "primary" else words
+            sources = [other] if any(start <= w["s"] < end for w in other_words) else []
+            other_evidence.append((start, end, name, rec["state"], sources))
+    quality = {}
+    if alt is not None and wh_words is not None and not whisper_evidence and not other_evidence:
+        quality["vote"] = vote3(words, alt, wh_words)
+        prev = None
+        for wd in words:                      # что заменило голосование — в список исправлений
+            if wd.get("voted") and wd.get("model", "") != "":
+                if prev is not None and prev["model"] == wd["model"] and prev["t2"] >= wd["s"] - 1.0:
+                    prev["to"] += " " + wd["w"]
+                    prev["t2"] = wd["s"]
+                else:
+                    prev = {"t": wd["s"], "t2": wd["s"], "model": wd["model"], "to": wd["w"]}
+                    quality.setdefault("asr_votes", []).append(prev)
+            elif wd.get("voted"):
+                quality.setdefault("asr_votes", []).append({"t": wd["s"], "t2": wd["s"], "model": "", "to": wd["w"]})
+                prev = None
+            else:
+                prev = None
+    elif alt is not None:
+        if whisper_evidence or (other_evidence and wh_words is not None):
+            # Не превращаем неизвестный результат Whisper в голос за пустоту.
+            quality["vote3_skipped"] = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
+        mark_alt(words, alt)
+    failed = sum(1 for stage in diagnostics.values() for item in stage["chunks"] if item["state"] == "error")
+    if failed:
+        quality["asr_incomplete_chunks"] = failed
+    return {"quality": quality, "evidence": {"whisper": whisper_evidence, "other": other_evidence}}
+
+
 # ---------- 4. голос по словам ----------
 class LabelAt:
     def __init__(self, tracks):

@@ -23,6 +23,7 @@ from unittest import mock
 import numpy as np
 
 import backends
+import words
 import worker
 
 SR = worker.SR
@@ -287,6 +288,52 @@ class RunWordsGoldenTests(unittest.TestCase):
         self.assertNotIn("vote3_skipped", quality)
         self.assertNotIn("asr_incomplete_chunks", quality)
         self.assertEqual([m for m in calls.models if m[0] == "make_asr"][1][1]["asr_batch"], 1)
+
+
+def hypothesis(tokens, offset=0.0):
+    return words.result_words(result(tokens), offset)
+
+
+class CombineHypothesesTests(unittest.TestCase):
+    """Стык «гипотезы -> слова и пометки» (words.combine_hypotheses) на синтетических гипотезах."""
+
+    def setUp(self):
+        self.main = hypothesis(PRIMARY[0])
+        self.second = hypothesis(SECOND[0])
+        self.whisper = [t for t in words.clean_whisper(WHISPER_TEXTS[0])[0].split() if words.norm_word(t)]
+        self.ok = {"primary": {"chunks": [{"state": "ok", "own_span": [0.0, 15.15]}]},
+                   "second": {"chunks": [{"state": "ok", "own_span": [0.0, 15.15]}]},
+                   "whisper": {"chunks": [{"state": "ok", "own_span": [0.0, 15.15]}]}}
+
+    def test_three_models_vote_like_vote3(self):
+        expected_words = copy.deepcopy(self.main)
+        stats = words.vote3(expected_words, copy.deepcopy(self.second), list(self.whisper))
+        got = words.combine_hypotheses({"primary": self.main, "second": self.second, "whisper": self.whisper},
+                                       self.ok)
+        self.assertEqual(self.main, expected_words)
+        self.assertEqual(got, {"quality": {"vote": stats, "asr_votes": [
+            {"t": 2.0, "t2": 2.0, "model": "дела?", "to": "дело"},
+            {"t": 10.3, "t2": 10.3, "model": "", "to": "там"}]},
+            "evidence": {"whisper": [], "other": []}})
+
+    def test_incomplete_whisper_skips_vote_and_compares_two_passes(self):
+        expected_words = copy.deepcopy(self.main)
+        words.mark_alt(expected_words, self.second)
+        diagnostics = {**self.ok, "whisper": {"chunks": [{"state": "error", "own_span": [0.0, 15.15]}]}}
+        got = words.combine_hypotheses({"primary": self.main, "second": self.second, "whisper": None},
+                                       diagnostics)
+        self.assertEqual(self.main, expected_words)
+        self.assertEqual(got, {"quality": {"vote3_skipped": "whisper_incomplete", "asr_incomplete_chunks": 1},
+                               "evidence": {"whisper": [(0.0, 15.15, "error", ["primary", "second"])],
+                                            "other": []}})
+
+    def test_failed_second_pass_leaves_primary_words_untouched(self):
+        before = copy.deepcopy(self.main)
+        diagnostics = {**self.ok, "second": {"chunks": [{"state": "error", "own_span": [0.0, 15.15]}]}}
+        got = words.combine_hypotheses({"primary": self.main, "second": None, "whisper": None}, diagnostics)
+        self.assertEqual(self.main, before)
+        self.assertEqual(got, {"quality": {"asr_incomplete_chunks": 1},
+                               "evidence": {"whisper": [], "other": [(0.0, 15.15, "second", "error", ["primary"])]}})
 
 
 if __name__ == "__main__":
