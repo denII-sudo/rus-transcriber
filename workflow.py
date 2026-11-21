@@ -41,6 +41,12 @@ def list_recent(store, limit=20):
         "FROM workflow_requests ORDER BY updated_at DESC LIMIT ?", (limit,))]
 
 
+def policy_head(store, request_id):
+    """Текущая ревизия политики запроса: строка (policy_revision) или None, если запроса нет."""
+    return store.db.execute("SELECT policy_revision FROM workflow_requests WHERE request_id=?",
+                            (request_id,)).fetchone()
+
+
 def get(store, request_id):
     storage._uuid(request_id)
     store.current_identity()
@@ -133,8 +139,7 @@ def confirm_verification(store, snapshot):
     with store._transaction():
         store.current_identity()
         store._check_context_refs(context)
-        head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
-                                (snapshot["recording_id"],)).fetchone()
+        head = recordings.recording_head(store, snapshot["recording_id"])
         latest = store.db.execute("SELECT MAX(document_revision) FROM document_versions WHERE recording_id=?",
                                   (snapshot["recording_id"],)).fetchone()[0]
         if (head is None or head["source_revision"] != snapshot["source_revision"]
@@ -352,8 +357,7 @@ def prepare_model_task(store, request_id):
                                  snapshots["review"]["revision"], turns=_task_turns(current["payload"]))
     with store._transaction():
         store.current_identity()
-        head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
-                                (request["recording_id"],)).fetchone()
+        head = recordings.recording_head(store, request["recording_id"])
         if (head is None or head["source_revision"] != current["revision"]
                 or head["review_revision"] != snapshots["review"]["revision"]):
             raise storage.Conflict("ревизия стенограммы изменилась")
@@ -568,8 +572,7 @@ def accept_model_part(store, request_id, part_index, result):
         store.current_identity()
         row = store.db.execute("SELECT state, model_task_json, model_run_id FROM workflow_requests WHERE request_id=?",
                                (request_id,)).fetchone()
-        head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
-                                (before["recording_id"],)).fetchone()
+        head = recordings.recording_head(store, before["recording_id"])
         run = store.db.execute("SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
                                "AND state='waiting_model'", (request_id,)).fetchall()
         if (row["state"] != "waiting_model" or storage._loads(row["model_task_json"]) != task
@@ -805,14 +808,11 @@ def _accept_model_result(store, request_id, result):
     operation_id = str(uuid.uuid5(uuid.UUID(request_id), "model-conspect:" + str((expected or 0) + 1)))
     with store._transaction():
         store.current_identity()
-        head = store.db.execute("SELECT source_revision FROM recordings WHERE recording_id=?",
-                                (request["recording_id"],)).fetchone()
-        review_head = store.db.execute("SELECT review_revision FROM recordings WHERE recording_id=?",
-                                       (request["recording_id"],)).fetchone()
+        head = recordings.recording_head(store, request["recording_id"])
         row = store.db.execute("SELECT state, model_task_json FROM workflow_requests WHERE request_id=?",
                                (request_id,)).fetchone()
         if (head["source_revision"] != current["revision"]
-                or review_head["review_revision"] != snapshots["review"]["revision"]
+                or head["review_revision"] != snapshots["review"]["revision"]
                 or row["state"] != "waiting_model"
                 or storage._loads(row["model_task_json"]) != request["model_task"]):
             raise storage.Conflict("задание или ревизия изменились")

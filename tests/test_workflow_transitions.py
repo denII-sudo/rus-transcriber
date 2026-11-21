@@ -145,6 +145,27 @@ class WorkflowTransitionTests(unittest.TestCase):
                 self.assertEqual(table_states(self.store, request), before)
                 self.assertEqual(self.store.db.execute("SELECT count(*) FROM recordings").fetchone()[0], count)
 
+    def test_shared_reads_of_heads_and_document_state(self):
+        """Общие чтения, которыми core.py и workflow.py заменили одинаковые запросы."""
+        request = workflow.create(self.store, self.source)
+        workflow.claim_start(self.store, request)
+        target = self.worker_target(request)
+        recording = self.save_result(request, target)["recording_id"]
+        head = recordings.recording_head(self.store, recording)
+        current = self.store.get_current(recording)
+        self.assertEqual((head["source_revision"], head["review_revision"]),
+                         (current["transcript"]["revision"], current["review"]["revision"]))
+        self.assertIsNone(recordings.recording_head(self.store, str(uuid.uuid4())))
+        binding = recordings.document_binding(self.store, recording)
+        self.assertEqual(recordings.document_sync_state(self.store, recording, binding["document_revision"]),
+                         "synced")
+        with self.assertRaises(TypeError):          # как прежний row["state"] у отсутствующей строки
+            recordings.document_sync_state(self.store, recording, binding["document_revision"] + 1)
+        self.assertEqual(workflow.policy_head(self.store, request)["policy_revision"], 1)
+        workflow.change_policy(self.store, request, {"goal": "Другая цель"}, 1)
+        self.assertEqual(workflow.policy_head(self.store, request)["policy_revision"], 2)
+        self.assertIsNone(workflow.policy_head(self.store, str(uuid.uuid4())))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -439,13 +439,11 @@ def workflow_status(request_id):
                       "readiness": readiness}
         with store._transaction():
             store.current_identity()
-            policy_head = store.db.execute("SELECT policy_revision FROM workflow_requests WHERE request_id=?",
-                                           (request_id,)).fetchone()
+            policy_head = workflow.policy_head(store, request_id)
             if policy_head is None or policy_head["policy_revision"] != request["policy_revision"]:
                 raise storage.Conflict("политика изменилась во время оценки")
             if recording_id:
-                head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
-                                        (recording_id,)).fetchone()
+                head = recordings.recording_head(store, recording_id)
                 if (head is None or head["source_revision"] != source_revision
                         or head["review_revision"] != review_revision):
                     raise storage.Conflict("состояние записи изменилось во время оценки")
@@ -557,10 +555,8 @@ def workflow_questions(request_id):
                  if item.get("status", "open") in ("open", "human") and isinstance(item.get("id"), str)]
         with store._transaction():
             store.current_identity()
-            head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
-                                    (request["recording_id"],)).fetchone()
-            policy_head = store.db.execute("SELECT policy_revision FROM workflow_requests WHERE request_id=?",
-                                           (request_id,)).fetchone()
+            head = recordings.recording_head(store, request["recording_id"])
+            policy_head = workflow.policy_head(store, request_id)
             if (head["source_revision"] != current["transcript"]["revision"]
                     or head["review_revision"] != current["review"]["revision"]
                     or policy_head["policy_revision"] != request["policy_revision"]):
@@ -739,8 +735,7 @@ def prepare_restore_snapshot(recording_id, source_revision, review_revision):
     store = recordings.open_store()
     try:
         store.current_identity()
-        head = store.db.execute("SELECT source_revision, review_revision FROM recordings "
-                                "WHERE recording_id=?", (recording_id,)).fetchone()
+        head = recordings.recording_head(store, recording_id)
         if head is None:
             raise KeyError(recording_id)
         expected = {"source_revision": head["source_revision"], "review_revision": head["review_revision"]}
@@ -1006,11 +1001,9 @@ def sync_recording_documents(recording_id):
         binding = recordings.document_binding(store, recording_id)
         path = binding["root"] / binding["paths"]["json"]
         conspects = recordings.refresh_conspects(store, recording_id, path)
-        row = store.db.execute(
-            "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
-            (recording_id, binding["document_revision"])).fetchone()
         return {"recording_id": recording_id, "document_revision": binding["document_revision"],
-                "document_sync": row["state"], "conspects": conspects}
+                "document_sync": recordings.document_sync_state(store, recording_id, binding["document_revision"]),
+                "conspects": conspects}
     finally:
         store.close()
 
@@ -1614,10 +1607,8 @@ def apply_answers_files(jp, md):
                     candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
                 if candidate == initial:
                     latest = recordings.document_binding(store, binding["recording_id"])
-                    current = store.db.execute(
-                        "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
-                        (binding["recording_id"], latest["document_revision"])).fetchone()
-                    if current["state"] != "synced":
+                    if recordings.document_sync_state(store, binding["recording_id"],
+                                                      latest["document_revision"]) != "synced":
                         completed = recordings.materialize_recording(store, binding["recording_id"])
                         if (binding["recording_id"], latest["document_revision"]) not in completed:
                             raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
