@@ -1,15 +1,18 @@
 """Песочница лаборатории: проверка места и подготовка копии (команда prepare).
 
 Что делает prepare (подробно — lab/README.md, раздел «Что копируется»):
-  * база записей state.sqlite3 (и её журнал -wal) читается побайтно — SQLite в базу не
-    заходит, иначе он оставил бы рядом файл -shm, — и из этой временной копии песочницы
-    делается штатная резервная копия программы (storage.Store.backup). Копия неактивна:
-    программа по ней не пишет файлы рядом с аудио, пока её явно не перепривязать;
+  * база записей state.sqlite3 копируется штатной резервной копией программы
+    (storage.Store.backup). Если рядом с базой нет -wal и -shm, она открывается штатно
+    storage.open_store_readonly (неизменяемой, без служебных файлов); иначе база и -wal
+    читаются побайтно во временную папку песочницы и копия делается оттуда (copy_database:
+    штатное чтение при служебных файлах меняет -shm). Копия неактивна: программа по ней не
+    пишет файлы рядом с аудио, пока её явно не перепривязать;
   * config.json, словари групп (groups/<группа>/vocab.json) и соль стенда
     (bench/testbed.json) копируются как есть;
   * голосовые профили (voices.json, voice-settings.json) — это биометрия — копируются только
     по явному выбору --voice-profiles copy;
-  * аудиофайлы только читаются (контрольная сумма); в песочницу не копируются.
+  * аудиофайлы записей из базы только читаются (контрольная сумма); внешние файлы (--audio,
+    add-audio) копируются в audio/ песочницы.
 
 Настоящая папка данных не меняется ни при каких условиях: в неё ничего не пишется.
 Модуль не импортирует paths.py (у его импорта побочные эффекты), только storage и runinfo.
@@ -369,6 +372,50 @@ def add_audio_units(sandbox, files, group=None, env=None, log=print, _marker=Non
     return added
 
 
+def _side_files(db):
+    return [p for p in (db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")) if p.exists()]
+
+
+def _file_state(path):
+    st = path.stat()
+    return st.st_size, st.st_mtime_ns
+
+
+def copy_database(src_db, dest, staging):
+    """Неактивная резервная копия базы записей в песочницу. -> (отчёт проверки копии, способ).
+
+    «readonly» — штатно: storage.open_store_readonly + Store.backup. Применяется, только когда
+    рядом с базой нет ни -wal, ни -shm (программа базу не держит): тогда SQLite открывает её как
+    неизменяемую и рядом ничего не создаёт. Если за время копирования база или служебные файлы
+    изменились (программа начала писать), копия выбрасывается и делается побайтно.
+    «bytes» — запасной путь, когда служебные файлы есть: штатное чтение в этом случае меняет
+    рядом файл -shm (обновляет его содержимое, а при одном лишь -wal создаёт новый -shm),
+    поэтому база и -wal читаются побайтно во временную папку песочницы, и резервная копия
+    делается уже оттуда."""
+    storage = _import_repo_module("storage")
+    if not _side_files(src_db):
+        before = _file_state(src_db)
+        store = storage.open_store_readonly(src_db)
+        try:
+            report = store.backup(dest)
+        finally:
+            store.close()
+        if not _side_files(src_db) and _file_state(src_db) == before:
+            return report, "readonly"
+        dest.unlink()                    # снимок мог оказаться несогласованным: делаем заново
+    staged = stage_database(src_db, staging)
+    try:
+        store = storage.open_store(staged)
+        try:
+            report = store.backup(dest)
+        finally:
+            store.close()
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)       # побайтная копия больше не нужна
+    return report, "bytes"
+
+
 def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=print, audio=(), group=None,
             only_audio=False):
     """Создать песочницу. -> отчёт (что скопировано, сколько единиц, каких записей нет).
@@ -398,32 +445,23 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
     if s.exists() and any(s.iterdir()):
         raise SandboxError(f"папка песочницы уже существует и не пуста: {s}. "
                            "Для новой подготовки укажите новую папку")
-    copied, report = [], None
+    copied, report, copy_method = [], None, None
     if not only_audio:
-        # SQLite даже в режиме только чтения оставляет рядом с базой в режиме WAL файл -shm, то
-        # есть меняет настоящую папку данных. Поэтому базу (и её журнал -wal) сначала читаем
-        # побайтно в песочницу, а штатное резервное копирование делаем уже из этой копии.
-        staging = s / "source" / "staging"
-        staged = stage_database(src_db, staging)
+        (s / "source").mkdir(parents=True, exist_ok=True)
+        report, copy_method = copy_database(src_db, s / "source" / "state.sqlite3", s / "source" / "staging")
+        store = storage.open_store_readonly(s / "source" / "state.sqlite3")
         try:
-            store = storage.open_store(staged)
-            try:
-                recordings = read_recordings(store.db)
-                audio_dirs = sorted({str(real(Path(r["location"]).parent)) for r in recordings})
-                try:
-                    check_sandbox(s, protected_dirs(source_data, program_dir, env), audio_dirs)
-                except SandboxError:
-                    store.close()
-                    shutil.rmtree(s / "source")      # только что созданные лабораторией файлы
-                    raise
-                report = store.backup(s / "source" / "state.sqlite3")
-            finally:
-                store.close()
+            recordings = read_recordings(store.db)
         finally:
-            if staging.exists():
-                shutil.rmtree(staging)               # побайтная копия больше не нужна
+            store.close()
+        audio_dirs = sorted({str(real(Path(r["location"]).parent)) for r in recordings})
+        try:
+            check_sandbox(s, protected_dirs(source_data, program_dir, env), audio_dirs)
+        except SandboxError:
+            shutil.rmtree(s / "source")      # только что созданные лабораторией файлы
+            raise
         copied.append({"what": "база записей (резервная копия, неактивная)", "relative": "source/state.sqlite3",
-                       "bytes": (s / "source" / "state.sqlite3").stat().st_size})
+                       "bytes": (s / "source" / "state.sqlite3").stat().st_size, "method": copy_method})
     s.mkdir(parents=True, exist_ok=True)
     data = s / "data"
     data.mkdir(exist_ok=True)
@@ -445,14 +483,7 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
 
     units, missing = [], []
     if not only_audio:
-        # единицы — по копии базы, чтобы источник был открыт как можно короче
-        import sqlite3
-        db = sqlite3.connect((s / "source" / "state.sqlite3").as_uri() + "?mode=ro", uri=True)
-        db.row_factory = sqlite3.Row
-        try:
-            recordings = read_recordings(db)
-        finally:
-            db.close()
+        # единицы — по копии базы (записи прочитаны из неё выше)
         units, missing = build_units(recordings, runinfo.sha256_file)
     (s / UNITS_FILE).write_text(json.dumps({"schema": "lab-units-1", "units": units,
                                             "missing_audio_recordings": missing},
@@ -474,7 +505,9 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
     log("Песочница подготовлена: " + str(s))
     log("Скопировано (только на этом компьютере, наружу ничего не передаётся):")
     for item in copied:
-        log(f"  - {item['what']}: {item['relative']} ({item['bytes']} байт)")
+        how = {"readonly": "; штатное чтение только на чтение",
+               "bytes": "; база была занята или с журналом — прочитана побайтно"}.get(item.get("method"), "")
+        log(f"  - {item['what']}: {item['relative']} ({item['bytes']} байт{how})")
     if voice_profiles == "copy":
         log("  ВНИМАНИЕ: скопированы голосовые профили — это биометрия участников. Они лежат только "
             "в песочнице; удалить их можно вместе с папкой песочницы.")

@@ -246,6 +246,67 @@ class PrepareAndRun(unittest.TestCase):
         self.assertTrue(all(u["group"] == "grp" for u in units))
         self.assertTrue(any("Голосовые профили не копировались" in m for m in self.log))
 
+    def copied_method(self):
+        marker = json.loads((lab_sandbox.real(self.sandbox) / lab_sandbox.MARKER).read_text(encoding="utf-8"))
+        return next(c["method"] for c in marker["copied"] if c["relative"] == "source/state.sqlite3")
+
+    def copied_user_name(self):
+        import storage
+        store = storage.open_store_readonly(lab_sandbox.real(self.sandbox) / "source" / "state.sqlite3")
+        try:
+            return store.db.execute("SELECT display_name FROM local_users").fetchone()[0]
+        finally:
+            store.close()
+
+    def test_closed_database_is_copied_by_standard_readonly(self):
+        import storage
+        self.assertEqual(sorted(p.name for p in self.data.glob("state.sqlite3*")), ["state.sqlite3"])
+        with mock.patch.object(storage, "open_store_readonly", wraps=storage.open_store_readonly) as spy:
+            self.prepare()
+        self.assertTrue(any(lab_sandbox.real(c.args[0]) == lab_sandbox.real(self.data / "state.sqlite3")
+                            for c in spy.call_args_list), "штатное чтение источника")
+        self.assertEqual(self.copied_method(), "readonly")
+        self.assertFalse((lab_sandbox.real(self.sandbox) / "source" / "staging").exists())
+        self.assert_source_unchanged()
+
+    def test_live_writer_with_nonempty_wal_falls_back_to_bytes(self):
+        import storage
+        writer = storage.open_store(self.data / "state.sqlite3")
+        try:
+            writer.db.execute("UPDATE local_users SET display_name='ИЗ-ЖУРНАЛА'")
+            self.assertGreater((self.data / "state.sqlite3-wal").stat().st_size, 0)
+            before = snapshot(self.data)
+            self.prepare()
+            self.assertEqual(snapshot(self.data), before,
+                             "при живом писателе папка данных не меняется (и -shm тоже)")
+        finally:
+            writer.close()
+        self.assertEqual(self.copied_method(), "bytes")
+        self.assertEqual(self.copied_user_name(), "ИЗ-ЖУРНАЛА", "данные из -wal попали в копию")
+        self.assertFalse((lab_sandbox.real(self.sandbox) / "source" / "staging").exists())
+
+    def test_leftover_wal_without_shm_leaves_no_new_file(self):
+        import shutil
+        import storage
+        db = self.data / "state.sqlite3"
+        keep = self.base / "kept"
+        keep.mkdir()
+        writer = storage.open_store(db)
+        try:
+            writer.db.execute("UPDATE local_users SET display_name='ПОСЛЕ-СБОЯ'")
+            shutil.copyfile(db, keep / db.name)
+            shutil.copyfile(self.data / "state.sqlite3-wal", keep / "state.sqlite3-wal")
+        finally:
+            writer.close()
+        shutil.copyfile(keep / db.name, db)                      # состояние «после сбоя»: база + -wal, без -shm
+        shutil.copyfile(keep / "state.sqlite3-wal", self.data / "state.sqlite3-wal")
+        before = snapshot(self.data)
+        self.assertNotIn("state.sqlite3-shm", before)
+        self.prepare()
+        self.assertEqual(snapshot(self.data), before, "новый -shm не появился, ничего не изменилось")
+        self.assertEqual(self.copied_method(), "bytes")
+        self.assertEqual(self.copied_user_name(), "ПОСЛЕ-СБОЯ")
+
     def test_prepare_with_voice_profiles_warns(self):
         self.prepare("copy")
         self.assertTrue((lab_sandbox.real(self.sandbox) / "data" / "groups" / "grp" / "voices.json").is_file())

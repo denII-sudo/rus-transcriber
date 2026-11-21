@@ -588,10 +588,14 @@ def pairwise_unit(canon, W):
 # ── решения человека ─────────────────────────────────────────────────────────────────────────────
 
 def open_readonly(path):
-    """Копия базы записей только на чтение; без журнала -wal — неизменяемой (без -shm)."""
+    """База результатов песочницы только на чтение; без служебных файлов — неизменяемой.
+
+    Копию базы записей анализ открывает штатно (storage.open_store_readonly, load_human);
+    здесь — база результатов lab.sqlite3: у неё своя схема, штатная проверка схемы не подходит.
+    Правило то же, что у storage: при -wal/-shm/-journal рядом — обычное mode=ro."""
     path = Path(path)
     uri = path.resolve().as_uri() + "?mode=ro"
-    if not path.with_name(path.name + "-wal").exists():
+    if not any(path.with_name(path.name + s).exists() for s in ("-wal", "-shm", "-journal")):
         uri += "&immutable=1"
     db = sqlite3.connect(uri, uri=True)
     db.row_factory = sqlite3.Row
@@ -703,7 +707,11 @@ def load_human(db_path, units, W):
     db_path = Path(db_path)
     if not db_path.is_file():
         return None, "нет копии базы записей source/state.sqlite3"
-    db = open_readonly(db_path)
+    # копия базы записей — штатным чтением программы: проверка схемы и правило «без -wal/-shm —
+    # неизменяемая». Копию делает Store.backup, служебных файлов рядом с ней нет.
+    import lab_sandbox
+    store = lab_sandbox._import_repo_module("storage").open_store_readonly(db_path)
+    db = store.db
     try:
         out = {}
         for u in units:
@@ -740,7 +748,7 @@ def load_human(db_path, units, W):
             out[u["unit_id"]] = {"variants": variants, "decisions": kept, "stats": stats}
         return out, None
     finally:
-        db.close()
+        store.close()
 
 
 def equal_norm(a, b, W):
