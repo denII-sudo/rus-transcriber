@@ -1,0 +1,67 @@
+{
+  "schema": "lab-experiment-1",
+  "name": "models-arbitration-2026-11",
+  "description": "Какие модели нужны для сведения «два из трёх»: нынешняя третья модель (faster-whisper), GigaAM Multilingual large третьей или второй, без третьей, третья только в местах расхождения. Среды исполнения, не заданные здесь, берутся из config.json песочницы (выбор теста скорости машины).",
+  "allow_torch_fallback": false,
+  "estimate_sec_per_audio_hour": {
+    "third:multilingual_large_ctc:all": 900,
+    "second:multilingual_large_ctc": 900
+  },
+  "configurations": [
+    {
+      "id": "a-current",
+      "label": "Как сейчас: RNN-T + CTC + faster-whisper (вся запись)",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "v3_e2e_ctc"},
+        "third": {"engine": "whisper-ct2", "mode": "all"}
+      }
+    },
+    {
+      "id": "b-ml3",
+      "label": "RNN-T + CTC + Multilingual large CTC третьей (fp32, процессор)",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "v3_e2e_ctc"},
+        "third": {"engine": "onnx", "model": "multilingual_large_ctc", "quant": null, "mode": "all"}
+      }
+    },
+    {
+      "id": "c-no-third",
+      "label": "RNN-T + CTC без третьей модели",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "v3_e2e_ctc"},
+        "third": null
+      }
+    },
+    {
+      "id": "d-ml2-whisper3",
+      "label": "RNN-T + Multilingual large второй + faster-whisper третьей",
+      "note": "замена второй модели независимой (гипотеза РАР-4)",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "multilingual_large_ctc", "backend": "onnx-cpu", "device": "CPU"},
+        "third": {"engine": "whisper-ct2", "mode": "all"}
+      }
+    },
+    {
+      "id": "e-ml2-no-third",
+      "label": "RNN-T + Multilingual large второй, без третьей",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "multilingual_large_ctc", "backend": "onnx-cpu", "device": "CPU"},
+        "third": null
+      }
+    },
+    {
+      "id": "f-whisper-doubt",
+      "label": "RNN-T + CTC + faster-whisper только там, где RNN-T и CTC расходятся",
+      "roles": {
+        "primary": {"model": "v3_e2e_rnnt"},
+        "second": {"model": "v3_e2e_ctc"},
+        "third": {"engine": "whisper-ct2", "mode": "doubt"}
+      }
+    }
+  ]
+}
