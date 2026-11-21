@@ -268,6 +268,20 @@ def validate_pair(transcript, review):
     _validate_embedded_provenance(review)
 
 
+def _connect_readonly(path):
+    """Соединение только для чтения, не оставляющее рядом служебных файлов.
+
+    База всегда в режиме WAL. Обычное mode=ro на закрытой базе создаёт -wal/-shm и не может
+    убрать их при закрытии. Если рядом нет ни -wal, ни -shm, все записи уже в основном файле
+    и никто его не использует: открываем с immutable=1, и файлы не появляются. Если они есть,
+    свежие данные могут лежать в -wal, а immutable=1 его игнорирует, поэтому открываем
+    обычным mode=ro: новых файлов оно не создаёт, они уже есть.
+    """
+    resolved = check_local_path(path).resolve()
+    busy = any(Path(str(resolved) + suffix).exists() for suffix in ("-wal", "-shm"))
+    return _connect(resolved, "ro" if busy else "ro&immutable=1")
+
+
 def _connect(path, mode):
     uri = check_local_path(path).resolve().as_uri() + "?mode=" + mode
     try:
@@ -498,10 +512,11 @@ def initialize(path, *, initial_display_name=None):
 def _release_wal_files(path):
     """Убрать служебные -wal/-shm временного имени до публикации файла.
 
-    validate_copy открывает копию только для чтения; такое соединение создаёт -wal/-shm,
-    но при закрытии не может их удалить, и они остались бы рядом под временным именем.
-    Последнее закрываемое соединение для записи само переносит журнал в файл и удаляет их;
-    журнал SQLite открывает только при первом обращении к базе, поэтому нужно одно чтение.
+    validate_copy обычно не оставляет служебных файлов (см. _connect_readonly), но страхуемся:
+    если они уже были, соединение только для чтения не может их удалить, и они остались бы
+    рядом под временным именем. Последнее закрываемое соединение для записи само переносит
+    журнал в файл и удаляет их; журнал SQLite открывает только при первом обращении к базе,
+    поэтому нужно одно чтение.
     """
     db = _connect(path, "rw")
     try:
@@ -582,7 +597,7 @@ def open_store(path):
 
 def open_store_readonly(path):
     """Открыть существующую совместимую БД только для чтения."""
-    db = _connect(path, "ro")
+    db = _connect_readonly(path)
     try:
         _check_schema(db)
         db.execute("PRAGMA query_only=ON")
@@ -594,7 +609,7 @@ def open_store_readonly(path):
 
 def validate_copy(path):
     """Проверка копии без записи и запуска восстановленных очередей."""
-    db = _connect(path, "ro")
+    db = _connect_readonly(path)
     try:
         _check_schema(db)
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
