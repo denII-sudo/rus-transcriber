@@ -597,6 +597,77 @@ class UnfitVariantTests(unittest.TestCase):
             self.res("whisper-dml", family="whisper", chunks=3, chunk_words=[30, 30, 30])),
             [(0, None), (0, None), (0, None), (0, None)])
 
+    def lost_empty(self, *results):
+        bench.mark_lost_chunks(list(results))
+        return [r.get("lost_empty_chunks") for r in results]
+
+    def test_empty_in_different_chunks_is_lost_for_both(self):
+        # по количеству разница 0 (по одному пустому у обоих); покусочно потеря у каждого
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[30, 0, 30, 30, 30])
+        self.assertEqual(self.lost(a, b), [(1, 0), (1, 0)])
+        self.assertEqual(bench.unfit_reason(a), "lost_chunks")
+        self.assertIn("текст пуст там, где у другого варианта он есть", bench.unfit_note(b))
+
+    def test_pause_empty_for_all_is_not_lost(self):
+        self.assertEqual(self.lost_empty(
+            self.res("torch-cpu", family="torch", empty_chunks=2, chunk_words=[0, 30, 0, 30, 30]),
+            self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 30, 0, 30, 30]),
+            self.res("ov-gpu", device="GPU", empty_chunks=2, chunk_words=[0, 29, 0, 31, 30])),
+            [0, 0, 0])
+
+    def test_few_words_of_a_neighbour_on_a_pause_is_not_lost(self):
+        # у соседа на паузе слова-галлюцинации ниже порога — пустой вариант прав
+        below = bench.LOST_EMPTY_MIN_REF - 1
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 0, 30, 30, 30]),
+            self.res("ov-gpu", device="GPU", chunk_words=[1, below, 30, 30, 30])),
+            [0, 0])
+        # от порога — уже речь, пустой кусок потерян
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30]),
+            self.res("ov-gpu", device="GPU", chunk_words=[bench.LOST_EMPTY_MIN_REF, 30, 30, 30, 30])),
+            [1, 0])
+
+    def test_whisper_uses_the_per_chunk_empty_rule(self):
+        # пустой кусок у Whisper — потеря; правило «слов в разы меньше» к Whisper не применяется
+        ct2 = self.res("whisper-ct2", family="whisper", chunks=3, empty_chunks=1, chunk_words=[0, 30, 90])
+        dml = self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=1, chunk_words=[30, 0, 10])
+        self.assertEqual(self.lost(ct2, dml), [(1, None), (1, None)])
+        self.assertEqual((ct2["lost_empty_chunks"], dml["lost_empty_chunks"]), (1, 1))
+
+    def test_old_results_without_chunk_words_count_empties(self):
+        # нет chunk_words ни у кого: прежний подсчёт по количеству, даже если пустые в разных кусках
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=1),
+            self.res("ov-gpu", device="GPU", empty_chunks=1),
+            self.res("ov-gpu-b8", device="GPU", empty_chunks=3)),
+            [0, 0, 2])
+
+    def test_mixed_group(self):
+        # у двух вариантов chunk_words есть, у старого нет
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[30, 0, 30, 30, 30])
+        old = self.res("ov-gpu-b8", device="GPU", empty_chunks=2)
+        self.assertEqual(self.lost_empty(a, b, old), [1, 1, 1])     # old — по количеству: 2 − 1
+        # оба новых пусты в одном куске (между собой — пауза), а старый пустых не имеет:
+        # проверка количеством против старого соседа сохраняет потерю
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        old = self.res("ov-gpu-b8", device="GPU", empty_chunks=0)
+        self.assertEqual(self.lost_empty(a, b, old), [1, 1, 0])
+        # новый вариант один в группе со старыми — у него тоже подсчёт по количеству
+        a = self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 0, 30, 30, 30])
+        old = self.res("ov-gpu", device="GPU", empty_chunks=1)
+        self.assertEqual(self.lost(a, old), [(1, None), (0, None)])
+
+    def test_empty_and_few_words_are_not_counted_twice(self):
+        cpu = self.res("ctc-cpu", family="ctc", chunk_words=[30, 30, 30, 30, 30])
+        gpu = self.res("ctc-gpu", family="ctc", device="GPU", empty_chunks=2, chunk_words=[0, 0, 2, 2, 30])
+        self.assertEqual(self.lost(cpu, gpu), [(0, 0), (4, 2)])
+        self.assertEqual(gpu["lost_chunks"], gpu["lost_empty_chunks"] + gpu["lost_few_words_chunks"])
+        self.assertEqual(gpu["lost_empty_chunks"], 2)
+
     def test_unfit_variant_is_not_a_reference_when_a_fit_one_exists(self):
         lost = self.res("ctc-cpu", family="ctc", lost_chunks=1)
         fit = self.res("ctc-gpu", family="ctc", device="GPU")

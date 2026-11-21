@@ -266,6 +266,15 @@ LOST_WORDS_MIN_REF = 10
 # Правило слов — только для моделей GigaAM: Whisper при зацикливании повторяет фразы, и раздутый
 # повторами кусок сделал бы «потерявшим речь» исправный вариант. Для Whisper — правило пустых кусков.
 WORD_RULE_FAMILIES = (RNNT, CTC, ML)
+# Пустой кусок — потеря, если у другого варианта той же группы в этом куске не меньше стольких
+# слов. Сравнение покусочное: прежний подсчёт по количеству не видел, что A пуст в куске 1, а B —
+# в куске 2 (по одному пустому у обоих, разница 0). Порог ниже LOST_WORDS_MIN_REF: пустота —
+# полная потеря, а не «в разы меньше», и короткий кусок с несколькими словами речи тоже должен
+# считаться. Но одно-два слова у соседа на паузе — обычно галлюцинация (GigaAM даёт на шуме
+# одиночные «а», «м»; Whisper — короткие «титры» вроде «Продолжение следует»), и пустой вариант
+# там прав. Явный случай — у соседа нормальный текст (кусок речи 15–20 с даёт 30–50 слов) —
+# порог не задевает: он остаётся потерей, как при прежнем правиле.
+LOST_EMPTY_MIN_REF = 5
 
 
 def chunk_words_of(result):
@@ -286,11 +295,20 @@ def mark_lost_chunks(results):
     Сравниваются варианты одного семейства с одинаковым числом кусков; PyTorch-эталон — та же
     модель, что RNN-T.
 
-    lost_chunks = lost_empty_chunks + lost_few_words_chunks. Пустые куски считаются по-прежнему:
-    разница с вариантом группы, у которого пустых меньше всего. Куски «слов в разы меньше»
-    считаются покусочно и только у вариантов, сообщивших chunk_words (у старых результатов это
-    правило не применяется); lost_few_words_kept / lost_few_words_ref — сколько слов осталось в
-    этих кусках и сколько было у опоры."""
+    lost_chunks = lost_empty_chunks + lost_few_words_chunks; один кусок не попадает в обе части:
+    пустой — это 0 слов, «в разы меньше» — хотя бы одно слово.
+
+    Пустые куски (все семейства, и Whisper: пустой кусок — не раздувание повторами) считаются
+    покусочно по chunk_words: кусок с 0 слов, где у другого варианта группы их не меньше
+    LOST_EMPTY_MIN_REF. Вариант без годного chunk_words (старый результат, длина не совпала) или
+    без другого такого варианта в группе считается по-прежнему, по количеству: пустых больше, чем
+    у варианта группы, у которого их меньше всего. Смешанная группа: у варианта с chunk_words
+    к покусочному числу добавляется проверка количеством против вариантов без chunk_words —
+    берётся большее, чтобы старый сосед с текстом не перестал выявлять потерю.
+
+    Куски «слов в разы меньше» — только GigaAM и только у вариантов, сообщивших chunk_words
+    (у старых результатов это правило не применяется); lost_few_words_kept / lost_few_words_ref —
+    сколько слов осталось в этих кусках и сколько было у опоры."""
     groups = {}
     for r in results:
         if "asr_sec" not in r or r.get("empty_chunks") is None:
@@ -299,14 +317,23 @@ def mark_lost_chunks(results):
         groups.setdefault((family, r.get("chunks")), []).append(r)
     for (family, chunks), group in groups.items():
         least = min(r["empty_chunks"] for r in group)
-        counted = [(r, chunk_words_of(r)) for r in group]
-        counted = [(r, w) for r, w in counted if w is not None]
-        ref = [max(col) for col in zip(*(w for _, w in counted))] \
-            if family in WORD_RULE_FAMILIES and len(counted) > 1 else None
+        words_of = {id(r): chunk_words_of(r) for r in group}
+        counted = [(r, words_of[id(r)]) for r in group if words_of[id(r)] is not None]
+        uncounted = [r for r in group if words_of[id(r)] is None]
+        least_uncounted = min((r["empty_chunks"] for r in uncounted), default=None)
+        ref = [max(col) for col in zip(*(w for _, w in counted))] if len(counted) > 1 else None
         for r in group:
-            r["lost_empty_chunks"] = r["empty_chunks"] - least
-            r["lost_chunks"] = r["lost_empty_chunks"]
-        if ref is None:
+            words = words_of[id(r)]
+            if words is None or ref is None:
+                lost = r["empty_chunks"] - least               # прежнее правило: по количеству
+            else:
+                # у самого варианта в пустом куске 0 слов, поэтому опора куска — другой вариант
+                lost = sum(1 for n, top in zip(words, ref) if n == 0 and top >= LOST_EMPTY_MIN_REF)
+                if least_uncounted is not None:
+                    lost = max(lost, r["empty_chunks"] - least_uncounted)
+            r["lost_empty_chunks"] = lost
+            r["lost_chunks"] = lost
+        if ref is None or family not in WORD_RULE_FAMILIES:
             continue
         for r, words in counted:
             few = [(n, top) for n, top in zip(words, ref)
