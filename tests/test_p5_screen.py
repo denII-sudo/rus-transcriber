@@ -16,6 +16,7 @@ import documents
 import paths
 import recordings
 import storage
+import workflow
 
 import core
 import rt
@@ -127,6 +128,40 @@ class P5ServiceTests(unittest.TestCase):
         self.change_text(ident, root_id, "ещё правка")
         with self.assertRaises(core.CoreError):
             core.restore_recording_revision(snapshot)
+
+    def save_plain_conspect(self, ident, name, payload):
+        """Сохранить конспект с заданным payload напрямую (как старые данные или чужие инструменты)."""
+        binding = recordings.document_binding(self.store, ident)
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.store.save_conspect(
+            ident, str(uuid.uuid4()), name, 1, None, payload, data, b"# synthetic\n",
+            f"{name}.conspect.json", f"{name}.conspect.md", binding["root_id"], str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"))
+
+    def test_screen_conspects_show_section_texts(self):
+        ident, _, _ = self.make_recording()
+        # свёртка, сделанная исполнителем: разделы лежат в payload["evidence"]
+        request = workflow.create(self.store, self.source, {"require_conspect": True})
+        workflow.claim_start(self.store, request)
+        with self.store._transaction():
+            self.store.db.execute("UPDATE workflow_requests SET recording_id=? WHERE request_id=?",
+                                  (ident, request))
+        workflow.observe(self.store, request, {"state": "done", "recording_id": ident})
+        task = workflow.prepare_model_task(self.store, request)
+        ids = [word["word_id"] for word in task["words"]]
+        workflow.accept_model_result(self.store, request, {
+            "source_revision": task["source_revision"],
+            "sections": [{"text": "Первый раздел.", "evidence": ids[:1]},
+                         {"text": "Второй раздел.", "evidence": ids[1:]}]})
+        # прежнее поле `sections` и конспект без разделов
+        self.save_plain_conspect(ident, "old-sections", {"sections": [{"text": "Старый раздел."}]})
+        self.save_plain_conspect(ident, "no-sections", {"name": "no-sections"})
+
+        by_name = {item["name"]: item for item in core.recording_conspects(ident)}
+        self.assertEqual(by_name["workflow-" + request]["sections"],
+                         [{"text": "Первый раздел."}, {"text": "Второй раздел."}])
+        self.assertEqual(by_name["old-sections"]["sections"], [{"text": "Старый раздел."}])
+        self.assertEqual(by_name["no-sections"]["sections"], [])
 
     def test_conflict_preview_shows_preserved_bytes(self):
         ident, root_id, doc_paths = self.make_recording()
