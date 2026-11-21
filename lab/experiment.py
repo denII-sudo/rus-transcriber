@@ -4,6 +4,7 @@
     <python> lab\\experiment.py run --sandbox D:\\lab-1 --dry-run
     <python> lab\\experiment.py run --sandbox D:\\lab-1 [--configs a-current,c-no-third] [--units 3fa1] [--limit 5]
     <python> lab\\experiment.py summary --sandbox D:\\lab-1
+    <python> lab\\experiment.py analyze --sandbox D:\\lab-1
 
 <python> — интерпретатор установленной программы: %LOCALAPPDATA%\\rus-transcriber\\.venv\\Scripts\\python.exe.
 Код конвейера берётся из этого клона, модели — из кэша установленной программы, без сети.
@@ -18,6 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import lab_analyze  # noqa: E402
 import lab_run  # noqa: E402
 import lab_sandbox  # noqa: E402
 import lab_spec  # noqa: E402
@@ -142,6 +144,19 @@ def cmd_summary(a):
         db.close()
 
 
+def cmd_analyze(a):
+    sandbox, marker, units_doc = lab_sandbox.load_sandbox(a.sandbox)
+    analysis = lab_analyze.analyze(sandbox, units_doc, baseline=a.baseline)
+    print(f"Отчёт (только этот компьютер): {sandbox / 'results' / 'report.md'}")
+    print(f"Примеры со словами (только этот компьютер): {sandbox / 'results' / 'examples.md'}")
+    print(f"Обезличенные числа: {sandbox / 'export' / 'analysis.json'}")
+    if analysis.get("not_measured"):
+        print("Не измерено: " + analysis["not_measured"])
+    bad = [k for k, v in (analysis.get("revote_check") or {}).items() if v.get("state") == "mismatch"]
+    if bad:
+        print(f"ВНИМАНИЕ: пересведение не совпало с конвейером в {len(bad)} парах — см. раздел «Сверка» отчёта")
+
+
 def _split(value):
     return [x.strip() for x in (value or "").split(",") if x.strip()]
 
@@ -170,6 +185,10 @@ def main(argv=None):
     s = sub.add_parser("summary", help="пересобрать обезличенную сводку export/summary.json")
     s.add_argument("--sandbox", required=True)
     s.set_defaults(fn=cmd_summary)
+    n = sub.add_parser("analyze", help="анализ результатов: отчёт results/report.md и числа export/analysis.json")
+    n.add_argument("--sandbox", required=True)
+    n.add_argument("--baseline", default=lab_analyze.BASELINE, help="базовая конфигурация для сравнения")
+    n.set_defaults(fn=cmd_analyze)
     a = ap.parse_args(argv)
     try:
         a.fn(a)
