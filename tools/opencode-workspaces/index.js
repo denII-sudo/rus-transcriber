@@ -140,12 +140,6 @@ export default {
       event.env.PYTHONUTF8 = "1"
       event.env.PYTHONIOENCODING = "utf-8"
     })
-    // A startup sweep is observation-only. The local scheduler performs the
-    // separately tested post-merge apply path, including when OpenCode is closed.
-    const startup = setTimeout(() => {
-      void maintenance(["sweep"]).catch(() => {})
-    }, 5_000)
-    startup.unref()
-    return () => clearTimeout(startup)
+    return () => {}
   },
 }

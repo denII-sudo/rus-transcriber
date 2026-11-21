@@ -72,6 +72,69 @@ class HousekeepingTests(unittest.TestCase):
         self.assertTrue(self.cwd.exists())
         self.assertEqual(self.g("rev-parse", "feature/test"), self.head)
 
+    def test_report_appends_modes_and_retains_only_recent_owned_entries(self):
+        report = self.root / "reports" / "daily.log"
+        now = time.time()
+        results = self.m.sweep()
+        aw.write_report(report, False, results, now - 31 * 86400)
+        with report.open("a", encoding="utf-8") as f:
+            f.write("unrecognized line kept\n")
+        aw.write_report(report, False, results, now)
+        aw.write_report(report, True, results, now + 1)
+        lines = report.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "unrecognized line kept")
+        self.assertEqual(len(lines), 3)
+        entries = [json.loads(line[len(aw.REPORT_PREFIX):]) for line in lines[1:]]
+        self.assertEqual([entry["mode"] for entry in entries], ["dry-run", "apply"])
+        task = entries[0]["tasks"][0]
+        self.assertEqual(task["branch"], "feature/test")
+        self.assertEqual(task["worktree"], str(self.cwd))
+        self.assertEqual(task["status"], "would-remove")
+        self.assertNotIn("file.txt", "\n".join(lines))
+
+    def test_report_hides_untrusted_reason(self):
+        report = self.root / "reports" / "daily.log"
+        aw.write_report(report, False, [{"branch": "feature/test", "cwd": str(self.cwd),
+                                        "status": "kept-unverified",
+                                        "reason": "secret-file-name and contents"}])
+        text = report.read_text(encoding="utf-8")
+        self.assertNotIn("secret-file-name", text)
+        self.assertIn("verification failed", text)
+
+    def test_invalid_task_record_is_reported_and_preserved(self):
+        self.path.write_text("[]", encoding="utf-8")
+        result = self.m.sweep()
+        report = self.root / "reports" / "daily.log"
+        aw.write_report(report, False, result)
+        self.assertIn("invalid task record", report.read_text(encoding="utf-8"))
+        self.assertTrue(self.cwd.exists())
+
+    def test_sweep_cli_writes_report(self):
+        config_file = self.root / "config.json"
+        config_file.write_text(json.dumps(self.config), encoding="utf-8")
+        report = self.root / "reports" / "daily.log"
+        # No network calls: this checkout has local uncommitted changes.
+        (self.cwd / "private-name.txt").write_text("private-content", encoding="utf-8")
+        out = subprocess.run([sys.executable, "-B", str(Path(aw.__file__)), "--config",
+                              str(config_file), "sweep", "--report", str(report)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        text = report.read_text(encoding="utf-8")
+        self.assertIn("unsaved or ignored files", text)
+        self.assertNotIn("private-name.txt", text)
+        self.assertNotIn("private-content", text)
+
+    def test_claude_hooks_never_sweep(self):
+        from io import StringIO
+        config_file = self.root / "config.json"
+        self.config["apply_on_claude_event"] = True
+        config_file.write_text(json.dumps(self.config), encoding="utf-8")
+        event = {"hook_event_name": "SessionEnd", "session_id": "synthetic-session"}
+        args = ["agent_workspaces.py", "--config", str(config_file), "claude-hook"]
+        with patch.object(sys, "argv", args), patch.object(sys, "stdin", StringIO(json.dumps(event))), \
+                patch.object(aw.Manager, "sweep", side_effect=AssertionError("unexpected sweep")):
+            self.assertEqual(aw.main(), 0)
+
     def test_verified_squash_removes_only_registered_checkout(self):
         # Mark main as squash-merged; original feature commit is NOT its ancestor.
         self.g("merge", "--squash", "feature/test")

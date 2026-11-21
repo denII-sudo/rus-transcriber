@@ -6,6 +6,7 @@ GitHub workflows and native Claude cleanup remain responsible for their own scop
 import argparse
 from contextlib import contextmanager
 import ctypes
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -391,18 +392,85 @@ class Manager:
     def sweep(self, apply=False):
         results = []
         for p in self.state.glob("*.json"):
+            branch, cwd = None, None
             try:
+                record = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("invalid task record")
+                branch = record.get("branch") if isinstance(record.get("branch"), str) else None
+                cwd = record.get("cwd") if isinstance(record.get("cwd"), str) else None
                 status = self.sweep_one(p, apply)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as ex:
                 status = "kept-unverified"
                 reason = str(ex) if isinstance(ex, ValueError) and type(ex) is ValueError else type(ex).__name__
-                results.append({"task": p.stem, "status": status, "reason": reason})
+                results.append({"task": p.stem, "branch": branch, "cwd": cwd,
+                                "status": status, "reason": reason})
                 continue
-            results.append({"task": p.stem, "status": status})
+            results.append({"task": p.stem, "branch": branch, "cwd": cwd, "status": status})
             if apply and status == "already-removed" and time.time() - p.stat().st_mtime > 30 * 86400:
                 p.unlink()  # Bounded retention for completed task metadata, never for checkouts.
         write_json(self.state / "last-sweep.result", {"time": time.time(), "results": results})
         return results
+
+
+REPORT_PREFIX = "AgentWorkspaceReport "
+REPORT_REASONS = {
+    "outside allowed checkout roots", "not a checkout root", "different repository",
+    "protected branch", "checkout locked or not registered", "linked sandbox",
+    "sandbox not owned", "active session", "recent session", "no matching merged PR",
+    "open PR", "remote branch changed", "unmanaged checkout", "branch changed",
+    "unsaved or ignored files", "active Claude process", "owner unknown", "project unknown",
+    "another registered owner", "checkout changed during verification",
+    "invalid task record",
+}
+REPORT_STATUS_REASONS = {
+    "would-remove": "checks passed; dry-run",
+    "removed": "checks passed; removed",
+    "already-removed": "previously removed",
+    "missing-kept": "checkout missing; metadata kept",
+}
+
+
+def write_report(path, apply, results, now=None):
+    """Append a single human-readable run; retain unknown lines and recent runs."""
+    path = Path(path).absolute()
+    if any(linked(p) for p in (path, *path.parents)):
+        raise ValueError("linked report")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time() if now is None else now
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+    kept = []
+    for line in lines:
+        if line.startswith(REPORT_PREFIX):
+            try:
+                previous = json.loads(line[len(REPORT_PREFIX):])
+                timestamp = datetime.fromisoformat(previous["time"]).timestamp()
+                if timestamp < now - 30 * 86400:
+                    continue
+            except (ValueError, TypeError, KeyError, OverflowError):
+                pass
+        kept.append(line)
+    tasks = []
+    for result in results:
+        reason = result.get("reason")
+        if reason and reason not in REPORT_REASONS:
+            reason = "verification failed"
+        tasks.append({"branch": result.get("branch"), "worktree": result.get("cwd"),
+                      "status": result["status"],
+                      "reason": reason or REPORT_STATUS_REASONS.get(result["status"], "unknown")})
+    entry = {"time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+             "mode": "apply" if apply else "dry-run", "tasks": tasks}
+    line = REPORT_PREFIX + json.dumps(entry, ensure_ascii=False) + "\n"
+    if len(kept) == len(lines):
+        with path.open("a", encoding="utf-8", newline="") as f:
+            f.write(line)
+    else:
+        tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            tmp.write_text("".join(kept) + line, encoding="utf-8", newline="")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def main():
@@ -419,6 +487,7 @@ def main():
     p.add_argument("--session", required=True)
     p = sub.add_parser("sweep")
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--report", type=Path)
     sub.add_parser("claude-hook")
     a = parser.parse_args()
     try:
@@ -435,9 +504,10 @@ def main():
                     out = manager.release("claude", data["session_id"])
                 else:
                     out = manager.register("claude", data["session_id"], data["cwd"], claude_owner())
-                manager.sweep(config.get("apply_on_claude_event", False))
             else:
                 out = manager.sweep(a.apply)
+                if a.report:
+                    write_report(a.report, a.apply, out)
         # Hooks must not inject registry paths or task metadata into the model context.
         if a.action != "claude-hook":
             print(json.dumps(out))
