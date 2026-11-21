@@ -4,6 +4,8 @@
     <python> lab\\experiment.py run --sandbox D:\\lab-1 --dry-run
     <python> lab\\experiment.py run --sandbox D:\\lab-1 [--configs a-current,c-no-third] [--units 3fa1] [--limit 5]
     <python> lab\\experiment.py summary --sandbox D:\\lab-1
+    <python> lab\\experiment.py prepare --sandbox D:\\trial-1 --voice-profiles copy --only-audio --audio "D:\\отрывок.m4a"
+    <python> lab\\experiment.py add-audio --sandbox D:\\lab-1 --audio "D:\\отрывок.m4a" [--group <группа>]
     <python> lab\\experiment.py analyze --sandbox D:\\lab-1
 
 <python> — интерпретатор установленной программы: %LOCALAPPDATA%\\rus-transcriber\\.venv\\Scripts\\python.exe.
