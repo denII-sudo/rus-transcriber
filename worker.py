@@ -54,6 +54,7 @@ EMO_RU = {"angry": "раздражение", "sad": "грусть", "neutral": "
 
 def asr_run_metadata():
     """Компактное описание запуска без загрузки сервера и обращения к сети."""
+    import buildinfo
     version = None
     try:
         tree = ast.parse((HERE / "server.py").read_text(encoding="utf-8"))
@@ -69,7 +70,7 @@ def asr_run_metadata():
         except metadata.PackageNotFoundError:
             pass
     return {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "program": version, "packages": packages, "models": {}}
+            "program": version, "build": buildinfo.identity(HERE), "packages": packages, "models": {}}
 
 
 def wait_slot(st, cfg, status_path):

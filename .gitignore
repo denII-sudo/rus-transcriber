@@ -36,6 +36,8 @@ backup*/
 Claude outputs/
 # рабочие копии Git, которые создаёт Claude Code
 .claude/worktrees/
+.opencode/worktrees/
+build-info.json
 
 # следы запуска MCP Inspector (npx)
 @modelcontextprotocol/

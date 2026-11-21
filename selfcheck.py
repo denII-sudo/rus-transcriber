@@ -130,7 +130,9 @@ def run_morph():
 
 
 def run(version=None, tests=True, repo=True, morph=True):
+    import buildinfo
     out = {"version": version, "python": platform.python_version(), "program": HERE.name}
+    out["build"] = buildinfo.identity(HERE)
     if tests:
         out["tests"] = run_tests()
     if repo:
