@@ -530,7 +530,7 @@ def print_plan(rows, units_all, experiment, db, limit, log=print):
                                 rates.get("voices", defaults["voices"]))
             total += sec
             rough_any = rough_any or rough
-            est = f"~{sec / 60:.0f} мин" + (" (грубо)" if rough else "")
+            est = f"~{sec / 60:.1f} мин" + (" (грубо)" if rough else "")
         name = Path(u["location"]).name
         missing = "" if Path(u["location"]).is_file() else " [аудио не найдено]"
         log(f"  {u['unit_id']}  {name}{missing}  {hours * 60:5.1f} мин  {conf['id']:<16} {mark:<8} {est}")

@@ -1,8 +1,9 @@
 """Песочница лаборатории: проверка места и подготовка копии (команда prepare).
 
 Что делает prepare (подробно — lab/README.md, раздел «Что копируется»):
-  * база записей state.sqlite3 копируется штатным резервным копированием программы
-    (storage.Store.backup) из источника, открытого только на чтение. Копия неактивна:
+  * база записей state.sqlite3 (и её журнал -wal) читается побайтно — SQLite в базу не
+    заходит, иначе он оставил бы рядом файл -shm, — и из этой временной копии песочницы
+    делается штатная резервная копия программы (storage.Store.backup). Копия неактивна:
     программа по ней не пишет файлы рядом с аудио, пока её явно не перепривязать;
   * config.json, словари групп (groups/<группа>/vocab.json) и соль стенда
     (bench/testbed.json) копируются как есть;
@@ -189,6 +190,41 @@ def _copy(src, dst, copied, what, root):
     copied.append({"what": what, "relative": dst.relative_to(root).as_posix(), "bytes": dst.stat().st_size})
 
 
+def _read_stable(path, attempts=5):
+    """Байты файла, не менявшегося во время чтения (сверка размера и времени до и после)."""
+    for _ in range(attempts):
+        before = path.stat()
+        data = path.read_bytes()
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns) == \
+                (len(data), after.st_mtime_ns):
+            return data, (after.st_size, after.st_mtime_ns)
+        time.sleep(0.5)
+    raise SandboxError("база записей меняется во время копирования: закройте программу и повторите")
+
+
+def stage_database(src_db, staging, attempts=5):
+    """Побайтная копия базы и журнала -wal в staging; источник только читается.
+
+    Пара «база + журнал» должна относиться к одному моменту: если за время чтения что-то
+    изменилось, чтение повторяется. -> путь копии базы."""
+    wal = src_db.with_name(src_db.name + "-wal")
+    for _ in range(attempts):
+        db_bytes, db_state = _read_stable(src_db)
+        wal_bytes, wal_state = _read_stable(wal) if wal.is_file() else (None, None)
+        if src_db.stat().st_mtime_ns == db_state[1] and \
+                (wal_state is None or (wal.is_file() and wal.stat().st_mtime_ns == wal_state[1])):
+            break
+    else:
+        raise SandboxError("база записей меняется во время копирования: закройте программу и повторите")
+    staging.mkdir(parents=True, exist_ok=False)
+    target = staging / "state.sqlite3"
+    target.write_bytes(db_bytes)
+    if wal_bytes is not None:
+        (staging / "state.sqlite3-wal").write_bytes(wal_bytes)
+    return target
+
+
 def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=print):
     """Создать песочницу. -> отчёт (что скопировано, сколько единиц, каких записей нет)."""
     if voice_profiles not in ("copy", "skip"):
@@ -201,18 +237,32 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
     storage = _import_repo_module("storage")
     runinfo = _import_repo_module("runinfo")
 
-    store = storage.open_store_readonly(src_db)
+    s = real(sandbox)
+    if s.exists() and any(s.iterdir()):
+        raise SandboxError(f"папка песочницы уже существует и не пуста: {s}. "
+                           "Для новой подготовки укажите новую папку")
+    # SQLite даже в режиме только чтения оставляет рядом с базой в режиме WAL файл -shm, то есть
+    # меняет настоящую папку данных. Поэтому базу (и её журнал -wal) сначала читаем побайтно
+    # в песочницу, а штатное резервное копирование делаем уже из этой копии.
+    staging = s / "source" / "staging"
+    staged = stage_database(src_db, staging)
     try:
-        recordings = read_recordings(store.db)
-        audio_dirs = sorted({str(real(Path(r["location"]).parent)) for r in recordings})
-        s = check_sandbox(sandbox, protected_dirs(source_data, program_dir, env), audio_dirs)
-        if s.exists() and any(s.iterdir()):
-            raise SandboxError(f"папка песочницы уже существует и не пуста: {s}. "
-                               "Для новой подготовки укажите новую папку")
-        (s / "source").mkdir(parents=True, exist_ok=True)
-        report = store.backup(s / "source" / "state.sqlite3")
+        store = storage.open_store(staged)
+        try:
+            recordings = read_recordings(store.db)
+            audio_dirs = sorted({str(real(Path(r["location"]).parent)) for r in recordings})
+            try:
+                check_sandbox(s, protected_dirs(source_data, program_dir, env), audio_dirs)
+            except SandboxError:
+                store.close()
+                shutil.rmtree(s / "source")      # только что созданные лабораторией файлы
+                raise
+            report = store.backup(s / "source" / "state.sqlite3")
+        finally:
+            store.close()
     finally:
-        store.close()
+        if staging.exists():
+            shutil.rmtree(staging)               # побайтная копия больше не нужна
 
     copied = [{"what": "база записей (резервная копия, неактивная)", "relative": "source/state.sqlite3",
                "bytes": (s / "source" / "state.sqlite3").stat().st_size}]

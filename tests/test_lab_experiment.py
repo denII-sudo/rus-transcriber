@@ -1,0 +1,415 @@
+"""Лаборатория опытов (lab/): песочница, файл опыта, возобновление, сводка без текстов.
+
+Модели не загружаются: тяжёлые части подменены. Установщик папку lab/ не ставит, поэтому
+в установленной копии (selfcheck.py) этот набор пропускается.
+"""
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+LAB = ROOT / "lab"
+HAVE_LAB = (LAB / "lab_run.py").is_file()
+if HAVE_LAB:
+    sys.path.insert(0, str(LAB))
+    import lab_run  # noqa: E402
+    import lab_sandbox  # noqa: E402
+    import lab_spec  # noqa: E402
+    import lab_summary  # noqa: E402
+
+SECRET = "Тайнословие"           # «текст записи»: не должен попасть в сводку
+NAME = "Неизвестнов"            # «имя участника»
+EXPERIMENT = LAB / "experiments" / "models-arbitration.json"
+
+
+def snapshot(root):
+    """Состояние папки: путь -> (размер, сумма, время изменения)."""
+    out = {}
+    for p in sorted(Path(root).rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            out[p.relative_to(root).as_posix()] = (st.st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
+                                                   st.st_mtime_ns)
+    return out
+
+
+def make_source(base):
+    """Синтетическая настоящая папка данных: база с двумя вариантами одного звука и ещё одним звуком."""
+    import storage
+    data = base / "real-data"
+    audio_dir = base / "audio"
+    data.mkdir()
+    audio_dir.mkdir()
+    (data / "config.json").write_text('{"schema_version": 1, "asr_third_backend": "whisper-ct2"}',
+                                      encoding="utf-8")
+    group = data / "groups" / "grp"
+    group.mkdir(parents=True)
+    (group / "vocab.json").write_text('{"group": "grp", "participants": []}', encoding="utf-8")
+    (group / "voices.json").write_text('{"version": 2, "speakers": {}, "sources": {}}', encoding="utf-8")
+    a1, a2 = audio_dir / "one.wav", audio_dir / "two.wav"
+    a1.write_bytes(b"RIFF-one-synthetic")
+    a2.write_bytes(b"RIFF-two-synthetic")
+    store = storage.initialize(data / "state.sqlite3")
+    try:
+        user = store.create_user("tester")
+        inst = str(uuid.uuid4())
+        store.bind_installation(inst, user)
+        ctx = store.capture_context(inst, "human")
+        (base / "docs").mkdir()
+        root_id = store.register_root(base / "docs")
+        for n, (audio, tag) in enumerate(((a1, "a"), (a1, "b"), (a2, ""))):
+            transcript = {"duration": "00:01:00",
+                          "quality": {"runtime": {"group": "grp", "timing": {
+                              "asr_model": "v3_e2e_rnnt", "asr_sec": 6, "diarization_sec": 12}}},
+                          "segments": [{"segment_id": f"s{n}", "speaker": NAME,
+                                        "words": [{"word_id": f"w{n}", "w": SECRET}]}]}
+            store.create_recording_with_document(
+                str(uuid.uuid4()), os.path.normcase(os.path.abspath(audio)), transcript,
+                {"review": [], "answers": {}}, str(uuid.uuid4()), ctx, root_id=root_id,
+                generated_at=f"t{n}")
+    finally:
+        store.close()
+    return data, audio_dir
+
+
+class FakeEngine:
+    """Подмена PipelineEngine: без моделей; считает вызовы, умеет падать на заданной паре."""
+
+    def __init__(self, fail=()):
+        self.fail = set(fail)
+        self.prepared, self.ran = [], []
+
+    def base_config(self):
+        import settings
+        return dict(settings.DEFAULTS)
+
+    def config_types(self):
+        import settings
+        return settings.CONFIG_TYPES
+
+    def prepare_unit(self, unit, cfg):
+        self.prepared.append(unit["unit_id"])
+        return SimpleNamespace(unit=unit, duration=60.0, diarization_sha256="d" * 64,
+                               shared_record={"label_name": {"Спикер 1": NAME}})
+
+    def run_config(self, shared, cfg, conf):
+        key = (shared.unit["unit_id"], conf["id"])
+        self.ran.append(key)
+        if conf["id"] in self.fail:
+            raise RuntimeError(f"сбой {shared.unit['location']}")
+        words = [{"w": SECRET, "s": 1.0, "e": 1.5, "c": 0.4, "flags": ["conf"]}]
+        data = {"file": shared.unit["location"], "speakers": [NAME],
+                "segments": [{"speaker": NAME, "text": SECRET, "words": words}],
+                "review": [{"id": "r1", "text": SECRET, "speaker": NAME, "reasons": ["conf", "voice"]},
+                           {"id": "r2", "text": "", "reasons": ["missed"]}],
+                "quality": {"words": 1, "flagged_words": 1, "vote": {"agree3": 1, "disputed": 0},
+                            "asr_diagnostics": {"primary": {"backend": "cpu", "chunks": [{"state": "ok"}]}},
+                            "asr3_errors": [f"whisper-ct2:CPU: RuntimeError: {shared.unit['location']}"]}}
+        hyps = {"schema": lab_run.HYP_SCHEMA, "primary": {"words": words}, "second": None,
+                "third": {"chunks": [{"raw_text": SECRET, "text": SECRET}]}}
+        timing = {"asr_sec": 3, "asr_model": "v3_e2e_rnnt", "diarization_sec": 12, "pair_sec": 4.0,
+                  "asr3_fallbacks": [f"onnx-cpu:CPU: OSError: {shared.unit['location']}"]}
+        calls = [{"requested": {"asr_model": "v3_e2e_rnnt"}, "actual": "cpu",
+                  "fallbacks": [f"openvino:CPU: RuntimeError: нет {shared.unit['location']}"]}]
+        return data, hyps, calls, timing
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class SandboxSafety(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-safety-")
+        self.base = Path(self.tmp.name)
+        self.data = self.base / "data"
+        self.program = self.base / "program"
+        self.data.mkdir()
+        self.program.mkdir()
+        self.protected = {"данные": self.data, "программа": self.program, "клон": ROOT}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_refuses_dangerous_places(self):
+        for bad in (self.data, self.data / "lab", self.program / "lab", ROOT / "lab-sandbox", self.base):
+            with self.subTest(bad=bad), self.assertRaises(lab_sandbox.SandboxError):
+                lab_sandbox.check_sandbox(bad, self.protected)
+        audio = self.base / "audio"
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.check_sandbox(audio / "lab", self.protected, [audio])
+
+    def test_accepts_separate_folder(self):
+        self.assertEqual(lab_sandbox.check_sandbox(self.base / "sandbox", self.protected),
+                         lab_sandbox.real(self.base / "sandbox"))
+
+    def test_case_insensitive_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("регистр путей важен только в Windows")
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.check_sandbox(Path(str(self.data).upper()) / "x", self.protected)
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class ExperimentFile(unittest.TestCase):
+    def test_shipped_experiment_parses_and_maps_roles(self):
+        spec, sha = lab_spec.load(EXPERIMENT)
+        self.assertEqual(len(sha), 64)
+        ids = [c["id"] for c in spec["configurations"]]
+        self.assertIn("a-current", ids)
+        base = {"asr_model": "x", "asr_third_model": "onnx-community/whisper-large-v3-turbo",
+                "emotions": True, "asr_third_mode": "all"}
+        by_id = {c["id"]: lab_spec.effective_settings(base, c) for c in spec["configurations"]}
+        self.assertEqual(by_id["a-current"]["asr_third_backend"], "whisper-ct2")
+        self.assertEqual(by_id["c-no-third"]["asr_third_mode"], "off")
+        self.assertEqual(by_id["b-ml3"]["asr_third_model"], "multilingual_large_ctc")
+        self.assertIsNone(by_id["b-ml3"]["asr_third_quant_cpu"])
+        self.assertEqual(by_id["d-ml2-whisper3"]["asr_second_model"], "multilingual_large_ctc")
+        self.assertEqual(by_id["f-whisper-doubt"]["asr_third_mode"], "doubt")
+        self.assertTrue(all(cfg["emotions"] is False for cfg in by_id.values()))
+        hashes = {lab_spec.config_hash(c, by_id[c["id"]]) for c in spec["configurations"]}
+        self.assertEqual(len(hashes), len(ids))
+
+    def test_rejects_errors(self):
+        good = {"schema": lab_spec.SCHEMA, "name": "x",
+                "configurations": [{"id": "a", "roles": {"primary": {"model": "m"}, "second": {"model": "s"}}}]}
+        lab_spec.parse(json.dumps(good))
+        cases = {
+            "shared": {"settings": {"diar_embeddings": "torch"}},
+            "third without second": {"roles": {"primary": {"model": "m"}, "second": None,
+                                               "third": {"engine": "whisper-ct2"}}},
+            "same model": {"roles": {"primary": {"model": "m"}, "second": {"model": "m"}}},
+            "unknown key": {"roles": {"primary": {"model": "m", "devise": "GPU"}}},
+            "onnx on gpu": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
+                                      "third": {"engine": "onnx", "model": "q", "device": "GPU"}}},
+            "bad id": {"id": "A B"},
+        }
+        for name, change in cases.items():
+            bad = json.loads(json.dumps(good))
+            bad["configurations"][0].update(change)
+            with self.subTest(name), self.assertRaises(lab_spec.SpecError):
+                lab_spec.parse(json.dumps(bad))
+        import settings
+        typo = json.loads(json.dumps(good))
+        typo["configurations"][0]["settings"] = {"asr_thrid_mode": "all"}
+        conf = lab_spec.parse(json.dumps(typo))["configurations"][0]
+        with self.assertRaises(lab_spec.SpecError):
+            lab_spec.effective_settings({}, conf, settings.CONFIG_TYPES)
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class PrepareAndRun(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-run-")
+        self.base = Path(self.tmp.name)
+        self.data, self.audio = make_source(self.base)
+        self.program = self.base / "program"
+        self.program.mkdir()
+        self.sandbox = self.base / "sandbox"
+        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.log = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def prepare(self, voices="skip"):
+        return lab_sandbox.prepare(self.sandbox, self.data, self.program, voices, env={},
+                                   log=self.log.append)
+
+    def assert_source_unchanged(self):
+        self.assertEqual(snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
+        self.assertEqual(snapshot(self.audio), self.before[1], "папка с аудио изменилась")
+
+    def test_prepare_copies_and_leaves_source_untouched(self):
+        report = self.prepare("skip")
+        self.assert_source_unchanged()
+        self.assertEqual(report["units"], 2)
+        self.assertEqual(report["recordings"], 3)
+        s = lab_sandbox.real(self.sandbox)
+        self.assertTrue((s / "source" / "state.sqlite3").is_file())
+        self.assertFalse((s / "data" / "state.sqlite3").exists(), "копия базы не должна стать рабочей")
+        self.assertTrue((s / "data" / "groups" / "grp" / "vocab.json").is_file())
+        self.assertFalse((s / "data" / "groups" / "grp" / "voices.json").exists(), "профили не просили")
+        db = sqlite3.connect((s / "source" / "state.sqlite3").as_uri() + "?mode=ro", uri=True)
+        try:
+            self.assertEqual(db.execute("SELECT locked FROM restore_guard").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM installations WHERE active=1").fetchone()[0], 0)
+        finally:
+            db.close()
+        units = json.loads((s / "units.json").read_text(encoding="utf-8"))["units"]
+        self.assertEqual(sorted(len(u["recordings"]) for u in units), [1, 2])
+        self.assertTrue(all(u["group"] == "grp" for u in units))
+        self.assertTrue(any("Голосовые профили не копировались" in m for m in self.log))
+
+    def test_prepare_with_voice_profiles_warns(self):
+        self.prepare("copy")
+        self.assertTrue((lab_sandbox.real(self.sandbox) / "data" / "groups" / "grp" / "voices.json").is_file())
+        self.assertTrue(any("биометрия" in m for m in self.log))
+        self.assert_source_unchanged()
+
+    def test_prepare_refuses_nonempty_and_dangerous(self):
+        self.sandbox.mkdir()
+        (self.sandbox / "x.txt").write_text("x", encoding="utf-8")
+        with self.assertRaises(lab_sandbox.SandboxError):
+            self.prepare()
+        for bad in (self.data / "lab", self.audio / "lab", self.program / "lab"):
+            with self.subTest(bad=bad), self.assertRaises(lab_sandbox.SandboxError):
+                lab_sandbox.prepare(bad, self.data, self.program, "skip", env={}, log=self.log.append)
+        self.assert_source_unchanged()
+        self.assertFalse((self.data / "lab").exists())
+
+    def run_lab(self, engine, **kw):
+        sandbox, marker, units = lab_sandbox.load_sandbox(self.sandbox, env={})
+        spec, sha = lab_spec.load(EXPERIMENT)
+        return lab_run.run(sandbox, spec, sha, units, engine, log=self.log.append, **kw)
+
+    def test_dry_run_resume_limit_and_summary(self):
+        self.prepare()
+        spec, _ = lab_spec.load(EXPERIMENT)
+        n_conf = len(spec["configurations"])
+        engine = FakeEngine()
+        res = self.run_lab(engine, dry_run=True)
+        self.assertEqual((res["pairs"], res["todo"]), (2 * n_conf, 2 * n_conf))
+        self.assertEqual(engine.ran, [], "--dry-run ничего не считает")
+        self.assertTrue(any("Оценка времени" in m for m in self.log))
+
+        res = self.run_lab(engine, limit=3)
+        self.assertEqual(res["computed"], 3)
+        res = self.run_lab(FakeEngine(fail={"b-ml3"}))
+        self.assertEqual((res["computed"], res["errors"]), (2 * n_conf - 3 - 1, 1))
+        retry = FakeEngine()
+        res = self.run_lab(retry)
+        self.assertEqual(res["computed"], 1, "повторяется только пара с ошибкой")
+        self.assertEqual(len(retry.ran), 1)
+        again = FakeEngine()
+        self.assertEqual(self.run_lab(again)["computed"], 0)
+        self.assertEqual(again.ran, [])
+
+        s = lab_sandbox.real(self.sandbox)
+        summary_text = (s / "export" / "summary.json").read_text(encoding="utf-8")
+        summary = json.loads(summary_text)
+        self.assertEqual(summary["schema"], lab_summary.SUMMARY_SCHEMA)
+        for forbidden in (SECRET, NAME, "one.wav", "two.wav", str(self.audio), str(self.base), "grp"):
+            self.assertNotIn(forbidden, summary_text, forbidden)
+        self.assertNotIn(str(self.audio).replace("\\", "\\\\"), summary_text)
+        done = [p for p in summary["pairs"] if p["state"] == "done"]
+        self.assertEqual(len(done), 2 * n_conf)
+        m = done[0]["metrics"]
+        self.assertEqual(m["review"]["by_reason"]["conf"], 1)
+        self.assertEqual(m["review"]["by_reason"]["missed"], 1)
+        self.assertEqual(m["review"]["total"], 2)
+        self.assertEqual(m["asr3_errors"], ["whisper-ct2:CPU: RuntimeError"])
+        self.assertEqual(m["make_asr"][0]["fallbacks"], ["openvino:CPU: RuntimeError"])
+        self.assertEqual(m["hypotheses"], {"primary": 1, "third": 1})
+        # тексты остаются в базе результатов песочницы
+        db = lab_run.open_results(s / "results" / "lab.sqlite3")
+        try:
+            row = db.execute("SELECT result_json, hypotheses_json FROM pairs WHERE state='done' LIMIT 1").fetchone()
+            self.assertIn(SECRET, row["result_json"])
+            self.assertIn(SECRET, row["hypotheses_json"])
+        finally:
+            db.close()
+        self.assert_source_unchanged()
+
+    def test_changed_audio_is_not_processed(self):
+        self.prepare()
+        (self.audio / "two.wav").write_bytes(b"RIFF-changed")
+        engine = FakeEngine()
+        res = self.run_lab(engine, config_filter=["c-no-third"])
+        self.assertEqual(res["computed"], 1)
+        self.assertEqual(res["errors"], 1)
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class CaptureWithRealPipeline(unittest.TestCase):
+    """Перехват гипотез вокруг настоящего worker.run_words (модели подменены, как в test_whisper_ct2)."""
+
+    def test_hypotheses_of_all_passes_are_captured(self):
+        import numpy as np
+        import backends
+        import words
+        import worker
+
+        class Main:
+            def __init__(self, model):
+                self.name, self.model_name = "fake-" + model, model
+
+            def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
+                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                word = " раз" if self.model_name == "primary" else " два"
+                return [SimpleNamespace(tokens=[word], timestamps=[0.1], logprobs=[-0.1], text=word)
+                        for _ in pieces]
+
+        class CT2:
+            name, compile_sec = "fake-ct2", None
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                return ["три три" for _ in pieces]
+
+        def fake_make_asr(cfg):
+            return Main(cfg["asr_model"]), ["openvino:GPU: RuntimeError: нет устройства"]
+
+        engine = object.__new__(lab_run.PipelineEngine)
+        engine.allow_torch, engine.log = False, lambda m: None
+        chunks = [{"a": 0.0, "b": 1.0, "own": (0.0, 1.0)}, {"a": 1.0, "b": 3.0, "own": (1.0, 3.0)}]
+        shared = SimpleNamespace(
+            unit={"unit_id": "u1"}, src=Path("synthetic.wav"), audio=np.zeros(48000, dtype=np.float32),
+            duration=3.0, raw=[(0.0, 3.0, "s")], order={"s": "L"}, turns=[], full_ann=None,
+            emb=SimpleNamespace(seconds=0.0), emb_shared_sec=0.0, label_name={}, label_of={},
+            voice_ctx={"cents": {"L": [1]}}, allowed=[], genders_by_name={}, vocab=None,
+            quality={"speaker_fixes": [], "vocab_fixes": []}, no_profile=False, group="g",
+            t_diar=1.0, t_voice=0.5, diar_info={})
+        cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "whisper",
+               "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2", "asr_third_mode": "all",
+               "asr_third_long_chunks": False, "asr_third_quant_cpu": "int8", "asr_third_batch": 4,
+               "emotions": False, "review_missed": False, "interaction": False}
+        conf = {"id": "a-current", "roles": {}}
+        with mock.patch.object(backends, "make_asr", fake_make_asr), \
+             mock.patch.object(backends, "WhisperCT2", CT2), \
+             mock.patch.object(words, "make_chunks", return_value=chunks), \
+             mock.patch.object(words, "assign_voices", return_value=0), \
+             mock.patch.object(words, "build_replies", return_value=[]), \
+             mock.patch.object(words, "overlap_regions", return_value=[]), \
+             mock.patch.object(words, "doubt_flags", return_value=0), \
+             mock.patch.object(words, "review_items", return_value=[]):
+            orig_transcribe = words.transcribe
+            data, hyps, calls, timing = engine.run_config(shared, cfg, conf)
+            self.assertIs(words.transcribe, orig_transcribe, "подмены сняты после вызова")
+        self.assertEqual([w["w"] for w in hyps["primary"]["words"]], ["раз", "раз"])
+        self.assertEqual([w["w"] for w in hyps["second"]["words"]], ["два", "два"])
+        self.assertEqual(hyps["primary"]["model"], "primary")
+        self.assertEqual(len(hyps["primary"]["chunks"]), 2)
+        self.assertEqual([c["raw_text"] for c in hyps["third"]["chunks"]], ["три три", "три три"])
+        self.assertEqual(hyps["vote"]["function"], "vote3")
+        self.assertEqual(hyps["vote"]["third_words"], ["три", "три", "три", "три"])
+        self.assertEqual([c["actual"] for c in calls], ["fake-primary", "fake-second"])
+        self.assertIn("asr_sec", timing)
+        self.assertIn("asr3_sec", timing)
+        self.assertEqual(timing["diarization_sec"], 1)
+        self.assertIsInstance(data["quality"]["vote"], dict)
+        m = lab_summary.pair_metrics(data, hyps, calls, timing, 3.0)
+        self.assertEqual(m["make_asr"][0]["fallbacks"], ["openvino:GPU: RuntimeError"])
+        self.assertNotIn("раз", json.dumps(m, ensure_ascii=False))
+
+    def test_torch_fallback_is_blocked(self):
+        import backends
+        import words
+        original = backends.TorchASR
+        cap = lab_run.Capture(words, backends)
+        with cap:
+            with self.assertRaises(RuntimeError):
+                backends.TorchASR("v3_e2e_rnnt")
+        self.assertIs(backends.TorchASR, original)
+
+
+if __name__ == "__main__":
+    unittest.main()

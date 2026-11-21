@@ -72,7 +72,7 @@ def model_warnings(experiment, base_cfg, program_dir):
         hint = MODEL_HINTS.get(model, str(model).split("/")[-1].lower())
         if not any(hint in n for n in names):
             out.append(f"модель «{model}» не найдена в кэше по имени папки (ищется «{hint}»); "
-                       "пары с ней завершатся ошибкой загрузки, скачивания не будет")
+                       "этапы с ней завершатся ошибкой загрузки (скачивания не будет)")
     return out
 
 
