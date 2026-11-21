@@ -1,0 +1,6 @@
+{
+  "name": "local-agent-workspaces",
+  "private": true,
+  "type": "module",
+  "exports": "./index.js"
+}
