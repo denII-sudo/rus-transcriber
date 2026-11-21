@@ -839,7 +839,25 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         for wd in seg["words"]:
             wd.pop("sims", None)
 
+    # слой признаков разговора для «горячих мест» (hotspots.py): только числа по времени,
+    # без текста, имён и отпечатков голоса. Ошибка слоя обработку не останавливает.
+    t_layer = time.time()
+    if cfg.get("interaction", True):
+        try:
+            import hotspots
+            layer_turns, turns_source = hotspots.cluster_turns(raw, full_ann)
+            quality["interaction"] = hotspots.build_layer(audio, SR, layer_turns, overlaps,
+                                                          turns_source=turns_source)
+        except Exception as ex:
+            quality.pop("interaction", None)
+            quality["interaction_error"] = f"{type(ex).__name__}: {ex}"[:300]
+            print(f"[words] слой признаков разговора не рассчитан: {ex}", file=sys.stderr, flush=True)
+    else:
+        quality["interaction_skipped"] = "disabled"
+    timing["interaction_sec"] = round(time.time() - t_layer, 1)
+
     # эмоции — по репликам от 2 с (если модель доступна)
+    t_emo = time.time()
     if cfg.get("emotions", True) and not a.no_emotions:
         try:
             import gigaam
@@ -857,6 +875,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             print(f"Эмоции отключены: {ex}", file=sys.stderr, flush=True)
             err = f"{type(ex).__name__}: {ex}"[:300]
             quality["emotions_error"] = (err + download_hint.certificate_hint(ex))[:600]
+        timing["emotions_sec"] = round(time.time() - t_emo, 1)
 
     labels = list(dict.fromkeys(s["label"] for s in segments))
     names = {l: label_name[l] for l in labels if l in label_name}
@@ -1258,6 +1277,7 @@ def main():
                                             "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                             "vote3_skipped": quality.get("vote3_skipped"),
                                            "emotions_error": quality.get("emotions_error"),
+                                           "interaction_error": quality.get("interaction_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),
                                            "vocab_fixes": sum(len(v["fixes"]) for v in quality["vocab_fixes"]),
                                            "voices_error": quality.get("voices_error"),

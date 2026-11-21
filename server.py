@@ -489,6 +489,26 @@ def review_items(job_id: str, offset: int = 0, limit: int = 40, reasons: str = "
 
 
 @mcp.tool()
+def conversation_hotspots(job_id: str, limit: int = 20, min_score: float = 0.0) -> str:
+    """Горячие места разговора — отрезки, где разговор был оживлён или напряжён. Только по просьбе человека:
+    сами по себе в стенограмму, конспект и ответы не добавляются.
+
+    В ответе hotspots: t1, t2 (секунды), time, score (0…1) и kinds — что измерено: «частые смены говорящих»,
+    «наложения», «громче обычного», «тон выше обычного» (громкость и высота — относительно обычных для
+    того же говорящего в этой записи). Это эвристика для навигации (где развернуть стенограмму или
+    послушать запись), а не оценка эмоций или поведения людей и не доказательство: не пересказывайте её
+    как «человек злился/волновался», пороги стартовые, на настоящей речи не проверялись.
+    limit — сколько мест показать (самые выраженные, по времени; 0 — все), min_score — нижняя граница оценки.
+    available=false — данных нет, причина в reason: запись обработана до появления слоя признаков, настройка
+    interaction была выключена или расчёт слоя не удался; старые записи не пересчитываются.
+    job_id — задача или "recording:<id>" записи в SQLite."""
+    try:
+        return json.dumps(core.conversation_hotspots(job_id, limit, min_score), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return str(ex)
+
+
+@mcp.tool()
 def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", note: str = "",
               by: str = "claude") -> str:
     """Правка произвольного отрезка стенограммы — для остатков, которые не исправил разбор, без пересборки
@@ -751,7 +771,12 @@ def find_recording_results(source_path: str) -> str:
 def read_recording_result(recording_id: str) -> str:
     """Прочитать SQLite-результат по recording_id без сохранённого job."""
     try:
-        return json.dumps(core.read_recording_result(recording_id), ensure_ascii=False)
+        result = core.read_recording_result(recording_id)
+        quality = result.get("quality")
+        if isinstance(quality, dict) and "interaction" in quality:
+            # слой признаков разговора (массивы чисел) показывается только по запросу
+            quality["interaction"] = {"omitted": "см. conversation_hotspots"}
+        return json.dumps(result, ensure_ascii=False)
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
 

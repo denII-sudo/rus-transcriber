@@ -5,6 +5,7 @@
     python rt.py jobs [--limit 10]
     python rt.py read ЗАДАЧА [--fmt md|json] [--extra] [--offset 0]
     python rt.py review ЗАДАЧА [--offset 0 --limit 40] [--reasons voice,gender] [--min-sec 1] [--brief] [--status open]
+    python rt.py hotspots ЗАДАЧА [--limit 20] [--min-score 0.5]  # горячие места разговора (эвристика, по запросу)
     python rt.py edit-span ЗАДАЧА T1 T2 "текст" [--speaker Имя] [--note ...] [--by human]
     python rt.py reopen ЗАДАЧА r57,r88
     python rt.py cancel ЗАДАЧА
@@ -202,6 +203,8 @@ def build():
     v = sub.add_parser("review"); v.add_argument("job"); v.add_argument("--offset", type=int, default=0); v.add_argument("--limit", type=int, default=40)
     v.add_argument("--reasons", default=""); v.add_argument("--min-sec", type=float, default=0.0)
     v.add_argument("--brief", action="store_true"); v.add_argument("--status", default="open")
+    hs = sub.add_parser("hotspots"); hs.add_argument("job"); hs.add_argument("--limit", type=int, default=20)
+    hs.add_argument("--min-score", type=float, default=0.0)
     es = sub.add_parser("edit-span"); es.add_argument("job"); es.add_argument("t1", type=float); es.add_argument("t2", type=float)
     es.add_argument("text"); es.add_argument("--speaker", default=""); es.add_argument("--note", default="")
     es.add_argument("--by", default="human", choices=["human", "claude"])
@@ -300,6 +303,8 @@ def run(a):
         print(core.read_transcript(a.job, a.fmt, a.offset, a.max_chars, a.extra))
     elif c == "review":
         out(core.review_items(a.job, a.offset, a.limit, a.reasons, a.min_sec, a.brief, a.status))
+    elif c == "hotspots":
+        out(core.conversation_hotspots(a.job, a.limit, a.min_score))
     elif c == "review-build":
         items = None
         if a.items:

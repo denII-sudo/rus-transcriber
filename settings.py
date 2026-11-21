@@ -14,6 +14,9 @@ import paths
 DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnnt",
             "asr_batch": 1, "asr_allow_npu": False,
             "pad_to_seconds": 0, "emotions": True,
+            # слой признаков разговора для «горячих мест» (hotspots.py): считается при обработке,
+            # показывается только по запросу
+            "interaction": True,
             # вторая модель GigaAM и третья модель Whisper: голосование «два из трёх».
             # У каждой группы своё устройство: RNN-T, CTC и Whisper могут считаться на разном железе.
             "asr_second_model": "v3_e2e_ctc", "asr_second_backend": "auto",

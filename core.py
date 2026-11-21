@@ -1269,6 +1269,41 @@ def review_items(job_id, offset=0, limit=40, reasons="", min_sec=0.0, brief=Fals
     return transcript.review_list(s["json"], max(0, int(offset)), limit, want, float(min_sec or 0), bool(brief), status)
 
 
+def conversation_hotspots(job_id, limit=20, min_score=0.0):
+    """Горячие места разговора готовой расшифровки — только по запросу (hotspots.py).
+
+    Оценка считается при чтении по текущим словам стенограммы и слою quality["interaction"];
+    в обоих хранилищах данные читаются через transcript.load. Если слоя нет — available=False
+    с причиной. limit — сколько мест показать (самые выраженные, в порядке времени); 0 — все.
+    min_score — нижняя граница оценки (0 — стартовый порог hotspots.HOT_SCORE).
+    """
+    import hotspots
+    import storage
+    import transcript
+    s = _done_json(job_id)
+    try:
+        limit, min_score = int(limit), float(min_score or 0)
+    except (TypeError, ValueError) as ex:
+        raise CoreError("limit — целое число, min_score — число от 0 до 1") from ex
+    if limit < 0 or not 0 <= min_score <= 1:
+        raise CoreError("limit — не меньше 0, min_score — от 0 до 1")
+    try:
+        data = transcript.load(s["json"])
+    except (OSError, ValueError, KeyError, storage.StorageError) as ex:
+        raise CoreError(f"Стенограмма недоступна: {type(ex).__name__}") from ex
+    threshold = min_score or hotspots.HOT_SCORE
+    try:
+        found = hotspots.find_hotspots(data, min_score=threshold)
+    except hotspots.NoData as ex:
+        return {"available": False, "reason_code": ex.code, "reason": f"Нет данных: {ex}", "hotspots": []}
+    shown = found
+    if limit and len(found) > limit:
+        shown = sorted(sorted(found, key=lambda h: -h["score"])[:limit], key=lambda h: h["t1"])
+    return {"available": True, "total": len(found), "min_score": threshold,
+            "hotspots": [{**h, "time": f"{transcript.hms(h['t1'])}–{transcript.hms(h['t2'])}"} for h in shown],
+            "note": hotspots.NOTE}
+
+
 def build_review_pack(job_id, items=None):
     """Подготовка карточек без зависимости от MCP или конкретной модели."""
     import review_pack as P
