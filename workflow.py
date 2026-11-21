@@ -206,6 +206,48 @@ def claim_start(store, request_id):
     return job_id
 
 
+def mark_launch_interrupted(store, request_id):
+    """Исход запуска worker неизвестен: запрос и выполняемый ASR — interrupted, повтора нет."""
+    with store._transaction():
+        now = storage._now()
+        store.db.execute("UPDATE workflow_requests SET state='interrupted', updated_at=? WHERE request_id=?",
+                         (now, request_id))
+        store.db.execute("UPDATE workflow_runs SET state='interrupted', updated_at=? "
+                         "WHERE request_id=? AND kind='asr' AND state='running'",
+                         (now, request_id))
+        store.db.execute("UPDATE workflow_steps SET state='interrupted', updated_at=? WHERE run_id IN "
+                         "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='asr') "
+                         "AND state='running'", (now, request_id))
+
+
+def check_worker_result_allowed(store, request_id, context, source):
+    """Внутри транзакции сохранения результата worker: запрос всё ещё ждёт результат этого запуска.
+
+    Отказ, если запрос завершён или брошен, уже связан с записью, инициатор или источник другие."""
+    row = store.db.execute(
+        "SELECT source, context_json, state, recording_id FROM workflow_requests WHERE request_id=?",
+        (request_id,)).fetchone()
+    if (row is None or row["state"] not in ("starting", "running", "interrupted")
+            or row["recording_id"] is not None
+            or storage._loads(row["context_json"]) != context
+            or recordings.normalize_location(row["source"]) != recordings.normalize_location(source)):
+        raise RuntimeError("workflow request no longer permits this worker result")
+
+
+def link_worker_result(store, request_id, recording_id):
+    """В той же транзакции, что и сохранение записи: связать запрос с ней, завершить шаг ASR."""
+    now = storage._now()
+    store.db.execute("UPDATE workflow_requests SET recording_id=?, state='processed', updated_at=? "
+                     "WHERE request_id=?", (recording_id, now, request_id))
+    store.db.execute("UPDATE workflow_runs SET state='completed', updated_at=? "
+                     "WHERE request_id=? AND kind='asr' AND state='running'",
+                     (now, request_id))
+    store.db.execute("UPDATE workflow_steps SET state='completed', result_json=?, updated_at=? "
+                     "WHERE run_id IN (SELECT run_id FROM workflow_runs "
+                     "WHERE request_id=? AND kind='asr') AND state='running'",
+                     (storage._json({"recording_id": recording_id}), now, request_id))
+
+
 def observe(store, request_id, job):
     """Зафиксировать наблюдаемый результат, не повторяя завершённое распознавание."""
     request = get(store, request_id)

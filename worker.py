@@ -1473,31 +1473,15 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
         context = sqlite_target["context"]
         with store._transaction():
             if workflow_request_id:
-                import storage
-                row = store.db.execute(
-                    "SELECT source, context_json, state, recording_id FROM workflow_requests WHERE request_id=?",
-                    (workflow_request_id,)).fetchone()
-                if (row is None or row["state"] not in ("starting", "running", "interrupted")
-                        or row["recording_id"] is not None
-                        or storage._loads(row["context_json"]) != context
-                        or recordings.normalize_location(row["source"]) != recordings.normalize_location(src)):
-                    raise RuntimeError("workflow request no longer permits this worker result")
+                import workflow
+                workflow.check_worker_result_allowed(store, workflow_request_id, context, src)
             result = recordings.commit_worker_result(
                 store, data, src, sqlite_target["root_id"], context,
                 recording_id=recording_id, operation_id=operation_id,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 document_paths=sqlite_target["paths"])
             if workflow_request_id:
-                now = storage._now()
-                store.db.execute("UPDATE workflow_requests SET recording_id=?, state='processed', updated_at=? "
-                                 "WHERE request_id=?", (recording_id, now, workflow_request_id))
-                store.db.execute("UPDATE workflow_runs SET state='completed', updated_at=? "
-                                 "WHERE request_id=? AND kind='asr' AND state='running'",
-                                 (now, workflow_request_id))
-                store.db.execute("UPDATE workflow_steps SET state='completed', result_json=?, updated_at=? "
-                                 "WHERE run_id IN (SELECT run_id FROM workflow_runs "
-                                 "WHERE request_id=? AND kind='asr') AND state='running'",
-                                 (storage._json({"recording_id": recording_id}), now, workflow_request_id))
+                workflow.link_worker_result(store, workflow_request_id, recording_id)
         status.set(recording_id=recording_id, source_revision=result["source_revision"],
                    review_revision=result["review_revision"], document_revision=result["document_revision"],
                    document_sync=result["document_sync"])

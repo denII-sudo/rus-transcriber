@@ -328,7 +328,6 @@ def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_simila
 def start_workflow(audio_path, policy=None):
     """Создать сохранённый запрос и один раз запустить SQLite-worker без обучения голосов."""
     import recordings
-    import storage
     import workflow
     if settings.recording_backend() != "sqlite":
         raise CoreError("Для сохранённого процесса требуется явно выбранный SQLite backend")
@@ -341,16 +340,7 @@ def start_workflow(audio_path, policy=None):
             start_transcription(request["source"], voices=False, workflow_job_id=job_id,
                                 workflow_context=request["context"], workflow_request_id=request_id)
         except Exception:
-            with store._transaction():
-                now = storage._now()
-                store.db.execute("UPDATE workflow_requests SET state='interrupted', updated_at=? WHERE request_id=?",
-                                 (now, request_id))
-                store.db.execute("UPDATE workflow_runs SET state='interrupted', updated_at=? "
-                                 "WHERE request_id=? AND kind='asr' AND state='running'",
-                                 (now, request_id))
-                store.db.execute("UPDATE workflow_steps SET state='interrupted', updated_at=? WHERE run_id IN "
-                                 "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='asr') "
-                                 "AND state='running'", (now, request_id))
+            workflow.mark_launch_interrupted(store, request_id)
             return {"request_id": request_id, "job_id": job_id, "state": "interrupted",
                     "note": "Исход запуска неизвестен; автоматический повтор отключён."}
         return {"request_id": request_id, "job_id": job_id}
