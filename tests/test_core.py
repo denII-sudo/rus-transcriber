@@ -114,6 +114,55 @@ class WhisperFilters(unittest.TestCase):
         self.assertEqual(text, "не знаю не знаю ладно")
 
 
+def res(*pairs):
+    """Результат распознавания куска: пары (токен, время)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(tokens=[t for t, _ in pairs], timestamps=[s for _, s in pairs],
+                           logprobs=[-0.1] * len(pairs))
+
+
+class ResultWords(unittest.TestCase):
+    """Токен без буквы и цифры («—», «…») — не слово: он приклеивается к соседнему слову."""
+
+    def test_sign_inside_chunk_sticks_to_previous_word(self):
+        out = W.result_words(res((" раз", 0.0), (" —", 0.3), (" два", 0.5), (" …", 0.8)), 10.0)
+        self.assertEqual([w["w"] for w in out], ["раз —", "два…"])
+
+    def test_leading_sign_becomes_prefix_of_next_word_with_its_time(self):
+        out = W.result_words(res((" —", 0.0), (" начало", 0.4), (" речи", 0.8)), 10.0)
+        self.assertEqual([w["w"] for w in out], ["— начало", "речи"])
+        self.assertEqual(out[0]["s"], 10.4)            # время слова, а не знака
+        self.assertEqual(W.norm_word(out[0]["w"]), "начало")
+        # слово из нескольких токенов (пробел — отдельный токен словаря GigaAM)
+        out = W.result_words(res(("—", 0.0), (" ", 0.1), ("на", 0.4), ("чало", 0.5)), 0.0)
+        self.assertEqual([(w["w"], w["s"]) for w in out], [("— начало", 0.4)])
+        # кавычка и многоточие — слитно, как в конце слова
+        out = W.result_words(res((" «", 0.0), (" цитата", 0.2)), 0.0)
+        self.assertEqual([w["w"] for w in out], ["«цитата"])
+
+    def test_several_leading_signs(self):
+        out = W.result_words(res((" —", 0.0), (" —", 0.1), (" …", 0.2), (" да", 0.6)), 0.0)
+        self.assertEqual([(w["w"], w["s"]) for w in out], [("— — …да", 0.6)])
+
+    def test_sign_at_start_and_in_middle(self):
+        out = W.result_words(res((" —", 0.0), (" раз", 0.2), (" —", 0.5), (" два", 0.7)), 0.0)
+        self.assertEqual([w["w"] for w in out], ["— раз —", "два"])
+        self.assertEqual([w["s"] for w in out], [0.2, 0.7])
+
+    def test_chunk_of_signs_only_gives_no_words(self):
+        for pairs in (((" —", 0.0),), ((" —", 0.0), (" …", 0.3), (" .", 0.5)), ()):
+            self.assertEqual(W.result_words(res(*pairs), 0.0), [], pairs)
+
+    def test_no_word_with_empty_norm_reaches_the_vote(self):
+        # куски начинаются с «—»: оба прохода согласны, спорных мест и вставок нет
+        main = W.result_words(res((" —", 0.0), (" мы", 0.2), (" пошли", 0.6)), 0.0)
+        ctc = W.result_words(res((" мы", 0.2), (" пошли", 0.6)), 0.0)
+        self.assertTrue(all(W.norm_word(w["w"]) for w in main + ctc))
+        st = W.vote3(main, ctc, ["мы", "пошли"])
+        self.assertEqual((st["disputed"], st["inserted"], st["replaced"]), (0, 0, 0))
+        self.assertEqual(W.reply_text(main), "— мы пошли")        # знак в тексте стенограммы остался
+
+
 class Chunks(unittest.TestCase):
     def test_chunks_cover_regions_and_respect_max(self):
         audio = np.zeros(60 * W.SR, dtype=np.float32)

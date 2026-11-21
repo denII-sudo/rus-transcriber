@@ -21,17 +21,20 @@ class Status:
 class Main:
     name = "fake-primary"
     model_name = "fake"
+    tokens = ([" test"], [0.1])          # токены и времена каждого куска
 
     def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
         diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
-        return [SimpleNamespace(tokens=[" test"], timestamps=[0.1], logprobs=[-0.1], text="test")
-                for _ in pieces]
+        toks, ts = self.tokens
+        return [SimpleNamespace(tokens=list(toks), timestamps=list(ts), logprobs=[-0.1] * len(toks),
+                                text="".join(toks)) for _ in pieces]
 
 
 class WhisperCT2WorkerTests(unittest.TestCase):
     """Сценарии worker.run_words с подменёнными бэкендами: ни одна модель не грузится."""
 
-    def run_worker(self, fail_indices=(0,), empty_indices=(), ct2_load_fails=False, cpu_fails=False):
+    def run_worker(self, fail_indices=(0,), empty_indices=(), ct2_load_fails=False, cpu_fails=False,
+                   ct2_text="от faster-whisper", main_tokens=None):
         cpu_calls = []
 
         class CT2:
@@ -50,7 +53,7 @@ class WhisperCT2WorkerTests(unittest.TestCase):
                     elif i in empty_indices:
                         state, result, text = "empty_unknown", "empty", ""
                     else:
-                        state, result, text = "ok", "ok", "от faster-whisper"
+                        state, result, text = "ok", "ok", ct2_text
                     records.append({"index": i, "samples": len(piece), "state": state,
                                     "attempts": [{"result": result, "error_type": "RuntimeError",
                                                   "retry": False, "batch": [i], "input_samples": len(piece),
@@ -89,11 +92,13 @@ class WhisperCT2WorkerTests(unittest.TestCase):
              patch.object(words, "overlap_regions", return_value=[]), \
              patch.object(words, "doubt_flags", return_value=0), \
              patch.object(words, "review_items", return_value=[]), \
-             patch.object(words, "vote3", return_value={}), \
+             patch.object(words, "vote3", return_value={}) as vote3, \
+             patch.object(Main, "tokens", main_tokens or Main.tokens), \
              patch.object(words, "disagreement_times", return_value=[]):
             data = worker.run_words(np.zeros(48000, dtype=np.float32), "synthetic", cfg, Status(),
                                     [(0., 3., "s")], {"s": "L"}, [], None, None, {}, {},
                                     {"cents": {"L": [1]}}, None, {}, None, quality, make_asr, a)
+        self.vote3_args = vote3.call_args
         return cpu_calls, quality, data
 
     def test_failed_chunk_is_retried_on_onnx_cpu(self):
@@ -128,6 +133,18 @@ class WhisperCT2WorkerTests(unittest.TestCase):
         self.assertEqual(cpu_calls, [], "пустой текст — не ошибка, повтор не нужен")
         records = quality["asr_diagnostics"]["whisper"]["chunks"]
         self.assertEqual([r["state"] for r in records], ["empty_unknown", "ok"])
+
+    def test_punctuation_only_tokens_do_not_reach_the_vote(self):
+        # «—» отдельным токеном в начале куска GigaAM и отдельным «словом» в тексте Whisper:
+        # в голосование «два из трёх» не попадает слово, у которого norm_word пуст
+        self.run_worker(fail_indices=(), ct2_text="— от faster-whisper —",
+                        main_tokens=([" —", " test"], [0.05, 0.1]))
+        main, ctc, third = self.vote3_args.args
+        self.assertEqual([w["w"] for w in main], ["— test", "— test"])
+        self.assertEqual([w["s"] for w in main], [0.1, 1.1])        # время — у слова, не у знака
+        self.assertEqual([w["w"] for w in ctc], ["— test", "— test"])
+        self.assertEqual(third, ["от", "faster-whisper"] * 2)
+        self.assertTrue(all(words.norm_word(w["w"]) for w in main + ctc))
 
 
 class FakeSegment:

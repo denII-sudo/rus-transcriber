@@ -109,11 +109,17 @@ def make_chunks(audio, regions, max_len=CHUNK_MAX, min_len=CHUNK_MIN):
 
 # ---------- 2–3. распознавание со временами ----------
 def result_words(res, offset):
-    """TimestampedResult -> [{"w", "s", "e", "c"}]; знаки препинания приклеиваются к слову."""
+    """TimestampedResult -> [{"w", "s", "e", "c"}]; знаки препинания приклеиваются к слову.
+
+    Токен без буквы и цифры («—», «…») словом не становится: он приклеивается к предыдущему слову,
+    а в начале куска — к следующему, как префикс («— начало»); время и уверенность слова — его
+    собственные. Кусок из одних знаков слов не даёт (знаку не к чему приклеиться): иначе слово
+    с пустым norm_word попадало бы в сравнение проходов, голосование и стенограмму."""
     toks = res.tokens or []
     ts = res.timestamps or [0.0] * len(toks)
     lp = res.logprobs or [0.0] * len(toks)
     words = []
+    lead = ""      # знаки до первого слова куска — префикс этого слова
     space = True   # в словаре GigaAM пробел бывает отдельным токеном: тогда новое слово — следующий токен
     for tok, t, p in zip(toks, ts, lp):
         if not tok.strip():
@@ -122,10 +128,17 @@ def result_words(res, offset):
         new = space or tok.startswith(" ") or not words
         space = tok.endswith(" ")
         piece = tok.strip() if new else tok.rstrip()
-        if new and not WORD_RE.search(piece) and words:      # «—», «…» как отдельный токен
-            words[-1]["w"] += (" " + piece) if piece in "—–-" else piece
+        if new and not WORD_RE.search(piece):                # «—», «…» как отдельный токен
+            if words:
+                words[-1]["w"] += (" " + piece) if piece in "—–-" else piece
+            else:      # тире отделяется пробелом, как в конце слова; остальные знаки — слитно
+                sep = " " if lead and (piece in "—–-" or lead[-1] in "—–-") else ""
+                lead += sep + piece
             continue
         if new:
+            if lead:
+                piece = lead + (" " if lead[-1] in "—–-" else "") + piece
+                lead = ""
             words.append({"w": piece, "s": offset + t, "e": offset + t + 0.04, "lp": [p]})
         else:
             words[-1]["w"] += piece

@@ -654,7 +654,9 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                         if by_k[k].strip() and not tx.strip():
                             rec["filtered_all"] = True
                         removed += n
-                        wh_words += tx.split()
+                        # токен из одних знаков («—») — не слово: в голосовании он не совпал бы
+                        # ни с одним словом GigaAM (те знаков отдельно не дают, words.result_words)
+                        wh_words += [t for t in tx.split() if W.norm_word(t)]
                     else:            # RNN-T и CTC здесь согласны: Whisper голосования не изменил бы
                         s0, e0 = c["own"]
                         wh_words += [w["w"] for w in words if s0 <= w["s"] < e0]
