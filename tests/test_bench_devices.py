@@ -668,11 +668,128 @@ class UnfitVariantTests(unittest.TestCase):
         self.assertEqual(gpu["lost_chunks"], gpu["lost_empty_chunks"] + gpu["lost_few_words_chunks"])
         self.assertEqual(gpu["lost_empty_chunks"], 2)
 
+    def test_empty_count_follows_chunk_words(self):
+        # одно определение пустого куска: при годных chunk_words пустые считаются по ним, даже если
+        # empty_chunks записан по тексту (кусок «.» — текст не пуст, но слов 0)
+        punct = self.res("ov-gpu", device="GPU", empty_chunks=0, chunk_words=[0, 30, 30, 30, 30])
+        cpu = self.res("onnx-cpu", chunk_words=[30, 30, 30, 30, 30])
+        self.assertEqual(bench.empty_count(punct), 1)
+        self.assertEqual(self.lost(punct, cpu), [(1, 0), (0, 0)])
+        # старый результат без chunk_words — по empty_chunks, как раньше
+        self.assertEqual(bench.empty_count(self.res("ov-gpu", empty_chunks=2)), 2)
+
+    def test_whisper_false_phrases_on_a_pause_do_not_make_empty_variant_lost(self):
+        # у соседа на паузе «титры» и зацикленная фраза: после фильтра конвейера они ниже порога Whisper
+        junk = ["Продолжение следует...", "Субтитры сделал DimaTorzok. Спасибо за просмотр!",
+                "Спасибо за внимание. " * 12]
+        speech = " ".join(f"слово{i}" for i in range(60))
+        counts = [bench.chunk_word_count(t, "whisper") for t in junk]
+        self.assertEqual(counts[:2], [0, 0])
+        self.assertLess(counts[2], bench.LOST_EMPTY_MIN_REF_WHISPER)
+        self.assertGreaterEqual(counts[2], bench.LOST_EMPTY_MIN_REF)    # прежний порог 5 здесь ошибся бы
+        noisy = self.res("whisper-ct2", family="whisper", chunks=4,
+                         chunk_words=counts + [bench.chunk_word_count(speech, "whisper")])
+        quiet = self.res("whisper-dml", family="whisper", chunks=4, empty_chunks=3, chunk_words=[0, 0, 0, 60])
+        self.assertEqual(self.lost(noisy, quiet), [(0, None), (0, None)])
+
+    def test_whisper_loss_next_to_normal_speech_is_caught(self):
+        # явный случай: у соседа обычная речь (30–50 слов в куске) — пустой кусок Whisper потерян
+        speech = [bench.chunk_word_count(" ".join(f"слово{i}" for i in range(n)) + ".", "whisper")
+                  for n in (30, 50, 40)]
+        self.assertEqual(speech, [30, 50, 40])
+        full = self.res("whisper-ct2", family="whisper", chunks=3, chunk_words=speech)
+        lost = self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=2, chunk_words=[0, 0, 40])
+        self.assertEqual(self.lost(full, lost), [(0, None), (2, None)])
+        self.assertEqual(bench.unfit_reason(lost), "lost_chunks")
+        edge = self.res("whisper-dml", family="whisper", chunks=3, chunk_words=[0, 0, 40])
+        at_threshold = self.res("whisper-ct2", family="whisper", chunks=3,
+                                chunk_words=[bench.LOST_EMPTY_MIN_REF_WHISPER,
+                                             bench.LOST_EMPTY_MIN_REF_WHISPER - 1, 40])
+        self.assertEqual(self.lost(at_threshold, edge), [(0, None), (1, None)])
+
+    def test_old_whisper_results_keep_the_count_rule(self):
+        # старые результаты Whisper без chunk_words — по количеству пустых, как раньше
+        self.assertEqual(self.lost_empty(
+            self.res("whisper-ct2", family="whisper", chunks=3, empty_chunks=0),
+            self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=2)),
+            [0, 2])
+
     def test_unfit_variant_is_not_a_reference_when_a_fit_one_exists(self):
         lost = self.res("ctc-cpu", family="ctc", lost_chunks=1)
         fit = self.res("ctc-gpu", family="ctc", device="GPU")
         self.assertIs(bench.family_refs([lost, fit])["ctc"], fit)
         self.assertIs(bench.family_refs([lost])["ctc"], lost)        # другого нет — остаётся прежнее правило
+
+
+class ChunkWordCountTests(unittest.TestCase):
+    """Слова куска в тесте скорости считаются так же, как их получает рабочий конвейер (words.py)."""
+
+    def test_punctuation_only_chunk_is_empty(self):
+        for text in ("", "   ", ".", ". , —", "… ?!", "– -", None):
+            self.assertEqual(bench.chunk_word_count(text), 0, text)
+            self.assertEqual(bench.chunk_word_count(text, "whisper"), 0, text)
+        self.assertEqual(bench.chunk_word_count("Ну — да, 25 раз… какой-то"), 5)
+
+    def test_matches_pipeline_words_on_examples(self):
+        # GigaAM: слово конвейера — токен с буквой или цифрой (words.result_words, WORD_RE);
+        # токен без них приклеивается к соседнему слову и словом не считается
+        import types
+        import words as W
+        for text in ("Привет, мир — как дела?", "раз . два …", "— начало", "ok 5 «цитата» ."):
+            toks = [(" " + t) for t in text.split()]
+            res = types.SimpleNamespace(tokens=toks, timestamps=[0.1 * i for i in range(len(toks))],
+                                        logprobs=[0.0] * len(toks))
+            pipeline = sum(1 for w in W.result_words(res, 0.0) if W.norm_word(w["w"]))
+            self.assertEqual(bench.chunk_word_count(text), pipeline, text)
+        # Whisper: конвейер берёт clean_whisper(текст).split() (worker.run_words)
+        text = "Да, конечно. Продолжение следует... Спасибо. Спасибо. Спасибо. Спасибо. Спасибо."
+        cleaned = W.clean_whisper(text)[0].split()
+        self.assertEqual(bench.chunk_word_count(text, "whisper"), sum(1 for t in cleaned if W.norm_word(t)))
+        self.assertEqual(bench.chunk_word_count(text, "whisper"), 5)
+        self.assertEqual(bench.chunk_word_count(text), 9)          # у GigaAM фильтра Whisper нет
+
+    def test_run_one_reports_one_definition_of_empty(self):
+        import contextlib
+        import io
+        import numpy as np
+        from unittest import mock
+        import backends
+        tmp = Path(tempfile.mkdtemp(prefix="rt-bench-one-", dir=_TMP))
+        npy = tmp / "audio.npy"
+        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))      # 20 + 20 + 5 с
+
+        class FakeOnnx:
+            name = "cpu"
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def transcribe(self, piece):
+                return "раз"
+
+            def transcribe_many(self, pieces):
+                return ["", ". , —", "раз два три"][:len(pieces)]
+
+        class FakeWhisper:
+            name = "whisper-ct2"
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def transcribe_texts(self, pieces):
+                return ["Продолжение следует...", " ".join(f"слово{i}" for i in range(40))][:len(pieces)]
+
+        out = io.StringIO()
+        with mock.patch.object(backends, "OnnxASR", FakeOnnx), \
+                mock.patch.object(backends, "WhisperCT2", FakeWhisper), contextlib.redirect_stdout(out):
+            bench.run_one({"id": "onnx-cpu", "family": "rnnt", "asr_backend": "onnx-cpu"}, str(npy),
+                          "v3_e2e_rnnt", 20.0)
+            bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
+                          "v3_e2e_rnnt", 20.0)
+        got = [json.loads(line[len("@@RESULT@@"):]) for line in out.getvalue().splitlines()
+               if line.startswith("@@RESULT@@")]
+        self.assertEqual([(r["chunks"], r["chunk_words"], r["empty_chunks"]) for r in got],
+                         [(3, [0, 0, 3], 2), (2, [0, 40], 1)])
 
 
 class ConditionsReportTests(unittest.TestCase):

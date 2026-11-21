@@ -36,6 +36,7 @@ import paths  # noqa: E402,F401
 import tmpfiles  # noqa: E402
 import download_hint  # noqa: E402
 import runinfo  # noqa: E402
+import words as W  # noqa: E402  (лёгкий модуль конвейера: только numpy, без побочных эффектов)
 SR = 16000
 
 RNNT, CTC, WHISPER, TORCH = "rnnt", "ctc", "whisper", "torch"
@@ -271,10 +272,30 @@ WORD_RULE_FAMILIES = (RNNT, CTC, ML)
 # в куске 2 (по одному пустому у обоих, разница 0). Порог ниже LOST_WORDS_MIN_REF: пустота —
 # полная потеря, а не «в разы меньше», и короткий кусок с несколькими словами речи тоже должен
 # считаться. Но одно-два слова у соседа на паузе — обычно галлюцинация (GigaAM даёт на шуме
-# одиночные «а», «м»; Whisper — короткие «титры» вроде «Продолжение следует»), и пустой вариант
-# там прав. Явный случай — у соседа нормальный текст (кусок речи 15–20 с даёт 30–50 слов) —
-# порог не задевает: он остаётся потерей, как при прежнем правиле.
+# одиночные «а», «м»), и пустой вариант там прав. Явный случай — у соседа нормальный текст
+# (кусок речи 15–20 с даёт 30–50 слов) — порог не задевает: он остаётся потерей, как прежде.
 LOST_EMPTY_MIN_REF = 5
+# Тот же порог для Whisper выше. Его известные ложные фразы на паузе («Продолжение следует»,
+# «Субтитры сделал…», «Спасибо за просмотр») chunk_word_count убирает фильтром конвейера и они дают
+# 0 слов. Но фраза не из списка, зациклившись, после того же фильтра остаётся max_repeat = 3 раза:
+# «Спасибо за внимание.» ×3 — 9 слов. Порог 10 не делает из-за этого исправный пустой вариант
+# «потерявшим речь», а явный случай не задевает: кусок Whisper в тесте — 24–28 с (run_one режет
+# его до 28 с), обычная речь в нём — 40–70 слов.
+LOST_EMPTY_MIN_REF_WHISPER = 10
+
+
+def chunk_word_count(text, family=None):
+    """Сколько слов куска попало бы в стенограмму или в голосование конвейера; 0 — кусок пуст.
+
+    Правило рабочего конвейера (words.py): слово — то, что содержит букву или цифру
+    (words.result_words по WORD_RE приклеивает «—», «…», «.» к соседнему слову, а не делает словом;
+    сравнение кусков и голосование идут по words.norm_word). Поэтому кусок из одной пунктуации
+    пуст. Текст Whisper конвейер сначала чистит words.clean_whisper (worker.run_words): ложные
+    фразы на тишине удаляются, зацикленные повторы сокращаются; здесь — то же самое."""
+    text = "" if text is None else str(text)
+    if family == WHISPER:
+        text = W.clean_whisper(text)[0]
+    return sum(1 for tok in text.split() if W.norm_word(tok))
 
 
 def chunk_words_of(result):
@@ -284,6 +305,13 @@ def chunk_words_of(result):
             or not all(isinstance(n, int) and n >= 0 for n in words):
         return None
     return words
+
+
+def empty_count(result):
+    """Пустые куски варианта: по chunk_words, если они есть (одно определение с покусочным
+    правилом), иначе по empty_chunks — у старых результатов это куски с пустым текстом."""
+    words = chunk_words_of(result)
+    return result["empty_chunks"] if words is None else words.count(0)
 
 
 def mark_lost_chunks(results):
@@ -298,13 +326,16 @@ def mark_lost_chunks(results):
     lost_chunks = lost_empty_chunks + lost_few_words_chunks; один кусок не попадает в обе части:
     пустой — это 0 слов, «в разы меньше» — хотя бы одно слово.
 
-    Пустые куски (все семейства, и Whisper: пустой кусок — не раздувание повторами) считаются
-    покусочно по chunk_words: кусок с 0 слов, где у другого варианта группы их не меньше
-    LOST_EMPTY_MIN_REF. Вариант без годного chunk_words (старый результат, длина не совпала) или
-    без другого такого варианта в группе считается по-прежнему, по количеству: пустых больше, чем
-    у варианта группы, у которого их меньше всего. Смешанная группа: у варианта с chunk_words
-    к покусочному числу добавляется проверка количеством против вариантов без chunk_words —
-    берётся большее, чтобы старый сосед с текстом не перестал выявлять потерю.
+    Пустой кусок — кусок, из которого в работу конвейера не попало бы ни одного слова
+    (chunk_word_count: в том числе кусок из одной пунктуации и кусок Whisper из одних ложных
+    фраз). Пустые куски (все семейства, и Whisper: пустой кусок — не раздувание повторами)
+    считаются покусочно по chunk_words: кусок с 0 слов, где у другого варианта группы их не меньше
+    LOST_EMPTY_MIN_REF (у Whisper — LOST_EMPTY_MIN_REF_WHISPER). Вариант без годного chunk_words
+    (старый результат, длина не совпала) или без другого такого варианта в группе считается
+    по-прежнему, по количеству: пустых больше, чем у варианта группы, у которого их меньше всего.
+    Смешанная группа: у варианта с chunk_words к покусочному числу добавляется проверка
+    количеством против вариантов без chunk_words — берётся большее, чтобы старый сосед с текстом
+    не перестал выявлять потерю.
 
     Куски «слов в разы меньше» — только GigaAM и только у вариантов, сообщивших chunk_words
     (у старых результатов это правило не применяется); lost_few_words_kept / lost_few_words_ref —
@@ -316,21 +347,23 @@ def mark_lost_chunks(results):
         family = RNNT if r.get("family") == TORCH else r.get("family")
         groups.setdefault((family, r.get("chunks")), []).append(r)
     for (family, chunks), group in groups.items():
-        least = min(r["empty_chunks"] for r in group)
+        empties = {id(r): empty_count(r) for r in group}
+        least = min(empties.values())
         words_of = {id(r): chunk_words_of(r) for r in group}
         counted = [(r, words_of[id(r)]) for r in group if words_of[id(r)] is not None]
         uncounted = [r for r in group if words_of[id(r)] is None]
-        least_uncounted = min((r["empty_chunks"] for r in uncounted), default=None)
+        least_uncounted = min((empties[id(r)] for r in uncounted), default=None)
         ref = [max(col) for col in zip(*(w for _, w in counted))] if len(counted) > 1 else None
+        min_ref = LOST_EMPTY_MIN_REF_WHISPER if family == WHISPER else LOST_EMPTY_MIN_REF
         for r in group:
             words = words_of[id(r)]
             if words is None or ref is None:
-                lost = r["empty_chunks"] - least               # прежнее правило: по количеству
+                lost = empties[id(r)] - least                  # прежнее правило: по количеству
             else:
                 # у самого варианта в пустом куске 0 слов, поэтому опора куска — другой вариант
-                lost = sum(1 for n, top in zip(words, ref) if n == 0 and top >= LOST_EMPTY_MIN_REF)
+                lost = sum(1 for n, top in zip(words, ref) if n == 0 and top >= min_ref)
                 if least_uncounted is not None:
-                    lost = max(lost, r["empty_chunks"] - least_uncounted)
+                    lost = max(lost, empties[id(r)] - least_uncounted)
             r["lost_empty_chunks"] = lost
             r["lost_chunks"] = lost
         if ref is None or family not in WORD_RULE_FAMILIES:
@@ -568,14 +601,16 @@ def run_one(variant, npy, model, chunk_max):
     else:
         texts = asr.transcribe_many(pieces)
     work = time.time() - t1
+    chunk_words = [chunk_word_count(t, family) for t in texts]   # вне замеряемого интервала
     # что получилось фактически: имя бэкенда после прогона (пакет мог откатиться на поштучное),
     # провайдеры сессии, откаты make_asr — по ним видно, что «GPU» на самом деле посчитан на процессоре
     fact = {"backend_name": getattr(asr, "name", None),
             "providers_actual": actual_providers(getattr(asr, "model", None)) or None,
             "compile_sec": getattr(asr, "compile_sec", None),
             "fallbacks": [str(x)[:200] for x in fallbacks] or None,
-            "empty_chunks": sum(1 for t in texts if not str(t).strip()),
-            "chunk_words": [len(norm(str(t))) for t in texts],   # для правила «слов в разы меньше»
+            # слова куска — по правилу конвейера (chunk_word_count); пустой кусок — 0 слов
+            "chunk_words": chunk_words,
+            "empty_chunks": chunk_words.count(0),
             "peak_memory_mb": runinfo.peak_memory_mb(),
             **runinfo.cache_delta(cache0, cache1)}
     print("@@RESULT@@" + json.dumps({"load_sec": round(load, 1), "first_chunk_sec": round(t_first, 1),
