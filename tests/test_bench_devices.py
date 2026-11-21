@@ -430,5 +430,290 @@ class TiebreakTests(unittest.TestCase):
         self.assertEqual(vt["contested"], 0)
 
 
+class ActualDeviceTests(unittest.TestCase):
+    """Паспорт прогона: на чём вариант посчитался на самом деле (21.11.2026).
+
+    Раньше в результат попадало только запрошенное устройство: «whisper-dml» после тихого отката
+    make_asr считался на процессоре, а записывался как GPU."""
+
+    def test_backend_names(self):
+        cases = {"openvino:GPU": "GPU", "openvino:GPU:b8": "GPU", "openvino:GPU.0:int8": "GPU",
+                 "openvino:CPU": "CPU", "openvino:NPU": "NPU", "dml": "GPU", "dml:b4:int8": "GPU",
+                 "cpu": "CPU", "cpu:b16": "CPU", "cpu:int8": "CPU", "torch:cpu": "CPU",
+                 "whisper-ov:GPU:fp16+dec-int8": "GPU", "whisper-ct2:int8:t18": "CPU"}
+        for name, device in cases.items():
+            self.assertEqual(bench.actual_device({"backend_name": name}), device, name)
+
+    def test_unknown_or_missing_name(self):
+        for name in (None, "", "что-то новое"):
+            self.assertIsNone(bench.actual_device({"backend_name": name}))
+
+    def test_session_providers_override_the_name(self):
+        cpu_only = ["CPUExecutionProvider"]
+        self.assertEqual(bench.actual_device({"backend_name": "openvino:GPU", "providers_actual": cpu_only}), "CPU")
+        self.assertEqual(bench.actual_device({"backend_name": "dml", "providers_actual": cpu_only}), "CPU")
+        self.assertEqual(bench.actual_device({"backend_name": "dml", "providers_actual":
+                                              ["DmlExecutionProvider", "CPUExecutionProvider"]}), "GPU")
+
+    def test_silent_fallback_is_marked(self):
+        results = bench.mark_actual([
+            {"id": "whisper-dml", "device": "GPU", "asr_sec": 60.0, "backend_name": "cpu:b4:int8"},
+            {"id": "ov-gpu", "device": "GPU", "asr_sec": 4.0, "backend_name": "openvino:GPU"},
+            {"id": "onnx-cpu", "device": "CPU", "asr_sec": 10.0, "backend_name": None},
+            {"id": "ov-npu-pad22", "device": "NPU", "error": ["не запустился"]}])
+        self.assertEqual([r.get("device_actual") for r in results], ["CPU", "GPU", None, None])
+        self.assertEqual([r.get("device_mismatch") for r in results], [True, False, False, None])
+
+
+class UnfitVariantTests(unittest.TestCase):
+    """Вариант, чьи числа не относятся к тому, что он обещает, не выбирается (21.11.2026).
+
+    Раньше «whisper-dml», тихо посчитанный на процессоре, мог быть выбран и записан в config.json
+    как вариант видеокарты, а быстрый вариант, потерявший часть речи, отсекался только порогом."""
+
+    @staticmethod
+    def res(vid, family="rnnt", device="CPU", rtfx=10.0, similarity=1.0, **extra):
+        return {"id": vid, "family": family, "device": device, "rtfx": rtfx, "asr_sec": 1.0,
+                "similarity": similarity, "text": "раз два три", "chunks": 5, "empty_chunks": 0, **extra}
+
+    def test_lost_chunks_are_counted_against_the_same_model(self):
+        results = bench.mark_lost_chunks([
+            self.res("torch-cpu", family="torch", empty_chunks=1),
+            self.res("onnx-cpu", empty_chunks=1),              # пауза: пусто у всех — не потеря
+            self.res("ov-gpu", device="GPU", empty_chunks=3),
+            self.res("ctc-cpu", family="ctc", empty_chunks=0),
+            self.res("whisper-ct2", family="whisper", chunks=4, empty_chunks=2),   # одна в семействе
+            self.res("whisper-cpu", family="whisper", chunks=3, empty_chunks=0),   # другая нарезка
+            {"id": "ov-npu-pad22", "family": "rnnt", "device": "NPU", "error": ["не запустился"]},
+            self.res("ctc-gpu", family="ctc", device="GPU", empty_chunks=None)])
+        self.assertEqual([r.get("lost_chunks") for r in results], [0, 0, 2, 0, 0, 0, None, None])
+
+    def test_reasons(self):
+        self.assertIsNone(bench.unfit_reason(self.res("onnx-cpu")))
+        self.assertIsNone(bench.unfit_reason({"id": "старый результат без новых полей"}))
+        swapped = self.res("whisper-dml", device="GPU", device_actual="CPU", device_mismatch=True, lost_chunks=2)
+        lost = self.res("ov-gpu", device="GPU", lost_chunks=2)
+        self.assertEqual(bench.unfit_reason(swapped), "device_mismatch")
+        self.assertEqual(bench.unfit_reason(lost), "lost_chunks")
+        self.assertEqual(bench.unfit_note(swapped), "посчитан на CPU вместо GPU — не выбирается")
+        self.assertIn("потеряно кусков: 2 из 5", bench.unfit_note(lost))
+        self.assertEqual(bench.unfit_note(self.res("onnx-cpu")), "")
+
+    def test_fast_but_unfit_variant_is_never_chosen(self):
+        honest = self.res("onnx-cpu", rtfx=15.0)
+        swapped = self.res("ov-gpu", device="GPU", rtfx=60.0, device_actual="CPU", device_mismatch=True)
+        lost = self.res("ov-gpu-pad5", device="GPU", rtfx=50.0, lost_chunks=1)
+        results = [honest, swapped, lost]
+        self.assertIs(bench.best_of(results, "rnnt", 0.97), honest)
+        self.assertIs(bench.most_accurate(results, "rnnt"), honest)
+        summary = bench.choice_summary(results, "rnnt", 0.97)
+        self.assertEqual((summary["accurate"], summary["fast_ok"], summary["fastest"]), (honest, honest, honest))
+
+    def test_nothing_is_chosen_when_every_variant_is_unfit(self):
+        only = [self.res("whisper-dml", family="whisper", device="GPU", device_actual="CPU", device_mismatch=True)]
+        self.assertIsNone(bench.best_of(only, "whisper", 0.0))
+        self.assertIsNone(bench.most_accurate(only, "whisper"))
+        self.assertEqual(bench.choice_summary(only, "whisper", 0.0),
+                         {"accurate": None, "fast_ok": None, "fastest": None})
+
+    def test_unfit_variant_is_not_a_reference_when_a_fit_one_exists(self):
+        lost = self.res("ctc-cpu", family="ctc", lost_chunks=1)
+        fit = self.res("ctc-gpu", family="ctc", device="GPU")
+        self.assertIs(bench.family_refs([lost, fit])["ctc"], fit)
+        self.assertIs(bench.family_refs([lost])["ctc"], lost)        # другого нет — остаётся прежнее правило
+
+
+class ConditionsReportTests(unittest.TestCase):
+    """Блок отчёта «Условия прогона»: человек видит, чем прогон отличается от образцового."""
+
+    RECORD = {"method_version": "bench-1", "audio": {"unit_id": "0123456789ab"},
+              "conditions": {"start": {"power_source": "ac", "battery_percent": 100, "cpu_load_percent": 4.0,
+                                       "power": {"scheme": "balanced"}, "memory": {"free_mb": 9000},
+                                       "other_heavy_jobs": 0}},
+              "environment": {"program_version": "2000.1.2.3",
+                              "code": {"git_revision": "a" * 40, "git_dirty": False, "files_sha256": "b" * 16},
+                              "packages": {"key": {"onnxruntime-openvino": "1.24.1", "openvino": "2025.4.1"}}},
+              "testbed": {"hardware": {"cpu": {"model": "Synthetic CPU 9000"}}},
+              "preflight": {"ok": True, "reasons": []}, "results": [], "run_file": "runs\\20260101-000000-aaaaaa.json"}
+
+    def test_good_run(self):
+        text = "\n".join(bench.conditions_lines(self.RECORD))
+        for part in ("## Условия прогона", "от сети", "balanced", "4%", "9000 МБ", "Synthetic CPU 9000",
+                     "2000.1.2.3", "aaaaaaaaaa", "onnxruntime-openvino 1.24.1", "bench-1", "0123456789ab",
+                     "runs\\20260101-000000-aaaaaa.json", "нет имени и пути записи"):
+            self.assertIn(part, text)
+        self.assertNotIn("с оговорками", text)
+        self.assertNotIn("Подмена устройства", text)
+
+    def test_marked_run_and_swapped_device(self):
+        record = {**self.RECORD,
+                  "conditions": {"start": {"power_source": "battery", "battery_percent": 32}},
+                  "preflight": {"ok": False, "reasons": ["battery", "other_heavy_jobs", "новая причина"]},
+                  "results": [{"label": "Whisper, DirectML", "device": "GPU", "device_actual": "CPU",
+                               "device_mismatch": True}]}
+        text = "\n".join(bench.conditions_lines(record))
+        self.assertIn("от батареи, заряд 32%", text)
+        self.assertIn("Прогон с оговорками", text)
+        self.assertIn("питание от батареи", text)
+        self.assertIn("другая тяжёлая задача", text)
+        self.assertIn("новая причина", text)
+        self.assertIn("«Whisper, DirectML» запрошен на GPU, посчитан на CPU", text)
+
+    def test_nothing_measured(self):
+        text = "\n".join(bench.conditions_lines({}))
+        for part in ("не определено", "не измерена", "не измерено", "не определён", "пакеты не определены"):
+            self.assertIn(part, text)
+        self.assertNotIn("Файл прогона", text)
+
+
+class RunFileFromMainTests(unittest.TestCase):
+    """bench.main() целиком, без моделей: дочерние процессы, звук и сведения о железе подменены.
+
+    Проверяется, что каждый запуск оставляет свой файл прогона, прежние не перезаписываются, имени
+    и пути записи в файле нет, а неудачный запуск тоже записан."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        import types
+        from unittest import mock
+        import numpy as np
+        import backends
+        import runinfo
+        import worker
+        self.dir = Path(tempfile.mkdtemp(prefix="rt-bench-main-", dir=_TMP))
+        self.audio = self.dir / "Синтетическая запись совещания.wav"
+        # содержимое своё у каждого теста: указатель units.json ведёт счёт прогонов по контрольной сумме
+        self.audio.write_bytes(b"synthetic-container-" + os.urandom(8))
+        self.samples = np.linspace(-0.5, 0.5, 16000 * 8, dtype=np.float32)
+
+        def child(cmd, **kw):
+            if "--one" not in cmd:
+                return self.real_run(cmd, **kw)
+            v = json.loads(cmd[cmd.index("--one") + 1])
+            res = {"load_sec": 1.0, "first_chunk_sec": 0.2, "asr_sec": 2.0 if v["family"] == "rnnt" else 1.0,
+                   "chunks": 3, "family": v["family"], "device": v["device"], "backend_name": "cpu",
+                   "providers_actual": ["CPUExecutionProvider"], "compile_sec": None, "fallbacks": None,
+                   "empty_chunks": 0, "peak_memory_mb": 512.0, "compile_cache_new_files": 0,
+                   "model_downloaded": False, "text": "раз два три четыре"}
+            res.update(self.overrides.get(v["id"], {}))
+            return types.SimpleNamespace(stdout="@@RESULT@@" + json.dumps(res, ensure_ascii=False), stderr="")
+
+        self.real_run = bench.subprocess.run
+        self.overrides = {}            # id варианта -> что его «процесс» сообщит иначе
+        self.load_audio = mock.Mock(return_value=self.samples)
+        patches = [mock.patch.object(bench.subprocess, "run", side_effect=child),
+                   mock.patch.object(worker, "load_audio", self.load_audio),
+                   mock.patch.object(worker, "wait_slot", lambda st, cfg, path: None),
+                   mock.patch.object(backends, "available_providers", lambda: ["CPUExecutionProvider"]),
+                   mock.patch.object(backends, "openvino_devices", lambda: ["CPU"]),
+                   mock.patch.object(backends, "npu_info", lambda: {"available": False, "fp32": False, "name": "",
+                                                                    "capabilities": [], "reason": "нет NPU"}),
+                   mock.patch.object(runinfo, "hardware", lambda: {"status": "ok",
+                                                                   "cpu": {"model": "Synthetic CPU 9000"}}),
+                   mock.patch.object(runinfo, "cpu_load_percent", lambda interval=1.0: 5.0)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.io, self.redirect = io, contextlib.redirect_stdout
+
+    def run_main(self, job, *extra, only="onnx-cpu,ctc-cpu"):
+        from unittest import mock
+        status = self.dir / f"{job}.json"
+        argv = ["bench.py", str(self.audio), "--only", only, "--no-write", "--seconds", "5",
+                "--status", str(status), *extra]
+        out = self.io.StringIO()
+        with mock.patch.object(sys, "argv", argv), self.redirect(out):
+            bench.main()
+        return json.loads(status.read_text(encoding="utf-8")), out.getvalue()
+
+    def test_every_run_leaves_its_own_file(self):
+        import runinfo
+        st1, report = self.run_main("20260101-000000-b00001")
+        st2, _ = self.run_main("20260101-000100-b00002")
+        f1, f2 = Path(st1["run_file"]), Path(st2["run_file"])
+        self.assertEqual(f1.parent, paths.BENCH / "runs")
+        self.assertNotEqual(f1, f2)
+        raw = f1.read_text(encoding="utf-8")
+        rec = json.loads(raw)
+        self.assertEqual((st1["state"], st1["run_id"], rec["run_id"]), ("done", f1.stem, f1.stem))
+        self.assertEqual((rec["schema_version"], rec["method_version"], rec["kind"], rec["status"]),
+                         (runinfo.SCHEMA_VERSION, runinfo.METHOD_VERSION, "bench", "done"))
+        self.assertEqual(rec["job_id"], "20260101-000000-b00001")
+        # имени и пути записи в файле прогона нет, только контрольные суммы
+        self.assertNotIn("Синтетическая", raw)
+        self.assertNotIn(self.dir.name, raw)
+        self.assertEqual(rec["audio"]["excerpt"]["duration_sec"], 5.0)
+        self.assertEqual(rec["audio"]["source_duration_sec"], 8.0)
+        self.assertEqual(rec["audio"]["source_format"], "wav")
+        self.assertEqual(rec["params"]["only"], "onnx-cpu,ctc-cpu")
+        self.assertEqual((rec["params"]["seconds"], rec["params"]["repeats"], rec["config_written"]), (5, 1, False))
+        self.assertEqual(rec["environment"]["program_version"], runinfo.program_version(bench.HERE))
+        self.assertEqual(rec["environment"]["onnx_providers"], ["CPUExecutionProvider"])
+        self.assertEqual(rec["testbed"]["hardware"]["cpu"]["model"], "Synthetic CPU 9000")
+        self.assertEqual(len(rec["testbed"]["testbed_id"]), 16)
+        self.assertEqual(rec["conditions"]["start"]["cpu_load_percent"], 5.0)
+        self.assertIsNotNone(rec["conditions"]["end"])
+        self.assertIn("reasons", rec["preflight"])
+        self.assertEqual([v["id"] for v in rec["variants"]], ["onnx-cpu", "ctc-cpu"])
+        by_id = {r["id"]: r for r in rec["results"]}
+        self.assertEqual(by_id["onnx-cpu"]["rtfx"], 2.5)
+        for r in by_id.values():
+            self.assertNotIn("text", r)
+            self.assertEqual((r["device_actual"], r["device_mismatch"], r["backend_name"]), ("CPU", False, "cpu"))
+            self.assertIn("wall_sec", r)
+            self.assertIn("started_utc", r)
+        self.assertEqual(by_id["ctc-cpu"]["reference_variant"], "ctc-cpu")
+        # правило эталонов записано для всех семейств: Whisper и Multilingual сверяются с основным проходом
+        self.assertEqual(rec["reference_variants"], {"rnnt": "onnx-cpu", "ctc": "ctc-cpu",
+                                                     "whisper": "onnx-cpu", "multilingual": "onnx-cpu"})
+        self.assertEqual(rec["choice"]["main"], "onnx-cpu")
+        texts = json.loads((f1.parent / rec["texts_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(texts["texts"], {"onnx-cpu": "раз два три четыре", "ctc-cpu": "раз два три четыре"})
+        # отчёт: блок условий со ссылкой на файл прогона; прежние файлы «последнего прогона» остались
+        self.assertIn("## Условия прогона", report)
+        self.assertIn(f"runs\\{Path(st2['run_file']).name}", (paths.BENCH / "bench_report.md").read_text(encoding="utf-8"))
+        self.assertTrue((paths.BENCH / "bench_texts.json").is_file())
+        # путь знает только локальный указатель
+        units = json.loads((paths.BENCH / "units.json").read_text(encoding="utf-8"))["units"]
+        unit = units[rec["audio"]["audio_sha256"]]
+        self.assertEqual((unit["path"], unit["runs"], unit["last_run_id"]), (str(self.audio), 2, f2.stem))
+        self.assertEqual(json.loads(f1.read_text(encoding="utf-8")), rec)        # второй прогон первый не тронул
+
+    def test_swapped_device_and_lost_speech_are_not_chosen(self):
+        # ov-gpu «быстрее всех», но его процесс сообщил, что считал на процессоре; пакетный вариант
+        # ещё быстрее, но вернул пустой текст для куска, который обычный вариант распознал
+        self.overrides = {"ov-gpu": {"backend_name": "cpu", "asr_sec": 0.5},
+                          "onnx-cpu-b8": {"asr_sec": 0.8, "empty_chunks": 1}}
+        st, report = self.run_main("20260101-000300-b00004", only="onnx-cpu,onnx-cpu-b8,ov-gpu")
+        rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
+        by_id = {r["id"]: r for r in rec["results"]}
+        self.assertEqual((st["best"], rec["choice"]["main"]), ("onnx-cpu", "onnx-cpu"))
+        self.assertEqual(rec["saved"]["asr_backend"], "onnx-cpu")           # в config.json ушёл бы честный вариант
+        self.assertEqual((by_id["ov-gpu"]["unfit"], by_id["ov-gpu"]["device_actual"]), ("device_mismatch", "CPU"))
+        self.assertEqual((by_id["onnx-cpu-b8"]["unfit"], by_id["onnx-cpu-b8"]["lost_chunks"]), ("lost_chunks", 1))
+        self.assertEqual((by_id["onnx-cpu"]["unfit"], by_id["onnx-cpu"]["lost_chunks"]), (None, 0))
+        self.assertIn("посчитан на CPU вместо GPU — не выбирается", report)
+        self.assertIn("потеряно кусков: 1 из 3", report)
+        self.assertIn("**Подмена устройства:**", report)
+        self.assertIn("**Потеря речи:**", report)
+        self.assertIn("Основной проход: **RNN-T, процессор**", report)
+
+    def test_failed_run_is_recorded_too(self):
+        self.load_audio.side_effect = RuntimeError(f"не прочитан {self.audio}")
+        before = set((paths.BENCH / "runs").glob("*.json")) if (paths.BENCH / "runs").is_dir() else set()
+        with self.assertRaises(SystemExit):
+            self.run_main("20260101-000200-b00003")
+        new = [p for p in set((paths.BENCH / "runs").glob("*.json")) - before]
+        self.assertEqual(len(new), 1)
+        raw = new[0].read_text(encoding="utf-8")
+        rec = json.loads(raw)
+        self.assertEqual((rec["status"], rec["error_type"], rec["job_id"]),
+                         ("error", "RuntimeError", "20260101-000200-b00003"))
+        self.assertIsNone(rec["texts_file"])
+        self.assertNotIn("Синтетическая", raw)
+        self.assertIn("start", rec["conditions"])
+
+
 if __name__ == "__main__":
     unittest.main()
