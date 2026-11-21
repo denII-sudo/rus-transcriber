@@ -19,6 +19,7 @@
   "asr_third_long_chunks": true,
   "asr_third_max_repeat": 3,
   "emotions": true,
+  "interaction": true,
   "diar_embeddings": "auto",
   "diar_ov_device": "CPU",
   "diar_chunks_per_batch": 16,
