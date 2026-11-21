@@ -253,6 +253,50 @@ def mark_actual(results):
     return results
 
 
+def mark_lost_chunks(results):
+    """Потерянные куски: у варианта пустых кусков больше, чем у другого варианта той же модели.
+
+    Пустой кусок сам по себе не сбой: пауза или музыка пусты у всех. Сбой — когда на той же
+    нарезке другой вариант семейства текст получил, а этот нет (так GigaAM на видеокарте терял
+    часть речи при высокой скорости). Сравниваются варианты одного семейства с одинаковым
+    числом кусков; PyTorch-эталон — та же модель, что RNN-T."""
+    groups = {}
+    for r in results:
+        if "asr_sec" not in r or r.get("empty_chunks") is None:
+            continue
+        family = RNNT if r.get("family") == TORCH else r.get("family")
+        groups.setdefault((family, r.get("chunks")), []).append(r)
+    for group in groups.values():
+        least = min(r["empty_chunks"] for r in group)
+        for r in group:
+            r["lost_chunks"] = r["empty_chunks"] - least
+    return results
+
+
+def unfit_reason(result):
+    """Почему отработавший вариант нельзя выбирать: его числа не относятся к тому, что он обещает.
+
+    device_mismatch — посчитан не на запрошенном устройстве (тихий откат на процессор): скорость
+    не принадлежит варианту, а в config.json записалось бы устройство, которое не работает.
+    lost_chunks — потерял речь, которую другой вариант той же модели распознал."""
+    if result.get("device_mismatch"):
+        return "device_mismatch"
+    if (result.get("lost_chunks") or 0) > 0:
+        return "lost_chunks"
+    return None
+
+
+def unfit_note(result):
+    """Пояснение для отчёта к варианту, который не выбирается; пусто, если вариант годен."""
+    reason = unfit_reason(result)
+    if reason == "device_mismatch":
+        return f"посчитан на {result.get('device_actual')} вместо {result.get('device')} — не выбирается"
+    if reason == "lost_chunks":
+        return (f"потеряно кусков: {result.get('lost_chunks')} из {result.get('chunks')} "
+                "(текст пуст там, где у другого варианта он есть) — не выбирается")
+    return ""
+
+
 def conditions_lines(record):
     """Блок отчёта «Условия прогона»: что записано в файл прогона и чем прогон отличается от образцового."""
     cond = (record.get("conditions") or {}).get("start") or {}
@@ -288,7 +332,12 @@ def conditions_lines(record):
     for r in record.get("results") or []:
         if r.get("device_mismatch"):
             lines.append(f"- **Подмена устройства:** «{r.get('label')}» запрошен на {r.get('device')}, посчитан на "
-                         f"{r.get('device_actual')} — его скорость не относится к {r.get('device')}.")
+                         f"{r.get('device_actual')} — его скорость не относится к {r.get('device')}, "
+                         "вариант не выбирается.")
+        elif (r.get("lost_chunks") or 0) > 0:
+            lines.append(f"- **Потеря речи:** «{r.get('label')}» вернул пустой текст для {r.get('lost_chunks')} "
+                         f"из {r.get('chunks')} кусков, которые другой вариант той же модели распознал, — "
+                         "вариант не выбирается.")
     if record.get("run_file"):
         lines.append(f"- Файл прогона: `{record['run_file']}` (в нём нет имени и пути записи).")
     return lines
@@ -345,7 +394,7 @@ def choice_summary(results, family, threshold):
     """Три ориентира для человека: точнее всего, быстрее всего в пределах порога, самое быстрое вообще."""
     usable = [r for r in results
               if r.get("family") == family and r.get("rtfx") and r.get("text", "").strip()
-              and not r.get("experimental")]
+              and not r.get("experimental") and not unfit_reason(r)]
     if not usable:
         return {"accurate": None, "fast_ok": None, "fastest": None}
     accurate = max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"]))
@@ -430,10 +479,12 @@ def run_one(variant, npy, model, chunk_max):
 
 
 def best_of(results, family, min_similarity=0.97):
-    """Самый быстрый вариант семейства в пределах порога; эксперименты не выбираются никогда."""
+    """Самый быстрый вариант семейства в пределах порога; эксперименты не выбираются никогда,
+    как и варианты с подменой устройства или потерянными кусками (unfit_reason)."""
     ok = [r for r in results
           if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
-          and r.get("similarity", 1) >= min_similarity and not r.get("experimental")]
+          and r.get("similarity", 1) >= min_similarity and not r.get("experimental")
+          and not unfit_reason(r)]
     return max(ok, key=lambda r: r["rtfx"]) if ok else None
 
 
@@ -442,11 +493,12 @@ def most_accurate(results, family):
 
     Для Whisper порог точности GigaAM не применяется: движок другой, поэтому даже исправный
     текст редко совпадает с RNN-T на 97%. Выбирается наибольшее совпадение, а зацикленный
-    или потерявший речь вариант проигрывает по этому же совпадению.
+    или потерявший речь вариант проигрывает по этому же совпадению. Вариант с подменой
+    устройства или потерянными кусками не выбирается вовсе (unfit_reason).
     """
     usable = [r for r in results
               if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
-              and not r.get("experimental")]
+              and not r.get("experimental") and not unfit_reason(r)]
     return max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"])) if usable else None
 
 
@@ -474,6 +526,8 @@ def family_refs(results):
     refs = {}
     for fam in (RNNT, CTC, WHISPER, ML):
         cands = [r for r in results if r.get("family") == fam and r.get("text", "").strip()]
+        # вариант с подменой устройства или потерянными кусками — плохой эталон, если есть годный
+        cands = [r for r in cands if not unfit_reason(r)] or cands
         # эталон семейства — обычный вариант (fp32), а не эксперимент: иначе int8 сверялся бы сам с собой
         plain = [r for r in cands if not r.get("experimental")] or cands
         cpu = [r for r in plain if str(r.get("device", "")).upper() == "CPU"]
@@ -655,6 +709,10 @@ def main():
             results.append(r)
 
         mark_actual(results)
+        mark_lost_chunks(results)
+        for r in results:
+            if "asr_sec" in r:
+                r["unfit"] = unfit_reason(r)       # в файл прогона: почему вариант не участвовал в выборе
         refs = family_refs(results)
         whisper_only = (any(r.get("family") == WHISPER for r in results)
                         and not any(r.get("family") == RNNT for r in results))
@@ -723,6 +781,8 @@ def main():
             if r.get("family") not in (WHISPER, ML) and r.get("similarity", 1) < threshold:
                 # порог — про точность GigaAM v3; у Whisper и Multilingual шкала другая
                 mark = f"ниже порога {threshold * 100:.0f}%"
+            if unfit_reason(r):
+                mark = unfit_note(r)               # числа варианта не относятся к тому, что он обещает
             if r.get("experimental"):
                 mark = (mark + "; " if mark else "") + "эксперимент, не сохраняется"
             lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
