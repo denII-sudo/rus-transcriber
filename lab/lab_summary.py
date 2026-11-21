@@ -143,7 +143,8 @@ def export_summary(db, units, experiment=None, out_path=None):
                   "passport": json.loads(r["passport_json"] or "null")} for r in runs],
         "configs": configs,
         "units": [{"unit_id": uid, "audio_sha256": u["audio_sha256"],
-                   "duration_sec": u.get("duration_sec"), "variants": len(u.get("recordings") or [])}
+                   "duration_sec": u.get("duration_sec"), "variants": len(u.get("recordings") or []),
+                   "origin": "audio_file" if u.get("origin") == "audio_file" else "database"}
                   for uid, u in unit_ids.items()],
         "pairs": pairs,
     }

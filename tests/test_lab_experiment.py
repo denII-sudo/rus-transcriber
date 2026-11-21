@@ -325,6 +325,199 @@ class PrepareAndRun(unittest.TestCase):
         self.assertEqual(res["errors"], 1)
 
 
+TRIAL_NAME = "Секретный отрывок 1"   # имя файла (с пробелами): не должно попасть в сводку и анализ
+TRIAL_DIR = "папка с записью"
+
+
+def write_wav(path, seconds=3.0, rate=16000):
+    import wave
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+    return path
+
+
+class TrialEngine:
+    """Подмена PipelineEngine для пробного запуска: пары — настоящий run_words с подменёнными
+    моделями (тот же помощник, что в test_lab_analyze)."""
+
+    def __init__(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_lab_analyze
+        self.helper = test_lab_analyze
+        self.ran = []
+
+    def base_config(self):
+        import settings
+        return dict(settings.DEFAULTS)
+
+    def config_types(self):
+        import settings
+        return settings.CONFIG_TYPES
+
+    def prepare_unit(self, unit, cfg):
+        return SimpleNamespace(unit=unit, src=Path(unit["location"]), duration=3.0, diarization_sha256="d" * 64,
+                               shared_record={"duration_sec": 3.0})
+
+    def run_config(self, shared, cfg, conf):
+        self.ran.append((shared.unit["unit_id"], conf["id"]))
+        _, data, hyps, _ = self.helper.run_pair(conf["id"])
+        data["file"] = str(shared.src)
+        return data, hyps, [], data["timing"]
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class TrialOnAudioFile(unittest.TestCase):
+    """Пробный запуск на произвольном файле: prepare --audio/--only-audio, add-audio, run, summary, analyze."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-trial-")
+        self.base = Path(self.tmp.name)
+        self.data, self.audio = make_source(self.base)
+        self.trial = write_wav(self.base / TRIAL_DIR / f"{TRIAL_NAME}.wav")
+        self.program = self.base / "program"
+        self.program.mkdir()
+        self.sandbox = self.base / "sandbox"
+        self.log = []
+        self.before = (snapshot(self.data), snapshot(self.audio), snapshot(self.trial.parent))
+        self.experiment = self.base / "trial-experiment.json"
+        self.experiment.write_text(json.dumps({
+            "schema": lab_spec.SCHEMA, "name": "trial",
+            "configurations": [{"id": "a-current", "roles": {
+                                    "primary": {"model": "v3_e2e_rnnt"}, "second": {"model": "v3_e2e_ctc"},
+                                    "third": {"engine": "whisper-ct2", "mode": "all"}}},
+                               {"id": "c-no-third", "roles": {
+                                   "primary": {"model": "v3_e2e_rnnt"}, "second": {"model": "v3_e2e_ctc"},
+                                   "third": None}}]}), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_lab(self, engine, **kw):
+        sandbox, marker, units = lab_sandbox.load_sandbox(self.sandbox, env={})
+        spec, sha = lab_spec.load(self.experiment)
+        return lab_run.run(sandbox, spec, sha, units, engine, log=self.log.append, **kw)
+
+    def test_only_audio_full_scenario_without_names_in_exports(self):
+        import lab_analyze
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append,
+                            audio=[self.trial], only_audio=True)
+        s = lab_sandbox.real(self.sandbox)
+        self.assertFalse((s / "source" / "state.sqlite3").exists(), "--only-audio: база записей не копируется")
+        units = json.loads((s / "units.json").read_text(encoding="utf-8"))["units"]
+        self.assertEqual(len(units), 1)
+        u = units[0]
+        self.assertEqual((u["origin"], u["recordings"], u["group"]), ("audio_file", [], None))
+        self.assertAlmostEqual(u["duration_sec"], 3.0, places=1)
+        copy_path = s / "audio" / f"{TRIAL_NAME}.wav"
+        self.assertEqual(lab_sandbox.real(u["location"]), copy_path, "считается копия в audio/ песочницы")
+        self.assertEqual(lab_sandbox.real(u["source_location"]), lab_sandbox.real(self.trial))
+        self.assertEqual(copy_path.read_bytes(), self.trial.read_bytes())
+        self.assertTrue(any("единственная группа" in m for m in self.log), self.log)
+
+        res = self.run_lab(TrialEngine(), dry_run=True)
+        self.assertEqual((res["pairs"], res["todo"]), (2, 2))
+        self.assertTrue(any("[файл вне базы]" in m for m in self.log))
+        engine = TrialEngine()
+        self.assertEqual(self.run_lab(engine)["computed"], 2)
+        again = TrialEngine()
+        self.assertEqual(self.run_lab(again)["computed"], 0, "возобновление: посчитанное не повторяется")
+
+        sandbox, marker, units_doc = lab_sandbox.load_sandbox(self.sandbox, env={})
+        analysis = lab_analyze.analyze(sandbox, units_doc, log=self.log.append)
+        self.assertEqual(analysis["human"]["not_measured"], lab_analyze.NO_HUMAN)
+        self.assertEqual(analysis["human"]["units_not_measured"], {u["unit_id"]: lab_analyze.NO_HUMAN})
+        self.assertEqual(analysis["data"]["units_with_pairs"], 1)
+        report = (s / "results" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("решений человека нет", report)
+        summary = (s / "export" / "summary.json").read_text(encoding="utf-8")
+        self.assertIn('"origin": "audio_file"', summary)
+        for path in (s / "export" / "summary.json", s / "export" / "analysis.json"):
+            text = path.read_text(encoding="utf-8")
+            for forbidden in (TRIAL_NAME, f"{TRIAL_NAME}.wav", TRIAL_DIR, str(self.base),
+                              json.dumps(str(self.base))[1:-1], "четыре", "шесть", "Неизвестнов"):
+                self.assertNotIn(forbidden, text, f"{path.name}: {forbidden}")
+        self.assertEqual(snapshot(self.data), self.before[0])
+        self.assertEqual(snapshot(self.audio), self.before[1])
+        self.assertEqual(snapshot(self.trial.parent), self.before[2], "пробный файл только читается")
+
+    def test_add_audio_to_existing_sandbox_and_run_only_it(self):
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append)
+        ids = lab_sandbox.add_audio_units(self.sandbox, [self.trial], group="grp", env={}, log=self.log.append)
+        copy_path = lab_sandbox.real(self.sandbox) / "audio" / self.trial.name
+        stamp = copy_path.stat().st_mtime_ns
+        self.assertEqual(lab_sandbox.add_audio_units(self.sandbox, [self.trial], env={}, log=self.log.append), ids,
+                         "тот же звук повторно не добавляется")
+        self.assertEqual(copy_path.stat().st_mtime_ns, stamp, "повторное добавление не копирует заново")
+        units = json.loads((lab_sandbox.real(self.sandbox) / "units.json").read_text(encoding="utf-8"))["units"]
+        self.assertEqual(len(units), 3)
+        self.assertEqual([u["group"] for u in units if u["unit_id"] == ids[0]], ["grp"])
+        engine = TrialEngine()
+        res = self.run_lab(engine, unit_filter=ids)
+        self.assertEqual(res["computed"], 2)
+        self.assertEqual({uid for uid, _ in engine.ran}, set(ids), "остальные записи не считаются")
+
+        import lab_analyze
+        sandbox, marker, units_doc = lab_sandbox.load_sandbox(self.sandbox, env={})
+        analysis = lab_analyze.analyze(sandbox, units_doc, log=self.log.append)
+        self.assertEqual(analysis["human"]["not_measured"], lab_analyze.NO_HUMAN)
+
+        # копия изменилась после добавления — контрольная сумма перед прогоном не сходится, пара не считается
+        self.assertEqual(snapshot(self.trial.parent), self.before[2], "исходный файл только читается")
+        write_wav(copy_path, seconds=2.0)
+        sandbox, marker, units_doc = lab_sandbox.load_sandbox(self.sandbox, env={})
+        spec, sha = lab_spec.load(self.experiment)
+        spec["configurations"][1]["settings"] = {"review_missed": True}      # новая версия конфигурации
+        res = lab_run.run(sandbox, spec, sha, units_doc, TrialEngine(), log=self.log.append,
+                          unit_filter=ids, config_filter=["c-no-third"])
+        self.assertEqual((res["computed"], res["errors"]), (0, 1))
+
+    def test_foreign_file_with_same_name_is_not_overwritten(self):
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append,
+                            audio=[self.trial], only_audio=True)
+        other = write_wav(self.base / "другая папка" / self.trial.name, seconds=1.0)
+        copy_path = lab_sandbox.real(self.sandbox) / "audio" / self.trial.name
+        before = copy_path.read_bytes()
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.add_audio_units(self.sandbox, [other], env={}, log=self.log.append)
+        self.assertEqual(copy_path.read_bytes(), before, "чужой файл с тем же именем не перезаписан")
+        units = json.loads((lab_sandbox.real(self.sandbox) / "units.json").read_text(encoding="utf-8"))["units"]
+        self.assertEqual(len(units), 1)
+
+    def test_trial_audio_safety(self):
+        # песочница в папке исходного файла допустима: файл лишь копируется в audio/ песочницы
+        inside = self.trial.parent / "лаб песочница"
+        lab_sandbox.prepare(inside, self.data, self.program, "skip", env={}, log=self.log.append,
+                            audio=[self.trial], only_audio=True)
+        lab_sandbox.load_sandbox(inside, env={})
+        # а с папками записей из базы — по-прежнему нет
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.prepare(self.audio / "lab", self.data, self.program, "skip", env={},
+                                log=self.log.append, audio=[self.trial])
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append,
+                                only_audio=True)
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append,
+                                audio=[self.base / "нет.wav"], only_audio=True)
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append,
+                            audio=[self.trial], only_audio=True)
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.add_audio_units(self.sandbox, [self.trial], group="../x", env={}, log=self.log.append)
+        # единица внешнего файла, указывающая не на audio/ песочницы, — отказ при загрузке
+        upath = lab_sandbox.real(self.sandbox) / "units.json"
+        doc = json.loads(upath.read_text(encoding="utf-8"))
+        doc["units"][0]["location"] = str(self.trial)
+        upath.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(lab_sandbox.SandboxError):
+            lab_sandbox.load_sandbox(self.sandbox, env={})
+        self.assertEqual(snapshot(self.trial.parent)[self.trial.name], self.before[2][self.trial.name],
+                         "исходный файл только читается")
+
+
 @unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
 class CaptureWithRealPipeline(unittest.TestCase):
     """Перехват гипотез вокруг настоящего worker.run_words (модели подменены, как в test_whisper_ct2)."""

@@ -25,6 +25,7 @@ import lab_summary
 ANALYSIS_SCHEMA = "lab-analysis-1"
 ANALYSIS_VERSION = 1
 BASELINE = "a-current"
+NO_HUMAN = "решений человека нет: звук добавлен из файла вне базы записей"
 # состояния кусков, при которых конвейер отключает голосование «два из трёх» (worker.run_words)
 BAD_STATES = ("error", "empty_unknown")
 # пригодность пары (bench-database-spec.md, раздел 8.3): пустой кусок при словах у соседа
@@ -1077,15 +1078,26 @@ def analyze(sandbox, units_doc, baseline=BASELINE, log=print):
     comparison = {cid: {"all": compare(rows_by_cfg, cid, baseline, False),
                         "fit_only": compare(rows_by_cfg, cid, baseline, True)}
                   for cid in order if cid != baseline}
-    human, reason = load_human(sandbox / "source" / "state.sqlite3", units, W)
+    # единицы из файлов вне базы записей (add-audio, prepare --audio): решений человека у них нет
+    no_human = {u["unit_id"]: NO_HUMAN for u in units if u.get("origin") == "audio_file"}
+    db_units = [u for u in units if u.get("origin") != "audio_file"]
+    with_pairs_db = [u for u in db_units if u["unit_id"] in pairs_by_unit]
+    if not with_pairs_db and pairs_by_unit:
+        human, reason = None, NO_HUMAN
+    else:
+        human, reason = load_human(sandbox / "source" / "state.sqlite3", db_units, W)
     examples = []
     if human is None:
         human_part = {"not_measured": reason}
+        if no_human:
+            human_part["units_not_measured"] = no_human
     else:
         human_part, examples = human_analysis(human, pairs_by_unit, canon_by_unit, order, W)
         human_part["units_stats"] = {uid: h["stats"] for uid, h in human.items()}
         human_part["warning"] = ("выборка мала и сделана по старым вариантам записей: числа абсолютные, "
                                  "это повод для опыта, а не вывод")
+        if no_human:
+            human_part["units_not_measured"] = no_human
     pw_total, sim_total = {}, {}
     for uid in pairwise:
         for k, v in pairwise[uid].items():
@@ -1396,8 +1408,13 @@ CHECK_TEXT = {"ok": "совпало", "mismatch": "НЕ совпало", "no_hyp
 def _human_section(a):
     h = a["human"]
     L = ["## Кто был прав: решения человека", ""]
+    extra = []
+    if h.get("units_not_measured"):
+        extra = ["Единицы без решений человека (звук из файла вне базы записей), не измерено: "
+                 + ", ".join(f"`{u}`" for u in sorted(h["units_not_measured"])) + ".", ""]
     if h.get("not_measured"):
-        return L + [f"Не измерено: {h['not_measured']}.", ""]
+        return L + [f"Не измерено: {h['not_measured']}.", ""] + extra
+    L += extra
     L += [f"**Предупреждение:** {h['warning']}.", "",
           "Решение человека — слова итоговой стенограммы старого варианта записи с отметкой автора "
           "«человек» (подтверждено как есть или исправлено), удаление слов человеком и ответ человека "

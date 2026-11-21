@@ -80,11 +80,22 @@ def model_warnings(experiment, base_cfg, program_dir):
 
 def cmd_prepare(a):
     sources = [Path(a.source_data)] if a.source_data else lab_sandbox.default_data_dirs()
-    source = next((p for p in sources if (p / "state.sqlite3").is_file()), None)
+    if a.only_audio:      # базы не нужно: из папки данных берутся только настройки, словари, профили
+        source = next((p for p in sources if p.is_dir()), None)
+    else:
+        source = next((p for p in sources if (p / "state.sqlite3").is_file()), None)
     if source is None:
-        raise SystemExit("не найдена папка данных с state.sqlite3; укажите --source-data")
+        raise SystemExit("не найдена папка данных" + ("" if a.only_audio else " с state.sqlite3")
+                         + "; укажите --source-data")
     program = Path(a.program_dir) if a.program_dir else lab_sandbox.default_program_dir()
-    lab_sandbox.prepare(a.sandbox, source, program, a.voice_profiles)
+    lab_sandbox.prepare(a.sandbox, source, program, a.voice_profiles, audio=a.audio or (), group=a.group or None,
+                        only_audio=a.only_audio)
+
+
+def cmd_add_audio(a):
+    sandbox, marker, units_doc = lab_sandbox.load_sandbox(a.sandbox)
+    ids = lab_sandbox.add_audio_units(sandbox, a.audio, a.group or None, _marker=marker)
+    print("Единицы: " + ", ".join(ids) + ". Посчитать только их: run --units " + ",".join(ids))
 
 
 def _passport(program_dir, cfg):
@@ -172,7 +183,18 @@ def main(argv=None):
                         "skip — без них")
     p.add_argument("--source-data", default="", help="настоящая папка данных (по умолчанию — как у программы)")
     p.add_argument("--program-dir", default="", help="папка установленной программы (кэш моделей)")
+    p.add_argument("--audio", action="append", default=[],
+                   help="аудиофайл вне базы записей как отдельная единица опыта (можно несколько раз)")
+    p.add_argument("--group", default="", help="группа (словарь и голосовой профиль) для файлов --audio; "
+                   "по умолчанию — как при обычной расшифровке нового файла")
+    p.add_argument("--only-audio", action="store_true",
+                   help="только файлы --audio: база записей не копируется (пробный запуск на отрывке)")
     p.set_defaults(fn=cmd_prepare)
+    d = sub.add_parser("add-audio", help="добавить в готовую песочницу единицу из аудиофайла вне базы записей")
+    d.add_argument("--sandbox", required=True)
+    d.add_argument("--audio", action="append", required=True, help="аудиофайл (можно несколько раз)")
+    d.add_argument("--group", default="", help="группа для этих файлов; по умолчанию — как при обычной расшифровке")
+    d.set_defaults(fn=cmd_add_audio)
     r = sub.add_parser("run", help="посчитать пары «запись × конфигурация»")
     r.add_argument("--sandbox", required=True)
     r.add_argument("--experiment", default=str(DEFAULT_EXPERIMENT), help="файл опыта (JSON)")

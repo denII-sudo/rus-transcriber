@@ -533,6 +533,8 @@ def print_plan(rows, units_all, experiment, db, limit, log=print):
             est = f"~{sec / 60:.1f} мин" + (" (грубо)" if rough else "")
         name = Path(u["location"]).name
         missing = "" if Path(u["location"]).is_file() else " [аудио не найдено]"
+        if u.get("origin") == lab_sandbox.AUDIO_ORIGIN:
+            missing += " [файл вне базы]"
         log(f"  {u['unit_id']}  {name}{missing}  {hours * 60:5.1f} мин  {conf['id']:<16} {mark:<8} {est}")
     log(f"Оценка времени счёта: около {total / 3600:.1f} ч" +
         (" (часть этапов — по грубым значениям по умолчанию)" if rough_any else "") +
