@@ -255,6 +255,28 @@ def observe(store, request_id, job):
     return get(store, request_id)
 
 
+def _speaker_labels(transcript):
+    """Условные метки говорящих по порядку первого появления значения `speaker`.
+
+    Учитываются только реплики со словами (другие в задание не попадают). Реплика без
+    говорящего метки «Участник N» не получает: разные неизвестные — не один человек.
+    """
+    labels = {}
+    for segment in transcript.get("segments", []):
+        speaker = segment.get("speaker")
+        if segment.get("words") and speaker and speaker not in labels:
+            labels[speaker] = model_tasks.speaker_label(len(labels) + 1)
+    return labels
+
+
+def _task_turns(transcript):
+    """Реплики задания версии 2: сегмент со словами — одна реплика с условной меткой."""
+    labels = _speaker_labels(transcript)
+    return [{"turn": number, "speaker": labels.get(segment.get("speaker"), model_tasks.UNKNOWN_SPEAKER)}
+            for number, segment in enumerate(
+                (segment for segment in transcript.get("segments", []) if segment.get("words")), 1)]
+
+
 def prepare_model_task(store, request_id):
     request = get(store, request_id)
     if request["state"] not in ("processed", "waiting_model", "completed"):
@@ -265,11 +287,27 @@ def prepare_model_task(store, request_id):
                   if item.get("status", "open") in ("open", "human")]
     unknown_spans = any(not item.get("word_ids") for item in open_items)
     uncertain = {ident for item in open_items for ident in item.get("word_ids", [])}
-    words = [{"word_id": word["word_id"], "text": word.get("w", word.get("text")),
-              "uncertain": unknown_spans or word["word_id"] in uncertain}
-             for segment in current["payload"].get("segments", []) for word in segment.get("words", [])]
-    task = model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
-                             snapshots["review"]["revision"])
+    words, turn = [], 0
+    for segment in current["payload"].get("segments", []):
+        if segment.get("words"):
+            turn += 1
+        for word in segment.get("words", []):
+            words.append({"word_id": word["word_id"], "text": word.get("w", word.get("text")),
+                          "uncertain": unknown_spans or word["word_id"] in uncertain, "turn": turn})
+    task = None
+    saved = request["model_task"]
+    if request["state"] == "waiting_model" and isinstance(saved, dict) and "version" not in saved:
+        # Сохранённое задание версии 1 доигрывается без изменений; иначе принятые блоки
+        # (ключ — хэш задания) потеряли бы связь с ним. Новое задание — всегда версии 2.
+        legacy = model_tasks.build(
+            request["recording_id"], current["revision"],
+            [{key: value for key, value in word.items() if key != "turn"} for word in words],
+            request["policy"]["goal"], snapshots["review"]["revision"])
+        if legacy == saved:
+            task = legacy
+    if task is None:
+        task = model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
+                                 snapshots["review"]["revision"], turns=_task_turns(current["payload"]))
     with store._transaction():
         store.current_identity()
         head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
@@ -334,6 +372,95 @@ def _record_model_error(store, request_id, before):
 
 
 MODEL_PART_WORDS = 500
+_SENTENCE_END = (".", "!", "?", "…")
+_CLOSING = "»\"”’')]"
+
+
+def _part_bounds(task):
+    """Границы блоков задания: список (начало, конец) по индексам слов. Единственное место деления.
+
+    Версия 1 — ровно по MODEL_PART_WORDS слов, как раньше. Версия 2 — блок не длиннее предела
+    и кончается на границе реплики; реплика длиннее предела делится по последнему в пределах
+    блока концу предложения, а если такого нет — по пределу. Блоки идут подряд без пропусков.
+    """
+    words, limit = task["words"], MODEL_PART_WORDS
+    if model_tasks.version(task) == 1:
+        return [(start, min(start + limit, len(words))) for start in range(0, len(words), limit)]
+    bounds, start, end, index = [], 0, 0, 0
+    while index < len(words):
+        stop = index
+        while stop < len(words) and words[stop]["turn"] == words[index]["turn"]:
+            stop += 1
+        if stop - start > limit:              # реплика [index, stop) не помещается в текущий блок
+            if end > start:
+                bounds.append((start, end))
+                start = end
+            while stop - start > limit:       # сама реплика длиннее предела
+                cut = start + limit
+                for candidate in range(start + limit, start, -1):
+                    if words[candidate - 1]["text"].rstrip().rstrip(_CLOSING).endswith(_SENTENCE_END):
+                        cut = candidate
+                        break
+                bounds.append((start, cut))
+                start = cut
+        end = index = stop
+    if end > start:
+        bounds.append((start, end))
+    return bounds
+
+
+def _part_task(task, bounds):
+    """Задание одного блока той же версии, что и целое."""
+    words = task["words"][bounds[0]:bounds[1]]
+    turns = None
+    if model_tasks.version(task) != 1:
+        used = {word["turn"] for word in words}
+        turns = [turn for turn in task["turns"] if turn["turn"] in used]
+    return model_tasks.build(task["recording_id"], task["source_revision"], words,
+                             task["goal"], task["review_revision"], turns=turns)
+
+
+def section_time_spans(sections, transcript):
+    """Отрезок времени каждого раздела свёртки по временам слов его `evidence`. Ничего не пишет.
+
+    sections — разделы сохранённой свёртки: [{"text": ..., "evidence": [word_id, ...]}, ...]
+    (поле `evidence` объекта конспекта). transcript — снимок стенограммы (payload с `segments`).
+    Возвращает по одному {"t1": начало, "t2": конец} на раздел, в том же порядке, в секундах
+    от начала записи; None, если ни у одного слова раздела в снимке нет времени. Слова,
+    которых в снимке нет (стенограмма изменилась), пропускаются.
+    """
+    times = {}
+    for segment in transcript.get("segments", []):
+        for word in segment.get("words", []):
+            start = word.get("s")
+            if "word_id" in word and type(start) in (int, float):
+                end = word.get("e")
+                times[word["word_id"]] = (start, end if type(end) in (int, float) and end >= start else start)
+    spans = []
+    for section in sections:
+        found = [times[ident] for ident in section.get("evidence", []) if ident in times]
+        spans.append({"t1": min(item[0] for item in found) if found else None,
+                      "t2": max(item[1] for item in found) if found else None})
+    return spans
+
+
+def _clock(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _speaker_anchors(transcript):
+    """Привязка условных меток к словам: [{"label", "word_ids"}] — первое слово каждой реплики метки.
+
+    По этим словам `conspect.render` при каждой сборке файла находит текущего говорящего,
+    поэтому расшифровка меток переживает переименование. Имён здесь нет.
+    """
+    labels, anchors = _speaker_labels(transcript), {}
+    for segment in transcript.get("segments", []):
+        if segment.get("words"):
+            label = labels.get(segment.get("speaker"), model_tasks.UNKNOWN_SPEAKER)
+            anchors.setdefault(label, []).append(segment["words"][0]["word_id"])
+    return [{"label": label, "word_ids": ids} for label, ids in anchors.items()]
 
 
 def _ensure_conspect_materialized(store, request):
@@ -372,13 +499,11 @@ def model_part(store, request_id, part_index):
     if request["state"] not in ("processed", "waiting_model"):
         raise storage.Conflict("нет ожидающего модельного задания")
     task = prepare_model_task(store, request_id)
-    total = (len(task["words"]) + MODEL_PART_WORDS - 1) // MODEL_PART_WORDS
-    if part_index >= total:
+    bounds = _part_bounds(task)
+    if part_index >= len(bounds):
         raise ValueError("блок отсутствует")
-    words = task["words"][part_index * MODEL_PART_WORDS:(part_index + 1) * MODEL_PART_WORDS]
-    return {"task": model_tasks.build(task["recording_id"], task["source_revision"], words,
-                                       task["goal"], task["review_revision"]),
-            "part_index": part_index, "part_count": total}
+    return {"task": _part_task(task, bounds[part_index]),
+            "part_index": part_index, "part_count": len(bounds)}
 
 
 def accept_model_part(store, request_id, part_index, result):
@@ -436,7 +561,8 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
     if before["state"] not in ("waiting_model", "completed") or before["model_task"] is None:
         raise storage.Conflict("нет ожидающего модельного задания")
     task = before["model_task"]
-    total = (len(task["words"]) + MODEL_PART_WORDS - 1) // MODEL_PART_WORDS
+    bounds = _part_bounds(task)
+    total = len(bounds)
     if type(part_index) is not int or not 0 <= part_index < total:
         raise ValueError("неверный номер блока")
     if before["state"] != "completed":
@@ -444,9 +570,7 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
         if (current["transcript"]["revision"] != task["source_revision"]
                 or current["review"]["revision"] != task["review_revision"]):
             raise storage.Conflict("стенограмма или сомнения изменились")
-    words = task["words"][part_index * MODEL_PART_WORDS:(part_index + 1) * MODEL_PART_WORDS]
-    subtask = model_tasks.build(task["recording_id"], task["source_revision"], words,
-                                task["goal"], task["review_revision"])
+    subtask = _part_task(task, bounds[part_index])
     accepted = model_tasks.validate(subtask, result, current_revision=task["source_revision"])
     if before["state"] != "completed":
         import conspect
@@ -524,7 +648,7 @@ def execute_model(store, request_id, *, retry_failed=False):
         task = request["model_task"]
     else:
         raise storage.Conflict("модельное задание ещё не готово к исполнению")
-    total = (len(task["words"]) + MODEL_PART_WORDS - 1) // MODEL_PART_WORDS
+    total = len(_part_bounds(task))
     if not task["words"] or len(task["words"]) > llm_provider.MAX_WORDS:
         message = f"задание превышает лимит исполнителя ({llm_provider.MAX_WORDS} слов)"
         _fail_model_run(store, request_id, "limit", message)
@@ -592,6 +716,17 @@ def _accept_model_result(store, request_id, result):
     text = "\n\n".join(section["text"] for section in accepted["sections"])
     if "{{q:" in text:
         raise ValueError("служебные маркеры цитат в ответе не допускаются")
+    labelled = model_tasks.version(request["model_task"]) != 1
+    if labelled:
+        # Локальные добавления к ответу модели, в облако не передаются. Время начала раздела
+        # (по словам его evidence) стоит отдельной строкой перед текстом раздела и попадает
+        # в шаблон. Расшифровку условных меток строит conspect.render при каждой сборке файла.
+        if _task_turns(current["payload"]) != request["model_task"]["turns"]:
+            raise storage.Conflict("реплики стенограммы не совпадают с заданием; подготовьте новое задание")
+        spans = section_time_spans(accepted["sections"], current["payload"])
+        text ="\n\n".join(
+            (f"[{_clock(span['t1'])}]\n" if span["t1"] is not None else "") + section["text"]
+            for section, span in zip(accepted["sections"], spans))
     data = {**current["payload"], "recording_id": request["recording_id"],
             "source_revision": current["revision"]}
     for section in accepted["sections"]:
@@ -612,10 +747,15 @@ def _accept_model_result(store, request_id, result):
     binding = recordings.document_binding(store, request["recording_id"])
     json_path, md_path = conspect.path_for(binding["root"] / binding["paths"]["json"], name)
     obj.update(name=name, provenance="model", evidence=accepted["sections"])
+    if labelled:
+        obj["speaker_labels"] = _speaker_anchors(current["payload"])
     md, _ = conspect.render(obj, data)
     payload = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")
-    md_bytes = ("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
-                + md + "\n").encode("utf-8")
+    # С метками говорящих шапку (заголовок, строку об авторстве, расшифровку меток) собирает
+    # conspect.render — она же восстановит её при пересборке. Без меток (задание версии 1) — как раньше.
+    if not labelled:
+        md = "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n" + md
+    md_bytes = (md + "\n").encode("utf-8")
     conspect_id = str(uuid.uuid5(uuid.UUID(request["recording_id"]), "conspect:" + name))
     previous = store.db.execute("SELECT current_revision FROM conspects WHERE conspect_id=?",
                                 (conspect_id,)).fetchone()

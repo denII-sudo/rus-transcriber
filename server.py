@@ -38,9 +38,10 @@ _job_json = core.job_json
 
 INSTRUCTIONS = """\
 rus-transcriber: расшифровка речи на этом компьютере. При заказанном конспекте П4 автоматически отправляет
-только текст слов, их ID/признаки сомнений, цель и ревизии в OpenAI GPT-6 Luna через OpenCode. Аудио,
-биометрия, пути и журналы не передаются. Ответ остаётся модельным предложением и проходит локальную проверку;
-он не является подтверждением человека. Рабочий процесс:
+только текст слов, их ID/признаки сомнений, деление на реплики и условные метки говорящих («Участник 1»…),
+цель и ревизии в OpenAI GPT-6 Luna через OpenCode. Имена говорящих, аудио, биометрия, пути и журналы
+не передаются; метки расшифровываются именами только в файле конспекта на этом компьютере. Ответ остаётся
+модельным предложением и проходит локальную проверку; он не является подтверждением человека. Рабочий процесс:
 
 П3/P4: start_workflow → workflow_status. Облако только по явному согласию человека: allow_cloud_model
 по умолчанию false; передавайте true, лишь если человек прямо согласился на отправку текста стенограммы
@@ -165,7 +166,9 @@ def workflow_status(request_id: str) -> str:
 
 @mcp.tool()
 def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000) -> str:
-    """Получить страницу задания. Прочитайте все страницы до next_offset=null."""
+    """Получить страницу задания. Прочитайте все страницы до next_offset=null. В задании версии 2 у слова
+    есть номер реплики turn, а в turns — условные метки говорящих («Участник N») для реплик этой страницы:
+    называйте говорящих только этими метками, имён в задании нет."""
     try:
         return json.dumps(core.workflow_model_task(request_id, offset, limit), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
@@ -240,7 +243,8 @@ def workflow_execute_model(request_id: str, retry_failed: bool = False) -> str:
 
 @mcp.tool()
 def workflow_model_part(request_id: str, part_index: int) -> str:
-    """Получить один блок длинной стенограммы, не более 500 слов."""
+    """Получить один блок длинной стенограммы, не более 500 слов. Блок кончается на границе реплики;
+    реплика длиннее 500 слов делится по концу предложения."""
     try:
         return json.dumps(core.workflow_model_part(request_id, part_index), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:

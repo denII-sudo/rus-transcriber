@@ -171,7 +171,8 @@ def build():
     wf = sub.add_parser("workflow-start"); wf.add_argument("audio")
     wf.add_argument("--conspect", action="store_true")
     wf.add_argument("--cloud-model", action="store_true",
-                    help="согласие отправить текст стенограммы в облачную модель OpenAI для конспекта")
+                    help="согласие отправить в облачную модель OpenAI для конспекта текст стенограммы: слова, "
+                         "деление на реплики и условные метки говорящих («Участник 1»…), без имён")
     wf.add_argument("--no-cloud-model", action="store_true",
                     help="облако запрещено (так и по умолчанию; ключ оставлен для совместимости)")
     wf.add_argument("--named-speakers", action="store_true")

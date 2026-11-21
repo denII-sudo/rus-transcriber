@@ -491,8 +491,12 @@ def workflow_model_task(request_id, offset=0, limit=1000):
     try:
         task = workflow.prepare_model_task(store, request_id)
         total = len(task["words"])
-        return {**task, "words": task["words"][offset:offset + limit], "offset": offset,
+        page = {**task, "words": task["words"][offset:offset + limit], "offset": offset,
                 "total_words": total, "next_offset": offset + limit if offset + limit < total else None}
+        if "turns" in task:      # на странице — только реплики её слов
+            used = {word["turn"] for word in page["words"]}
+            page["turns"] = [turn for turn in task["turns"] if turn["turn"] in used]
+        return page
     finally:
         store.close()
 
