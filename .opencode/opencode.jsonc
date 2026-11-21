@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "worktree": { "directory": ".opencode/worktrees" },
+  "watcher": { "ignore": [".opencode/worktrees/**", ".claude/worktrees/**"] }
+}
