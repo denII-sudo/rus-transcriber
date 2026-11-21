@@ -373,12 +373,19 @@ class Manager:
                                         "directory": data["cwd"], "force": False})
         else:
             git(repo["root"], "worktree", "remove", str(cwd))
-        # Squash needs -D, but only for the exact checked head of the verified merged PR.
-        actual = git(repo["root"], "rev-parse", "refs/heads/" + info["branch"])
-        if actual == info["head"]:
-            git(repo["root"], "branch", "-D" if pr else "-d", info["branch"])
         data.update(removed=True, pr=pr["number"] if pr else None, updated=time.time())
         write_json(path, data)
+        # Record successful checkout removal before attempting branch deletion.
+        # A changed or undeletable branch remains intact and is reported separately.
+        status = "removed"
+        try:
+            actual = git(repo["root"], "rev-parse", "refs/heads/" + info["branch"])
+            if actual == info["head"]:
+                git(repo["root"], "branch", "-D" if pr else "-d", info["branch"])
+            else:
+                status = "removed-branch-kept"
+        except RuntimeError:
+            status = "removed-branch-kept"
         self.cleanup_sandbox(data["cwd"])
         # Updating main is best effort and never resets a busy/modified checkout.
         if git(repo["root"], "branch", "--show-current") == "main" and not git(
@@ -387,7 +394,7 @@ class Manager:
                 git(repo["root"], "merge", "--ff-only", "origin/main")
             except RuntimeError:
                 pass
-        return "removed"
+        return status
 
     def sweep(self, apply=False):
         results = []
@@ -426,6 +433,7 @@ REPORT_REASONS = {
 REPORT_STATUS_REASONS = {
     "would-remove": "checks passed; dry-run",
     "removed": "checks passed; removed",
+    "removed-branch-kept": "checkout removed; branch retained",
     "already-removed": "previously removed",
     "missing-kept": "checkout missing; metadata kept",
 }

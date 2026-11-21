@@ -130,9 +130,13 @@ def run_morph():
 
 
 def run(version=None, tests=True, repo=True, morph=True):
-    import buildinfo
     out = {"version": version, "python": platform.python_version(), "program": HERE.name}
-    out["build"] = buildinfo.identity(HERE)
+    try:
+        import buildinfo
+        out["build"] = buildinfo.identity(HERE)
+    except Exception:
+        out["build"] = {"release": None, "commit": None, "source_state": "unknown",
+                        "payload_sha256": None, "manifest_status": "unknown"}
     if tests:
         out["tests"] = run_tests()
     if repo:

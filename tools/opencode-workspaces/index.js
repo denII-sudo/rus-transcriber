@@ -33,9 +33,23 @@ export default {
         // Planning/read-only requests do not create checkouts. Build sessions use a
         // deterministic name, and the move control is admitted before tools run.
         if (session.agent === "plan" || session.agent === "explore") return
-        await exec("git", ["-C", repo.root, "fetch", "origin"], {
-          windowsHide: true, timeout: 30_000,
-        })
+        try {
+          await exec("git", ["-C", repo.root, "fetch", "origin"], {
+            windowsHide: true, timeout: 30_000,
+          })
+        } catch {
+          await exec("git", ["-C", repo.root, "rev-parse", "--verify", "origin/main^{commit}"],
+            { windowsHide: true, timeout: 10_000 })
+          console.warn("Workspace: fetch failed; using potentially stale local origin/main.")
+          try {
+            await ctx.session.synthetic({
+              sessionID,
+              text: "Не удалось обновить origin/main по сети; рабочая копия создаётся из локальной, возможно устаревшей версии.",
+            })
+          } catch {
+            console.warn("Workspace: could not deliver the stale-base warning to the session.")
+          }
+        }
         const task = `task-${sessionID.replace(/[^a-zA-Z0-9-]/g, "-")}`
         const key = `workspace:${sessionID}`
         let created = await ctx.storage.get(key)
@@ -114,8 +128,7 @@ export default {
     // Reject tool execution until a move has actually taken effect. Never guess
     // that a queued move already isolated the main checkout.
     await ctx.tool.hook("execute.before", async (event) => {
-      if (event.tool !== "shell" && event.tool !== "patch" &&
-          event.tool !== "edit" && event.tool !== "write") return
+      if (["read", "glob", "grep"].includes(event.tool)) return
       await once(event.sessionID)
       const result = await ctx.session.get({ sessionID: event.sessionID })
       const session = result.data ?? result
@@ -124,6 +137,16 @@ export default {
     })
     await ctx.shell.hook("create.before", async (event) => {
       const worktrees = path.join(repo.root, ".opencode", "worktrees")
+      const claudeWorktrees = path.join(repo.root, ".claude", "worktrees")
+      const inside = (base, target) => {
+        const rel = path.relative(base, path.resolve(target))
+        return !rel || (!rel.startsWith("..") && !path.isAbsolute(rel))
+      }
+      // Session shell requests bypass tool.execute.before. Never allow them
+      // to start in the integration checkout, including nested directories.
+      if (inside(repo.root, event.cwd) && !inside(worktrees, event.cwd) &&
+          !inside(claudeWorktrees, event.cwd))
+        throw new Error("Shell requires a task worktree; main checkout remains protected.")
       const relative = path.relative(worktrees, path.resolve(event.cwd))
       if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return
       const taskDirectory = path.join(worktrees, relative.split(path.sep)[0])

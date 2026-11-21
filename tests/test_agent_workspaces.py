@@ -145,6 +145,21 @@ class HousekeepingTests(unittest.TestCase):
         self.assertFalse(self.m.sandbox_path(self.cwd).exists())
         self.assertEqual(self.m.sweep_one(self.path, True), "already-removed")
 
+    def test_branch_delete_failure_records_removed_checkout(self):
+        self.g("merge", "--squash", "feature/test")
+        self.g("commit", "-qm", "squash")
+        real_git = aw.git
+        def fail_branch_delete(repo, *args):
+            if args[:2] == ("branch", "-D"):
+                raise RuntimeError("synthetic failure")
+            return real_git(repo, *args)
+        with patch.object(aw, "git", side_effect=fail_branch_delete):
+            self.assertEqual(self.m.sweep_one(self.path, True), "removed-branch-kept")
+        self.assertFalse(self.cwd.exists())
+        self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))["removed"])
+        self.assertEqual(self.m.sweep_one(self.path), "already-removed")
+        self.assertEqual(self.g("rev-parse", "feature/test"), self.head)
+
     def test_dirty_file_is_kept(self):
         (self.cwd / "file.txt").write_text("unsaved", encoding="utf-8")
         self.assertEqual(self.m.sweep(True)[0]["status"], "kept-unverified")
@@ -311,6 +326,9 @@ class HousekeepingTests(unittest.TestCase):
         aw.command(["git", "init", "--bare", "-q", str(bare)])
         self.g("remote", "add", "origin", str(bare))
         self.g("push", "-u", "origin", "main")
+        # Keep the local origin/main but make the remote unavailable.
+        self.g("remote", "set-url", "origin", str(self.root / "missing-remote.git"))
+        self.config["expect_offline"] = True
         config_file = self.root / "config.json"
         config_file.write_text(json.dumps(self.config), encoding="utf-8")
         project = Path(__file__).resolve().parent.parent

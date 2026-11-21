@@ -4,8 +4,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import buildinfo
 
@@ -39,6 +41,20 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(got["source_state"], "unknown")
         self.assertIsNone(got["commit"])
         self.assertEqual(got["release"], "2099.1.1.1")
+
+    def test_metadata_consumers_survive_missing_or_failing_buildinfo(self):
+        import runinfo
+        import selfcheck
+        import worker
+        def check_consumers():
+            self.assertEqual(worker.asr_run_metadata()["build"]["source_state"], "unknown")
+            self.assertEqual(runinfo.code_revision(self.source)["build"]["source_state"], "unknown")
+            self.assertEqual(selfcheck.run(tests=False, repo=False, morph=False)["build"]["source_state"],
+                             "unknown")
+        with patch.object(buildinfo, "identity", side_effect=RuntimeError("synthetic failure")):
+            check_consumers()
+        with patch.dict(sys.modules, {"buildinfo": None}):
+            check_consumers()
 
     def test_manifest_survives_install_without_git_and_detects_edit(self):
         self.init_git()

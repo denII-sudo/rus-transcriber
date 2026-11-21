@@ -161,8 +161,12 @@ def code_revision(here):
             out["git_revision"] = rev.strip()
             dirty = _run(["git", "-C", str(here), "status", "--porcelain", "--untracked-files=all"])
             out["git_dirty"] = bool(dirty.strip()) if dirty is not None else None
-    import buildinfo
-    out["build"] = buildinfo.identity(here)
+    try:
+        import buildinfo
+        out["build"] = buildinfo.identity(here)
+    except Exception:
+        out["build"] = {"release": None, "commit": None, "source_state": "unknown",
+                        "payload_sha256": None, "manifest_status": "unknown"}
     if out["git_revision"] is None and out["build"]["manifest_status"] in ("matched", "modified"):
         out["git_revision"] = out["build"]["commit"]
         out["git_dirty"] = {"clean": False, "dirty": True}.get(out["build"]["source_state"])

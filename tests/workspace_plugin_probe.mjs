@@ -13,7 +13,7 @@ const hooks = {}
 const storage = new Map()
 let directory = repo, creates = 0, agent = "build"
 let delayed = false, pendingDirectory
-let archived = false
+let archived = false, warnings = 0
 const ctx = {
   storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v) },
   options: { config: configFile, python, script },
@@ -25,6 +25,7 @@ const ctx = {
       else directory = x.directory
     },
     update: async (x) => { archived = x.archived },
+    synthetic: async () => { warnings++ },
     hook: async (name, fn) => { hooks[name] = fn },
   },
   worktree: {
@@ -42,6 +43,7 @@ const ctx = {
 const dispose = await plugin.setup(ctx)
 try {
   await hooks.workspace({ sessionID: "ses_synthetic" })
+  if (config.expect_offline) assert.equal(warnings, 1)
   const first = directory
   await hooks.prompt({ sessionID: "ses_synthetic" })
   assert.equal(directory, first)
@@ -49,6 +51,8 @@ try {
   await hooks["tool-execute.before"]({ sessionID: "ses_synthetic", tool: "patch" })
   const shell = { cwd: directory, env: {} }
   await hooks["shell-create.before"](shell)
+  await assert.rejects(hooks["shell-create.before"]({ cwd: repo, env: {} }))
+  await assert.rejects(hooks["shell-create.before"]({ cwd: path.join(repo, "tests"), env: {} }))
   assert.ok(shell.env.RUS_TRANSCRIBER_DATA.startsWith(config.state))
   assert.equal(shell.env.TMP, shell.env.TEMP)
   const nested = { cwd: path.join(directory, "tests"), env: {} }
@@ -66,6 +70,9 @@ try {
   agent = "plan"
   await hooks.prompt({ sessionID: "ses_plan" })
   await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_plan", tool: "patch" }))
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_plan", tool: "functions_shell" }))
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_plan", tool: "unknown_mutator" }))
+  await hooks["tool-execute.before"]({ sessionID: "ses_plan", tool: "read" })
   assert.equal(creates, 1)
   directory = first
   agent = "build"
