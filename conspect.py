@@ -7,7 +7,9 @@
   "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6}], "author": "текст как в конспекте",
                    "speaker": "Вера" | null,               — имя перед цитатой («Вера: «…»»)
                    "base": "текст стенограммы при связывании", "base_speaker": "...",
-                   "last": "текст при последней сборке", "last_speaker": "..."}}
+                   "last": "текст при последней сборке", "last_speaker": "..."}},
+  "speaker_labels": [{"label": "Участник 1", "word_ids": [...]}]   — только у модельной свёртки с условными
+                   метками говорящих: по словам метки сборка находит текущего говорящего и пишет шапку файла
 }
 Сборка (render): новые ссылки используют word_id, прежние — временное окно с проверкой неоднозначности.
   * текст места не менялся с момента связывания — выводится авторская версия цитаты (в ней могут быть
@@ -332,6 +334,49 @@ def link(conspect_md, data, min_score=0.75, selections=None):
                  "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision")}
 
 
+SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
+
+
+def _speaker_display(speaker, names):
+    """Как назвать говорящего в шапке: текущее имя или честное «имя не указано»."""
+    if not speaker:
+        return "говорящий в стенограмме не указан"
+    name = " ".join(str(names.get(speaker, speaker)).split())
+    if not name or re.fullmatch(r"Спикер(\s*\d+)?", name):
+        return f"имя не указано (в стенограмме: {name or speaker})"
+    return name
+
+
+def _labels_header(obj, data, needs_review):
+    """Шапка модельного конспекта с условными метками говорящих («Участник N»).
+
+    Собирается при каждой сборке файла по текущей стенограмме: метка привязана к словам
+    (`speaker_labels[i].word_ids` — первые слова реплик этой метки), а не к имени на момент
+    создания, поэтому после переименования говорящих в файле стоят текущие имена.
+    У конспектов без `speaker_labels` шапки нет — они собираются как раньше.
+    """
+    labels = obj.get("speaker_labels")
+    if not isinstance(labels, list):
+        return ""
+    names = data.get("speaker_names")
+    names = names if isinstance(names, dict) else {}
+    current = {word.get("word_id"): seg.get("speaker")
+               for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    lines = []
+    for item in labels:
+        found = Counter(current[wid] for wid in item.get("word_ids") or [] if wid in current)
+        shown = list(dict.fromkeys(_speaker_display(speaker, names) for speaker, _ in found.most_common()))
+        text = "реплики не найдены в текущей стенограмме" if not shown else shown[0] + (
+            f"; часть реплик в текущей стенограмме: {', '.join(shown[1:])}" if shown[1:] else "")
+        lines.append(f"- {item.get('label')} — {text}")
+    head = "# Конспект\n\nСоздан моделью" + ("; проверка человеком не подтверждена" if needs_review else "") + ".\n\n"
+    if lines:
+        head += "Участники (условные метки; имена — по текущей стенограмме):\n\n" + "\n".join(lines) + "\n\n"
+    if SECTION_TIME.search(obj.get("template") or ""):
+        head += "Время в квадратных скобках — начало раздела в записи (часы:минуты:секунды).\n\n"
+    return head
+
+
 def render(obj, data, update_last=True):
     """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания."""
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
@@ -376,7 +421,7 @@ def render(obj, data, update_last=True):
             q["last"], q["last_speaker"] = cur, cur_spk
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
-    md = PLACE.sub(sub, obj["template"])
+    md = _labels_header(obj, data, rep["analysis_needs_review"]) + PLACE.sub(sub, obj["template"])
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
     rep["assembly_revision"] = obj.get("assembly_revision")

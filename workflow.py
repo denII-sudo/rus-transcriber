@@ -1,7 +1,6 @@
 """Сохранённые запросы П3. Исполнение вызывается сервисом, не при импорте."""
 
 import json
-import re
 import uuid
 from pathlib import Path
 
@@ -450,16 +449,18 @@ def _clock(seconds):
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-def _speaker_legend(transcript):
-    """Локальная расшифровка меток: [{"label", "speaker", "name"}]; name=None — имени нет."""
-    names = transcript.get("speaker_names")
-    names = names if isinstance(names, dict) else {}
-    legend = []
-    for speaker, label in _speaker_labels(transcript).items():
-        name = " ".join(str(names.get(speaker, speaker)).split())
-        legend.append({"label": label, "speaker": speaker,
-                       "name": None if not name or re.fullmatch(r"Спикер(\s*\d+)?", name) else name})
-    return legend
+def _speaker_anchors(transcript):
+    """Привязка условных меток к словам: [{"label", "word_ids"}] — первое слово каждой реплики метки.
+
+    По этим словам `conspect.render` при каждой сборке файла находит текущего говорящего,
+    поэтому расшифровка меток переживает переименование. Имён здесь нет.
+    """
+    labels, anchors = _speaker_labels(transcript), {}
+    for segment in transcript.get("segments", []):
+        if segment.get("words"):
+            label = labels.get(segment.get("speaker"), model_tasks.UNKNOWN_SPEAKER)
+            anchors.setdefault(label, []).append(segment["words"][0]["word_id"])
+    return [{"label": label, "word_ids": ids} for label, ids in anchors.items()]
 
 
 def _ensure_conspect_materialized(store, request):
@@ -715,17 +716,15 @@ def _accept_model_result(store, request_id, result):
     text = "\n\n".join(section["text"] for section in accepted["sections"])
     if "{{q:" in text:
         raise ValueError("служебные маркеры цитат в ответе не допускаются")
-    legend, timed = None, False
-    if model_tasks.version(request["model_task"]) != 1:
-        # Локальные добавления к ответу модели: время начала раздела по словам его evidence
-        # и расшифровка условных меток. В облако они не передаются. Время стоит отдельной
-        # строкой перед текстом раздела и попадает в шаблон, поэтому переживает пересборку.
+    labelled = model_tasks.version(request["model_task"]) != 1
+    if labelled:
+        # Локальные добавления к ответу модели, в облако не передаются. Время начала раздела
+        # (по словам его evidence) стоит отдельной строкой перед текстом раздела и попадает
+        # в шаблон. Расшифровку условных меток строит conspect.render при каждой сборке файла.
         if _task_turns(current["payload"]) != request["model_task"]["turns"]:
             raise storage.Conflict("реплики стенограммы не совпадают с заданием; подготовьте новое задание")
-        legend = _speaker_legend(current["payload"])
         spans = section_time_spans(accepted["sections"], current["payload"])
-        timed = any(span["t1"] is not None for span in spans)
-        text = "\n\n".join(
+        text ="\n\n".join(
             (f"[{_clock(span['t1'])}]\n" if span["t1"] is not None else "") + section["text"]
             for section, span in zip(accepted["sections"], spans))
     data = {**current["payload"], "recording_id": request["recording_id"],
@@ -748,23 +747,15 @@ def _accept_model_result(store, request_id, result):
     binding = recordings.document_binding(store, request["recording_id"])
     json_path, md_path = conspect.path_for(binding["root"] / binding["paths"]["json"], name)
     obj.update(name=name, provenance="model", evidence=accepted["sections"])
-    header = ""
-    if legend is not None:
-        obj["speaker_labels"] = legend
-        lines = [f"- {item['label']} — {item['name']}" if item["name"] else
-                 f"- {item['label']} — имя не указано (в стенограмме: {' '.join(item['speaker'].split())})"
-                 for item in legend]
-        if any(turn["speaker"] == model_tasks.UNKNOWN_SPEAKER for turn in request["model_task"]["turns"]):
-            lines.append(f"- {model_tasks.UNKNOWN_SPEAKER} — реплики, у которых говорящий в стенограмме не указан")
-        if lines:
-            header = ("Участники (условные метки; имена — из стенограммы на момент создания конспекта):\n\n"
-                      + "\n".join(lines) + "\n\n")
-        if timed:
-            header += "Время в квадратных скобках — начало раздела в записи (часы:минуты:секунды).\n\n"
+    if labelled:
+        obj["speaker_labels"] = _speaker_anchors(current["payload"])
     md, _ = conspect.render(obj, data)
     payload = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")
-    md_bytes = ("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
-                + header + md + "\n").encode("utf-8")
+    # С метками говорящих шапку (заголовок, строку об авторстве, расшифровку меток) собирает
+    # conspect.render — она же восстановит её при пересборке. Без меток (задание версии 1) — как раньше.
+    if not labelled:
+        md = "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n" + md
+    md_bytes = (md + "\n").encode("utf-8")
     conspect_id = str(uuid.uuid5(uuid.UUID(request["recording_id"]), "conspect:" + name))
     previous = store.db.execute("SELECT current_revision FROM conspects WHERE conspect_id=?",
                                 (conspect_id,)).fetchone()

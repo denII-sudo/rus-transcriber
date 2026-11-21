@@ -525,10 +525,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("[00:01:15]\nУчастник 1 предложил обсудить план.", md)
         self.assertIn("[01:02:05]\nУчастник 2 и Участник 3 согласились.", md)
         self.assertLess(md.index("Участник 1 — Анна"), md.index("[00:01:15]"))
+        # метка привязана к словам (первое слово каждой её реплики), имён в привязке нет
         self.assertEqual(payload["speaker_labels"], [
-            {"label": "Участник 1", "speaker": "Анна Синтетическая", "name": "Анна Синтетическая"},
-            {"label": "Участник 2", "speaker": "Спикер 2", "name": None},
-            {"label": "Участник 3", "speaker": "Спикер 3", "name": "Борис Синтетический"}])
+            {"label": "Участник 1", "word_ids": [ids[0]]}, {"label": "Участник 2", "word_ids": [ids[2]]},
+            {"label": "Участник 3", "word_ids": [ids[3]]},
+            {"label": "Говорящий не определён", "word_ids": [ids[4]]}])
         self.assertEqual(payload["evidence"], answer["sections"])       # ответ модели сохранён как есть
         self.assertIn("[00:01:15]", payload["template"])                # время переживает пересборку
         self.assertNotIn("Анна", payload["template"])
@@ -541,6 +542,71 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(set(turn) == {"turn", "speaker"} for turn in stored_task["turns"]))
         self.assertEqual(workflow.accept_model_result(self.store, request, answer)["sections"], answer["sections"])
         self.assertEqual(self.conspect_files(recording)[1], md)
+
+    def test_label_legend_survives_rebuild_and_shows_current_names_after_rename(self):
+        import paths
+        import transcript
+        # основной сценарий: свёртка создана сразу после распознавания, говорящие ещё безымянные
+        request, recording = self.ready_request(segments=[
+            self.segment("Спикер 1", ["обсудим", "план."], start=75),
+            self.segment("Спикер 2", ["согласен"], start=80),
+            self.segment("Спикер 1", ["тогда", "начнём"], start=85)])
+        task = workflow.prepare_model_task(self.store, request)
+        ids = [word["word_id"] for word in task["words"]]
+        workflow.accept_model_result(self.store, request, {"source_revision": task["source_revision"], "sections": [
+            {"text": "Участник 1 предложил план, Участник 2 согласился.", "evidence": ids}]})
+        payload, md = self.conspect_files(recording)
+        self.assertIn("- Участник 1 — имя не указано (в стенограмме: Спикер 1)\n", md)
+        self.assertEqual(payload["speaker_labels"][0], {"label": "Участник 1", "word_ids": [ids[0], ids[3]]})
+        binding = recordings.document_binding(self.store, recording)
+        json_path = binding["root"] / binding["paths"]["json"]
+        md_path = binding["root"] / binding["paths"]["md"]
+        with mock.patch.object(paths, "STATE_DB", self.root / "state.sqlite3"):
+            renamed, unknown = transcript.rename(json_path, md_path, {"Спикер 1": "Вера Синтетическая"})
+        self.assertEqual(unknown, [])
+        self.assertNotIn("error", renamed["_conspects"])
+        saved = self.store.list_conspects(recording)[0]
+        self.assertEqual(saved["current_revision"], 2)          # файл пересобран после переименования
+        payload, md = self.conspect_files(recording)
+        self.assertTrue(md.startswith("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"))
+        self.assertIn("- Участник 1 — Вера Синтетическая\n", md)
+        self.assertIn("- Участник 2 — имя не указано (в стенограмме: Спикер 2)\n", md)
+        self.assertNotIn("Спикер 1", md)
+        self.assertIn("[00:01:15]\nУчастник 1 предложил план, Участник 2 согласился.", md)
+        self.assertEqual(payload["speaker_labels"][0], {"label": "Участник 1", "word_ids": [ids[0], ids[3]]})
+        self.assertNotIn("Вера", json.dumps(payload["speaker_labels"], ensure_ascii=False))
+
+    def test_label_legend_follows_words_not_names(self):
+        import conspect
+        words = lambda *idents: [{"word_id": ident, "w": "слово", "s": 1.0} for ident in idents]
+        data = {"recording_id": "r", "source_revision": 2, "speaker_names": {"Спикер 2": "Борис Синтетический"},
+                "segments": [{"speaker": "Анна Синтетическая", "words": words("a1", "a2")},
+                             {"speaker": "Спикер 2", "words": words("b1")},
+                             {"speaker": "Анна Синтетическая", "words": words("a3")},
+                             {"speaker": "Спикер 7", "words": words("c1")},
+                             {"speaker": None, "words": words("d1")}]}
+        obj = {"template": "[00:00:01]\nТекст раздела.", "quotes": {}, "recording_id": "r", "analysis_revision": None,
+               "provenance": "model", "speaker_labels": [
+                   {"label": "Участник 1", "word_ids": ["a1", "b1", "a3"]},     # часть реплик переотнесена
+                   {"label": "Участник 2", "word_ids": ["c1"]},
+                   {"label": "Участник 3", "word_ids": ["удалено"]},
+                   {"label": "Говорящий не определён", "word_ids": ["d1"]}]}
+        md, _ = conspect.render(obj, data, update_last=False)
+        self.assertEqual(md, (
+            "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
+            "Участники (условные метки; имена — по текущей стенограмме):\n\n"
+            "- Участник 1 — Анна Синтетическая; часть реплик в текущей стенограмме: Борис Синтетический\n"
+            "- Участник 2 — имя не указано (в стенограмме: Спикер 7)\n"
+            "- Участник 3 — реплики не найдены в текущей стенограмме\n"
+            "- Говорящий не определён — говорящий в стенограмме не указан\n\n"
+            "Время в квадратных скобках — начало раздела в записи (часы:минуты:секунды).\n\n"
+            "[00:00:01]\nТекст раздела."))
+        # после подтверждения человеком на текущей ревизии строка об отсутствии проверки не пишется
+        confirmed, _ = conspect.render({**obj, "analysis_revision": 2}, data, update_last=False)
+        self.assertTrue(confirmed.startswith("# Конспект\n\nСоздан моделью.\n\n"))
+        # конспект без привязки меток собирается как раньше — без шапки
+        plain = {key: value for key, value in obj.items() if key != "speaker_labels"}
+        self.assertEqual(conspect.render(plain, data, update_last=False)[0], "[00:00:01]\nТекст раздела.")
 
     def test_section_time_spans_is_pure_and_tolerates_missing_words(self):
         transcript = {"segments": [
