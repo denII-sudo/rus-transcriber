@@ -35,6 +35,7 @@ sys.path.insert(0, str(HERE))
 import paths  # noqa: E402,F401
 import tmpfiles  # noqa: E402
 import download_hint  # noqa: E402
+import runinfo  # noqa: E402
 SR = 16000
 
 RNNT, CTC, WHISPER, TORCH = "rnnt", "ctc", "whisper", "torch"
@@ -216,6 +217,132 @@ def npu_note(npu):
     return f"NPU {name}: будет проверен после процессора и видеокарты."
 
 
+def actual_device(result):
+    """На чём вариант посчитался на самом деле — по имени бэкенда, которое сообщил дочерний процесс.
+
+    Запрошенное устройство известно из варианта, но бэкенд умеет тихо откатиться на процессор
+    (make_asr). None — понять не удалось."""
+    name = str(result.get("backend_name") or "").strip()
+    if not name:
+        return None
+    parts = name.split(":")
+    head = parts[0].lower()
+    provs = result.get("providers_actual") or []
+    if head == "openvino":
+        if provs and "OpenVINOExecutionProvider" not in provs:
+            return "CPU"
+        dev = parts[1].upper() if len(parts) > 1 else "GPU"
+        return next((d for d in ("CPU", "GPU", "NPU") if dev.startswith(d)), None)
+    if head == "dml":
+        return "CPU" if provs and "DmlExecutionProvider" not in provs else "GPU"
+    if head == "whisper-ov":
+        dev = parts[1].upper() if len(parts) > 1 else ""
+        return next((d for d in ("CPU", "GPU", "NPU") if dev.startswith(d)), None)
+    if head in ("cpu", "onnx-cpu", "torch", "whisper-ct2"):
+        return "CPU"
+    return None
+
+
+def mark_actual(results):
+    """Дописывает фактическое устройство и признак подмены: запрошено одно — посчитано на другом."""
+    for r in results:
+        if "asr_sec" not in r:
+            continue
+        r["device_actual"] = actual_device(r)
+        r["device_mismatch"] = bool(r["device_actual"] and r["device_actual"] != r.get("device"))
+    return results
+
+
+def mark_lost_chunks(results):
+    """Потерянные куски: у варианта пустых кусков больше, чем у другого варианта той же модели.
+
+    Пустой кусок сам по себе не сбой: пауза или музыка пусты у всех. Сбой — когда на той же
+    нарезке другой вариант семейства текст получил, а этот нет (так GigaAM на видеокарте терял
+    часть речи при высокой скорости). Сравниваются варианты одного семейства с одинаковым
+    числом кусков; PyTorch-эталон — та же модель, что RNN-T."""
+    groups = {}
+    for r in results:
+        if "asr_sec" not in r or r.get("empty_chunks") is None:
+            continue
+        family = RNNT if r.get("family") == TORCH else r.get("family")
+        groups.setdefault((family, r.get("chunks")), []).append(r)
+    for group in groups.values():
+        least = min(r["empty_chunks"] for r in group)
+        for r in group:
+            r["lost_chunks"] = r["empty_chunks"] - least
+    return results
+
+
+def unfit_reason(result):
+    """Почему отработавший вариант нельзя выбирать: его числа не относятся к тому, что он обещает.
+
+    device_mismatch — посчитан не на запрошенном устройстве (тихий откат на процессор): скорость
+    не принадлежит варианту, а в config.json записалось бы устройство, которое не работает.
+    lost_chunks — потерял речь, которую другой вариант той же модели распознал."""
+    if result.get("device_mismatch"):
+        return "device_mismatch"
+    if (result.get("lost_chunks") or 0) > 0:
+        return "lost_chunks"
+    return None
+
+
+def unfit_note(result):
+    """Пояснение для отчёта к варианту, который не выбирается; пусто, если вариант годен."""
+    reason = unfit_reason(result)
+    if reason == "device_mismatch":
+        return f"посчитан на {result.get('device_actual')} вместо {result.get('device')} — не выбирается"
+    if reason == "lost_chunks":
+        return (f"потеряно кусков: {result.get('lost_chunks')} из {result.get('chunks')} "
+                "(текст пуст там, где у другого варианта он есть) — не выбирается")
+    return ""
+
+
+def conditions_lines(record):
+    """Блок отчёта «Условия прогона»: что записано в файл прогона и чем прогон отличается от образцового."""
+    cond = (record.get("conditions") or {}).get("start") or {}
+    env = record.get("environment") or {}
+    hw = (record.get("testbed") or {}).get("hardware") or {}
+    code = env.get("code") or {}
+    power = {"ac": "от сети", "battery": "от батареи"}.get(cond.get("power_source"), "не определено")
+    if cond.get("battery_percent") is not None and cond.get("power_source") == "battery":
+        power += f", заряд {cond['battery_percent']}%"
+    scheme = (cond.get("power") or {}).get("scheme") or "не определена"
+    load = cond.get("cpu_load_percent")
+    free = (cond.get("memory") or {}).get("free_mb")
+    others = cond.get("other_heavy_jobs")
+    key = (env.get("packages") or {}).get("key") or {}
+    pk = ", ".join(f"{n} {key[n]}" for n in ("onnxruntime-openvino", "onnxruntime-directml", "onnxruntime",
+                                             "openvino", "onnx-asr", "faster-whisper", "torch") if n in key)
+    rev = (code.get("git_revision") or "")[:10] or code.get("files_sha256") or "—"
+    lines = ["", "## Условия прогона",
+             f"- Питание: {power}; схема питания: {scheme}.",
+             "- Загрузка процессора перед стартом: " + (f"{load:g}%" if load is not None else "не измерена")
+             + "; свободно памяти: " + (f"{free} МБ" if free is not None else "не измерено")
+             + "; других тяжёлых задач: " + (str(others) if others is not None else "не определено") + ".",
+             f"- Процессор: {(hw.get('cpu') or {}).get('model') or 'не определён'}.",
+             f"- Программа {env.get('program_version') or '—'}, код {rev}"
+             + (" (есть незакоммиченные изменения)" if code.get("git_dirty") else "")
+             + "; " + (pk or "пакеты не определены") + ".",
+             f"- Методика {record.get('method_version')}; звук {(record.get('audio') or {}).get('unit_id') or '—'} "
+             "(начало контрольной суммы отрывка); повтор один, разброс не измерялся."]
+    reasons = (record.get("preflight") or {}).get("reasons") or []
+    if reasons:
+        lines.append("- **Прогон с оговорками** — с другими прогонами сравнивать осторожно:")
+        lines += [f"  - {runinfo.REASONS_RU.get(x, x)}" for x in reasons]
+    for r in record.get("results") or []:
+        if r.get("device_mismatch"):
+            lines.append(f"- **Подмена устройства:** «{r.get('label')}» запрошен на {r.get('device')}, посчитан на "
+                         f"{r.get('device_actual')} — его скорость не относится к {r.get('device')}, "
+                         "вариант не выбирается.")
+        elif (r.get("lost_chunks") or 0) > 0:
+            lines.append(f"- **Потеря речи:** «{r.get('label')}» вернул пустой текст для {r.get('lost_chunks')} "
+                         f"из {r.get('chunks')} кусков, которые другой вариант той же модели распознал, — "
+                         "вариант не выбирается.")
+    if record.get("run_file"):
+        lines.append(f"- Файл прогона: `{record['run_file']}` (в нём нет имени и пути записи).")
+    return lines
+
+
 def norm(t):
     return re.sub(r"[^\w ]+", "", t.lower().replace("ё", "е")).split()
 
@@ -267,7 +394,7 @@ def choice_summary(results, family, threshold):
     """Три ориентира для человека: точнее всего, быстрее всего в пределах порога, самое быстрое вообще."""
     usable = [r for r in results
               if r.get("family") == family and r.get("rtfx") and r.get("text", "").strip()
-              and not r.get("experimental")]
+              and not r.get("experimental") and not unfit_reason(r)]
     if not usable:
         return {"accurate": None, "fast_ok": None, "fastest": None}
     accurate = max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"]))
@@ -292,6 +419,9 @@ def run_one(variant, npy, model, chunk_max):
     if not pieces:
         raise RuntimeError("не удалось нарезать запись на куски")
     model = variant.get("asr_model", model)
+    from backends import actual_providers
+    cache0 = runinfo.cache_counts(paths.CACHE)       # до загрузки: по разнице видно компиляцию и скачивание
+    fallbacks = []
     t0 = time.time()
     if variant["asr_backend"] == "torch":
         asr = TorchASR(model)
@@ -302,16 +432,16 @@ def run_one(variant, npy, model, chunk_max):
                             language="ru", batch=4)
         elif variant["asr_backend"] == "dml":
             # Whisper через общий OnnxASR с провайдером DirectML (для машин без OpenVINO GPU)
-            asr, _ = make_asr({"asr_model": third, "asr_backend": "dml", "asr_device": "GPU",
-                               "asr_quant": variant.get("asr_quant", "int8"),
-                               "asr_quant_cpu": variant.get("asr_quant", "int8"),
-                               "asr_language": "ru", "asr_batch": 4})
+            asr, fallbacks = make_asr({"asr_model": third, "asr_backend": "dml", "asr_device": "GPU",
+                                       "asr_quant": variant.get("asr_quant", "int8"),
+                                       "asr_quant_cpu": variant.get("asr_quant", "int8"),
+                                       "asr_language": "ru", "asr_batch": 4})
         elif variant["asr_backend"] == "whisper-ct2":
             asr = WhisperCT2()
         else:
-            asr, _ = make_asr({"asr_model": third, "asr_backend": "onnx-cpu", "asr_device": "CPU",
-                               "asr_quant_cpu": variant.get("asr_third_quant_cpu", "int8"),
-                               "asr_language": "ru", "asr_batch": 4})
+            asr, fallbacks = make_asr({"asr_model": third, "asr_backend": "onnx-cpu", "asr_device": "CPU",
+                                       "asr_quant_cpu": variant.get("asr_third_quant_cpu", "int8"),
+                                       "asr_language": "ru", "asr_batch": 4})
     else:
         prov = {"onnx-cpu": "cpu"}.get(variant["asr_backend"], variant["asr_backend"])
         asr = OnnxASR(model, device=variant.get("asr_device", "CPU"), provider=prov,
@@ -326,23 +456,35 @@ def run_one(variant, npy, model, chunk_max):
         asr.transcribe(pieces[0])
     t_first = time.time() - t_first
     load = time.time() - t0
+    cache1 = runinfo.cache_counts(paths.CACHE)       # вне замеряемых интервалов
     t1 = time.time()
     if family == WHISPER:
         texts = asr.transcribe_texts(pieces)
     else:
         texts = asr.transcribe_many(pieces)
     work = time.time() - t1
+    # что получилось фактически: имя бэкенда после прогона (пакет мог откатиться на поштучное),
+    # провайдеры сессии, откаты make_asr — по ним видно, что «GPU» на самом деле посчитан на процессоре
+    fact = {"backend_name": getattr(asr, "name", None),
+            "providers_actual": actual_providers(getattr(asr, "model", None)) or None,
+            "compile_sec": getattr(asr, "compile_sec", None),
+            "fallbacks": [str(x)[:200] for x in fallbacks] or None,
+            "empty_chunks": sum(1 for t in texts if not str(t).strip()),
+            "peak_memory_mb": runinfo.peak_memory_mb(),
+            **runinfo.cache_delta(cache0, cache1)}
     print("@@RESULT@@" + json.dumps({"load_sec": round(load, 1), "first_chunk_sec": round(t_first, 1),
                                      "asr_sec": round(work, 3), "chunks": len(pieces),
-                                     "family": family, "device": device_of(variant),
+                                     "family": family, "device": device_of(variant), **fact,
                                      "text": " ".join(texts)}, ensure_ascii=False))
 
 
 def best_of(results, family, min_similarity=0.97):
-    """Самый быстрый вариант семейства в пределах порога; эксперименты не выбираются никогда."""
+    """Самый быстрый вариант семейства в пределах порога; эксперименты не выбираются никогда,
+    как и варианты с подменой устройства или потерянными кусками (unfit_reason)."""
     ok = [r for r in results
           if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
-          and r.get("similarity", 1) >= min_similarity and not r.get("experimental")]
+          and r.get("similarity", 1) >= min_similarity and not r.get("experimental")
+          and not unfit_reason(r)]
     return max(ok, key=lambda r: r["rtfx"]) if ok else None
 
 
@@ -351,11 +493,12 @@ def most_accurate(results, family):
 
     Для Whisper порог точности GigaAM не применяется: движок другой, поэтому даже исправный
     текст редко совпадает с RNN-T на 97%. Выбирается наибольшее совпадение, а зацикленный
-    или потерявший речь вариант проигрывает по этому же совпадению.
+    или потерявший речь вариант проигрывает по этому же совпадению. Вариант с подменой
+    устройства или потерянными кусками не выбирается вовсе (unfit_reason).
     """
     usable = [r for r in results
               if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()
-              and not r.get("experimental")]
+              and not r.get("experimental") and not unfit_reason(r)]
     return max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"])) if usable else None
 
 
@@ -383,6 +526,8 @@ def family_refs(results):
     refs = {}
     for fam in (RNNT, CTC, WHISPER, ML):
         cands = [r for r in results if r.get("family") == fam and r.get("text", "").strip()]
+        # вариант с подменой устройства или потерянными кусками — плохой эталон, если есть годный
+        cands = [r for r in cands if not unfit_reason(r)] or cands
         # эталон семейства — обычный вариант (fp32), а не эксперимент: иначе int8 сверялся бы сам с собой
         plain = [r for r in cands if not r.get("experimental")] or cands
         cpu = [r for r in plain if str(r.get("device", "")).upper() == "CPU"]
@@ -490,15 +635,37 @@ def main():
     cfg = load_config()
     wait_slot(st, cfg, a.status)
     threshold = threshold_from(cfg, a.min_similarity)
+    # Паспорт прогона (runinfo.py): всё, что нужно, чтобы потом сопоставить этот прогон с другими.
+    # Имени и пути записи в нём нет — только контрольные суммы; путь знает локальный указатель units.json.
+    t_run = time.time()
+    record = {"schema_version": runinfo.SCHEMA_VERSION, "method_version": runinfo.METHOD_VERSION,
+              "kind": "bench", "run_id": runinfo.new_run_id(), "job_id": Path(a.status).stem if a.status else None,
+              "started_utc": runinfo.utc_now(), "status": "running",
+              "params": {"seconds": a.seconds, "chunk_max": a.chunk_max, "only": a.only, "timeout": a.timeout,
+                         "model": a.model, "no_write": a.no_write, "no_whisper": a.no_whisper,
+                         "no_npu": a.no_npu, "min_similarity_cli": a.min_similarity, "threshold": threshold,
+                         "repeats": 1}}
     try:
+        slot_limit = cfg.get("max_heavy_jobs", 2)
+        cond_start = runinfo.conditions(paths.JOBS, slot_limit, own_slots=1)   # до всякой своей нагрузки
+        record["conditions"] = {"start": cond_start, "end": None}
         providers = available_providers()
         npu = npu_info()
         if a.no_npu:
             npu = {**npu, "fp32": False, "reason": "проверка NPU отключена ключом --no-npu"}
         st.set(stage="подготовка теста", progress=1, openvino_devices=openvino_devices(),
                onnx_providers=providers, npu=npu)
-        audio = load_audio(Path(a.audio).expanduser())[: a.seconds * SR]
+        src = Path(a.audio).expanduser()
+        full = load_audio(src)
+        audio = full[: a.seconds * SR]
         dur = len(audio) / SR
+        pcm = np.clip(np.rint(audio * 32767.0), -32768, 32767).astype("<i2").tobytes()
+        identity = runinfo.audio_identity(src, pcm, SR, source_samples=len(full))
+        record.update(audio=identity,
+                      testbed={"testbed_id": runinfo.testbed_id(paths.BENCH), "hardware": runinfo.hardware()},
+                      environment={**runinfo.environment(HERE), "onnx_providers": providers,
+                                   "openvino_devices": openvino_devices(), "npu": npu},
+                      models=runinfo.models_cache(paths.CACHE))
         tmp = tmpfiles.scratch("bench_")
         npy = tmp / "audio.npy"
         np.save(npy, audio)
@@ -522,6 +689,8 @@ def main():
             r = {"id": v["id"], "label": v["label"], "family": v["family"], "device": device_of(v)}
             if v.get("experimental"):
                 r["experimental"] = True
+            r["started_utc"] = runinfo.utc_now()
+            t_var = time.time()
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                    errors="replace", timeout=a.timeout, cwd=str(HERE))
@@ -536,8 +705,14 @@ def main():
                         r["cert_error"] = True
             except subprocess.TimeoutExpired:
                 r["error"] = [f"дольше {a.timeout} с (скорее всего, долгая компиляция модели)"]
+            r["wall_sec"] = round(time.time() - t_var, 1)
             results.append(r)
 
+        mark_actual(results)
+        mark_lost_chunks(results)
+        for r in results:
+            if "asr_sec" in r:
+                r["unfit"] = unfit_reason(r)       # в файл прогона: почему вариант не участвовал в выборе
         refs = family_refs(results)
         whisper_only = (any(r.get("family") == WHISPER for r in results)
                         and not any(r.get("family") == RNNT for r in results))
@@ -545,6 +720,7 @@ def main():
             if "text" not in r:
                 continue
             ref = refs.get(r.get("family"))
+            r["reference_variant"] = ref["id"] if ref is not None else None
             r["similarity"] = 1.0 if ref is None or ref is r \
                 else round(similarity(ref["text"], r["text"]), 3)
             stats = word_stats(ref["text"], r["text"]) if ref is not None else \
@@ -605,6 +781,8 @@ def main():
             if r.get("family") not in (WHISPER, ML) and r.get("similarity", 1) < threshold:
                 # порог — про точность GigaAM v3; у Whisper и Multilingual шкала другая
                 mark = f"ниже порога {threshold * 100:.0f}%"
+            if unfit_reason(r):
+                mark = unfit_note(r)               # числа варианта не относятся к тому, что он обещает
             if r.get("experimental"):
                 mark = (mark + "; " if mark else "") + "эксперимент, не сохраняется"
             lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
@@ -690,21 +868,51 @@ def main():
                 lines.append(f"- {title}, самое быстрое вообще: {describe(ch['fastest'])} — ниже порога, "
                              f"для работы, где важна точность, не подходит")
 
-        # тексты всех вариантов — чтобы глазами сравнить, где именно они расходятся
         paths.BENCH.mkdir(parents=True, exist_ok=True)
-        (paths.BENCH / "bench_texts.json").write_text(json.dumps(
-            {r["id"]: r.get("text", "") for r in results}, ensure_ascii=False, indent=2), encoding="utf-8")
-        report = paths.BENCH / "bench_report.md"
-        report.write_text("\n".join(lines), encoding="utf-8")
+        texts = {r["id"]: r.get("text", "") for r in results}
         for r in results:
             r.pop("text", None)
+        # Файл прогона — история: он не перезаписывается, в отличие от bench_report.md и bench_texts.json,
+        # которые по-прежнему хранят только последний прогон.
+        cond_end = runinfo.conditions(paths.JOBS, slot_limit, own_slots=1, load_interval=0.0)
+        record["conditions"]["end"] = cond_end
+        record.update(status="done", finished_utc=runinfo.utc_now(), duration_sec=round(time.time() - t_run, 1),
+                      variants=variants, results=results,
+                      reference_variants={fam: ref["id"] for fam, ref in refs.items() if ref},
+                      choice={"main": best_main["id"] if best_main else None,
+                              "ctc": best_ctc["id"] if best_ctc else None,
+                              "whisper": best_whisper["id"] if best_whisper else None},
+                      saved=saved or None, config_written=bool(saved and not a.no_write),
+                      preflight=runinfo.preflight(cond_start, cond_end,
+                                                  downloaded=any(r.get("model_downloaded") for r in results)))
+        run_path = None
+        try:
+            run_path = runinfo.write_run(paths.BENCH, record, texts)
+            runinfo.update_units_index(paths.BENCH, identity, src, run_path.stem)
+        except OSError as ex:
+            print(f"[bench] файл прогона не записан: {type(ex).__name__}", file=sys.stderr, flush=True)
+        lines += conditions_lines({**record, "run_file": f"runs\\{run_path.name}" if run_path else None})
+
+        # тексты всех вариантов — чтобы глазами сравнить, где именно они расходятся
+        (paths.BENCH / "bench_texts.json").write_text(json.dumps(texts, ensure_ascii=False, indent=2),
+                                                      encoding="utf-8")
+        report = paths.BENCH / "bench_report.md"
+        report.write_text("\n".join(lines), encoding="utf-8")
         st.set(state="done", stage="готово", progress=100, report=str(report),
-               best=best_main["id"] if best_main else None, results=results, saved=saved or None)
+               best=best_main["id"] if best_main else None, results=results, saved=saved or None,
+               run_id=run_path.stem if run_path else None, run_file=str(run_path) if run_path else None,
+               preflight=record["preflight"])
         print("\n".join(lines))
     except Exception as ex:
         import traceback
         st.set(state="error", stage="ошибка", error=f"{type(ex).__name__}: {ex}",
                trace=traceback.format_exc()[-3000:])
+        try:        # неудачный прогон тоже записывается; текст ошибки — в задаче, сюда только её вид
+            record.update(status="error", error_type=type(ex).__name__, finished_utc=runinfo.utc_now(),
+                          duration_sec=round(time.time() - t_run, 1))
+            runinfo.write_run(paths.BENCH, record)
+        except Exception:
+            pass
         sys.exit(1)
 
 
