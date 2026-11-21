@@ -29,8 +29,9 @@ import lab_summary  # noqa: E402
 
 DEFAULT_EXPERIMENT = HERE / "experiments" / "models-arbitration.json"
 # что искать в кэше моделей для предупреждения в --dry-run (только имена папок, без загрузки)
-MODEL_HINTS = {"v3_e2e_rnnt": "gigaam-v3-e2e-rnnt", "v3_e2e_ctc": "gigaam-v3-e2e-ctc",
-               "v3_rnnt": "gigaam-v3-rnnt", "v3_ctc": "gigaam-v3-ctc",
+# Все варианты GigaAM v3 для ONNX лежат в одном хранилище моделей (gigaam-v3-onnx).
+MODEL_HINTS = {"v3_e2e_rnnt": "gigaam-v3-onnx", "v3_e2e_ctc": "gigaam-v3-onnx",
+               "v3_rnnt": "gigaam-v3-onnx", "v3_ctc": "gigaam-v3-onnx",
                "multilingual_ctc": "gigaam-multilingual-ctc",
                "multilingual_large_ctc": "gigaam-multilingual-large-ctc",
                "whisper-ct2": "faster-whisper-large-v3-turbo",
