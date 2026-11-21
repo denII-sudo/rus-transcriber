@@ -266,6 +266,9 @@ LOST_WORDS_FACTOR = 3
 LOST_WORDS_MIN_REF = 10
 # Правило слов — только для моделей GigaAM: Whisper при зацикливании повторяет фразы, и раздутый
 # повторами кусок сделал бы «потерявшим речь» исправный вариант. Для Whisper — правило пустых кусков.
+# Multilingual (кандидат в третью модель) остаётся под правилом слов: его слова считаются после той же
+# чистки, что в расшифровке (chunk_word_count), — она лишь сокращает повторы, так что вариант,
+# потерявший речь, по-прежнему беднее опоры, а зациклившийся сосед не раздувает опору.
 WORD_RULE_FAMILIES = (RNNT, CTC, ML)
 # Пустой кусок — потеря, если у другого варианта той же группы в этом куске не меньше стольких
 # слов. Сравнение покусочное: прежний подсчёт по количеству не видел, что A пуст в куске 1, а B —
@@ -284,17 +287,37 @@ LOST_EMPTY_MIN_REF = 5
 LOST_EMPTY_MIN_REF_WHISPER = 10
 
 
-def chunk_word_count(text, family=None):
+def third_max_repeat(cfg):
+    """Сколько повторов подряд оставляет чистка текста третьей модели — как в расшифровке
+    (worker.run_words: настройка asr_third_max_repeat, умолчание 3; 0 — без ограничения)."""
+    try:
+        return int((cfg or {}).get("asr_third_max_repeat", 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+# Семейства, чей текст в тесте оценивается как текст третьей модели: расшифровка чистит
+# words.clean_whisper текст любой третьей модели (worker.run_words), не только Whisper.
+THIRD_FAMILIES = (WHISPER, ML)
+
+
+def clean_third(text, max_repeat=3):
+    """Текст третьей модели после той же чистки, что в расшифровке."""
+    return W.clean_whisper("" if text is None else str(text), max_repeat)[0]
+
+
+def chunk_word_count(text, family=None, max_repeat=3):
     """Сколько слов куска попало бы в стенограмму или в голосование конвейера; 0 — кусок пуст.
 
     Правило рабочего конвейера (words.py): слово — то, что содержит букву или цифру
     (words.result_words по WORD_RE приклеивает «—», «…», «.» к соседнему слову, а не делает словом;
     сравнение кусков и голосование идут по words.norm_word). Поэтому кусок из одной пунктуации
-    пуст. Текст Whisper конвейер сначала чистит words.clean_whisper (worker.run_words): ложные
-    фразы на тишине удаляются, зацикленные повторы сокращаются; здесь — то же самое."""
+    пуст. Текст третьей модели (Whisper и кандидат Multilingual, THIRD_FAMILIES) конвейер сначала
+    чистит words.clean_whisper с max_repeat из настройки asr_third_max_repeat (worker.run_words):
+    ложные фразы на тишине удаляются, зацикленные повторы сокращаются; здесь — то же самое."""
     text = "" if text is None else str(text)
-    if family == WHISPER:
-        text = W.clean_whisper(text)[0]
+    if family in THIRD_FAMILIES:
+        text = clean_third(text, max_repeat)
     return sum(1 for tok in text.split() if W.norm_word(tok))
 
 
@@ -543,8 +566,9 @@ def choice_summary(results, family, threshold):
 
 
 
-def run_one(variant, npy, model, chunk_max):
-    """Выполняется в дочернем процессе: грузит бэкенд, распознаёт куски, печатает JSON."""
+def run_one(variant, npy, model, chunk_max, max_repeat=3):
+    """Выполняется в дочернем процессе: грузит бэкенд, распознаёт куски, печатает JSON.
+    max_repeat — asr_third_max_repeat родительского процесса (для подсчёта слов третьей модели)."""
     from backends import OnnxASR, TorchASR, WhisperCT2, WhisperOV, make_asr
     from worker import split_at_pauses
     audio = np.load(npy)
@@ -601,7 +625,7 @@ def run_one(variant, npy, model, chunk_max):
     else:
         texts = asr.transcribe_many(pieces)
     work = time.time() - t1
-    chunk_words = [chunk_word_count(t, family) for t in texts]   # вне замеряемого интервала
+    chunk_words = [chunk_word_count(t, family, max_repeat) for t in texts]   # вне замеряемого интервала
     # что получилось фактически: имя бэкенда после прогона (пакет мог откатиться на поштучное),
     # провайдеры сессии, откаты make_asr — по ним видно, что «GPU» на самом деле посчитан на процессоре
     fact = {"backend_name": getattr(asr, "name", None),
@@ -693,9 +717,12 @@ def tiebreak_stats(main_text, ctc_text, third_text):
     """
     import copy
     import words as W
-    main = [{"w": w, "s": 0.0, "e": 0.0} for w in (main_text or "").split()]
-    ctc = [{"w": w, "s": 0.0, "e": 0.0} for w in (ctc_text or "").split()]
-    third = (third_text or "").split()
+
+    def toks(text):          # как в расшифровке: токен из одних знаков («—») — не слово
+        return [t for t in (text or "").split() if W.norm_word(t)]
+    main = [{"w": w, "s": 0.0, "e": 0.0} for w in toks(main_text)]
+    ctc = [{"w": w, "s": 0.0, "e": 0.0} for w in toks(ctc_text)]
+    third = toks(third_text)
     a = [W.norm_word(w["w"]) for w in main]
     ag_ctc, _ = W._ops(a, [W.norm_word(w["w"]) for w in ctc])
     ag_third, _ = W._ops(a, [W.norm_word(w) for w in third])
@@ -756,6 +783,7 @@ def main():
     ap.add_argument("--status", default="")
     ap.add_argument("--one", default="", help=argparse.SUPPRESS)
     ap.add_argument("--npy", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--max-repeat", type=int, default=3, help=argparse.SUPPRESS)
     ap.add_argument("--model", default="v3_e2e_rnnt")
     ap.add_argument("--chunk-max", type=float, default=20.0,
                     help="макс. длина фрагмента, с (как в рабочем конвейере: 12–20 с)")
@@ -765,7 +793,7 @@ def main():
     a = ap.parse_args()
 
     if a.one:
-        run_one(json.loads(a.one), a.npy, a.model, a.chunk_max)
+        run_one(json.loads(a.one), a.npy, a.model, a.chunk_max, a.max_repeat)
         return
 
     from worker import Status, load_audio, load_config, wait_slot
@@ -776,6 +804,7 @@ def main():
     cfg = load_config()
     wait_slot(st, cfg, a.status)
     threshold = threshold_from(cfg, a.min_similarity)
+    max_repeat = third_max_repeat(cfg)      # чистка текста третьей модели — как в расшифровке
     # Паспорт прогона (runinfo.py): всё, что нужно, чтобы потом сопоставить этот прогон с другими.
     # Имени и пути записи в нём нет — только контрольные суммы; путь знает локальный указатель units.json.
     t_run = time.time()
@@ -785,7 +814,7 @@ def main():
               "params": {"seconds": a.seconds, "chunk_max": a.chunk_max, "only": a.only, "timeout": a.timeout,
                          "model": a.model, "no_write": a.no_write, "no_whisper": a.no_whisper,
                          "no_npu": a.no_npu, "min_similarity_cli": a.min_similarity, "threshold": threshold,
-                         "repeats": 1}}
+                         "third_max_repeat": max_repeat, "repeats": 1}}
     try:
         slot_limit = cfg.get("max_heavy_jobs", 2)
         cond_start = runinfo.conditions(paths.JOBS, slot_limit, own_slots=1)   # до всякой своей нагрузки
@@ -826,7 +855,7 @@ def main():
             st.set(stage=f"тест: {v['label']}", progress=int(100 * n / len(variants)))
             cmd = [sys.executable, str(Path(__file__).resolve()), "--one",
                    json.dumps(v, ensure_ascii=False), "--npy", str(npy), "--model", a.model,
-                   "--chunk-max", str(a.chunk_max)]
+                   "--chunk-max", str(a.chunk_max), "--max-repeat", str(max_repeat)]
             r = {"id": v["id"], "label": v["label"], "family": v["family"], "device": device_of(v)}
             if v.get("experimental"):
                 r["experimental"] = True
@@ -873,9 +902,10 @@ def main():
         if vote_ok:
             import words as W
             for r in results:
-                if r.get("family") in (WHISPER, ML) and r.get("text", "").strip():
-                    third = W.clean_whisper(r["text"])[0] if r["family"] == WHISPER else r["text"]
-                    r["vote"] = tiebreak_stats(refs[RNNT]["text"], refs[CTC]["text"], third)
+                if r.get("family") in THIRD_FAMILIES and r.get("text", "").strip():
+                    # расшифровка чистит текст любой третьей модели, с её же max_repeat
+                    r["vote"] = tiebreak_stats(refs[RNNT]["text"], refs[CTC]["text"],
+                                               clean_third(r["text"], max_repeat))
 
         main_family = CTC if "ctc" in str(a.model).lower() else RNNT
         best_main = best_of(results, main_family, threshold)

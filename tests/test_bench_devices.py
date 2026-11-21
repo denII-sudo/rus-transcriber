@@ -429,6 +429,11 @@ class TiebreakTests(unittest.TestCase):
         vt = bench.tiebreak_stats("", "", "")
         self.assertEqual(vt["contested"], 0)
 
+    def test_punctuation_tokens_are_not_words(self):
+        # «—» отдельным токеном текста — не слово, как в расшифровке (words.result_words, worker.run_words)
+        vt = bench.tiebreak_stats("— мы пошли гулять", "мы — пошли гулять", "мы пошли — гулять —")
+        self.assertEqual(vt, {"contested": 0, "for_rnnt": 0, "for_ctc": 0, "unresolved": 0, "inserted": 0})
+
 
 class ActualDeviceTests(unittest.TestCase):
     """Паспорт прогона: на чём вариант посчитался на самом деле (21.11.2026).
@@ -748,6 +753,39 @@ class ChunkWordCountTests(unittest.TestCase):
         self.assertEqual(bench.chunk_word_count(text, "whisper"), 5)
         self.assertEqual(bench.chunk_word_count(text), 9)          # у GigaAM фильтра Whisper нет
 
+    def test_third_model_cleaning_follows_settings_and_covers_multilingual(self):
+        loop = "да " * 8 + "конец"
+        self.assertEqual(bench.third_max_repeat({}), 3)
+        self.assertEqual(bench.third_max_repeat({"asr_third_max_repeat": 1}), 1)
+        self.assertEqual(bench.third_max_repeat({"asr_third_max_repeat": "x"}), 3)
+        self.assertEqual(bench.chunk_word_count(loop, "whisper"), 4)
+        self.assertEqual(bench.chunk_word_count(loop, "whisper", 1), 2)
+        self.assertEqual(bench.chunk_word_count(loop, "whisper", 0), 9)       # 0 — без ограничения
+        # Multilingual — кандидат в третью модель: тот же фильтр, что в расшифровке
+        self.assertEqual(bench.chunk_word_count(loop, "multilingual", 2), 3)
+        self.assertEqual(bench.chunk_word_count("Продолжение следует...", "multilingual"), 0)
+        for family in ("rnnt", "ctc", "torch"):                 # основной и второй проход не чистятся
+            self.assertEqual(bench.chunk_word_count(loop, family, 1), 9)
+
+    def test_multilingual_variant_that_lost_speech_is_still_unfit(self):
+        # чистка лишь сокращает повторы: потерявший речь Multilingual по-прежнему исключается,
+        # а сосед, зациклившийся в куске, не делает «потерявшим» исправный вариант
+        speech = " ".join(f"слово{i}" for i in range(30))
+        loop = "и " * 40
+        def r(id_, texts):
+            words = [bench.chunk_word_count(t, "multilingual") for t in texts]
+            return {"id": id_, "family": "multilingual", "device": "CPU", "asr_sec": 1.0, "chunks": len(texts),
+                    "empty_chunks": words.count(0), "chunk_words": words}
+        full = r("ml-cpu", [speech, speech, "слово " + speech[:40]])
+        lost = r("ml-large-gpu", ["слово", "", speech[:40]])
+        bench.mark_lost_chunks([full, lost])
+        self.assertEqual((full["lost_chunks"], lost["lost_chunks"]), (0, 2))
+        self.assertEqual(bench.unfit_reason(lost), "lost_chunks")
+        looped = r("ml-cpu-int8", [speech, loop, speech])
+        fine = r("ml-cpu", [speech, " ".join(f"слово{i}" for i in range(12)), speech])
+        bench.mark_lost_chunks([looped, fine])
+        self.assertEqual(fine["lost_chunks"], 0)
+
     def test_run_one_reports_one_definition_of_empty(self):
         import contextlib
         import io
@@ -786,10 +824,14 @@ class ChunkWordCountTests(unittest.TestCase):
                           "v3_e2e_rnnt", 20.0)
             bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
                           "v3_e2e_rnnt", 20.0)
+            # max_repeat родителя (asr_third_max_repeat) доходит до подсчёта слов кусков
+            FakeWhisper.transcribe_texts = lambda self, pieces: ["да " * 6, "слово"][:len(pieces)]
+            bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
+                          "v3_e2e_rnnt", 20.0, 2)
         got = [json.loads(line[len("@@RESULT@@"):]) for line in out.getvalue().splitlines()
                if line.startswith("@@RESULT@@")]
         self.assertEqual([(r["chunks"], r["chunk_words"], r["empty_chunks"]) for r in got],
-                         [(3, [0, 0, 3], 2), (2, [0, 40], 1)])
+                         [(3, [0, 0, 3], 2), (2, [0, 40], 1), (2, [2, 1], 0)])
 
 
 class ConditionsReportTests(unittest.TestCase):
@@ -859,6 +901,7 @@ class RunFileFromMainTests(unittest.TestCase):
         def child(cmd, **kw):
             if "--one" not in cmd:
                 return self.real_run(cmd, **kw)
+            self.cmds.append(cmd)
             v = json.loads(cmd[cmd.index("--one") + 1])
             res = {"load_sec": 1.0, "first_chunk_sec": 0.2, "asr_sec": 2.0 if v["family"] == "rnnt" else 1.0,
                    "chunks": 3, "family": v["family"], "device": v["device"], "backend_name": "cpu",
@@ -870,6 +913,7 @@ class RunFileFromMainTests(unittest.TestCase):
 
         self.real_run = bench.subprocess.run
         self.overrides = {}            # id варианта -> что его «процесс» сообщит иначе
+        self.cmds = []                 # команды дочерних процессов
         self.load_audio = mock.Mock(return_value=self.samples)
         patches = [mock.patch.object(bench.subprocess, "run", side_effect=child),
                    mock.patch.object(worker, "load_audio", self.load_audio),
@@ -895,6 +939,22 @@ class RunFileFromMainTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), self.redirect(out):
             bench.main()
         return json.loads(status.read_text(encoding="utf-8")), out.getvalue()
+
+    def test_third_model_text_is_cleaned_with_the_configured_max_repeat(self):
+        # как в расшифровке (worker.run_words): asr_third_max_repeat из настроек, и чистится текст
+        # любой третьей модели — не только Whisper, но и кандидата Multilingual
+        from unittest import mock
+        import settings
+        import worker
+        self.overrides["ml-cpu"] = {"text": "да да да раз два три четыре"}
+        cfg = {**settings.DEFAULTS, "asr_third_max_repeat": 1}
+        with mock.patch.object(worker, "load_config", lambda: cfg),                 mock.patch.object(bench, "tiebreak_stats", wraps=bench.tiebreak_stats) as tb:
+            st, _ = self.run_main("20260101-000200-b00003", only="onnx-cpu,ctc-cpu,ml-cpu")
+        self.assertEqual(tb.call_args.args[2], "да раз два три четыре")
+        for cmd in self.cmds:          # подсчёт слов кусков в дочернем процессе — с тем же числом
+            self.assertEqual(cmd[cmd.index("--max-repeat") + 1], "1")
+        rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(rec["params"]["third_max_repeat"], 1)
 
     def test_every_run_leaves_its_own_file(self):
         import runinfo
