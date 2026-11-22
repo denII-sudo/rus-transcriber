@@ -57,6 +57,19 @@ try {
   await hooks["tool-execute.before"]({ sessionID: "ses_native", tool: "shell" })
   await strategy.remove({ directory: native, force: false })
   assert.deepEqual(await strategy.list(repo), [])
+  // An explicit bare "main" must not select the possibly lagging local branch.
+  const explicit = path.join(repo, ".opencode", "worktrees", "explicit-main")
+  await strategy.create({ sourceDirectory: repo, directory: explicit, branch: "main" })
+  assert.equal(execFileSync("git", ["-C", explicit, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  await strategy.remove({ directory: explicit, force: false })
+  // A pre-existing detached copy is not adopted; the refusal names the cause.
+  const detached = path.join(repo, ".opencode", "worktrees", "detached-child")
+  execFileSync("git", ["-C", repo, "worktree", "add", "--detach", detached, base])
+  directory = detached
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_detached", tool: "shell" }),
+    /detached HEAD/)
+  assert.equal(execFileSync("git", ["-C", detached, "branch", "--show-current"], { encoding: "utf8" }).trim(), "")
+  execFileSync("git", ["-C", repo, "worktree", "remove", detached])
   execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(repo, "missing-remote")])
   const offline = path.join(repo, ".opencode", "worktrees", "offline-child")
   await strategy.create({ sourceDirectory: repo, directory: offline })

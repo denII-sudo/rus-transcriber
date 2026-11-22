@@ -39,7 +39,8 @@ export default {
             fresh = false
             console.warn("Workspace: fetch failed; using the last fetched origin/main.")
           }
-          const ref = input.branch || "origin/main"
+          // A bare "main" means the integration branch; the local one may lag behind.
+          const ref = !input.branch || input.branch === "main" ? "origin/main" : input.branch
           if (ref.startsWith("-")) throw new Error("Invalid workspace starting ref.")
           const base = (await exec("git", ["-C", repo.root, "rev-parse", "--verify", `${ref}^{commit}`],
             { windowsHide: true, timeout: 10_000 })).stdout.trim()
@@ -159,6 +160,15 @@ export default {
       }
       const parent = path.dirname(directory)
       if (same(parent, path.join(repo.root, ".opencode", "worktrees"))) {
+        // Registration needs a task branch. Name the real cause instead of the
+        // generic "maintenance deferred", and never adopt an existing checkout.
+        const current = await exec("git", ["-C", directory, "branch", "--show-current"],
+          { windowsHide: true, timeout: 10_000 })
+        if (!current.stdout.trim())
+          throw new Error(`Workspace ${path.basename(directory)} has a detached HEAD, so it cannot be ` +
+            "registered and build tools stay blocked. Not a permission problem: from a session outside " +
+            "this copy, create a task branch in it from origin/main (only if it is clean and holds " +
+            "no unique commits), or make a new workspace.")
         await maintenance(["register", "--tool", "opencode", "--session", sessionID,
           "--cwd", directory, "--project", ctx.location.project.id])
       }
