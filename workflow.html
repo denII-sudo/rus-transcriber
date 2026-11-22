@@ -667,8 +667,12 @@ document.querySelectorAll(".hist").forEach(b => b.onclick = () => loadHistory(b.
 $("backup").onclick = async () => {
   try {
     const d = await post("api/backup", {destination: $("backup-dest").value});
-    $("backup-report").innerHTML = `<p class="ok">Резерв создан: ${esc(d.destination)}.
+    const warning = d.warning || [];
+    const report = $("backup-report");
+    report.innerHTML = `<p class="${warning.length ? "warn" : "ok"}">Резерв создан${warning.length
+      ? " с предупреждением" : ""}: ${esc(d.destination)}.
       Проверка копии: ${esc(d.report.integrity)}, схема ${esc(d.report.schema_version)}.</p>`;
+    warning.forEach(line => report.append(node("p", line, "warn")));
   } catch (ex) { $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
 };
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };

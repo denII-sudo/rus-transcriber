@@ -82,7 +82,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.23.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.23.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -316,15 +316,28 @@ async def restore_recording_revision(recording_id: str, source_revision: int, re
         lambda: core.restore_recording_revision(snapshot), require_human=True)
 
 
+def _backup_for_agent(destination):
+    """Агенту — число и номера повреждённых копий: пути файлов остаются экрану и rt.py."""
+    result = core.backup_store(destination)
+    copies = result["report"].get("damaged_copies")
+    if copies:
+        result["report"]["damaged_copies"] = {"count": len(copies),
+                                              "conflict_ids": [item["conflict_id"] for item in copies]}
+        result["warning"] = result["warning"][:1]
+    return result
+
+
 @mcp.tool()
 async def backup_state(destination: str) -> str:
-    """Создать проверенную неактивную копию базы состояния; аудио и папки документов она не заменяет."""
+    """Создать проверенную неактивную копию базы состояния; аудио и папки документов она не заменяет.
+    Если в ответе есть warning (повреждённые копии правок), передайте его человеку."""
     return await _gated(
         "Создание резерва состояния БД", {"destination": destination},
         lambda: [f"Новый файл: {destination}",
                  "Копия неактивна: установки отключены, незавершённые запуски прерываются.",
-                 "Существующие файлы не изменяются и не удаляются."],
-        lambda: core.backup_store(destination), require_human=True)
+                 "Существующие файлы не изменяются и не удаляются.",
+                 "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением."],
+        lambda: _backup_for_agent(destination), require_human=True)
 
 
 @mcp.tool()

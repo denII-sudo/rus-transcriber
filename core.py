@@ -1690,20 +1690,30 @@ def retry_conflict_file(recording_id, conflict_id, kind):
         store.close()
 
 
+def _damaged_copies_warning(copies):
+    """Предупреждение о повреждённых копиях. Первая строка без путей: её получает и агент."""
+    if not copies:
+        return []
+    return [f"Повреждённых сохранённых копий правок: {len(copies)}. В резерве они такие же повреждённые: "
+            "вернуть по ним правку нельзя. Если файл с правкой ещё цел, сохраните его отдельно.",
+            *(f"- «{item['relative_path']}» — конфликт {item['conflict_id']}" for item in copies)]
+
+
 def backup_store(destination):
     """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии."""
     import recordings
     store = recordings.open_store()
     try:
         store.current_identity()
-        report = store.backup(destination)
-        return {"destination": str(destination), "report": report}
+        report = store.backup(destination, allow_damaged_copies=True)
+        warning = _damaged_copies_warning(report.get("damaged_copies"))
+        return {"destination": str(destination), "report": report, **({"warning": warning} if warning else {})}
     finally:
         store.close()
 
 
 def inspect_backup(backup_path):
-    """Прочитать резервную копию только для чтения: корни, пользователи, число записей."""
+    """Прочитать резервную копию только для чтения: корни, пользователи, число записей, повреждённые копии."""
     import storage
     store = storage.open_store_readonly(str(backup_path))
     try:
@@ -1712,8 +1722,10 @@ def inspect_backup(backup_path):
         users = [dict(row) for row in store.db.execute(
             "SELECT user_id, display_name FROM local_users ORDER BY display_name")]
         recordings_count = store.db.execute("SELECT count(*) FROM recordings").fetchone()[0]
+        damaged = storage.damaged_conflict_copies(store.db)
         return {"path": str(backup_path), "roots": roots, "users": users,
-                "recordings": recordings_count,
+                "recordings": recordings_count, "damaged_copies": damaged,
+                "warning": _damaged_copies_warning(damaged),
                 "restore_guard_locked": bool(store.db.execute(
                     "SELECT locked FROM restore_guard WHERE id=1").fetchone()[0])}
     finally:
@@ -1752,7 +1764,7 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
             materialized = []
             for root_id, path in mapping.items():
                 materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
-            validation = storage.validate_copy(staged)
+            validation = storage.validate_copy(staged, allow_damaged_copies=True)
         finally:
             store.close()
     except (storage.StorageError, ValueError) as ex:
@@ -1770,9 +1782,10 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
     except OSError as ex:
         raise CoreError(f"не удалось опубликовать восстановленную базу (возможно, программа "
                         f"запущена — закройте её и повторите); файл остался: {staged}") from ex
+    warning = _damaged_copies_warning(validation.get("damaged_copies"))
     return {"destination": str(destination), "installation_id": installation_id,
             "previous_saved_as": previous_saved_as, "validation": validation,
-            "materialized": materialized}
+            "materialized": materialized, **({"warning": warning} if warning else {})}
 
 
 def live(s, job_id):

@@ -610,8 +610,26 @@ def open_store_readonly(path):
         raise
 
 
-def validate_copy(path):
-    """Проверка копии без записи и запуска восстановленных очередей."""
+def damaged_conflict_copies(db):
+    """Копии правок, у которых не совпал размер или сумма. Отсутствие копии (файл больше предела) — не повреждение."""
+    found = []
+    for scope, table in (("document", "document_conflicts"), ("conspect", "conspect_conflicts")):
+        for row in db.execute("SELECT conflict_id, relative_path, observed_bytes, observed_hash, observed_size "
+                              f"FROM {table} ORDER BY rowid"):
+            content = row["observed_bytes"]
+            if content is not None and (len(content) != row["observed_size"] or
+                                        _hash_bytes(content) != row["observed_hash"]):
+                found.append({"scope": scope, "conflict_id": row["conflict_id"],
+                              "relative_path": row["relative_path"]})
+    return found
+
+
+def validate_copy(path, *, allow_damaged_copies=False):
+    """Проверка копии без записи и запуска восстановленных очередей.
+
+    allow_damaged_copies — только для резерва и восстановления (решение владельца 23.11.2026): повреждённая
+    копия правки не отказ, а список damaged_copies в отчёте. Любое другое нарушение — отказ, как прежде.
+    """
     db = _connect_readonly(path)
     try:
         _check_schema(db)
@@ -669,16 +687,10 @@ def validate_copy(path):
             if ({item["sha256"] for item in manifest["files"].values()} != expected or
                     {item["sha256"] for item in archive_manifest["files"].values()} != expected):
                 raise StorageError("manifest hash mismatch")
-        for row in db.execute("SELECT observed_bytes, observed_hash, observed_size FROM document_conflicts"):
-            if row["observed_bytes"] is not None and (
-                    len(row["observed_bytes"]) != row["observed_size"] or
-                    hashlib.sha256(row["observed_bytes"]).hexdigest() != row["observed_hash"]):
-                raise StorageError("conflict copy hash mismatch")
-        for row in db.execute("SELECT observed_bytes, observed_hash, observed_size FROM conspect_conflicts"):
-            if row["observed_bytes"] is not None and (
-                    len(row["observed_bytes"]) != row["observed_size"] or
-                    _hash_bytes(row["observed_bytes"]) != row["observed_hash"]):
-                raise StorageError("conspect conflict copy hash mismatch")
+        damaged = damaged_conflict_copies(db)
+        if damaged and not allow_damaged_copies:
+            prefix = "conspect " if damaged[0]["scope"] == "conspect" else ""
+            raise StorageError(prefix + "conflict copy hash mismatch")
         for row in db.execute("SELECT * FROM document_outbox"):
             if row["generation"] != row["document_revision"]:
                 raise StorageError("outbox generation mismatch")
@@ -736,7 +748,8 @@ def validate_copy(path):
             if _loads(row["expected_previous_hashes"]) != previous:
                 raise StorageError("conspect outbox expected hash mismatch")
         return {"integrity": "ok", "foreign_keys": "ok", "schema_version": SCHEMA_VERSION,
-                "inactive": bool(db.execute("SELECT locked FROM restore_guard WHERE id=1").fetchone()[0])}
+                "inactive": bool(db.execute("SELECT locked FROM restore_guard WHERE id=1").fetchone()[0]),
+                **({"damaged_copies": damaged} if damaged else {})}
     except StorageError:
         raise
     except sqlite3.DatabaseError as exc:
@@ -770,7 +783,7 @@ class Store:
             raise StorageError("store must have exactly one active installation")
         return dict(rows[0])
 
-    def backup(self, destination):
+    def backup(self, destination, *, allow_damaged_copies=False):
         """SQLite backup в новый файл; восстановленная копия неактивна."""
         if self.db.in_transaction:
             raise Conflict("cannot back up an open transaction")
@@ -798,7 +811,7 @@ class Store:
             raise
         finally:
             target.close()
-        report = validate_copy(staged)
+        report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
         _release_wal_files(staged)
         os.link(staged, destination)
         staged.unlink()

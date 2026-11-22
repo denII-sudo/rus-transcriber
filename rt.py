@@ -134,9 +134,15 @@ def cmd_db_restore(a):
     lines = [f"Резерв: {a.backup}", f"Восстановленная база: {destination}",
              f"Корни документов: " + "; ".join(f"{k} → {v}" for k, v in mapping.items()),
              "Документы будут сформированы в новых корнях из сохранённых байтов.",
-             "Прежняя база (если есть) будет сохранена рядом, из резерва ничего не удаляется."]
-    return gated("Восстановление базы из резерва", lines,
-                 lambda: core.restore_from_backup(a.backup, destination, mapping, user_id))
+             "Прежняя база (если есть) будет сохранена рядом, из резерва ничего не удаляется.",
+             *info["warning"]]
+
+    def restore():
+        result = core.restore_from_backup(a.backup, destination, mapping, user_id)
+        if result.get("warning"):
+            say("\n".join(result["warning"]))
+        return result
+    return gated("Восстановление базы из резерва", lines, restore)
 
 
 def cmd_approve(a):
@@ -276,8 +282,12 @@ def run(a):
         workflow_page.main(["--port", str(a.port), "--hours", str(a.hours)])
     elif c == "db-backup":
         report = core.backup_store(a.dest)
-        print(f"Резерв создан: {report['destination']}; проверка: {report['report'].get('integrity')}. "
+        warning = report.get("warning")
+        print(f"Резерв создан{' с предупреждением' if warning else ''}: {report['destination']}; "
+              f"проверка: {report['report'].get('integrity')}. "
               "Копия неактивна; для использования нужен rebind_restored_copy.")
+        if warning:
+            say("\n".join(warning))
     elif c == "db-restore":
         return cmd_db_restore(a)
     elif c == "workflow-confirm":
