@@ -461,11 +461,11 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     replies = split_replies(text, names)
     if len(replies) > 1 and replies[0][0] is None and replies[1][0] and \
-            all(norm(x) == "нет" for x in replies[0][1]):
+            (all(norm(x) == "нет" for x in replies[0][1]) or holds_place(" ".join(replies[0][1]))):
         # «нет, Анна: слово» — «нет» здесь скорее поправка к карточке, чем речь из записи; угадывать
         # не будем: ни «нет» в стенограмму, ни смену говорящего — место остаётся человеку
         rep["kind"] = "unmatched"
-        rep["human"] = "перед меткой «Имя:» стоит только «нет»; напишите «Имя: точные слова» без «нет»"
+        rep["human"] = "перед меткой «Имя:» стоит только «нет» или отрицание; напишите «Имя: точные слова» без него"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if item.get("answer_mode") == "speaker":
         # Карточка подтверждения говорящего: пояснение («Вера говорит только слово …») не должно
