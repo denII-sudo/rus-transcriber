@@ -466,9 +466,10 @@ function fileStateText(state, open, preserved) {
   }[state] || "";
 }
 
-function lineBlock(title, lines, total, notes) {
+function lineBlock(title, lines, total, notes, approximate = false) {
   const box = node("div");
-  box.append(node("p", total ? `${title}: ${total}${lines.length < total ? ` (показано ${lines.length})` : ""}` : `${title}: ничего.`));
+  const count = approximate ? `не более ${total} строк (оценка сверху)` : total;
+  box.append(node("p", total ? `${title}: ${count}${lines.length < total ? ` (показано ${lines.length})` : ""}` : `${title}: ничего.`));
   if (lines.length) box.append(node("pre", lines.map(l => l === "" ? "(пустая строка)" : l).join("\n"), "lines"));
   (notes || []).forEach((n, i) => { if (n) box.append(node("p", `Строка ${i + 1} этого списка. ${n}`, "warn")); });
   return box;
@@ -495,12 +496,16 @@ async function showCompare(box, panel, c) {
           "Подробности — в скачанной копии."), "warn"));
       } else {
         // открытый конфликт говорит о будущей замене; просмотр решённой копии — нейтрально
-        const gone = open ? "Пропадёт из файла при замене (есть в вашей копии, нет в версии программы)"
+        const gone = p.comparison_approximate ? (open ? "Могут пропасть при замене (список огрублён)"
+          : "Строки вашей копии в огрублённом сравнении")
+          : open ? "Пропадёт из файла при замене (есть в вашей копии, нет в версии программы)"
           : "Есть только в вашей копии (нет в версии программы)";
-        const came = open ? "Появится в файле (есть в версии программы, нет в вашей копии)"
+        const came = p.comparison_approximate ? (open ? "Могут появиться при замене (список огрублён)"
+          : "Строки версии программы в огрублённом сравнении")
+          : open ? "Появится в файле (есть в версии программы, нет в вашей копии)"
           : "Есть только в версии программы (нет в вашей копии)";
-        parts.push(lineBlock(gone, p.removed, p.removed_total, p.removed_notes),
-          lineBlock(came, p.added, p.added_total, p.added_notes),
+        parts.push(lineBlock(gone, p.removed, p.removed_total, p.removed_notes, p.comparison_approximate),
+          lineBlock(came, p.added, p.added_total, p.added_notes, p.comparison_approximate),
           node("p", "Сравнение построчное и по порядку строк: строка, перенесённая на другое место, считается " +
             "и потерей, и появлением. У очень больших файлов сравнение приблизительное: потери не занижаются, " +
             "но лишнее может попасть в список.", "muted"));

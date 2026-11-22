@@ -460,19 +460,21 @@ def _materialize_conspects_locked(store, recording_id):
                    "md": (row["md_relative"], saved["md"], saved["md_hash"])}
         expected = storage._loads(row["expected_previous_hashes"])
         conflicts = []
+        overrides = []
         for kind, (relative, desired_bytes, desired_hash) in targets.items():
             target, exists = documents._read_only_target(root, relative)
             current_hash = documents._file_hash(target) if exists else None
             resolved = store.db.execute(
-                "SELECT observed_hash FROM conspect_conflicts WHERE conspect_id=? AND revision=? "
-                "AND kind=? AND resolution_operation_id IS NOT NULL ORDER BY rowid DESC LIMIT 1",
-                (row["conspect_id"], row["revision"], kind)).fetchone()
+                "SELECT observed_hash, observed_size, observed_bytes FROM conspect_conflicts WHERE conspect_id=? AND revision=? "
+                "AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                (row["conspect_id"], row["revision"], kind, relative)).fetchone()
             if resolved is not None and current_hash not in (desired_hash, resolved["observed_hash"]):
                 if not exists:
                     raise storage.Conflict("external conspect file disappeared after confirmation")
                 conflicts.append(documents._FileConflict(kind, target))
             elif resolved is None and current_hash not in (None, desired_hash, expected.get(kind)):
                 conflicts.append(documents._FileConflict(kind, target))
+            overrides.append((resolved, current_hash, desired_hash, relative))
         if conflicts:
             with store._transaction():
                 store.db.execute("UPDATE conspect_outbox SET state='conflict', error_code='external_edit' "
@@ -487,6 +489,10 @@ def _materialize_conspects_locked(store, recording_id):
                     store.db.execute("UPDATE conspect_file_locations SET conflict=1 "
                                      "WHERE conspect_id=? AND kind=?", (row["conspect_id"], conflict.kind))
             continue
+        # Проверять только запись, которая действительно состоится, а не открытые конфликты
+        # или исторические решения. Защита общая для экрана, MCP и синхронизации.
+        for resolved, current_hash, desired_hash, relative in overrides:
+            documents._check_override_copy(resolved, current_hash, desired_hash, relative)
         paths = {kind: root / relative for kind, (relative, _, _) in targets.items()}
         conspect._write_files_raw(
             Path(document_binding(store, recording_id)["root"] /

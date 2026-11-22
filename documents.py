@@ -177,6 +177,23 @@ def _record_conflict(store, root_id, rid, revision, exc):
                          "WHERE recording_id=? AND document_revision=?", (rid, revision))
 
 
+def _check_override_copy(override, current, desired, relative):
+    """Под блокировкой писателя проверить копию, разрешающую именно эту перезапись.
+
+    Старые решения не участвуют; новый внешний файл обработается как новый конфликт.
+    Уже записанная версия программы не требует пригодной копии для повторного подтверждения.
+    """
+    if override is None or current == desired or current != override["observed_hash"]:
+        return
+    content = override["observed_bytes"]
+    if (not isinstance(content, (bytes, bytearray, memoryview)) or len(content) != override["observed_size"]
+            or _digest(content) != override["observed_hash"]):
+        raise storage.StorageError(
+            f"Сохранённая копия правки файла «{relative}» повреждена или отсутствует. "
+            "Этот файл не заменён: сначала сохраните его отдельно и восстановите копию; "
+            "повтор записи без исправления копии не поможет.")
+
+
 def _authorized_root(store, root_id, root_path):
     """Проверить, что корень зарегистрирован, активен и совпадает с переданным путём."""
     storage._uuid(root_id)
@@ -230,9 +247,9 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     desired = _digest(doc[kind])
                     expected = expected_hashes[kind]
                     override = store.db.execute(
-                        "SELECT observed_hash FROM document_conflicts WHERE recording_id=? "
-                        "AND document_revision=? AND kind=? AND resolution_operation_id IS NOT NULL "
-                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind)).fetchone()
+                        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
+                        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
+                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
                     if override is not None and current not in (desired, override["observed_hash"]):
                         if current is None:
                             raise storage.Conflict("external document disappeared after confirmation")
@@ -240,6 +257,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     if override is None and current not in (None, desired, expected):
                         raise _FileConflict(kind, path)
                     if current != desired:
+                        _check_override_copy(override, current, desired, filename)
                         _write_atomic(path, doc[kind])
                     fault("replace_" + kind, rid, rev)
                 fault("before_ack", rid, rev)
