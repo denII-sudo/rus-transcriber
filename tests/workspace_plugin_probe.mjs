@@ -13,9 +13,12 @@ const hooks = {}
 const storage = new Map()
 let directory = repo, creates = 0, agent = "build"
 let delayed = false, pendingDirectory
-let archived = false, warnings = 0
+let archived = false, warnings = 0, strategy
 const ctx = {
-  storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v) },
+  storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v),
+    remove: async (k) => storage.delete(k),
+    scan: async ({ prefix }) => ({ entries: [...storage].filter(([k]) => k.startsWith(prefix))
+      .map(([key, value]) => ({ key, value })), next: null }) },
   options: { config: configFile, python, script },
   location: { project: { id: "synthetic", canonical: repo } },
   session: {
@@ -29,11 +32,11 @@ const ctx = {
     hook: async (name, fn) => { hooks[name] = fn },
   },
   worktree: {
+    transform: async (fn) => fn({ add: (s) => { strategy = s } }),
     create: async (x) => {
       creates++
       const out = path.join(repo, ".opencode", "worktrees", x.name)
-      execFileSync("git", ["-C", repo, "worktree", "add", "--detach", out, "origin/main"])
-      return { directory: out }
+      return strategy.create({ sourceDirectory: repo, directory: out, branch: x.branch })
     },
   },
   command: { transform: async (fn) => fn({ add: (cmd) => { hooks[cmd.name] = cmd.execute } }) },
@@ -42,6 +45,23 @@ const ctx = {
 }
 const dispose = await plugin.setup(ctx)
 try {
+  // Native worktree.create must work even when the main checkout is behind.
+  const native = path.join(repo, ".opencode", "worktrees", "native-child")
+  const base = execFileSync("git", ["-C", repo, "rev-parse", "origin/main"], { encoding: "utf8" }).trim()
+  await strategy.create({ sourceDirectory: repo, directory: native })
+  assert.equal(execFileSync("git", ["-C", native, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  assert.equal(execFileSync("git", ["-C", native, "branch", "--show-current"], { encoding: "utf8" }).trim(),
+    "opencode/native-child")
+  assert.equal((await strategy.list())[0].directory, native)
+  directory = native
+  await hooks["tool-execute.before"]({ sessionID: "ses_native", tool: "shell" })
+  await strategy.remove({ directory: native, force: false })
+  assert.deepEqual(await strategy.list(), [])
+  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(repo, "missing-remote")])
+  const offline = path.join(repo, ".opencode", "worktrees", "offline-child")
+  await assert.rejects(strategy.create({ sourceDirectory: repo, directory: offline }), /cannot refresh origin/)
+  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(path.dirname(repo), "remote.git")])
+  directory = repo
   await hooks.workspace({ sessionID: "ses_synthetic" })
   if (config.expect_offline) assert.equal(warnings, 1)
   const first = directory

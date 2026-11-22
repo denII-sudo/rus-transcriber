@@ -443,9 +443,15 @@ class HousekeepingTests(unittest.TestCase):
         aw.command(["git", "init", "--bare", "-q", str(bare)])
         self.g("remote", "add", "origin", str(bare))
         self.g("push", "-u", "origin", "main")
-        # Keep the local origin/main but make the remote unavailable.
-        self.g("remote", "set-url", "origin", str(self.root / "missing-remote.git"))
-        self.config["expect_offline"] = True
+        # Simulate a newer remote-tracking main while the integration checkout
+        # remains behind: the plugin must use the remote ref, not local HEAD.
+        self.g("switch", "-q", "-c", "synthetic/new-base")
+        (self.repo / "file.txt").write_text("new remote base\n", encoding="utf-8")
+        self.g("commit", "-qam", "new base")
+        self.g("push", "origin", "synthetic/new-base:main")
+        self.g("fetch", "origin")
+        self.g("switch", "-q", "main")
+        self.assertNotEqual(self.g("rev-parse", "HEAD"), self.g("rev-parse", "origin/main"))
         config_file = self.root / "config.json"
         config_file.write_text(json.dumps(self.config), encoding="utf-8")
         project = Path(__file__).resolve().parent.parent

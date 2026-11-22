@@ -20,6 +20,69 @@ export default {
     if (!repo) return
     const pending = new Map()
 
+    // OpenCode's bundled strategy creates detached worktrees from the local
+    // checkout. Own creation end-to-end, including calls from other sessions.
+    await ctx.worktree.transform((editor) => {
+      editor.add({
+        id: "local.agent-workspaces.git",
+        async create(input) {
+          const root = path.join(repo.root, ".opencode", "worktrees")
+          const directory = path.resolve(input.directory)
+          if (!same(input.sourceDirectory, repo.root) || !same(path.dirname(directory), root))
+            throw new Error("Workspace creation is limited to the configured repository and worktree root.")
+          try {
+            await exec("git", ["-C", repo.root, "fetch", "origin"], { windowsHide: true, timeout: 30_000 })
+          } catch {
+            throw new Error("Workspace creation stopped: cannot refresh origin; no checkout was created.")
+          }
+          const ref = input.branch || "origin/main"
+          if (ref.startsWith("-")) throw new Error("Invalid workspace starting ref.")
+          const base = (await exec("git", ["-C", repo.root, "rev-parse", "--verify", `${ref}^{commit}`],
+            { windowsHide: true, timeout: 10_000 })).stdout.trim()
+          if (!/^[0-9a-f]{40,64}$/i.test(base)) throw new Error("Workspace base is not a commit.")
+          const branch = `opencode/${path.basename(directory)}`
+          await exec("git", ["-C", repo.root, "worktree", "add", "-b", branch, directory, base],
+            { windowsHide: true, timeout: 30_000 })
+          const key = `owned-worktree:${directory.toLowerCase()}`
+          await ctx.storage.set(key, { directory })
+          const head = (await exec("git", ["-C", directory, "rev-parse", "HEAD"],
+            { windowsHide: true, timeout: 10_000 })).stdout.trim()
+          if (head !== base) throw new Error("Workspace base mismatch; checkout was preserved.")
+          return { directory }
+        },
+        async remove(input) {
+          const root = path.join(repo.root, ".opencode", "worktrees")
+          const directory = path.resolve(input.directory)
+          if (!same(path.dirname(directory), root))
+            throw new Error("Workspace removal is limited to the configured worktree root.")
+          const key = `owned-worktree:${directory.toLowerCase()}`
+          if (!await ctx.storage.get(key))
+            throw new Error("Workspace ownership cannot be verified; checkout was preserved.")
+          const args = ["-C", repo.root, "worktree", "remove"]
+          if (input.force) args.push("--force")
+          await exec("git", [...args, directory], { windowsHide: true, timeout: 30_000 })
+          await ctx.storage.remove(key)
+        },
+        async list() {
+          const found = []
+          let after
+          do {
+            const page = await ctx.storage.scan({ prefix: "owned-worktree:", after })
+            for (const entry of page.entries) {
+              const directory = entry.value?.directory
+              if (typeof directory !== "string") continue
+              try {
+                await access(path.join(directory, ".git"))
+                found.push({ directory, type: "worktree" })
+              } catch { /* Keep ownership metadata; do not recreate or prune it. */ }
+            }
+            after = page.next || undefined
+          } while (after)
+          return found
+        },
+      })
+    })
+
     async function maintenance(args) {
       await exec(options.python, ["-B", options.script, "--config", options.config, ...args], {
         windowsHide: true, timeout: 30_000,
@@ -33,23 +96,6 @@ export default {
         // Planning/read-only requests do not create checkouts. Build sessions use a
         // deterministic name, and the move control is admitted before tools run.
         if (session.agent === "plan" || session.agent === "explore") return
-        try {
-          await exec("git", ["-C", repo.root, "fetch", "origin"], {
-            windowsHide: true, timeout: 30_000,
-          })
-        } catch {
-          await exec("git", ["-C", repo.root, "rev-parse", "--verify", "origin/main^{commit}"],
-            { windowsHide: true, timeout: 10_000 })
-          console.warn("Workspace: fetch failed; using potentially stale local origin/main.")
-          try {
-            await ctx.session.synthetic({
-              sessionID,
-              text: "Не удалось обновить origin/main по сети; рабочая копия создаётся из локальной, возможно устаревшей версии.",
-            })
-          } catch {
-            console.warn("Workspace: could not deliver the stale-base warning to the session.")
-          }
-        }
         const task = `task-${sessionID.replace(/[^a-zA-Z0-9-]/g, "-")}`
         const key = `workspace:${sessionID}`
         let created = await ctx.storage.get(key)
