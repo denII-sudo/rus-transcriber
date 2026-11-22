@@ -360,6 +360,38 @@ class WriteGuardTests(fixtures.ScreenCase):
         self.assertEqual(paths["md"].read_bytes(), b"ordered\n")
         self.assertEqual(bad.path.read_bytes(), bad.saved)
 
+    def test_waiting_replacement_is_named_in_preview_and_snapshot(self):
+        md, other = self.both_conspect_files()
+        shown = self.preview(md)
+        self.assertEqual(shown.get("waits_for"), [other.path.name])
+        self.resolve_directly(other)    # ожидание кончилось: прежнее «сейчас не изменится» уже неверно
+        self.refused("api/conflict/resolve", {"snapshot": shown["snapshot"], "confirm": True})
+        self.assertEqual(md.path.read_bytes(), md.saved)
+        self.assertTrue(self.is_open(md))
+        self.assertEqual(self.preview(md).get("waits_for"), [])
+
+    def test_waiting_document_window_does_not_promise_replacement_now(self):
+        case = self.conflict("document")
+        archive = self.duplicate(case, kind="archive_md", relative_path="history/прежняя.md")
+        _, asked = fixtures.ConflictMCPTests.mcp_resolve(self, case)
+        action, _, lines = asked.call_args.args
+        text = "\n".join([action, *lines]).casefold()
+        self.assertIn("сейчас файл не изменится", text)
+        self.assertIn("прежняя.md", text)
+        self.assertNotIn("заменить файл на диске", text)
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        self.assertTrue(self.is_open(archive))
+
+    def test_waiting_conspect_window_does_not_promise_replacement_now(self):
+        md, other = self.both_conspect_files()
+        _, asked = fixtures.ConflictMCPTests.mcp_resolve(self, md)
+        action, _, lines = asked.call_args.args
+        text = "\n".join([action, *lines]).casefold()
+        self.assertIn("сейчас файл не изменится", text)
+        self.assertIn(other.path.name.casefold(), text)
+        self.assertNotIn("заменить файл на диске", text)
+        self.assertEqual(md.path.read_bytes(), md.saved)
+
     def test_copy_with_a_wrong_size_is_not_downloaded(self):
         case = self.conflict("document")
         self.damage(case, "observed_size")

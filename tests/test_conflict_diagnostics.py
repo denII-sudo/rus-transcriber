@@ -116,5 +116,34 @@ class ApproximatePageTests(unittest.TestCase):
         self.assertNotIn("при замене", seen["resolved"]["panel"].casefold())
 
 
+@unittest.skipUnless(shutil.which("node"), "Node.js нужен для проверки JavaScript")
+class WaitingPageTests(unittest.TestCase):
+    def test_confirmation_does_not_promise_what_will_not_happen_now(self):
+        scenarios = {}
+        for state in ("same", "changed"):
+            scenario = fixtures.page_scenarios()["changed"]
+            scenario["preview"] = {**scenario["preview"], "file_state": state, "waits_for": ["Другой.json"],
+                                   "also_replaces": ["Третий.md"]}
+            scenarios[state] = scenario
+        result = subprocess.run(
+            [shutil.which("node"), "-e", fixtures.PAGE_RUNNER],
+            input=json.dumps({"html": (fixtures.PROJECT / "workflow.html").read_text(encoding="utf-8"),
+                              "scenarios": scenarios}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(result.stdout)
+        for state in scenarios:
+            with self.subTest(state=state):
+                question = seen[state]["question"]
+                self.assertIn("Сейчас файл", question)
+                self.assertIn("не изменится", question)
+                self.assertIn("Другой.json", question)
+                self.assertIn("Да, записать решение", question)
+                for false in ("будет заменён версией программы", "Да, заменить файл", "Да, сохранить новую копию",
+                              "сохранит новую копию нынешнего"):
+                    self.assertNotIn(false, question)
+                self.assertNotIn("подтверждение запишет заново", seen[state]["panel"])
+
+
 if __name__ == "__main__":
     unittest.main()
