@@ -60,6 +60,8 @@ class WorkerSnapshotTests(unittest.TestCase):
         if word_ids:
             data["segments"][0]["words"][0]["word_id"] = "w1"
             data["review"][0]["word_ids"] = ["w1"]
+        else:                     # старый вид карточки: без номеров слов (пустой список — не старый вид)
+            data["review"][0].pop("word_ids", None)
         return data
 
     @contextlib.contextmanager
