@@ -124,6 +124,123 @@ class HousekeepingTests(unittest.TestCase):
         self.assertNotIn("private-name.txt", text)
         self.assertNotIn("private-content", text)
 
+    def row(self, rows, path):
+        return next(r for r in rows if Path(r["worktree"]).exists() and
+                    os.path.samefile(r["worktree"], path))
+
+    def test_inventory_lists_main_clone_and_task_without_changing_anything(self):
+        before_state = sorted((p.name, p.stat().st_mtime_ns) for p in self.m.state.glob("*.json"))
+        before_branches = self.g("branch", "--list")
+        with patch.object(aw, "pr_state", return_value="merged"), \
+                patch.object(aw.Manager, "sweep_one", side_effect=AssertionError("unexpected sweep")):
+            rows = self.m.inventory()
+        main = self.row(rows, self.repo)
+        task = self.row(rows, self.cwd)
+        self.assertEqual((main["kind"], main["branch"], main["changes"], main["hint"]),
+                         ("main-clone", "main", 0, "ok"))
+        self.assertEqual((task["kind"], task["branch"], task["registration"], task["pr"], task["hint"]),
+                         ("managed-root", "feature/test", "registered", "merged", "review-removal"))
+        self.assertEqual(task["head"], self.head[:12])
+        self.assertTrue(self.cwd.exists())
+        self.assertEqual(self.g("branch", "--list"), before_branches)
+        self.assertEqual(sorted((p.name, p.stat().st_mtime_ns) for p in self.m.state.glob("*.json")),
+                         before_state)
+
+    def test_inventory_keeps_dirty_locked_and_unknown(self):
+        (self.cwd / "extra.txt").write_text("x", encoding="utf-8")
+        with patch.object(aw, "pr_state", return_value="merged"):
+            self.assertEqual(self.row(self.m.inventory(), self.cwd)["hint"], "keep")
+            self.assertEqual(self.row(self.m.inventory(), self.cwd)["changes"], 1)
+        (self.cwd / "extra.txt").unlink()
+        self.g("worktree", "lock", str(self.cwd))
+        self.addCleanup(lambda: subprocess.run(["git", "-C", str(self.repo), "worktree", "unlock",
+                                                str(self.cwd)], capture_output=True))
+        with patch.object(aw, "pr_state", return_value="merged"):
+            row = self.row(self.m.inventory(), self.cwd)
+        self.assertEqual((row["locked"], row["hint"]), (True, "keep"))
+        self.g("worktree", "unlock", str(self.cwd))
+        with patch.object(aw, "pr_state", side_effect=RuntimeError("command failed")):
+            row = self.row(self.m.inventory(), self.cwd)
+        self.assertEqual((row["pr"], row["hint"]), ("unknown", "keep"))
+        self.assertEqual(self.row(self.m.inventory(github=False), self.cwd)["pr"], "-")
+
+    def test_inventory_flags_main_clone_off_main_and_missing_checkout(self):
+        self.g("switch", "-q", "-c", "stray")
+        self.assertEqual(self.row(self.m.inventory(github=False), self.repo)["hint"], "check")
+        shutil.rmtree(self.cwd, ignore_errors=True)
+        rows = self.m.inventory(github=False)
+        gone = next(r for r in rows if r["branch"] == "feature/test")
+        self.assertEqual((gone["missing"], gone["changes"], gone["hint"]), (True, None, "check"))
+
+    def test_inventory_shows_excluded_unregistered_and_outside_roots(self):
+        other = self.repo / ".claude/worktrees/other"
+        self.g("worktree", "add", "-q", "-b", "feature/other", str(other), "HEAD")
+        outside = self.root / "elsewhere"
+        self.g("worktree", "add", "-q", "-b", "feature/outside", str(outside), "HEAD")
+        self.addCleanup(lambda: [subprocess.run(["git", "-C", str(self.repo), "worktree", "remove",
+                                                 "--force", str(p)], capture_output=True)
+                                 for p in (other, outside)])
+        rows = self.m.inventory(github=False)
+        self.assertEqual(self.row(rows, other)["registration"], "unregistered")
+        self.assertEqual(self.row(rows, outside)["kind"], "outside-roots")
+        self.config["repos"][0]["excluded"] = [str(other)]
+        rows = aw.Manager(self.config).inventory(github=False)
+        self.assertEqual(self.row(rows, other)["registration"], "excluded")
+
+    def test_pr_state_matches_exact_head_only(self):
+        repo = {"github": "synthetic/example"}
+
+        def listing(rows):
+            return patch.object(aw, "command", return_value=json.dumps(rows))
+        merged = {"state": "MERGED", "headRefOid": "a" * 40, "isCrossRepository": False,
+                  "baseRefName": "main"}
+        with listing([]):
+            self.assertEqual(aw.pr_state(repo, "b", "a" * 40), "none")
+        with listing([merged]):
+            self.assertEqual(aw.pr_state(repo, "b", "a" * 40), "merged")
+            self.assertEqual(aw.pr_state(repo, "b", "c" * 40), "head-differs")
+        with listing([merged, dict(merged, state="OPEN")]):
+            self.assertEqual(aw.pr_state(repo, "b", "a" * 40), "open")
+        with listing([dict(merged, state="CLOSED")]):
+            self.assertEqual(aw.pr_state(repo, "b", "a" * 40), "closed")
+        with listing([dict(merged, isCrossRepository=True)]):
+            self.assertEqual(aw.pr_state(repo, "b", "a" * 40), "none")
+
+    def test_inventory_report_shares_file_with_sweep_report(self):
+        report = self.root / "reports" / "daily.log"
+        now = time.time()
+        rows = self.m.inventory(github=False)
+        aw.write_inventory_report(report, rows, now - 31 * 86400)
+        with report.open("a", encoding="utf-8") as f:
+            f.write("unrecognized line kept\n")
+        aw.write_report(report, False, self.m.sweep(), now - 31 * 86400)
+        aw.write_inventory_report(report, rows, now - 86400)
+        aw.write_report(report, False, self.m.sweep(), now)
+        lines = report.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "unrecognized line kept")
+        self.assertEqual([line.split(" ", 1)[0] for line in lines[1:]],
+                         ["AgentWorkspaceInventory", "AgentWorkspaceReport"])
+        entry = json.loads(lines[1][len(aw.INVENTORY_PREFIX):])
+        self.assertEqual(entry["counts"], {"ok": 1, "keep": 1})
+        self.assertNotIn("file.txt", "\n".join(lines))
+
+    def test_inventory_cli_is_read_only_and_reports(self):
+        config_file = self.root / "config.json"
+        config_file.write_text(json.dumps(self.config), encoding="utf-8")
+        report = self.root / "reports" / "inventory.log"
+        (self.cwd / "private-name.txt").write_text("private-content", encoding="utf-8")
+        out = subprocess.run([sys.executable, "-B", str(Path(aw.__file__)), "--config",
+                              str(config_file), "inventory", "--no-github", "--report", str(report)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = json.loads(out.stdout)
+        self.assertEqual(self.row(rows, self.cwd)["changes"], 1)
+        text = report.read_text(encoding="utf-8")
+        self.assertIn("feature/test", text)
+        self.assertNotIn("private-name.txt", text)
+        self.assertNotIn("private-content", text)
+        self.assertTrue(self.cwd.exists())
+
     def test_claude_hooks_never_sweep(self):
         from io import StringIO
         config_file = self.root / "config.json"
@@ -326,9 +443,15 @@ class HousekeepingTests(unittest.TestCase):
         aw.command(["git", "init", "--bare", "-q", str(bare)])
         self.g("remote", "add", "origin", str(bare))
         self.g("push", "-u", "origin", "main")
-        # Keep the local origin/main but make the remote unavailable.
-        self.g("remote", "set-url", "origin", str(self.root / "missing-remote.git"))
-        self.config["expect_offline"] = True
+        # Simulate a newer remote-tracking main while the integration checkout
+        # remains behind: the plugin must use the remote ref, not local HEAD.
+        self.g("switch", "-q", "-c", "synthetic/new-base")
+        (self.repo / "file.txt").write_text("new remote base\n", encoding="utf-8")
+        self.g("commit", "-qam", "new base")
+        self.g("push", "origin", "synthetic/new-base:main")
+        self.g("fetch", "origin")
+        self.g("switch", "-q", "main")
+        self.assertNotEqual(self.g("rev-parse", "HEAD"), self.g("rev-parse", "origin/main"))
         config_file = self.root / "config.json"
         config_file.write_text(json.dumps(self.config), encoding="utf-8")
         project = Path(__file__).resolve().parent.parent

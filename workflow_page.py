@@ -2,9 +2,10 @@
 
 Отдаёт workflow.html на секретном адресе (только 127.0.0.1) и принимает запросы к core.py:
 запуск обработки, состояние и готовность, чтение стенограммы и конспектов, добровольные
-уточнения, история ревизий с просмотром старой версии и возвратом как текущей, конфликты
-документов с предпросмотром внешней правки, резерв состояния БД. Сам выключается после
---hours часов без запросов.
+уточнения, история ревизий с просмотром старой версии и возвратом как текущей, общий список
+конфликтов файлов, изменённых вне программы (скачивание копии человека, сравнение и явная
+замена файла версией программы после показа; правка в стенограмму не переносится), резерв
+состояния БД. Сам выключается после --hours часов без запросов.
 
     python workflow_page.py [--port 8766] [--hours 6]
 
@@ -15,12 +16,13 @@ import json
 import mimetypes
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -121,7 +123,7 @@ def make_server(port):
             # URL содержит секрет сессии: не записывать запрос целиком в журнал.
             pass
 
-        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        def _send(self, code, body, ctype="application/json; charset=utf-8", headers=()):
             b = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -129,6 +131,8 @@ def make_server(port):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(b)
 
@@ -191,16 +195,22 @@ def make_server(port):
                     return self._send(200, core.read_recording_revision(
                         q.get("recording_id", ""), q.get("kind", "transcript"),
                         int(q.get("revision", "0"))))
+                if u == "api/conflicts/all":
+                    return self._send(200, core.list_all_conflicts())
                 if u == "api/conflicts":
                     recording_id = q.get("recording_id", "")
                     return self._send(200, {
                         "documents": core.list_document_conflicts(recording_id),
                         "conspects": core.list_conspect_conflicts(recording_id)})
                 return self._send(404, {"error": "не найдено"})
-            except (core.CoreError, storage.StorageError) as ex:
+            except core.CoreError as ex:
                 return self._send(400, {"error": str(ex)})
-            except (ValueError, KeyError, OSError) as ex:
+            except (storage.StorageError, sqlite3.Error, OSError) as ex:
+                return self._send(400, {"error": core.explain_error(ex)})
+            except (ValueError, KeyError) as ex:
                 return self._send(400, {"error": f"не удалось выполнить запрос: {ex}"})
+            except Exception as ex:    # неизвестный сбой: человек видит русское пояснение и причину, а не оборванную связь
+                return self._send(500, {"error": core.explain_error(ex)})
 
         def do_POST(self):
             u = self._path(post=True)
@@ -252,23 +262,29 @@ def make_server(port):
                         int(body.get("review_revision", 0))))
                 if u == "api/restore/confirm":
                     return self._send(200, core.restore_recording_revision(body.get("snapshot")))
+                conflict = (str(body.get("recording_id", "")), str(body.get("conflict_id", "")),
+                            str(body.get("kind") or "document"))    # kind — область: document или conspect
                 if u == "api/conflict/preview":
-                    return self._send(200, core.preview_conflict(
-                        str(body.get("recording_id", "")), str(body.get("conflict_id", "")),
-                        str(body.get("kind") or "document")))
+                    return self._send(200, core.preview_conflict(*conflict))
+                if u == "api/conflict/copy":
+                    copy = core.conflict_copy(*conflict)
+                    return self._send(200, copy["data"], "application/octet-stream", [
+                        ("Content-Disposition", "attachment; filename*=UTF-8''" + quote(copy["name"], safe=""))])
                 if u == "api/conflict/resolve":
-                    if not body.get("confirm"):
-                        return self._send(400, {"error": "требуется явное подтверждение"})
-                    kind = str(body.get("kind") or "document")
-                    recording_id, conflict_id = str(body.get("recording_id", "")), str(body.get("conflict_id", ""))
-                    if kind == "document":
-                        return self._send(200, core.resolve_document_conflict(recording_id, conflict_id))
-                    return self._send(200, core.resolve_conspect_conflict(recording_id, conflict_id))
+                    if body.get("confirm") is not True:
+                        return self._send(400, {"error": "Нужно явное подтверждение замены файла."})
+                    return self._send(200, core.replace_conflict_file(body.get("snapshot")))
+                if u == "api/conflict/retry":
+                    return self._send(200, core.retry_conflict_file(*conflict))
                 return self._send(404, {"error": "не найдено"})
-            except (core.CoreError, storage.StorageError) as ex:
+            except core.CoreError as ex:
                 return self._send(400, {"error": str(ex)})
-            except (ValueError, KeyError, OSError) as ex:
+            except (storage.StorageError, sqlite3.Error, OSError) as ex:
+                return self._send(400, {"error": core.explain_error(ex)})
+            except (ValueError, KeyError) as ex:
                 return self._send(400, {"error": f"не удалось обработать запрос: {ex}"})
+            except Exception as ex:    # неизвестный сбой: человек видит русское пояснение и причину, а не оборванную связь
+                return self._send(500, {"error": core.explain_error(ex)})
 
     srv, port = None, port
     for port in range(port, port + 20):
