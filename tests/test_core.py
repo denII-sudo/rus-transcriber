@@ -392,6 +392,15 @@ class Answers(unittest.TestCase):
                 self.assertNotIn(c(text, self.names)["kind"], ("agree", "negative", "doubtful"))
                 self.assertFalse(freeform.holds_place(text, self.names))
 
+    def test_negation_before_label_is_not_inserted(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Борис"}]
+        for text in ("неверно, Анна: слово", "не согласен. Анна: слово", "совсем не верно, Анна: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
         for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
