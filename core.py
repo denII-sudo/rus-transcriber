@@ -974,7 +974,7 @@ def _conflict_item(store, row, rows, cache):
             "title": _real_case(row["location"], cache).name, "name": row["name"], "kind": row["kind"],
             "relative_path": row["relative_path"], "file": str(_shown_file(row, cache)),
             "observed_size": row["observed_size"], "preserved": row["preserved"], "status": "open",
-            "can_replace": False, "can_retry": False, "problem": None}
+            "can_replace": False, "can_retry": False, "problem": None, "wait_reason": None}
     try:
         same_object = [other for other in rows if other["object"] == row["object"]]
         status = "resolved" if row["resolved"] else "open"
@@ -989,6 +989,8 @@ def _conflict_item(store, row, rows, cache):
         item.update(status=status,
                     can_replace=status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
                     can_retry=status == "not_written" and not any(not other["resolved"] for other in same_object))
+        if status == "not_written" and not item["can_retry"]:
+            item["wait_reason"] = _unresolvable_wait(row, same_object)
     except (CoreError, storage.StorageError, sqlite3.Error, ValueError, KeyError, TypeError, OSError) as ex:
         item.update(status="damaged", can_replace=False, can_retry=False,
                     problem=str(ex) if isinstance(ex, CoreError) else
@@ -1065,13 +1067,15 @@ def _waits_for(row, rows):
 
 
 def replacement_waits(recording_id, conflict_id, kind):
-    """Чего будет ждать замена, если подтвердить её сейчас: имена файлов; ничего не записывает."""
+    """Чего будет ждать замена, если подтвердить её сейчас: (имена файлов, есть ли среди них неразрешимый
+    на экране); ничего не записывает."""
     import recordings
     store = recordings.open_store()
     try:
         store.current_identity()
         row = _conflict_row(store, recording_id, conflict_id, kind)
-        return _waits_for(row, _conflict_rows(store, kind))
+        rows = _conflict_rows(store, kind)
+        return _waits_for(row, rows), bool(_unresolvable_wait(row, rows))
     finally:
         store.close()
 
@@ -1323,7 +1327,7 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "encoding": encoding, "file_notes": notes, "copy_problem": copy_problem,
                 "comparison_approximate": comparison["approximate"],
                 "also_replaces": facts["also_replaces"] if can_replace else [],
-                "waits_for": facts["waits_for"] if can_replace else [],
+                "waits_for": facts["waits_for"] if can_replace else [], "waits_blocked": bool(waits),
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
         store.close()
@@ -1470,7 +1474,7 @@ def _file_outcome(store, row, failure):
     if any(not other["resolved"] for other in rows):
         reason = _unresolvable_wait(row, rows) or (
             "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
-            "Когда вы решите тот файл, программа допишет этот, если вы его с тех пор не меняли; "
+            "Если тот файл будет решён, программа допишет этот, если вы его с тех пор не меняли; "
             "если меняли, появится новый конфликт.")
     elif state == "missing":
         reason = _missing_text(row, "и нажмите «Повторить».")

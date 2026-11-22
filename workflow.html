@@ -419,14 +419,15 @@ function conflictCard(c) {
       });
       bar.append(again);
     } else {
-      box.append(node("p", "Решение принято; запись этого файла ждёт решения по другому файлу той же записи " +
-        "(он выше, среди ждущих решения).", "warn"),
-        node("p", "Когда вы решите тот файл, программа допишет этот, если вы его с тех пор не меняли; если меняли, " +
+      box.append(node("p", c.wait_reason ? `Решение принято. ${c.wait_reason}`
+        : "Решение принято; запись этого файла ждёт решения по другому файлу той же записи " +
+          "(он выше, среди ждущих решения).", "warn"),
+        node("p", "Если тот файл будет решён, программа допишет этот, если вы его с тех пор не меняли; если меняли, " +
           "появится новый конфликт."));
     }
-    box.append(node("p", "Принятое решение программа может довести и сама, при любой следующей записи файлов этой " +
-      "записи, не спрашивая снова. Если вы успели изменить файл или вернуть в него свою копию, сохраните её копию " +
-      "сами: программа знает только прежнюю копию.", "muted"));
+    box.append(node("p", (c.can_retry ? "Принятое решение программа может довести и сама, при любой следующей " +
+      "записи файлов этой записи, не спрашивая снова. " : "") + "Если вы успели изменить файл или вернуть в него " +
+      "свою копию, сохраните её копию сами: программа знает только прежнюю копию.", "muted"));
   }
   box.append(bar, panel);
   return box;
@@ -452,7 +453,11 @@ async function downloadCopy(c) {
   conflictNote(`Копия «${link.download}» передана браузеру: ищите её в папке загрузок.`);
 }
 
-function fileStateText(state, open, preserved) {
+function fileStateText(state, open, preserved, waiting) {
+  if (state === "changed" && open && waiting) {
+    return "Файл в папке изменили после того, как копия была сохранена: он не равен ни копии, ни версии программы. " +
+      "Различия ниже показаны для прежней копии.";
+  }
   return {
     program: "Файл в папке сейчас равен версии программы." + (open ? " Подтверждение лишь закроет конфликт." : ""),
     same: preserved ? "Файл в папке сейчас равен вашей сохранённой копии."
@@ -481,7 +486,7 @@ async function showCompare(box, panel, c) {
   const p = await post("api/conflict/preview", {recording_id: c.recording_id, conflict_id: c.conflict_id, kind: c.scope});
   if (gen !== conflictGen || !box.isConnected) return;     // список обновился: старое сравнение не показываем
   const open = c.status === "open", archive = c.kind.startsWith("archive_");
-  const parts = archive ? [] : [node("p", fileStateText(p.file_state, open && p.can_replace, p.preserved))];
+  const parts = archive ? [] : [node("p", fileStateText(p.file_state, open && p.can_replace, p.preserved, (p.waits_for || []).length > 0))];
   if (p.copy_problem) parts.push(node("p", p.copy_problem, "bad"));
   if (p.preserved && !p.copy_problem) {
     if (archive) {
@@ -542,7 +547,8 @@ function confirmBox(box, panel, c, p) {
   ask.append(waits.length
     ? node("p", `Сейчас файл «${c.relative_path}» не изменится: он ждёт решения по другому файлу той же записи ` +
         `(${waits.map(n => `«${n}»`).join(", ")}). Подтверждение только запишет решение, отменить его нельзя. ` +
-        "Когда ожидание кончится, программа " + (changed
+        (p.waits_blocked ? "Решить тот файл на этом экране нельзя: нужен отдельный ручной разбор. " : "") +
+        "Если тот файл будет решён, программа " + (changed
           ? "не заменит этот изменённый файл, а сохранит его новую копию, если он не больше 8 МиБ, и спросит снова. " +
             "До этого новой копии у неё нет: сохраните файл отдельно сами."
           : "заменит файл сама, если вы его с тех пор не меняли: ваша правка пропадёт из файла, её копия останется " +
