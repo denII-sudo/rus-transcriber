@@ -102,6 +102,8 @@ class WriteGuardTests(fixtures.ScreenCase):
                         pass  # До записи — отказ; после решения экран также может дать not_written.
                     self.assertEqual(bad.path.read_bytes(), bad.saved,
                                      "Соседний файл заменён при повреждённой копии")
+                    self.assertNotEqual(target.path.read_bytes(), target.saved,
+                                        "Исправный файл остановлен чужой повреждённой копией")
 
     def test_current_override_checks_size_too(self):
         for scope in fixtures.SCOPES:
@@ -192,3 +194,98 @@ class WriteGuardTests(fixtures.ScreenCase):
                 with self.assertRaises(storage.StorageError):
                     self.materialize(case.rec, "conspect")
                 self.assertEqual(case.path.read_bytes(), case.saved)
+
+    def test_damaged_copy_does_not_stop_a_neighbour_recording(self):
+        for bad_first in (True, False):
+            with self.subTest(bad_first=bad_first):
+                low = uuid.uuid4().int & ~1
+                ids = [str(uuid.UUID(int=low + i)) for i in (0, 1)]
+                bad_id, good_id = ids if bad_first else ids[::-1]
+                bad = self.conflict("document", rec=self.recording(ident=bad_id))
+                self.resolve_directly(bad)
+                self.damage(bad)
+                good = self.recording(root=bad.rec.root, ident=good_id)    # создание и есть запись файлов соседа
+                changed = self.change_text(good, "правка")
+                self.assertIn((good.rid, changed["document_revision"]), self.materialize(good, "document"))
+                self.assertEqual(good.files["md"].read_bytes(), self.program(good, "document", "md"))
+                self.assertEqual(core.sync_recording_documents(good.rid)["document_sync"], "synced")
+                self.assertEqual(bad.path.read_bytes(), bad.saved)
+                with self.assertRaises(storage.StorageError):
+                    self.materialize(bad.rec, "document")
+
+    def test_damaged_copy_does_not_stop_a_neighbour_conspect(self):
+        for name in ("А-полная", "Я-полная"):    # до и после повреждённой «Краткий»
+            with self.subTest(name=name):
+                bad = self.conflict("conspect")
+                self.resolve_directly(bad)
+                self.damage(bad)
+                rec = bad.rec
+                paths = {kind: rec.root / f"{rec.stem}.{name}.conspect.{kind}" for kind in ("json", "md")}
+                value = json.dumps({"recording_id": rec.rid, "name": name}, ensure_ascii=False).encode("utf-8")
+                recordings.save_conspect_files(rec.files["json"], [(paths["json"], value), (paths["md"], b"other\n")])
+                self.assertEqual(paths["md"].read_bytes(), b"other\n")
+                self.assertEqual(bad.path.read_bytes(), bad.saved)
+                with self.assertRaises(storage.StorageError):
+                    self.materialize(rec, "conspect")
+
+    def test_neighbour_decision_through_mcp_succeeds(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                bad, target = self.pair(scope)
+                self.resolve_directly(bad)
+                self.damage(bad)
+                result = getattr(core, f"resolve_{scope}_conflict")(target.rid, target.id)
+                self.assertTrue(result["materialized"])
+                self.assertEqual(bad.path.read_bytes(), bad.saved)
+
+    def test_later_revision_waits_for_the_damaged_conspect(self):
+        case = self.conflict("conspect")
+        self.resolve_directly(case)
+        self.damage(case)
+        self.save_conspect(case.rec)
+        with self.assertRaises(storage.StorageError):
+            self.materialize(case.rec, "conspect")
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        self.assertEqual(self.store.db.execute(
+            "SELECT count(*) FROM conspect_conflicts WHERE resolution_operation_id IS NULL AND conspect_id=?",
+            (case.rec.conspect_id,)).fetchone()[0], 0)
+
+    def test_damaged_copy_advice_really_leads_out(self):
+        for scope in fixtures.SCOPES:
+            for kind in (("md", "json", "manifest") if scope == "document" else ("md", "json")):
+                with self.subTest(scope=scope, kind=kind):
+                    case = self.conflict(scope, kind=kind)
+                    self.resolve_directly(case)
+                    self.damage(case)
+                    reason = self.retry(case)["reason"]
+                    self.assertIn("измените", reason.casefold())
+                    self.assertNotIn("восстановите копию", reason.casefold())
+                    self.assertNotIn("если ошибка повторится", reason.casefold())
+                    case.path.write_bytes(case.saved + b"\n")    # ровно то, что советует причина
+                    self.assertEqual(self.retry(case)["outcome"], "changed")
+                    fresh = self.open_case(case.rec, scope, kind)
+                    self.assertEqual(self.replace(self.snapshot(fresh))["outcome"], "replaced")
+                    self.assertEqual(self.copy(fresh), case.saved + b"\n")
+
+    def test_unresolvable_neighbour_is_named_before_and_after_the_decision(self):
+        rec = self.recording()
+        self.save_conspect(rec)
+        self.materialize(rec, "conspect")
+        rec.conspect_files["md"].write_bytes(b"my edit\n")
+        rec.conspect_files["json"].write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+        self.save_conspect(rec)
+        self.materialize(rec, "conspect")
+        case = self.open_case(rec, "conspect", "md")
+        shown = self.preview(case)
+        name = rec.conspect_files["json"].name
+        self.assertTrue(any(name in note and "нельзя" in note for note in shown["file_notes"]), shown["file_notes"])
+        reason = self.replace(shown["snapshot"])["reason"]
+        self.assertIn(name, reason)
+        self.assertIn("нельзя", reason)
+        self.assertNotIn("когда вы решите", reason.casefold())
+
+    def test_copy_with_a_wrong_size_is_not_downloaded(self):
+        case = self.conflict("document")
+        self.damage(case, "observed_size")
+        status, _, _ = self.request("POST", "api/conflict/copy", self.body(case))
+        self.assertEqual(status, 400)
