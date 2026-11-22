@@ -7,6 +7,7 @@ from unittest import mock
 
 import conspect
 import core
+import documents
 import recordings
 import storage
 import test_conflict_replace as fixtures
@@ -255,18 +256,60 @@ class WriteGuardTests(fixtures.ScreenCase):
         for scope in fixtures.SCOPES:
             for kind in (("md", "json", "manifest") if scope == "document" else ("md", "json")):
                 with self.subTest(scope=scope, kind=kind):
-                    case = self.conflict(scope, kind=kind)
+                    case = self.conflict(scope, body=lambda original: original + b"xy", kind=kind)
                     self.resolve_directly(case)
                     self.damage(case)
                     reason = self.retry(case)["reason"]
                     self.assertIn("измените", reason.casefold())
                     self.assertNotIn("восстановите копию", reason.casefold())
                     self.assertNotIn("если ошибка повторится", reason.casefold())
-                    case.path.write_bytes(case.saved + b"\n")    # ровно то, что советует причина
+                    case.path.write_bytes(case.saved[:-1])    # ровно то, что советует причина
                     self.assertEqual(self.retry(case)["outcome"], "changed")
                     fresh = self.open_case(case.rec, scope, kind)
                     self.assertEqual(self.replace(self.snapshot(fresh))["outcome"], "replaced")
-                    self.assertEqual(self.copy(fresh), case.saved + b"\n")
+                    self.assertEqual(self.copy(fresh), case.saved[:-1])
+
+    def test_advice_works_at_the_copy_size_limit_and_for_an_empty_file(self):
+        limit = documents.MAX_CONFLICT_BYTES
+        for scope in fixtures.SCOPES:
+            for size in (limit, limit - 1, 1, 0):
+                with self.subTest(scope=scope, size=size):
+                    case = self.conflict(scope, body=b"x" * size)
+                    self.resolve_directly(case)
+                    self.damage(case)
+                    reason = self.retry(case)["reason"].casefold()
+                    self.assertIn("удалите один", reason)
+                    self.assertIn("пустой файл", reason)
+                    self.assertIn("не больше 8 миб", reason)
+                    self.assertNotIn("добавьте пустую строку", reason)
+                    changed = case.saved[:-1] if size else b"x"
+                    case.path.write_bytes(changed)
+                    self.assertEqual(self.retry(case)["outcome"], "changed")
+                    fresh = self.open_case(case.rec, scope, "md")
+                    self.assertTrue(fresh.saved == changed, "новая копия не сохранена")
+                    self.assertEqual(self.replace(self.snapshot(fresh))["outcome"], "replaced")
+
+    def test_advice_names_the_case_when_the_file_becomes_the_program_version(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                rec = self.recording()
+                if scope == "conspect":
+                    self.save_conspect(rec)
+                    self.materialize(rec, scope)
+                    path = rec.conspect_files["md"]
+                    path.write_bytes(b"temporary edit")
+                    self.save_conspect(rec)
+                else:
+                    path = rec.files["md"]
+                path.write_bytes(self.program(rec, scope, "md") + b"x")
+                self.materialize(rec, scope)
+                case = self.open_case(rec, scope, "md")
+                self.resolve_directly(case)
+                self.damage(case)
+                self.assertIn("совпадёт с версией программы", self.retry(case)["reason"])
+                path.write_bytes(case.saved[:-1])    # совет выполнен, и правки в файле больше нет
+                self.assertEqual(self.item(case)["status"], "resolved")
+                self.assertTrue(self.materialize(rec, scope))
 
     def test_unresolvable_neighbour_is_named_before_and_after_the_decision(self):
         rec = self.recording()
