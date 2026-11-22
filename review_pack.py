@@ -373,6 +373,9 @@ def match(text, item):
     j = " ".join(w)
     if not w:
         return {"kind": "skip", "why": "пустой ответ"}
+    import freeform
+    if freeform.negative_answer(text):     # закрытый список отрицаний: ничего не подтверждает
+        return {"kind": "free"}
     if re.search(r"повтор|еще раз|не расслыша|не понял", j):
         return {"kind": "repeat"}
     if re.search(r"человек|оставь|оставить|не знаю|не уверен", j):
@@ -388,7 +391,7 @@ def match(text, item):
             for stem, n in _ORD:
                 if x.startswith(stem) and n < len(opts):
                     return {"kind": "option", "option": n}
-        if re.search(r"рекоменд|как предлож|согла|верно|правильно|^да$|^ага$|^угу$", j) and \
+        if re.search(r"рекоменд|как предлож|согла|(?<!на)верно|правильно|^да$|^ага$|^угу$", j) and \
                 item.get("recommended") is not None:
             return {"kind": "recommended", "option": item["recommended"]}
     # совпадение по словам варианта (имена, слова текста): берём вариант с наибольшим числом
@@ -527,6 +530,7 @@ def decisions(json_path):
     применения (на карточке «Изменить ответ») — при наличии структурного снимка прежняя правка сначала
     отменяется, затем применяется новый ответ; без снимка изменение блокируется конфликтом. Ответ
     «отменить» только откатывает и снова открывает место."""
+    import freeform
     import transcript as T
     pd = pack_dir(json_path)
     man = manifest(json_path)
@@ -550,6 +554,10 @@ def decisions(json_path):
             continue
         src = f"разбор ({a['source']}, {a['ts']})"
         k = a["kind"]
+        if k == "free" and freeform.negative_answer(a.get("text")):
+            # отрицание не отменяет и ранее применённый ответ; подсказку даёт разбор свободного ответа
+            rep["free"].append({"id": aid, "text": a.get("text")})
+            continue
         if aid in applied:
             snapshot = (store.get("undo_snapshots") or {}).get(aid)
             if not snapshot:
@@ -605,11 +613,14 @@ def decisions(json_path):
 
 
 def free_answers(json_path):
-    """Свободные ответы пакета, ещё не применённые: {id: ответ}."""
+    """Свободные ответы пакета, ещё не применённые: {id: ответ}. Отрицание — и после применения (место
+    остаётся с подсказкой, применённая правка не трогается)."""
+    import freeform
     pd = pack_dir(json_path)
     store = _read_answers(json_path, {"answers": {}})
     applied = _applied_map(store)
-    return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and aid not in applied}
+    return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and
+            (aid not in applied or freeform.negative_answer(a.get("text")))}
 
 
 def apply_free(json_path, md_path, free, dry_run=False):
@@ -696,9 +707,11 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
             continue
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
-    if human and not dry_run:                     # не понятые ответы — человеку, с текстом ответа
+    negative_ids = {r["id"] for r in reports if r.get("kind") == "negative"}
+    mark_human = [h for h in human if h["id"] not in negative_ids]
+    if mark_human and not dry_run:                # не понятые ответы — человеку; отрицание оставляет место как было
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
-                                             "note": f"{h['why']}: «{h['answer']}»"} for h in human], by="human")
+                                             "note": f"{h['why']}: «{h['answer']}»"} for h in mark_human], by="human")
     return {**({"target_ids": {aid: sorted(ids) for aid, ids in targets.items()}} if dry_run else {}),
             "cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +

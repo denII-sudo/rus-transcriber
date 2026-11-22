@@ -1,15 +1,26 @@
 name: Tests
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
-    # ready_for_review: a draft marked ready runs Tests again, so automerge can queue it.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # No ready_for_review: the commit is already tested, automerge.yml reuses that result.
+    types: [opened, synchronize, reopened]
+  # A merge is not tested again (branch protection requires an up-to-date, tested branch).
+  # main runs only to fill the dependency cache that every PR can read: when this file
+  # changes and every few days, because GitHub drops a cache unused for 7 days.
+  push:
+    branches: [main]
+    paths: [".github/workflows/tests.yml"]
+  schedule:
+    - cron: "41 1 */5 * *"
 
 permissions:
   contents: read
+
+# A new commit in a PR makes the running check of its previous commit useless.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   tests:
@@ -22,9 +33,47 @@ jobs:
       PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2 # the merge commit of a PR and its first parent (main)
+      # Среди тестов от docs/*.md и README.md зависит только test_text_hygiene. Любой другой файл,
+      # событие не PR или сбой определения - полный набор.
+      - name: Choose the test scope
+        id: scope
+        shell: pwsh
+        run: |
+          $scope = "full"
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $files = @(git -c core.quotePath=false diff --no-renames --name-only "HEAD^1" HEAD)
+            if ($LASTEXITCODE -eq 0 -and $files.Count -gt 0 -and
+                @($files | Where-Object { $_ -cnotmatch '^(docs/.+\.md|README\.md)$' }).Count -eq 0) {
+              $scope = "docs"
+            }
+          }
+          "scope=$scope" >> $env:GITHUB_OUTPUT
+          Write-Output "Test scope: $scope"
+          exit 0
       - uses: actions/setup-python@v7
+        id: python
         with:
           python-version: "3.12"
+      # Пакеты заданы в этом файле, поэтому его хэш входит в ключ кэша.
+      - name: Restore test dependencies
+        id: deps
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/test-venv
+          key: test-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('.github/workflows/tests.yml') }}
+      - name: Use the test environment
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.deps.outputs.cache-hit }}
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "test-venv"
+          if ($env:CACHE_HIT -ne "true") {
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Join-Path $venv "Scripts" >> $env:GITHUB_PATH
       - name: Prepare isolated Windows test directories
         shell: pwsh
         run: |
@@ -37,6 +86,7 @@ jobs:
           "TMP=$testTemp" >> $env:GITHUB_ENV
           "RUS_TRANSCRIBER_DATA=$testData" >> $env:GITHUB_ENV
       - name: Install lightweight test dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
         run: >-
           python -m pip install --disable-pip-version-check
           numpy==2.3.5
@@ -46,15 +96,31 @@ jobs:
           onnx-asr==0.12.0
           onnxruntime==1.32.0
       - name: Install CPU-only PyTorch
+        if: steps.deps.outputs.cache-hit != 'true'
         run: >-
           python -m pip install --disable-pip-version-check
           torch==2.15.0
           --index-url https://download.pytorch.org/whl/cpu
+      # Сохраняется до тестов: упавший тест не должен стоить повторной установки пакетов.
+      - name: Save test dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/test-venv
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+      # Набор идёт один раз, с подробным выводом (при падении в журнале виден полный разбор).
       - name: Run unit tests
+        if: steps.scope.outputs.scope != 'docs'
         run: python -B -m unittest discover -s tests -v
-      # так же, как self_check у пользователя после обновления: свои временные папки и данные
-      - name: Run self-check like an installed copy
-        run: python -B selfcheck.py
+      - name: Run text tests for a documentation-only change
+        if: steps.scope.outputs.scope == 'docs'
+        run: python -B -m unittest discover -s tests -p test_text_hygiene.py -v
+      # Остальные проверки самопроверки установленной копии (файлы на личные данные, морфология,
+      # сведения о сборке) без повторного запуска набора: selfcheck.py без --no-tests прогонял бы
+      # те же тесты второй раз (около 2,5 минут). Сама самопроверка с тестами проверяется
+      # tests/test_selfcheck.py и при установке (шаг 10 install.ps1).
+      - name: Run self-check checks without repeating the unit tests
+        run: python -B rt.py self-check --no-tests
       # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,
       # по одному в строке. Журнал публичный: --hide-words выводит только файл и строку, без слова.
       # PR из форков секрет не получают — там проверка пропускается с пометкой.

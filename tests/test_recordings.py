@@ -1,5 +1,6 @@
 import copy
 import asyncio
+import contextlib
 import json
 import os
 import http.client
@@ -17,6 +18,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 import documents
+import freeform
 import recordings
 import review_pack
 import settings
@@ -46,6 +48,328 @@ class WorkerSnapshotTests(unittest.TestCase):
             "review_done": False,
             "edits": [],
         }
+
+    NAME_SPEAKERS = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера", "Глеб"]
+
+    def answer_result(self, word_ids=False):
+        """Результат с одним словом «тест» у Глеба: любой названный в ответе говорящий — это правка."""
+        data = self.worker_result()
+        data["speakers"] = list(self.NAME_SPEAKERS)
+        data["segments"][0]["speaker"] = "Глеб"
+        data["review"][0]["speaker"] = "Глеб"
+        if word_ids:
+            data["segments"][0]["words"][0]["word_id"] = "w1"
+            data["review"][0]["word_ids"] = ["w1"]
+        else:                     # старый вид карточки: без номеров слов (пустой список — не старый вид)
+            data["review"][0].pop("word_ids", None)
+        return data
+
+    @contextlib.contextmanager
+    def answer_files(self, backend, data=None):
+        """Пара файлов стенограммы в выбранном режиме хранения: (jp, md). Папка и база — временные."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db, audio = root / "state.sqlite3", root / "sample.wav"
+            audio.write_bytes(b"synthetic")
+            data = copy.deepcopy(data or self.answer_result())
+            data["file"] = str(audio)
+            layout = recordings.document_layout(audio)
+            layout["root"].mkdir()
+            store = None
+            with mock.patch.object(settings.paths, "STATE_DB", db), \
+                    mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
+                try:
+                    if backend == "sqlite":
+                        store = recordings.initialize_store(db, display_name="Тест")
+                        root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                        rid = str(uuid.uuid4())
+                        recordings.commit_worker_result(
+                            store, data, audio, root_id, recordings.operation_context(store, "model"),
+                            recording_id=rid, operation_id=str(uuid.uuid4()),
+                            generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                        recordings.materialize_recording(store, rid)
+                        jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                    else:
+                        jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
+                        transcript.save(data, jp, md)
+                    yield jp, md
+                finally:
+                    if store:
+                        store.close()
+
+    @staticmethod
+    def answer_card(jp, md, answers, recommended=0):
+        """Собрать пакет, по очереди сохранить и применить ответы человека: [(текст, голос?)] | {"option": n}.
+        -> отчёт последнего применения."""
+        question = {"id": "r1", "question": "Проверьте", "recommended": recommended, "options": [
+            {"label": "Другое слово", "decision": {"text": "другое"}},
+            {"label": "Третье слово", "decision": {"text": "третье"}}]}
+        pack = review_pack.build(jp, [question])
+        result = None
+        for answer in answers:
+            row = {"id": "r1", "version": pack["version"]}
+            if isinstance(answer, dict):
+                row.update(answer)
+            else:
+                row.update(text=answer[0], heard=answer[1])
+            review_pack.add_answers(jp, [row], "local", trusted_actor="human")
+            result = core.apply_answers_files(jp, md)
+        return result
+
+    @staticmethod
+    def card_state(jp):
+        d = transcript.load(jp)
+        return ([w["w"] for s in d["segments"] for w in s["words"]],
+                [s["speaker"] for s in d["segments"]], d["review"][0].get("status"))
+
+    def test_names_and_labels_in_both_storage_modes(self):
+        # Различий между режимами хранения в разборе ответа нет: один и тот же ожидаемый итог для обоих.
+        cases = [
+            ("Спикер 1:", "name", "Спикер 1"),
+            ("Спикер 1", "name", "Спикер 1"),
+            ("Спикер 10", "name", "Спикер 10"),
+            ("Анна", "name", "Анна"),
+            ("Анна Петровна", "name", "Анна Петровна"),
+            ("Борис, не Анна", "name", "Борис"),
+            ("не Анна, а Вера", "name", "Вера"),
+            ("это не Анна", "unmatched", None),
+            ("нет, не Анна", "unmatched", None),
+            ("не Анна и не Борис", "unmatched", None),
+            ("ни Анна, ни Борис", "unmatched", None),
+            ("не Анна: тест", "unmatched", None),
+            ("ни Анна: тест", "unmatched", None),
+            ("нет, Анна: тест", "unmatched", None),
+            ("не Спикер 1: тест", "unmatched", None),
+            ("Спикер 3: тест", "unmatched", None),
+        ]
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), self.answer_files(backend) as (jp, _md):
+                loaded = transcript.load(jp)
+                man = {"items": [dict(loaded["review"][0])]}
+                for text, kind, speaker in cases:
+                    with self.subTest(backend=backend, answer=text):
+                        edits, reports, _, _ = freeform.plan(man, {"r1": {"text": text}}, loaded)
+                        self.assertEqual(reports[0]["kind"], kind)
+                        if speaker:
+                            self.assertEqual([e["speaker"] for e in edits], [speaker])
+                        if kind == "unmatched":
+                            self.assertFalse(edits)
+                            self.assertTrue(reports[0]["human"])
+
+    def test_name_answers_applied_in_both_storage_modes(self):
+        # Сквозной путь: ответ сохранён и применён. Итог одинаков для sqlite и legacy_files.
+        named = [("Спикер 1:", "Спикер 1"), ("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
+                 ("Анна", "Анна"), ("Анна Петровна", "Анна Петровна"), ("Борис, не Анна", "Борис"),
+                 ("не Анна, а Вера", "Вера"), ("нет, не Анна, а Вера", "Вера")]
+        to_human = ["это не Анна", "нет, не Анна", "не Анна и не Борис", "ни Анна, ни Борис",
+                    "не Анна: тест", "нет, Анна: тест", "Спикер 3: тест"]
+        for backend in ("legacy_files", "sqlite"):
+            for ids in (False, True):
+                for text, speaker in named:
+                    with self.subTest(backend=backend, word_ids=ids, answer=text), \
+                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
+                        self.answer_card(jp, md, [(text, False)])
+                        self.assertEqual(self.card_state(jp)[:2], (["тест"], [speaker]))
+                        if "не Анна" in text:      # отрицаемое имя не назначено ни одной правкой
+                            edits = transcript.load(jp).get("edits") or []
+                            self.assertNotIn("Анна", json.dumps(edits, ensure_ascii=False).replace(text, ""))
+                for text in to_human:
+                    with self.subTest(backend=backend, word_ids=ids, answer=text), \
+                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, False)])
+                        self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "human"))
+                        self.assertTrue(result["free_text"]["left_to_human"])
+
+    def test_negative_answers_remain_open_in_both_storage_modes(self):
+        negatives = ("неверно", "не верно", "неправильно", "не согласен",
+                     "это неверно", "нет, неверно", "не согласен с этим")
+        item = {"id": "r1", "options": [{"label": "верный вариант", "decision": {"text": "другое"}}],
+                "recommended": 0}
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                db = root / "state.sqlite3"
+                audio = root / "sample.wav"
+                audio.write_bytes(b"synthetic")
+                data = self.worker_result()
+                data["file"] = str(audio)
+                layout = recordings.document_layout(audio)
+                layout["root"].mkdir()
+                store = None
+                with mock.patch.object(settings.paths, "STATE_DB", db):
+                    try:
+                        if backend == "sqlite":
+                            store = recordings.initialize_store(db, display_name="Тест")
+                            root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                            rid = str(uuid.uuid4())
+                            recordings.commit_worker_result(
+                                store, data, audio, root_id, recordings.operation_context(store, "model"),
+                                recording_id=rid, operation_id=str(uuid.uuid4()),
+                                generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                            recordings.materialize_recording(store, rid)
+                            jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                        else:
+                            jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
+                            transcript.save(data, jp, md)
+                        before = transcript.load(jp)
+                        card = dict(before["review"][0])
+                        card.pop("word_ids", None)
+                        man = {"items": [card], "recording_id": before.get("recording_id")}
+                        with mock.patch.object(review_pack, "manifest", return_value=man):
+                            for text in negatives:
+                                for mode in ("typed", "voice"):
+                                    with self.subTest(backend=backend, mode=mode, answer=text):
+                                        if mode == "voice":
+                                            self.assertEqual(review_pack.match(text, item)["kind"], "free")
+                                        result = review_pack.apply_free(jp, md, {"r1": {"text": text}})
+                                        self.assertTrue(result["left_to_human"])
+                                        self.assertIn("слово", result["left_to_human"][0]["why"])
+                                        self.assertEqual(transcript.load(jp), before)
+                        self.assertEqual(review_pack.match("всё верно", item)["kind"], "recommended")
+                    finally:
+                        if store:
+                            store.close()
+
+    def test_negative_does_not_undo_applied_answer_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
+                                                         "это неверно", "нет, неверно", "не согласен с этим",
+                                                         "неверно: слово")
+                               for mode in ("typed", "voice")):
+                with self.subTest(backend=backend, answer=text, mode=mode), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    db, audio = root / "state.sqlite3", root / "sample.wav"
+                    audio.write_bytes(b"synthetic")
+                    data = self.worker_result()
+                    data["file"] = str(audio)
+                    data["review"][0].pop("word_ids", None)
+                    layout = recordings.document_layout(audio)
+                    layout["root"].mkdir()
+                    store = None
+                    with mock.patch.object(settings.paths, "STATE_DB", db):
+                        try:
+                            if backend == "sqlite":
+                                store = recordings.initialize_store(db, display_name="Тест")
+                                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                                rid = str(uuid.uuid4())
+                                recordings.commit_worker_result(
+                                    store, data, audio, root_id, recordings.operation_context(store, "model"),
+                                    recording_id=rid, operation_id=str(uuid.uuid4()),
+                                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                                recordings.materialize_recording(store, rid)
+                                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                            else:
+                                jp = layout["root"] / layout["paths"]["json"]
+                                md = layout["root"] / layout["paths"]["md"]
+                                transcript.save(data, jp, md)
+                            question = {"id": "r1", "question": "Проверьте", "options": [
+                                {"label": "Другое", "decision": {"text": "другое"}}]}
+                            with mock.patch.object(review_pack, "cut_clip",
+                                                   side_effect=lambda _s, t1, _t2, _out: t1):
+                                pack = review_pack.build(jp, [question])
+                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "option": 0}],
+                                                    "local", trusted_actor="human")
+                            core.apply_answers_files(jp, md)
+                            before = transcript.load(jp)
+                            self.assertEqual(before["segments"][0]["words"][0]["w"], "другое")
+                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
+                                                          "text": text, "heard": mode == "voice"}],
+                                                    "local", trusted_actor="human")
+                            result = core.apply_answers_files(jp, md)
+                            after = transcript.load(jp)
+                            self.assertEqual(after["segments"], before["segments"])
+                            self.assertEqual(after["review"], before["review"])
+                            self.assertEqual(after["edits"], before["edits"])
+                            self.assertFalse(result["reverted"])
+                            self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
+                        finally:
+                            if store:
+                                store.close()
+
+    # Ответы на карточку «тест» у Глеба с рекомендацией «другое» (вариант 1) и вариантом 2 «третье».
+    # Закрытый список отрицаний: печатью и голосом — стенограмма не меняется, место открыто.
+    NEGATIVES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна", "не согласны",
+                 "это неверно", "нет, неверно", "не согласен с этим", "я не согласен", "совершенно неверно",
+                 "совсем не верно", "нет-нет, неверно", "абсолютно неправильно", "неверно: слово",
+                 "не согласен: слово", "НЕВЕРНО", "Неверно!")
+
+    def test_negative_answers_keep_place_open_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text in self.NEGATIVES:
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, heard)])
+                        self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "open"))
+                        self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
+
+    def test_negative_then_correct_answer_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for negative in ("неверно", "совсем не верно", "неверно: слово"):
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=negative, voice=heard, then="text"), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), ("слово", False)])
+                        self.assertEqual(self.card_state(jp)[0], ["слово"])
+                    with self.subTest(backend=backend, answer=negative, voice=heard, then="option"), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), {"option": 1}])
+                        self.assertEqual(self.card_state(jp)[0], ["третье"])
+
+    # Остальные ответы — как до закрытого списка отрицаний: (ответ, итог печатью, итог голосом),
+    # итог — (слова карточки, говорящий, статус места). «наверно» голосом больше не подтверждает рекомендацию.
+    AS_BEFORE = (
+        ("согласен", ("согласен", "resolved"), ("другое", "resolved")),
+        ("согласна", ("согласна", "resolved"), ("другое", "resolved")),
+        ("принимаю", ("принимаю", "resolved"), ("принимаю", "resolved")),
+        ("рекомендую", ("рекомендую", "resolved"), ("другое", "resolved")),
+        ("ну да", ("ну да", "resolved"), ("ну да", "resolved")),
+        ("да, это я", ("да, это я", "resolved"), ("да, это я", "resolved")),
+        ("верно", ("тест", "open"), ("другое", "resolved")),
+        ("Верно.", ("тест", "open"), ("другое", "resolved")),
+        ("да, верно", ("тест", "open"), ("другое", "resolved")),
+        ("да", ("тест", "open"), ("другое", "resolved")),
+        ("ага", ("тест", "open"), ("другое", "resolved")),
+        ("угу", ("тест", "open"), ("другое", "resolved")),
+        ("всё правильно", ("всё правильно", "resolved"), ("другое", "resolved")),
+        ("да, согласен", ("да, согласен", "resolved"), ("другое", "resolved")),
+        ("я согласен", ("я согласен", "resolved"), ("другое", "resolved")),
+        ("согласен с этим", ("согласен с этим", "resolved"), ("другое", "resolved")),
+        ("совершенно верно", ("совершенно верно", "resolved"), ("другое", "resolved")),
+        ("абсолютно правильно", ("абсолютно правильно", "resolved"), ("другое", "resolved")),
+        ("да, всё верно", ("да, всё верно", "resolved"), ("другое", "resolved")),
+        ("принимаю рекомендацию", ("принимаю рекомендацию", "resolved"), ("другое", "resolved")),
+        ("да, как рекомендовано", ("да, как рекомендовано", "resolved"), ("другое", "resolved")),
+        ("как предложено", ("как предложено", "resolved"), ("другое", "resolved")),
+        ("так", ("тест", "open"), ("тест", "open")),
+        ("как есть", ("тест", "open"), ("тест", "open")),
+        ("да да", ("да да", "resolved"), ("да да", "resolved")),
+        ("мы согласны", ("мы согласны", "resolved"), ("другое", "resolved")),
+        ("Борис Иванович", ("тест", "human"), ("тест", "human")),
+        ("Анна Иванова", ("тест", "human"), ("тест", "human")),
+        ("Вера Николаевна", ("тест", "human"), ("тест", "human")),
+        ("нет", ("нет", "resolved"), ("нет", "resolved")),
+        ("не совсем верно", ("не совсем верно", "resolved"), ("другое", "resolved")),
+        ("вряд ли верно", ("вряд ли верно", "resolved"), ("другое", "resolved")),
+        ("нет, это не так", ("нет, это не так", "resolved"), ("нет, это не так", "resolved")),
+        ("да, но неверно", ("да, но неверно", "resolved"), ("другое", "resolved")),
+        ("неверное слово", ("неверное слово", "resolved"), ("другое", "resolved")),
+        ("он верно сказал", ("он верно сказал", "resolved"), ("другое", "resolved")),
+        ("вариант 2: да", ("вариант 2: да", "resolved"), ("третье", "resolved")),
+        ("проверено", ("проверено", "resolved"), ("проверено", "resolved")),
+        ("Анна: слово", ("тест", "human"), ("тест", "human")),
+        ("наверно", ("наверно", "resolved"), ("наверно", "resolved")),
+    )
+
+    def test_other_answers_behave_as_before_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text, typed, voice in self.AS_BEFORE:
+                for heard, (word, status) in ((False, typed), (True, voice)):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(text, heard)])
+                        words, speakers, got = self.card_state(jp)
+                        self.assertEqual((" ".join(words), speakers, got), (word, ["Глеб"], status))
 
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()

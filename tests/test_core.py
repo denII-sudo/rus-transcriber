@@ -348,6 +348,114 @@ class Gender(unittest.TestCase):
 class Answers(unittest.TestCase):
     names = ["Анна", "Борис", "Вера", "Глеб"]
 
+    def test_negated_name_is_not_selected(self):
+        self.assertEqual(freeform.classify("Борис, не Анна", self.names),
+                         {"kind": "name", "speaker": "Борис"})
+
+    # Закрытый список отрицаний: «неверно», «не согласен» и т. п. с короткой приставкой и/или усилителем.
+    CLOSED_NEGATIVES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна",
+                        "не согласны", "это неверно", "нет, неверно", "я не согласен", "нет-нет, неверно",
+                        "совершенно неверно", "совсем не верно", "абсолютно неправильно", "не согласен с этим",
+                        "я совершенно не согласен", "это совершенно неверно", "Неверно!", "НЕ ВЕРНО", "неверно: слово",
+                        "не согласен: слово")
+    # вне списка — как раньше: оценка не распознаётся, ответ разбирается обычным путём
+    NOT_NEGATIVES = ("нет", "наверно", "не совсем верно", "вряд ли верно", "это не так", "не очень верно",
+                     "думаю, что неверно", "да, но неверно", "неверное слово", "он сказал неверно", "Анна: неверно",
+                     "Спикер 1: не согласен", "время: всё верно", "верно", "неверно-неверно", "не")
+
+    def test_negative_answer_closed_list(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
+        for text in self.CLOSED_NEGATIVES:
+            with self.subTest(text=text):
+                self.assertTrue(freeform.negative_answer(text))
+                self.assertEqual(freeform.classify(text, self.names), {"kind": "negative"})
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertFalse(result["edits"])
+                self.assertIn("слово", result["report"]["human"])
+        for text in self.NOT_NEGATIVES:
+            with self.subTest(text=text):
+                self.assertFalse(freeform.negative_answer(text))
+                self.assertNotEqual(freeform.classify(text, self.names)["kind"], "negative")
+
+    def test_multiword_names_and_labels(self):
+        names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
+        for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
+                              ("Анна Петровна", "Анна Петровна"), ("не Анна, а Вера", "Вера")):
+            with self.subTest(text=text):
+                self.assertEqual(freeform.classify(text, names), {"kind": "name", "speaker": speaker})
+        self.assertEqual(freeform.split_replies("Спикер 1: привет Спикер 10: пока", names),
+                         [("Спикер 1", ["привет"]), ("Спикер 10", ["пока"])])
+        self.assertEqual(freeform.split_replies("Анна Петровна: привет", names),
+                         [("Анна Петровна", ["привет"])])
+        self.assertEqual(freeform.split_replies("время: пришло", names),
+                         [(None, ["время:", "пришло"])])
+
+    def test_negated_only_and_unknown_label_need_human(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
+        for text in ("это не Анна", "Спикер 3: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+
+    def test_only_negated_names_leave_place_to_human(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Глеб"}]
+        for text in ("нет, не Анна", "не Анна и не Борис", "ни Анна, ни Борис", "нет, это не Анна",
+                     "не Анна, а не Борис", "Нет, не Анна!"):
+            with self.subTest(text=text):
+                self.assertEqual(freeform.classify(text, self.names), {"kind": "unmatched"})
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+        for text, speaker in (("нет, не Анна, а Вера", "Вера"), ("не Анна и не Борис, а Вера", "Вера"),
+                              ("ни Анна, ни Борис, а Глеб", "Глеб")):
+            with self.subTest(text=text):
+                self.assertEqual(freeform.classify(text, self.names), {"kind": "name", "speaker": speaker})
+        # обычная речь со словами «нет», «ни», «и», «не» без известных имён — текст, как раньше
+        for text in ("нет", "нет и не", "ни туда ни сюда", "и не говори", "нет, не надо", "Анна и Борис"):
+            with self.subTest(text=text):
+                self.assertEqual(freeform.classify(text, self.names), {"kind": "text"})
+
+    def test_one_negation_rule_for_names_and_labels(self):
+        # «не» и «ни» перед именем отрицают его одинаково — и в имени без двоеточия, и в метке «Имя:»
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Борис"}]
+        for neg in ("не", "ни", "Не", "НИ"):
+            with self.subTest(neg=neg):
+                self.assertEqual(freeform.classify(f"{neg} Анна", self.names), {"kind": "unmatched"})
+                result = freeform.card_edits(item, {"text": f"{neg} Анна: слово"}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+
+    def test_negation_before_label_is_not_inserted_as_words(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Борис"}]
+        for text in ("нет, Анна: слово", "Нет. Анна: слово", "нет нет, Анна: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+        # «нет» внутри явной реплики — слова этой реплики, не поправка
+        result = freeform.card_edits(item, {"text": "Борис: нет слово"}, words, self.names)
+        self.assertNotEqual(result["kind"], "unmatched")
+
+    def test_negated_label_cannot_assign_speaker_or_insert_negation(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Борис"}]
+        for text in ("не Анна: слово", "это не Анна: слово", "Борис: слово не Анна: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+                self.assertNotIn("Анна", [speaker for speaker, _ in freeform.split_replies(text, self.names)])
+
     def test_classify(self):
         c = freeform.classify
         self.assertEqual(c("да", self.names), {"kind": "agree"})

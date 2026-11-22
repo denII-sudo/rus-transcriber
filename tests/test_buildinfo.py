@@ -1,5 +1,6 @@
 """Build provenance uses only a synthetic installation and Git repository."""
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -10,6 +11,15 @@ import unittest
 from unittest.mock import patch
 
 import buildinfo
+
+
+def setUpModule():
+    """An inherited GIT_DIR (hooks, rebase --exec) overrides git -C: never write to that repository."""
+    environment = patch.dict(os.environ)
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
+    for name in [n for n in os.environ if n.upper().startswith("GIT_")]:
+        del os.environ[name]
 
 
 class BuildTests(unittest.TestCase):

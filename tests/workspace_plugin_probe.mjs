@@ -13,9 +13,13 @@ const hooks = {}
 const storage = new Map()
 let directory = repo, creates = 0, agent = "build"
 let delayed = false, pendingDirectory
-let archived = false, warnings = 0
+let archived = false, warnings = 0, strategy
+const refusals = []
 const ctx = {
-  storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v) },
+  storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v),
+    remove: async (k) => storage.delete(k),
+    scan: async ({ prefix }) => ({ entries: [...storage].filter(([k]) => k.startsWith(prefix))
+      .map(([key, value]) => ({ key, value })), next: null }) },
   options: { config: configFile, python, script },
   location: { project: { id: "synthetic", canonical: repo } },
   session: {
@@ -25,15 +29,15 @@ const ctx = {
       else directory = x.directory
     },
     update: async (x) => { archived = x.archived },
-    synthetic: async () => { warnings++ },
+    synthetic: async (x) => { if (/detached HEAD/.test(x.text)) refusals.push(x.text); else warnings++ },
     hook: async (name, fn) => { hooks[name] = fn },
   },
   worktree: {
+    transform: async (fn) => fn({ add: (s) => { strategy = s } }),
     create: async (x) => {
       creates++
       const out = path.join(repo, ".opencode", "worktrees", x.name)
-      execFileSync("git", ["-C", repo, "worktree", "add", "--detach", out, "origin/main"])
-      return { directory: out }
+      return strategy.create({ sourceDirectory: repo, directory: out, branch: x.branch })
     },
   },
   command: { transform: async (fn) => fn({ add: (cmd) => { hooks[cmd.name] = cmd.execute } }) },
@@ -42,8 +46,49 @@ const ctx = {
 }
 const dispose = await plugin.setup(ctx)
 try {
+  // Native worktree.create must work even when the main checkout is behind.
+  const native = path.join(repo, ".opencode", "worktrees", "native-child")
+  const base = execFileSync("git", ["-C", repo, "rev-parse", "origin/main"], { encoding: "utf8" }).trim()
+  await strategy.create({ sourceDirectory: repo, directory: native })
+  assert.equal(execFileSync("git", ["-C", native, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  assert.equal(execFileSync("git", ["-C", native, "branch", "--show-current"], { encoding: "utf8" }).trim(),
+    "opencode/native-child")
+  assert.equal((await strategy.list(repo))[0].directory, native)
+  directory = native
+  await hooks["tool-execute.before"]({ sessionID: "ses_native", tool: "shell" })
+  await strategy.remove({ directory: native, force: false })
+  assert.deepEqual(await strategy.list(repo), [])
+  // An explicit bare "main" must not select the possibly lagging local branch.
+  const explicit = path.join(repo, ".opencode", "worktrees", "explicit-main")
+  await strategy.create({ sourceDirectory: repo, directory: explicit, branch: "main" })
+  assert.equal(execFileSync("git", ["-C", explicit, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  await strategy.remove({ directory: explicit, force: false })
+  // A pre-existing detached copy is not adopted; the refusal names the cause.
+  const detached = path.join(repo, ".opencode", "worktrees", "detached-child")
+  execFileSync("git", ["-C", repo, "worktree", "add", "--detach", detached, base])
+  directory = detached
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_detached", tool: "shell" }),
+    /detached HEAD/)
+  // The prompt itself must not fail (a thrown hook error reaches clients as a
+  // generic HTTP 500): the cause goes into the session, tools stay blocked.
+  await hooks.prompt({ sessionID: "ses_detached" })
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /detached-child has a detached HEAD/)
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_detached", tool: "patch" }),
+    /detached HEAD/)
+  assert.equal(execFileSync("git", ["-C", detached, "branch", "--show-current"], { encoding: "utf8" }).trim(), "")
+  execFileSync("git", ["-C", repo, "worktree", "remove", detached])
+  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(repo, "missing-remote")])
+  const offline = path.join(repo, ".opencode", "worktrees", "offline-child")
+  await strategy.create({ sourceDirectory: repo, directory: offline })
+  assert.equal(execFileSync("git", ["-C", offline, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  await strategy.remove({ directory: offline, force: false })
+  directory = repo
+  // Offline ensure() must still isolate the session and warn it, using the
+  // last fetched origin/main rather than the possibly older local branch.
   await hooks.workspace({ sessionID: "ses_synthetic" })
-  if (config.expect_offline) assert.equal(warnings, 1)
+  assert.equal(warnings, 1)
+  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(path.dirname(repo), "remote.git")])
   const first = directory
   await hooks.prompt({ sessionID: "ses_synthetic" })
   assert.equal(directory, first)
