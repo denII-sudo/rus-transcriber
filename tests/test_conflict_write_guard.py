@@ -10,6 +10,7 @@ import core
 import recordings
 import storage
 import test_conflict_replace as fixtures
+import workflow
 
 
 class WriteGuardTests(fixtures.ScreenCase):
@@ -283,6 +284,38 @@ class WriteGuardTests(fixtures.ScreenCase):
         self.assertIn(name, reason)
         self.assertIn("нельзя", reason)
         self.assertNotIn("когда вы решите", reason.casefold())
+
+    def test_own_damaged_file_is_not_reported_as_success(self):
+        md, other = self.both_conspect_files()
+        self.resolve_directly(other)
+        self.damage(other)
+        with self.assertRaises(core.CoreError):
+            core.resolve_conspect_conflict(md.rid, md.id)
+        self.assertEqual(md.path.read_bytes(), md.saved)
+        self.assertEqual(other.path.read_bytes(), other.saved)
+
+    def test_mcp_window_warns_not_to_edit_during_replacement(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                _, asked = fixtures.ConflictMCPTests.mcp_resolve(self, case)
+                self.assertIn("пока идёт замена", "\n".join(asked.call_args.args[2]).casefold())
+
+    def test_workflow_conspect_is_not_stopped_by_a_neighbour(self):
+        bad = self.conflict("conspect")
+        self.resolve_directly(bad)
+        self.damage(bad)
+        rec, request_id, name = bad.rec, str(uuid.uuid4()), "Заказанный"
+        ident = str(uuid.uuid5(uuid.UUID(rec.rid), "conspect:workflow-" + request_id))
+        paths = {kind: rec.root / f"{rec.stem}.{name}.conspect.{kind}" for kind in ("json", "md")}
+        payload = {"name": name}
+        self.store.save_conspect(
+            rec.rid, ident, name, 1, None, payload, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            b"ordered\n", paths["json"].name, paths["md"].name, rec.root_id, str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"))
+        workflow._ensure_conspect_materialized(self.store, {"recording_id": rec.rid, "request_id": request_id})
+        self.assertEqual(paths["md"].read_bytes(), b"ordered\n")
+        self.assertEqual(bad.path.read_bytes(), bad.saved)
 
     def test_copy_with_a_wrong_size_is_not_downloaded(self):
         case = self.conflict("document")

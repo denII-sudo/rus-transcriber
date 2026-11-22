@@ -1285,6 +1285,9 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
             if comparison["approximate"]:
                 notes.append("Сравнение огрублено: число строк — оценка сверху, а не точное число изменений. "
                              "В списки могли попасть совпадающие строки. Сохранённая копия доступна целиком.")
+        waits = _unresolvable_wait(row, _conflict_rows(store, row["scope"])) if can_replace else None
+        if waits:
+            notes.append(waits)
         removed, removed_notes, whole_removed = _present(mine, gone, theirs)
         added, added_notes, whole_added = _present(theirs, came, mine)
         shown_text = None if text is None else _show_text(text)
@@ -1394,9 +1397,12 @@ def _journal_reason(store, row):
 
 def _failure_reason(store, row, ex):
     """Настоящая причина, по которой файл не записан, когда она известна по ошибке записи."""
+    import documents
     import storage
     if _is_journal_stop(ex):
         return _journal_reason(store, row)
+    if isinstance(ex, documents.DamagedCopy):
+        return str(ex) + " После изменения файла нажмите «Повторить»."
     if isinstance(ex, storage.Busy) or (isinstance(ex, sqlite3.OperationalError)
                                         and ("locked" in str(ex).lower() or "busy" in str(ex).lower())):
         return ("База записей была занята другой операцией. Решение принято; подождите немного "
@@ -1416,6 +1422,19 @@ def _file_words(row, digest):
             "Причину изменения по этой проверке установить нельзя. Сверьте его содержимое.")
 
 
+def _unresolvable_wait(row, rows):
+    """Открытый конфликт того же объекта, который на экране не решить, но запись этого файла его ждёт."""
+    stuck = sorted({Path(other["relative_path"]).name for other in rows
+                    if other["object"] == row["object"] and other["conflict_id"] != row["conflict_id"]
+                    and not other["resolved"] and (not other["preserved"] or other["kind"].startswith("archive_"))})
+    if not stuck:
+        return None
+    names = ", ".join(f"«{name}»" for name in stuck)
+    return (f"Запись этого файла ждёт решения по другому файлу той же записи: {names}. Но решить его на этом экране "
+            "нельзя (файл больше 8 МиБ или это архив), нужен отдельный ручной разбор. До него этот файл останется "
+            "как есть, даже если решение о замене принято.")
+
+
 def _file_outcome(store, row, failure):
     """Итог записи по самому файлу: что в нём лежит сейчас."""
     import documents
@@ -1428,9 +1447,10 @@ def _file_outcome(store, row, failure):
     if fresh:
         return {"outcome": "changed", "new_conflict_id": fresh[-1]["conflict_id"], "reason": None}
     if any(not other["resolved"] for other in rows):
-        reason = ("Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
-                  "Когда вы решите тот файл, программа допишет этот, если вы его с тех пор не меняли; "
-                  "если меняли, появится новый конфликт.")
+        reason = _unresolvable_wait(row, rows) or (
+            "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
+            "Когда вы решите тот файл, программа допишет этот, если вы его с тех пор не меняли; "
+            "если меняли, появится новый конфликт.")
     elif state == "missing":
         reason = _missing_text(row, "и нажмите «Повторить».")
     elif state == "unavailable":
@@ -1448,10 +1468,12 @@ def _file_outcome(store, row, failure):
 def _write_and_report(store, row):
     """Довести запись файлов объекта и сообщить итог по самому файлу, а не по очереди."""
     import recordings
-    write = recordings.materialize_recording if row["scope"] == "document" else recordings.materialize_conspects
     failure = None
     try:
-        write(store, row["recording_id"])
+        if row["scope"] == "document":
+            recordings.materialize_recording(store, row["recording_id"])
+        else:
+            recordings.materialize_conspects(store, row["recording_id"], conspect_id=row["conspect_id"])
     except Exception as ex:    # решение уже записано, и ответ всегда по факту: что лежит в файле
         failure = ex
     try:
@@ -1875,7 +1897,7 @@ def _resolve_for_agent(scope, recording_id, conflict_id):
         else:
             result = store.resolve_conspect_conflict(
                 conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
-            completed = recordings.materialize_conspects(store, recording_id)
+            completed = recordings.materialize_conspects(store, recording_id, conspect_id=result["conspect_id"])
             result["materialized"] = (result["conspect_id"], result["revision"]) in completed
         return result
     except (OSError, ValueError, storage.StorageError) as ex:

@@ -515,7 +515,7 @@ def _ensure_conspect_materialized(store, request):
     row = store.db.execute("SELECT current_revision FROM conspects WHERE conspect_id=?", (ident,)).fetchone()
     if row is None:
         raise storage.StorageError("сохранённый конспект отсутствует")
-    completed = recordings.materialize_conspects(store, request["recording_id"])
+    completed = recordings.materialize_conspects(store, request["recording_id"], conspect_id=ident)
     if (ident, row["current_revision"]) in completed:
         return
     state = store.db.execute("SELECT state FROM conspect_outbox WHERE conspect_id=? AND revision=?",
@@ -831,7 +831,7 @@ def _accept_model_result(store, request_id, result):
                          "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
                          "AND state='completed') AND state='waiting_model'",
                          (now, request_id))
-    completed = recordings.materialize_conspects(store, request["recording_id"])
+    completed = recordings.materialize_conspects(store, request["recording_id"], conspect_id=conspect_id)
     if (conspect_id, saved["conspect_revision"]) not in completed:
         raise storage.StorageError("конспект сохранён в БД; формирование файлов не завершено")
     return accepted

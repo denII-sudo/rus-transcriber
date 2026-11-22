@@ -850,6 +850,7 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
             lambda: ["Заменить файл на диске версией программы: правка в нём пропадёт.",
                      "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
                      "Строки различий это окно не показывает; их показывает локальный экран.",
+                     "Пока идёт замена, не сохраняйте этот файл в других программах: правка может пропасть без копии.",
                      f"Запись: {recording_id}; файл: {row['relative_path']}",
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_document_conflict(recording_id, conflict_id), require_human=True)
@@ -874,6 +875,7 @@ async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
             lambda: ["Заменить файл на диске версией программы: правка в нём пропадёт.",
                      "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
                      "Строки различий это окно не показывает; их показывает локальный экран.",
+                     "Пока идёт замена, не сохраняйте этот файл в других программах: правка может пропасть без копии.",
                      f"Запись: {recording_id}; конспект: {row['name']}",
                      f"Файл: {row['relative_path']}",
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],

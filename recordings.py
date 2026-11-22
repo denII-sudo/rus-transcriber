@@ -224,7 +224,7 @@ def context_for_document(document_path):
 
 def materialize_recording(store, recording_id):
     binding = document_binding(store, recording_id)
-    return documents.materialize_pending(store, binding["root_id"], binding["root"])
+    return documents.materialize_pending(store, binding["root_id"], binding["root"], recording_id=recording_id)
 
 
 def read_review_pack_state(document_path):
@@ -381,7 +381,7 @@ def save_conspect_files(document_path, files, *, create=False):
             recording_id, conspect_id, name, source_revision, expected_revision,
              payload, json_bytes, md_bytes, json_relative, md_relative, binding["root_id"],
              str(uuid.uuid4()), current_operation_context(store))
-        completed = materialize_conspects(store, recording_id)
+        completed = materialize_conspects(store, recording_id, conspect_id=conspect_id)
         if (conspect_id, result["conspect_revision"]) not in completed:
             raise storage.StorageError("conspect committed; materialization is pending")
         return result
@@ -413,7 +413,11 @@ def conspect_for_document(document_path, name):
         store.close()
 
 
-def materialize_conspects(store, recording_id):
+def materialize_conspects(store, recording_id, *, conspect_id=None):
+    """Записать очередь свёрток записи. Повреждённая копия останавливает только свою свёртку.
+
+    conspect_id — чья это операция: отказ бросается лишь за неё, без него — за любую свёртку записи.
+    """
     import conspect
     binding = document_binding(store, recording_id)
     json_path = binding["root"] / binding["paths"]["json"]
@@ -421,7 +425,11 @@ def materialize_conspects(store, recording_id):
         root = documents._authorized_root(store, binding["root_id"], binding["root"])
         with documents._file_lock(root):
             conspect.recover_pending(json_path)
-            return _materialize_conspects_locked(store, recording_id)
+            completed, damaged = _materialize_conspects_locked(store, recording_id)
+    for ident, exc in damaged.items():
+        if conspect_id in (None, ident):
+            raise exc
+    return completed
 
 
 def refresh_conspects(store, recording_id, document_path):
@@ -442,7 +450,7 @@ def refresh_conspects(store, recording_id, document_path):
 
 def _materialize_conspects_locked(store, recording_id):
     import conspect
-    completed = []
+    completed, damaged = [], {}
     rows = store.db.execute(
         "SELECT o.conspect_id, o.revision, o.root_id, o.expected_previous_hashes, "
         "r.path AS root_path, c.json_relative, c.md_relative "
@@ -450,6 +458,8 @@ def _materialize_conspects_locked(store, recording_id):
         "JOIN allowed_roots r USING(root_id) WHERE c.recording_id=? AND o.state='pending' "
         "ORDER BY c.name, o.revision", (recording_id,)).fetchall()
     for row in rows:
+        if row["conspect_id"] in damaged:
+            continue    # следующая ревизия не обгоняет остановленную
         if store.db.execute(
                 "SELECT 1 FROM conspect_outbox WHERE conspect_id=? AND revision<? AND state='conflict'",
                 (row["conspect_id"], row["revision"])).fetchone():
@@ -491,8 +501,12 @@ def _materialize_conspects_locked(store, recording_id):
             continue
         # Проверять только запись, которая действительно состоится, а не открытые конфликты
         # или исторические решения. Защита общая для экрана, MCP и синхронизации.
-        for resolved, current_hash, desired_hash, relative in overrides:
-            documents._check_override_copy(resolved, current_hash, desired_hash, relative)
+        try:
+            for resolved, current_hash, desired_hash, relative in overrides:
+                documents._check_override_copy(resolved, current_hash, desired_hash, relative)
+        except documents.DamagedCopy as exc:
+            damaged[row["conspect_id"]] = exc
+            continue
         paths = {kind: root / relative for kind, (relative, _, _) in targets.items()}
         conspect._write_files_raw(
             Path(document_binding(store, recording_id)["root"] /
@@ -508,7 +522,7 @@ def _materialize_conspects_locked(store, recording_id):
                              "error_code=NULL WHERE conspect_id=? AND revision=?",
                              (row["conspect_id"], row["revision"]))
         completed.append((row["conspect_id"], row["revision"]))
-    return completed
+    return completed, damaged
 
 
 def load_recording(store, recording_id):
