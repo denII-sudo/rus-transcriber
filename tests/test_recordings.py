@@ -368,7 +368,8 @@ class WorkerSnapshotTests(unittest.TestCase):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
                             self.answer_files(backend) as (jp, md):
                         self.answer_card(jp, md, [(text, heard)])
-                        self.assertEqual(self.card_state(jp), (word.split(), ["Глеб"], status))
+                        words, speakers, got = self.card_state(jp)
+                        self.assertEqual((" ".join(words), speakers, got), (word, ["Глеб"], status))
 
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()
