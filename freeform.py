@@ -127,10 +127,35 @@ def _name_at(toks, pos, names):
     return None, 0
 
 
+NAME_NEGATIONS = {"не", "ни"}
+# служебные слова ответа «только имя»: «это Вера», «не Анна, а Вера», «Вера говорит»
+NAME_FILLER = {"это", "не", "а", "говорит", "был", "была", "тут", "здесь"}
+# в ответе с отрицаемым именем служебными считаются и «нет», «ни», «и»: «нет, не Анна», «ни Анна, ни Борис»
+NEGATED_NAME_FILLER = NAME_FILLER | {"нет", "ни", "и"}
+
+
+def _negated_name(toks, pos):
+    """Единое правило отрицания имени: имя, перед которым стоит «не» или «ни», не назначается.
+    Его используют и ответ «только имя» (classify), и метка «Имя:» (split_replies, card_edits)."""
+    return bool(pos) and norm(toks[pos - 1]) in NAME_NEGATIONS
+
+
+def _name_mentions(toks, names):
+    """-> [(позиция, число слов, имя, отрицается)] — все имена ответа слева направо."""
+    out, i = [], 0
+    while i < len(toks):
+        name, count = _name_at(toks, i, names)
+        if name:
+            out.append((i, count, name, _negated_name(toks, i)))
+            i += count
+        else:
+            i += 1
+    return out
+
+
 def _negated_label(toks, pos, names):
     name, count = _name_at(toks, pos, names)
-    return bool(name and pos and norm(toks[pos - 1]) == "не" and
-                toks[pos + count - 1].rstrip().endswith(":"))
+    return bool(name and _negated_name(toks, pos) and toks[pos + count - 1].rstrip().endswith(":"))
 
 
 def classify(text, names):
@@ -140,23 +165,18 @@ def classify(text, names):
     if t in AGREE:
         return {"kind": "agree"}
     ws = t.split()
-    named, rest = [], []
-    i = 0
-    while i < len(ws):
-        name, count = _name_at(ws, i, names)
-        if name:
-            if not (i and ws[i - 1] == "не"):
-                named.append(name)
-            i += count
-        else:
-            if ws[i] not in {"это", "не", "а", "говорит", "был", "была", "тут", "здесь"}:
-                rest.append(ws[i])
-            i += 1
-    if named and not rest:
+    mentions = _name_mentions(ws, names)
+    if not mentions:
+        return {"kind": "text"}
+    filler = NEGATED_NAME_FILLER if any(neg for *_, neg in mentions) else NAME_FILLER
+    covered = {k for pos, count, _, _ in mentions for k in range(pos, pos + count)}
+    rest = [w for k, w in enumerate(ws) if k not in covered and w not in filler]
+    named = [name for _, _, name, neg in mentions if not neg]
+    if rest:
+        return {"kind": "text"}
+    if named:
         return {"kind": "name", "speaker": named[-1]}
-    if not rest and any(_name_at(ws, i, names)[0] for i in range(len(ws))):
-        return {"kind": "unmatched"}
-    return {"kind": "text"}
+    return {"kind": "unmatched"}      # все названные имена отрицаются — выбрать говорящего должен человек
 
 
 def split_replies(text, names):
@@ -360,6 +380,13 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             rep["human"] = "неизвестная метка говорящего; выберите имя"
             return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     replies = split_replies(text, names)
+    if len(replies) > 1 and replies[0][0] is None and replies[1][0] and \
+            all(norm(x) == "нет" for x in replies[0][1]):
+        # «нет, Анна: слово» — «нет» здесь скорее поправка к карточке, чем речь из записи; угадывать
+        # не будем: ни «нет» в стенограмму, ни смену говорящего — место остаётся человеку
+        rep["kind"] = "unmatched"
+        rep["human"] = "перед меткой «Имя:» стоит только «нет»; напишите «Имя: точные слова» без «нет»"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if item.get("answer_mode") == "speaker":
         # Карточка подтверждения говорящего: пояснение («Вера говорит только слово …») не должно
         # молча стать текстом реплики. Слова принимаются лишь в явной форме «Имя: точные слова».
