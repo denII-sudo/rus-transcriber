@@ -740,7 +740,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 
 Step "4/10" "Копирование файлов программы"
 if ($Source -ne $Target) {
-    foreach ($f in @("server.py", "worker.py", "bench.py", "runinfo.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
+    foreach ($f in @("server.py", "worker.py", "bench.py", "runinfo.py", "buildinfo.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hotspots.py", "quotes.py", "conspect.py",
                      "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
@@ -797,6 +797,13 @@ if ($Source -ne $Target) {
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает;
     # старые profiles\, config.json, jobs\ из папки программы переносит явная команда migrate_data (или migrate.py)
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
+# Generate provenance from the checked source, not from a nonexistent .git in the installation.
+# Use base Python before dependency installation; buildinfo imports only the standard library.
+$manifestPython = $basePyExe
+if (-not $manifestPython) { $manifestPython = (Get-Command python -ErrorAction Stop).Source }
+$buildSummary = & $manifestPython -B (Join-Path $Target "buildinfo.py") --source $Source --target $Target
+if ($LASTEXITCODE -ne 0) { Fail "Не удалось проверить состав установленной сборки" }
+Write-Host "  сборка: $buildSummary"
 Set-Location $Target
 
 # все кэши — внутри папки программы

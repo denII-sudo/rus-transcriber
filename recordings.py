@@ -144,6 +144,19 @@ def document_binding(store, recording_id):
             "paths": documents.current_paths_from_document(document, recording_id)}
 
 
+def recording_head(store, recording_id):
+    """Текущие ревизии записи: строка (source_revision, review_revision) или None, если записи нет."""
+    return store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
+                            (recording_id,)).fetchone()
+
+
+def document_sync_state(store, recording_id, document_revision):
+    """Состояние формирования файлов этой ревизии документа (очередь outbox): synced, pending…"""
+    return store.db.execute(
+        "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
+        (recording_id, document_revision)).fetchone()["state"]
+
+
 def resolve_document(store, document_path):
     """Разрешить только зарегистрированный текущий JSON/MD/manifest, не угадывая по имени."""
     target = os.path.normcase(os.path.abspath(Path(document_path).expanduser()))
@@ -507,10 +520,8 @@ def load_recording(store, recording_id):
             "source_revision": current["transcript"]["revision"],
             "review_revision": current["review"]["revision"]}
     binding = document_binding(store, recording_id)
-    row = store.db.execute(
-        "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
-        (recording_id, binding["document_revision"])).fetchone()
-    data.update(document_revision=binding["document_revision"], document_sync=row["state"],
+    data.update(document_revision=binding["document_revision"],
+                document_sync=document_sync_state(store, recording_id, binding["document_revision"]),
                 json=str(binding["root"] / binding["paths"]["json"]),
                 markdown=str(binding["root"] / binding["paths"]["md"]),
                 manifest=str(binding["root"] / binding["paths"]["manifest"]))
@@ -644,11 +655,9 @@ def commit_recording_data(store, recording_id, data, expected_versions, operatio
                 current["review"]["revision"] != expected_versions["review_revision"]):
             raise storage.Conflict("stale recording snapshot")
         binding = document_binding(store, recording_id)
-        row = store.db.execute(
-            "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
-            (recording_id, binding["document_revision"])).fetchone()
         return {"recording_id": recording_id, **expected_versions,
-                "document_revision": binding["document_revision"], "document_sync": row["state"],
+                "document_revision": binding["document_revision"],
+                "document_sync": document_sync_state(store, recording_id, binding["document_revision"]),
                 "unchanged": True}
     binding = document_binding(store, recording_id)
     operation_id = operation_id or str(uuid.uuid4())

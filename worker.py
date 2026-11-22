@@ -37,6 +37,7 @@ import tmpfiles  # noqa: E402
 import paths  # noqa: E402  (кэши моделей — в папке программы)
 import download_hint  # noqa: E402
 import transcript  # noqa: E402
+import words as W  # noqa: E402  (пословная обработка: нарезка, сведение гипотез, голос по словам)
 from transcript import hms  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -54,6 +55,12 @@ EMO_RU = {"angry": "раздражение", "sad": "грусть", "neutral": "
 
 def asr_run_metadata():
     """Компактное описание запуска без загрузки сервера и обращения к сети."""
+    try:
+        import buildinfo
+        build = buildinfo.identity(HERE)
+    except Exception:
+        build = {"release": None, "commit": None, "source_state": "unknown",
+                 "payload_sha256": None, "manifest_status": "unknown"}
     version = None
     try:
         tree = ast.parse((HERE / "server.py").read_text(encoding="utf-8"))
@@ -69,7 +76,7 @@ def asr_run_metadata():
         except metadata.PackageNotFoundError:
             pass
     return {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "program": version, "packages": packages, "models": {}}
+            "program": version, "build": build, "packages": packages, "models": {}}
 
 
 def wait_slot(st, cfg, status_path):
@@ -452,17 +459,252 @@ def link_missed_diagnostics(items, trace):
     return items
 
 
-def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of, voice_ctx,
-              allowed, genders_by_name, vocab, quality, make_asr, a):
-    """Пословная обработка (words.py). -> данные расшифровки (без file/duration/timing)."""
-    import gender
-    import vocab as vocab_mod
-    import voices
-    import words as W
+def _progress(st):
+    """Ход этапа в статусе: не чаще раза в секунду и в конце этапа. Счётчик общий для всех проходов."""
+    last = [0.0]
 
-    timing = {}
-    # опорные голоса: профили опознанных участников; участники из словаря с профилем, но без кластера
-    # (pyannote мог слить ребёнка с другим); крупные неопознанные кластеры — по центру кластера
+    def prog(lo, hi, name):
+        def f(done, total):
+            if time.time() - last[0] > 1 or done == total:
+                last[0] = time.time()
+                st.set(stage=name, progress=lo + int((hi - lo) * done / total), done=f"{done}/{total}")
+        return f
+    return prog
+
+
+def _register_pass(quality, name, model_id, backend, chunks):
+    """Сведения прохода модели: движок и диагностика кусков, модель в описании запуска."""
+    quality["asr_diagnostics"][name] = {"backend": backend, "chunks": chunks}
+    quality["asr_run"]["models"][name] = {"id": model_id, "backend": backend, "revision": None}
+
+
+def _failed_records(chunks, attempts, selected=None):
+    """Сведения о проходе, который не дал результата: каждый кусок — ошибка с этими попытками.
+    selected — номера кусков, отданных модели (Whisper в режиме doubt); тогда пишется и chunk_index."""
+    out = []
+    for i, k in enumerate(range(len(chunks)) if selected is None else selected):
+        rec = {"index": i}
+        if selected is not None:
+            rec["chunk_index"] = k
+        rec.update(state="error", audio_span=[chunks[k]["a"], chunks[k]["b"]], own_span=list(chunks[k]["own"]),
+                   attempts=[dict(x) for x in attempts])
+        out.append(rec)
+    return out
+
+
+def timestamped_pass(name, asr, audio, chunks, quality, model_id, progress):
+    """Проход модели со временами слов по кускам -> гипотеза: слова {"w", "s", "e", "c"}.
+    Сведения о сбоях кусков — в quality["asr_diagnostics"][name]."""
+    diagnostics = []
+    _register_pass(quality, name, model_id, asr.name, diagnostics)
+    return W.transcribe(asr, audio, chunks, progress=progress, diagnostics=diagnostics)
+
+
+def primary_pass(audio, chunks, cfg, st, quality, make_asr, prog, timing):
+    """Основной проход (GigaAM RNN-T): его слова, времена и пунктуация — основа расшифровки.
+    Сбой загрузки модели останавливает обработку."""
+    st.set(stage="загрузка модели распознавания", progress=36)
+    asr, asr_errors = make_asr(cfg)
+    if not hasattr(asr, "transcribe_timestamped"):
+        raise RuntimeError(f"бэкенд {asr.name} не отдаёт времена слов; задайте \"pipeline\": \"segments\"")
+    t1 = time.time()
+    st.set(stage="распознавание", progress=38, asr_backend=asr.name, asr_fallbacks=asr_errors or None)
+    quality.setdefault("asr_diagnostics", {})
+    quality.setdefault("asr_run", asr_run_metadata())
+    words = timestamped_pass("primary", asr, audio, chunks, quality,
+                             getattr(asr, "model_name", cfg.get("asr_model")), prog(38, 62, "распознавание"))
+    timing.update(asr_sec=round(time.time() - t1), asr_chunks=len(chunks), asr_backend=asr.name,
+                  asr_model=getattr(asr, "model_name", cfg.get("asr_model")))
+    return words
+
+
+def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
+    """Второй проход (CTC) по тем же кускам -> слова или None (не задан, та же модель или сбой)."""
+    second = cfg.get("asr_second_model", "v3_e2e_ctc")
+    if not second or second == cfg.get("asr_model"):
+        return None
+    try:
+        t2 = time.time()
+        from backends import backend_for_device, normalize_device
+        main_dev = normalize_device(cfg.get("asr_device", "CPU"))
+        sec_dev = normalize_device(cfg.get("asr_second_device") or main_dev)
+        sec_backend = str(cfg.get("asr_second_backend") or "auto")
+        if sec_backend == "auto":
+            # своё устройство — свой бэкенд; если устройство то же, доверяем основному
+            sec_backend = (cfg.get("asr_backend", "auto") if sec_dev == main_dev
+                           else backend_for_device(sec_dev))
+        second_cfg = {**cfg, "asr_model": second, "asr_backend": sec_backend,
+                      "asr_device": sec_dev,
+                      "asr_batch": int(cfg.get("asr_second_batch") or cfg.get("asr_batch", 1))}
+        asr2, _ = make_asr(second_cfg)
+        alt = timestamped_pass("second", asr2, audio, chunks, quality, getattr(asr2, "model_name", second),
+                               prog(62, 68, "второй проход распознавания (CTC)"))
+        del asr2
+        timing.update(asr2_sec=round(time.time() - t2), asr2_model=second)
+        return alt
+    except Exception as ex:
+        quality["asr2_error"] = f"{type(ex).__name__}: {ex}"[:300]
+        print(f"[words] второй проход не выполнен: {ex}", file=sys.stderr, flush=True)
+        _register_pass(quality, "second", second, None,
+                       _failed_records(chunks, [{"result": "error", "error_type": type(ex).__name__}]))
+        return None
+
+
+def whisper_plan(audio, regions, chunks, cfg, a, words, alt):
+    """Что считает третья модель: модель (None — выключена), режим, предел повторов и куски."""
+    third = cfg.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
+    wmode = (getattr(a, "whisper", "") or cfg.get("asr_third_mode", "all")).lower()
+    wrep = a.whisper_max_repeat if getattr(a, "whisper_max_repeat", -1) >= 0 else int(cfg.get("asr_third_max_repeat", 3))
+    if wmode == "off":
+        third = None
+    # куски для Whisper — свои, до 28 с (он всегда считает окно 30 с); в режиме doubt — только те,
+    # где GigaAM RNN-T и CTC расходятся: в остальных голосование «два из трёх» решено без него
+    wchunks = W.make_chunks(audio, regions, max_len=W.WHISPER_MAX, min_len=W.WHISPER_MIN) \
+        if cfg.get("asr_third_long_chunks", True) else chunks
+    selected = list(range(len(wchunks)))
+    if third and alt is not None and wmode == "doubt":
+        dt = W.disagreement_times(words, alt)
+        selected = [k for k, c in enumerate(wchunks) if any(c["own"][0] <= x < c["own"][1] for x in dt)]
+    pieces = [audio[int(wchunks[k]["a"] * SR):int(wchunks[k]["b"] * SR)] for k in selected]
+    return {"model": third, "mode": wmode, "max_repeat": wrep, "chunks": wchunks, "selected": selected,
+            "pieces": pieces}
+
+
+def _third_label(third, backend=""):
+    """Короткое название третьей модели для статуса обработки: Whisper, Multilingual large или имя модели."""
+    name = str(third or "")
+    if backend.startswith("whisper-") or "whisper" in name.lower():
+        return "Whisper"
+    if name == "multilingual_large_ctc":
+        return "Multilingual large"
+    return name
+
+
+def _load_whisper(backend, device, quant, third, cfg, make_asr):
+    """Третья модель выбранным движком -> (модель, откаты движка)."""
+    if backend == "whisper-ov":
+        from backends import WhisperOV
+        return WhisperOV(third, device=device, quant=quant, language="ru",
+                         batch=int(cfg.get("asr_third_batch", 4))), None
+    if backend == "whisper-ct2":
+        from backends import WhisperCT2
+        return WhisperCT2(cpu_threads=int(cfg.get("torch_threads") or 0)), None
+    return make_asr({**cfg, "asr_model": third, "asr_backend": backend, "asr_device": device,
+                     "asr_quant": quant, "asr_quant_cpu": quant, "asr_language": "ru",
+                     "asr_batch": int(cfg.get("asr_third_batch", 4))})
+
+
+def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cfg, st, make_asr, prog):
+    """Повтор ошибочных фрагментов на onnx-cpu; сведения о попытках дописываются к фрагменту."""
+    try:
+        st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
+        cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",
+                           "asr_device": "CPU", "asr_quant": cfg.get("asr_third_quant_cpu", "int8"),
+                           "asr_quant_cpu": cfg.get("asr_third_quant_cpu", "int8"),
+                           "asr_language": "ru", "asr_batch": int(cfg.get("asr_third_batch", 4))})
+        cpu_diag = []
+        cpu_texts = cpu.transcribe_texts([pieces[i] for i in failed_indices], diagnostics=cpu_diag,
+                                        progress=prog(74, 74, f"повтор {_third_label(third)} на CPU"))
+        if len(cpu_texts) != len(failed_indices) or len(cpu_diag) != len(failed_indices):
+            raise ValueError("неверное количество результатов CPU")
+        for pos, i in enumerate(failed_indices):
+            rec, replacement = whisper_diag[i], cpu_diag[pos]
+            for attempt in replacement["attempts"]:
+                attempt["backend"] = "onnx-cpu:CPU"
+                attempt["batch"] = [failed_indices[j] for j in attempt["batch"]]
+            rec["attempts"].extend(replacement["attempts"])
+            rec["state"] = replacement["state"]
+            texts[i] = cpu_texts[pos]
+        del cpu
+    except Exception as ex:
+        for i in failed_indices:
+            whisper_diag[i]["attempts"].append(
+                {"result": "error", "backend": "onnx-cpu:CPU",
+                 "error_type": type(ex).__name__, "fallback": True})
+
+
+def _whisper_words(plan, texts, whisper_diag, words):
+    """Текст Whisper по кускам -> слова гипотезы (без «субтитров» и зацикливания) и число убранных."""
+    by_k = dict(zip(plan["selected"], texts))
+    diag_by_k = dict(zip(plan["selected"], whisper_diag))
+    wh_words, removed = [], 0
+    for k, c in enumerate(plan["chunks"]):
+        if k in by_k:
+            tx, n = W.clean_whisper(by_k[k], plan["max_repeat"])
+            rec = diag_by_k[k]
+            rec.update(chunk_index=k, audio_span=[c["a"], c["b"]], own_span=list(c["own"]),
+                       raw_words=len(by_k[k].split()), cleaned_words=len(tx.split()),
+                       removed_words=n)
+            if by_k[k].strip() and not tx.strip():
+                rec["filtered_all"] = True
+            removed += n
+            # токен из одних знаков («—») — не слово: в голосовании он не совпал бы
+            # ни с одним словом GigaAM (те знаков отдельно не дают, words.result_words)
+            wh_words += [t for t in tx.split() if W.norm_word(t)]
+        else:            # RNN-T и CTC здесь согласны: Whisper голосования не изменил бы
+            s0, e0 = c["own"]
+            wh_words += [w["w"] for w in words if s0 <= w["s"] < e0]
+    return wh_words, removed
+
+
+def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
+    """Третий проход (Whisper, только текст) -> слова-строки или None, если не удался ни один движок.
+
+    Движки по очереди: faster-whisper (если выбран тестом скорости, asr_third_backend=whisper-ct2),
+    видеокарта Arc (OpenVINO, fp16), процессор (int8). Ошибочные фрагменты повторяются на onnx-cpu:
+    для Arc (GPU) это повтор на CPU, для faster-whisper (whisper-ct2) — возврат к прежнему движку.
+    Для самого onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается."""
+    from backends import normalize_device
+    third, pieces = plan["model"], plan["pieces"]
+    dev = normalize_device(cfg.get("asr_third_device", "CPU"))
+    if dev not in ("GPU", "CPU"):
+        print(f"[words] Whisper: устройство {dev} не поддерживается, считаю на CPU",
+              file=sys.stderr, flush=True)
+        dev = "CPU"
+    tries = ([("whisper-ct2", "CPU", "int8")] if cfg.get("asr_third_backend", "") == "whisper-ct2" else []) \
+        + ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
+        + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
+    outer_attempts = []
+    for backend, device, quant in tries:
+        try:
+            t3 = time.time()
+            label = _third_label(third, backend)
+            st.set(stage=f"третья модель: загрузка {label} ({device})", progress=68)
+            asr3, errs3 = _load_whisper(backend, device, quant, third, cfg, make_asr)
+            t_load = time.time() - t3
+            compile_sec, name3 = getattr(asr3, "compile_sec", None), getattr(asr3, "name", None)
+            whisper_diag = []
+            _register_pass(quality, "whisper", third, asr3.name, whisper_diag)
+            texts = asr3.transcribe_texts(pieces, progress=prog(68, 74, f"третья модель ({label}, {device})"),
+                                          diagnostics=whisper_diag)
+            del asr3
+            for rec in whisper_diag:
+                rec["attempts"][:0] = [dict(attempt) for attempt in outer_attempts]
+                for attempt in rec["attempts"]:
+                    attempt.setdefault("backend", backend + ":" + device)
+            failed_indices = [i for i, rec in enumerate(whisper_diag) if rec["state"] == "error"]
+            if failed_indices and backend != "onnx-cpu":
+                _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cfg, st, make_asr, prog)
+            wh_words, removed = _whisper_words(plan, texts, whisper_diag, words)
+            timing.update(asr3_mode=plan["mode"], asr3_pieces=f"{len(plan['selected'])}/{len(plan['chunks'])}",
+                          asr3_removed_words=removed or None)
+            timing.update(asr3_sec=round(time.time() - t3), asr3_load_sec=round(t_load, 1),
+                          asr3_model=third, asr3_device=f"{backend}:{device}:{quant}",
+                          asr3_fallbacks=errs3 or None, asr3_compile_sec=compile_sec, asr3_name=name3)
+            return wh_words
+        except Exception as ex:
+            outer_attempts.append({"result": "error", "backend": backend + ":" + device,
+                                   "error_type": type(ex).__name__})
+            quality.setdefault("asr3_errors", []).append(f"{backend}:{device}: {type(ex).__name__}: {ex}"[:300])
+            print(f"[words] Whisper ({backend}:{device}) не выполнен: {ex}", file=sys.stderr, flush=True)
+    _register_pass(quality, "whisper", third, None, _failed_records(plan["chunks"], outer_attempts, plan["selected"]))
+    return None
+
+
+def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
+    """Опорные голоса -> (refs, found): профили опознанных участников; участники из словаря с профилем,
+    но без кластера (pyannote мог слить ребёнка с другим); крупные неопознанные кластеры — по центру."""
+    import voices
     pvecs = voice_ctx.get("pvecs") or {}
     cents = voice_ctx.get("cents") or {}
     if not cents:
@@ -483,272 +725,25 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         if lbl not in label_name and size.get(lbl, 0) >= 10.0:
             refs[lbl] = c
             found.add(lbl)
-    refs = {k: v for k, v in refs.items() if v is not None}
-    mapping = voice_ctx.get("mapping") or {}
+    return {k: v for k, v in refs.items() if v is not None}, found
 
-    def name_of_label(lbl):   # метка pyannote -> имя (в т.ч. для кластеров, слитых в одного человека)
-        return (mapping.get(lbl) or (label_name.get(lbl),))[0] or lbl
 
-    prior = W.LabelAt([(s, e, name_of_label(order[spk])) for s, e, spk in raw])
+def _apply_vocab(words, vocab, quality):
+    """Словарь группы — по словам; исходное слово сохраняется в raw."""
+    if not vocab:
+        return
+    import vocab as vocab_mod
+    fixer = vocab_mod.Fixer(vocab)
+    for k, w in enumerate(words):
+        new, fx = fixer.apply(w["w"], prev=words[k - 1]["w"] if k else None,
+                              nxt=words[k + 1]["w"] if k + 1 < len(words) else None)
+        if fx:
+            w["raw"], w["w"] = w["w"], new
+            quality["vocab_fixes"].append({"t": w["s"], "fixes": fx})
 
-    # распознавание длинными кусками
-    regions = W.speech_regions(raw)
-    chunks = W.make_chunks(audio, regions)
-    st.set(stage="загрузка модели распознавания", progress=36)
-    asr, asr_errors = make_asr(cfg)
-    if not hasattr(asr, "transcribe_timestamped"):
-        raise RuntimeError(f"бэкенд {asr.name} не отдаёт времена слов; задайте \"pipeline\": \"segments\"")
-    t1 = time.time()
-    last = [0.0]
 
-    def prog(lo, hi, name):
-        def f(done, total):
-            if time.time() - last[0] > 1 or done == total:
-                last[0] = time.time()
-                st.set(stage=name, progress=lo + int((hi - lo) * done / total), done=f"{done}/{total}")
-        return f
-
-    st.set(stage="распознавание", progress=38, asr_backend=asr.name, asr_fallbacks=asr_errors or None)
-    asr_diag = quality.setdefault("asr_diagnostics", {})
-    run_meta = quality.setdefault("asr_run", asr_run_metadata())
-    run_meta["models"]["primary"] = {"id": getattr(asr, "model_name", cfg.get("asr_model")),
-                                      "backend": asr.name, "revision": None}
-    primary_diag = []
-    asr_diag["primary"] = {"backend": asr.name, "chunks": primary_diag}
-    words = W.transcribe(asr, audio, chunks, progress=prog(38, 62, "распознавание"),
-                         diagnostics=primary_diag)
-    timing.update(asr_sec=round(time.time() - t1), asr_chunks=len(chunks), asr_backend=asr.name,
-                  asr_model=getattr(asr, "model_name", cfg.get("asr_model")))
-    pieces = [audio[int(c["a"] * SR):int(c["b"] * SR)] for c in chunks]
-    alt = None
-    second = cfg.get("asr_second_model", "v3_e2e_ctc")
-    if second and second != cfg.get("asr_model"):
-        try:
-            t2 = time.time()
-            del asr
-            from backends import backend_for_device, normalize_device
-            main_dev = normalize_device(cfg.get("asr_device", "CPU"))
-            sec_dev = normalize_device(cfg.get("asr_second_device") or main_dev)
-            sec_backend = str(cfg.get("asr_second_backend") or "auto")
-            if sec_backend == "auto":
-                # своё устройство — свой бэкенд; если устройство то же, доверяем основному
-                sec_backend = (cfg.get("asr_backend", "auto") if sec_dev == main_dev
-                               else backend_for_device(sec_dev))
-            second_cfg = {**cfg, "asr_model": second, "asr_backend": sec_backend,
-                          "asr_device": sec_dev,
-                          "asr_batch": int(cfg.get("asr_second_batch") or cfg.get("asr_batch", 1))}
-            asr2, _ = make_asr(second_cfg)
-            second_diag = []
-            asr_diag["second"] = {"backend": asr2.name, "chunks": second_diag}
-            run_meta["models"]["second"] = {"id": getattr(asr2, "model_name", second),
-                                             "backend": asr2.name, "revision": None}
-            alt = W.transcribe(asr2, audio, chunks, progress=prog(62, 68, "второй проход распознавания (CTC)"),
-                               diagnostics=second_diag)
-            del asr2
-            timing.update(asr2_sec=round(time.time() - t2), asr2_model=second)
-        except Exception as ex:
-            quality["asr2_error"] = f"{type(ex).__name__}: {ex}"[:300]
-            print(f"[words] второй проход не выполнен: {ex}", file=sys.stderr, flush=True)
-            asr_diag["second"] = {"backend": None, "chunks": [
-                {"index": i, "state": "error", "audio_span": [c["a"], c["b"]],
-                 "own_span": list(c["own"]), "attempts": [{"result": "error", "error_type": type(ex).__name__}]}
-                for i, c in enumerate(chunks)]}
-            run_meta["models"]["second"] = {"id": second, "backend": None, "revision": None}
-    wh_words = None
-    third = cfg.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
-    wmode = (getattr(a, "whisper", "") or cfg.get("asr_third_mode", "all")).lower()
-    wrep = a.whisper_max_repeat if getattr(a, "whisper_max_repeat", -1) >= 0 else int(cfg.get("asr_third_max_repeat", 3))
-    if wmode == "off":
-        third = None
-    # куски для Whisper — свои, до 28 с (он всегда считает окно 30 с); в режиме doubt — только те,
-    # где GigaAM RNN-T и CTC расходятся: в остальных голосование «два из трёх» решено без него
-    wchunks = W.make_chunks(audio, regions, max_len=W.WHISPER_MAX, min_len=W.WHISPER_MIN) \
-        if cfg.get("asr_third_long_chunks", True) else chunks
-    selected = list(range(len(wchunks)))
-    if third and alt is not None and wmode == "doubt":
-        dt = W.disagreement_times(words, alt)
-        selected = [k for k, c in enumerate(wchunks) if any(c["own"][0] <= x < c["own"][1] for x in dt)]
-    wpieces = [audio[int(wchunks[k]["a"] * SR):int(wchunks[k]["b"] * SR)] for k in selected]
-    if third and alt is not None:
-        # Whisper: faster-whisper (если выбран тестом скорости, asr_third_backend=whisper-ct2),
-        # на видеокарте Arc (OpenVINO, fp16), при сбое — процессор (int8)
-        from backends import normalize_device
-        dev = normalize_device(cfg.get("asr_third_device", "CPU"))
-        if dev not in ("GPU", "CPU"):
-            print(f"[words] Whisper: устройство {dev} не поддерживается, считаю на CPU",
-                  file=sys.stderr, flush=True)
-            dev = "CPU"
-        tries = ([("whisper-ct2", "CPU", "int8")] if cfg.get("asr_third_backend", "") == "whisper-ct2" else []) \
-            + ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
-            + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
-        outer_attempts = []
-        whisper_finished = False
-        for backend, device, quant in tries:
-            try:
-                t3 = time.time()
-                st.set(stage=f"третья модель: загрузка Whisper ({device})", progress=68)
-                if backend == "whisper-ov":
-                    from backends import WhisperOV
-                    asr3, errs3 = WhisperOV(third, device=device, quant=quant, language="ru",
-                                            batch=int(cfg.get("asr_third_batch", 4))), None
-                elif backend == "whisper-ct2":
-                    from backends import WhisperCT2
-                    asr3, errs3 = WhisperCT2(cpu_threads=int(cfg.get("torch_threads") or 0)), None
-                else:
-                    asr3, errs3 = make_asr({**cfg, "asr_model": third, "asr_backend": backend, "asr_device": device,
-                                            "asr_quant": quant, "asr_quant_cpu": quant, "asr_language": "ru",
-                                            "asr_batch": int(cfg.get("asr_third_batch", 4))})
-                t_load = time.time() - t3
-                asr3_meta = type("M", (), {"compile_sec": getattr(asr3, "compile_sec", None),
-                                           "name": getattr(asr3, "name", None)})
-                whisper_diag = []
-                asr_diag["whisper"] = {"backend": asr3.name, "chunks": whisper_diag}
-                run_meta["models"]["whisper"] = {"id": third, "backend": asr3.name, "revision": None}
-                texts = asr3.transcribe_texts(wpieces, progress=prog(68, 74, f"третья модель (Whisper, {device})"),
-                                              diagnostics=whisper_diag)
-                del asr3
-                for rec in whisper_diag:
-                    rec["attempts"][:0] = [dict(attempt) for attempt in outer_attempts]
-                    for attempt in rec["attempts"]:
-                        attempt.setdefault("backend", backend + ":" + device)
-                failed_indices = [i for i, rec in enumerate(whisper_diag) if rec["state"] == "error"]
-                # Ошибочные фрагменты повторяем на onnx-cpu: для Arc (GPU) это повтор на CPU,
-                # для faster-whisper (whisper-ct2) — возврат к прежнему движку. Для самого
-                # onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается.
-                if failed_indices and backend != "onnx-cpu":
-                    try:
-                        st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
-                        cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",
-                                           "asr_device": "CPU", "asr_quant": cfg.get("asr_third_quant_cpu", "int8"),
-                                           "asr_quant_cpu": cfg.get("asr_third_quant_cpu", "int8"),
-                                           "asr_language": "ru", "asr_batch": int(cfg.get("asr_third_batch", 4))})
-                        cpu_diag = []
-                        cpu_texts = cpu.transcribe_texts([wpieces[i] for i in failed_indices], diagnostics=cpu_diag,
-                                                        progress=prog(74, 74, "повтор Whisper на CPU"))
-                        if len(cpu_texts) != len(failed_indices) or len(cpu_diag) != len(failed_indices):
-                            raise ValueError("неверное количество результатов CPU")
-                        for pos, i in enumerate(failed_indices):
-                            rec, replacement = whisper_diag[i], cpu_diag[pos]
-                            for attempt in replacement["attempts"]:
-                                attempt["backend"] = "onnx-cpu:CPU"
-                                attempt["batch"] = [failed_indices[j] for j in attempt["batch"]]
-                            rec["attempts"].extend(replacement["attempts"])
-                            rec["state"] = replacement["state"]
-                            texts[i] = cpu_texts[pos]
-                        del cpu
-                    except Exception as ex:
-                        for i in failed_indices:
-                            whisper_diag[i]["attempts"].append(
-                                {"result": "error", "backend": "onnx-cpu:CPU",
-                                 "error_type": type(ex).__name__, "fallback": True})
-                by_k = dict(zip(selected, texts))
-                diag_by_k = dict(zip(selected, whisper_diag))
-                wh_words, removed = [], 0
-                for k, c in enumerate(wchunks):
-                    if k in by_k:
-                        tx, n = W.clean_whisper(by_k[k], wrep)
-                        rec = diag_by_k[k]
-                        rec.update(chunk_index=k, audio_span=[c["a"], c["b"]], own_span=list(c["own"]),
-                                   raw_words=len(by_k[k].split()), cleaned_words=len(tx.split()),
-                                   removed_words=n)
-                        if by_k[k].strip() and not tx.strip():
-                            rec["filtered_all"] = True
-                        removed += n
-                        # токен из одних знаков («—») — не слово: в голосовании он не совпал бы
-                        # ни с одним словом GigaAM (те знаков отдельно не дают, words.result_words)
-                        wh_words += [t for t in tx.split() if W.norm_word(t)]
-                    else:            # RNN-T и CTC здесь согласны: Whisper голосования не изменил бы
-                        s0, e0 = c["own"]
-                        wh_words += [w["w"] for w in words if s0 <= w["s"] < e0]
-                timing.update(asr3_mode=wmode, asr3_pieces=f"{len(selected)}/{len(wchunks)}",
-                              asr3_removed_words=removed or None)
-                timing.update(asr3_sec=round(time.time() - t3), asr3_load_sec=round(t_load, 1),
-                              asr3_model=third, asr3_device=f"{backend}:{device}:{quant}",
-                              asr3_fallbacks=errs3 or None,
-                              asr3_compile_sec=getattr(asr3_meta, "compile_sec", None),
-                              asr3_name=getattr(asr3_meta, "name", None))
-                whisper_finished = True
-                break
-            except Exception as ex:
-                outer_attempts.append({"result": "error", "backend": backend + ":" + device,
-                                       "error_type": type(ex).__name__})
-                quality.setdefault("asr3_errors", []).append(f"{backend}:{device}: {type(ex).__name__}: {ex}"[:300])
-                print(f"[words] Whisper ({backend}:{device}) не выполнен: {ex}", file=sys.stderr, flush=True)
-        if not whisper_finished:
-            records = [{"index": i, "chunk_index": k, "state": "error",
-                        "audio_span": [wchunks[k]["a"], wchunks[k]["b"]],
-                        "own_span": list(wchunks[k]["own"]), "attempts": [dict(x) for x in outer_attempts]}
-                       for i, k in enumerate(selected)]
-            asr_diag["whisper"] = {"backend": None, "chunks": records}
-            run_meta["models"]["whisper"] = {"id": third, "backend": None, "revision": None}
-    # Свидетельства других проходов фиксируем до изменения слов голосованием.
-    whisper_evidence = []
-    for rec in (asr_diag.get("whisper") or {}).get("chunks", []):
-        reason = "filtered" if rec.get("filtered_all") else rec.get("state")
-        if reason not in ("error", "empty_unknown", "filtered"):
-            continue
-        start, end = rec["own_span"]
-        sources = [name for name, ws in (("primary", words), ("second", alt or []))
-                   if any(start <= w["s"] < end for w in ws)]
-        whisper_evidence.append((start, end, reason, sources))
-    other_evidence = []
-    for name in ("primary", "second"):
-        for rec in (asr_diag.get(name) or {}).get("chunks", []):
-            if rec.get("state") not in ("error", "empty_unknown") or not rec.get("own_span"):
-                continue
-            start, end = rec["own_span"]
-            other = "second" if name == "primary" else "primary"
-            other_words = (alt or []) if name == "primary" else words
-            sources = [other] if any(start <= w["s"] < end for w in other_words) else []
-            other_evidence.append((start, end, name, rec["state"], sources))
-    if alt is not None and wh_words is not None and not whisper_evidence and not other_evidence:
-        quality["vote"] = W.vote3(words, alt, wh_words)
-        prev = None
-        for wd in words:                      # что заменило голосование — в список исправлений
-            if wd.get("voted") and wd.get("model", "") != "":
-                if prev is not None and prev["model"] == wd["model"] and prev["t2"] >= wd["s"] - 1.0:
-                    prev["to"] += " " + wd["w"]
-                    prev["t2"] = wd["s"]
-                else:
-                    prev = {"t": wd["s"], "t2": wd["s"], "model": wd["model"], "to": wd["w"]}
-                    quality.setdefault("asr_votes", []).append(prev)
-            elif wd.get("voted"):
-                quality.setdefault("asr_votes", []).append({"t": wd["s"], "t2": wd["s"], "model": "", "to": wd["w"]})
-                prev = None
-            else:
-                prev = None
-    elif alt is not None:
-        if whisper_evidence or (other_evidence and wh_words is not None):
-            # vote3 выравнивает всю запись целиком и не умеет исключать отдельные интервалы.
-            # Не превращаем неизвестный результат Whisper в голос за пустоту.
-            quality["vote3_skipped"] = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
-        W.mark_alt(words, alt)
-
-    failed = sum(1 for stage in asr_diag.values() for item in stage["chunks"] if item["state"] == "error")
-    if failed:
-        quality["asr_incomplete_chunks"] = failed
-
-    # словарь — по словам, исходное слово сохраняется
-    if vocab:
-        fixer = vocab_mod.Fixer(vocab)
-        for k, w in enumerate(words):
-            new, fx = fixer.apply(w["w"], prev=words[k - 1]["w"] if k else None,
-                                  nxt=words[k + 1]["w"] if k + 1 < len(words) else None)
-            if fx:
-                w["raw"], w["w"] = w["w"], new
-                quality["vocab_fixes"].append({"t": w["s"], "fixes": fx})
-
-    # голос для каждого слова
-    st.set(stage="голос для каждого слова", progress=75)
-    t3 = time.time()
-    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found},
-                           win_near_change=float(cfg.get("word_win_near_change", 0) or 0),
-                           confusions=voice_ctx.get("confusions"),
-                           progress=prog(75, 85, "голос для каждого слова"))
-    timing.update(word_voice_sec=round(time.time() - t3, 1), word_windows=nwin)
-    replies = W.build_replies(words)
-
-    # реплики -> сегменты
+def _segments_from_replies(replies, refs, label_name, label_of):
+    """Реплики -> сегменты расшифровки. Голосам без метки (из профиля) даются метки «Спикер N»."""
     used = set(label_name)
     for nm in refs:
         if nm not in label_of and not str(nm).startswith("Спикер"):
@@ -773,8 +768,12 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         if r.get("inserts"):
             seg["inserts"] = [{**i, "label": label_of.get(i["speaker"], i["speaker"])} for i in r["inserts"]]
         segments.append(seg)
+    return segments
 
-    # род глагола против пола: голос близок к участнику нужного пола — переносим, иначе метка
+
+def _check_gender(segments, genders_by_name, refs, label_of, quality):
+    """Род глагола против пола: голос близок к участнику нужного пола — переносим, иначе метка."""
+    import gender
     for seg in segments:
         need = genders_by_name.get(seg["speaker"])
         g, ev = gender.evidence(seg["text"])
@@ -800,7 +799,22 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                 f"«{', '.join(ev)}»: голос ближе к {seg['speaker']} ({cur:.2f}), чем к {alt_n} "
                 f"({cands[0][0]:.2f})" if cands else f"«{', '.join(ev)}»: нет участника нужного пола")
 
-    # метки сомнения
+
+def _asr_problem_items(evidence, segments, note):
+    """Места для прослушивания, где результат прохода неполон или неизвестен.
+    evidence — [(начало, конец, проход, причина, проходы со словами в этом месте)]."""
+    items = []
+    for start, end, name, reason, sources in evidence:
+        has_words = any(start <= w.get("s", -1) < end for seg in segments for w in seg.get("words") or [])
+        items.append({"id": "", "t": start, "t1": start, "t2": end, "gap": [start, end],
+                      "speaker": None, "text": "", "reasons": ["asr"] if has_words else ["asr", "missed"],
+                      "asr_problem": {"model": name, "state": reason, "words_from": sources},
+                      "note": note})
+    return items
+
+
+def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality):
+    """Метки сомнения и места для разбора -> (места, порог сомнения голоса, наложения голосов)."""
     overlaps = W.overlap_regions(full_ann)
     thr = W.doubt_flags(words, overlaps)
     for seg in segments:
@@ -820,18 +834,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             start, end = item.get("t1", item["t"]), item.get("t2", item["t"])
             item["gap"] = [start, max(end + 0.04, start + 0.04)]
             item["asr_problem"] = {"model": "whisper", "state": "disagreement", "words_from": ["primary", "second"]}
-    for start, end, reason, sources in whisper_evidence:
-        has_words = any(start <= w.get("s", -1) < end for seg in segments for w in seg.get("words") or [])
-        items.append({"id": "", "t": start, "t1": start, "t2": end, "gap": [start, end],
-                      "speaker": None, "text": "", "reasons": ["asr"] if has_words else ["asr", "missed"],
-                      "asr_problem": {"model": "whisper", "state": reason, "words_from": sources},
-                      "note": "Результат Whisper неполон или неизвестен; прослушайте фрагмент."})
-    for start, end, model, reason, sources in other_evidence:
-        has_words = any(start <= w.get("s", -1) < end for seg in segments for w in seg.get("words") or [])
-        items.append({"id": "", "t": start, "t1": start, "t2": end, "gap": [start, end],
-                      "speaker": None, "text": "", "reasons": ["asr"] if has_words else ["asr", "missed"],
-                      "asr_problem": {"model": model, "state": reason, "words_from": sources},
-                      "note": "Результат прохода неполон или неизвестен; прослушайте фрагмент."})
+    items += _asr_problem_items([(s, e, "whisper", reason, sources) for s, e, reason, sources in evidence["whisper"]],
+                                segments, "Результат Whisper неполон или неизвестен; прослушайте фрагмент.")
+    items += _asr_problem_items(evidence["other"], segments,
+                                "Результат прохода неполон или неизвестен; прослушайте фрагмент.")
     items.sort(key=lambda item: item["t"])
     for index, item in enumerate(items, 1):
         item["id"] = f"r{index}"
@@ -840,9 +846,12 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     for seg in segments:
         for wd in seg["words"]:
             wd.pop("sims", None)
+    return items, thr, overlaps
 
-    # слой признаков разговора для «горячих мест» (hotspots.py): только числа по времени,
-    # без текста, имён и отпечатков голоса. Ошибка слоя обработку не останавливает.
+
+def _interaction_layer(audio, raw, full_ann, overlaps, cfg, quality, timing):
+    """Слой признаков разговора для «горячих мест» (hotspots.py): только числа по времени,
+    без текста, имён и отпечатков голоса. Ошибка слоя обработку не останавливает."""
     t_layer = time.time()
     if cfg.get("interaction", True):
         try:
@@ -858,7 +867,9 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         quality["interaction_skipped"] = "disabled"
     timing["interaction_sec"] = round(time.time() - t_layer, 1)
 
-    # эмоции — по репликам от 2 с (если модель доступна)
+
+def _emotions(audio, segments, cfg, a, quality, timing):
+    """Эмоции — по репликам от 2 с (если модель доступна)."""
     t_emo = time.time()
     if cfg.get("emotions", True) and not a.no_emotions:
         try:
@@ -878,6 +889,57 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             err = f"{type(ex).__name__}: {ex}"[:300]
             quality["emotions_error"] = (err + download_hint.certificate_hint(ex))[:600]
         timing["emotions_sec"] = round(time.time() - t_emo, 1)
+
+
+def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of, voice_ctx,
+              allowed, genders_by_name, vocab, quality, make_asr, a):
+    """Пословная обработка (words.py). -> данные расшифровки (без file/duration/timing).
+
+    Этапы: опорные голоса; проходы моделей по кускам, каждый даёт гипотезу (primary_pass,
+    second_pass, whisper_pass; сведения о сбоях — в quality["asr_diagnostics"]); сведение гипотез
+    (words.combine_hypotheses); словарь; голос для каждого слова; реплики; род глагола; места
+    для разбора; слой признаков разговора; эмоции."""
+
+    timing = {}
+    refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed)
+    mapping = voice_ctx.get("mapping") or {}
+
+    def name_of_label(lbl):   # метка pyannote -> имя (в т.ч. для кластеров, слитых в одного человека)
+        return (mapping.get(lbl) or (label_name.get(lbl),))[0] or lbl
+
+    prior = W.LabelAt([(s, e, name_of_label(order[spk])) for s, e, spk in raw])
+
+    # проходы моделей по длинным кускам -> гипотезы
+    regions = W.speech_regions(raw)
+    chunks = W.make_chunks(audio, regions)
+    prog = _progress(st)
+    words = primary_pass(audio, chunks, cfg, st, quality, make_asr, prog, timing)
+    alt = second_pass(audio, chunks, cfg, quality, make_asr, prog, timing)
+    plan = whisper_plan(audio, regions, chunks, cfg, a, words, alt)
+    wh_words = whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing) \
+        if plan["model"] and alt is not None else None
+
+    # сведение гипотез -> слова с пометками расхождений, решения голосования, сведения о сбоях
+    fused = W.combine_hypotheses({"primary": words, "second": alt, "whisper": wh_words},
+                                 quality["asr_diagnostics"])
+    quality.update(fused["quality"])
+
+    _apply_vocab(words, vocab, quality)
+
+    # голос для каждого слова
+    st.set(stage="голос для каждого слова", progress=75)
+    t3 = time.time()
+    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found},
+                           win_near_change=float(cfg.get("word_win_near_change", 0) or 0),
+                           confusions=voice_ctx.get("confusions"),
+                           progress=prog(75, 85, "голос для каждого слова"))
+    timing.update(word_voice_sec=round(time.time() - t3, 1), word_windows=nwin)
+    segments = _segments_from_replies(W.build_replies(words), refs, label_name, label_of)
+    _check_gender(segments, genders_by_name, refs, label_of, quality)
+    items, thr, overlaps = _review_places(words, segments, turns, full_ann, cfg, label_name,
+                                          fused["evidence"], quality)
+    _interaction_layer(audio, raw, full_ann, overlaps, cfg, quality, timing)
+    _emotions(audio, segments, cfg, a, quality, timing)
 
     labels = list(dict.fromkeys(s["label"] for s in segments))
     names = {l: label_name[l] for l in labels if l in label_name}
@@ -1278,6 +1340,7 @@ def main():
                                             "review_items": len(data.get("review", [])),
                                             "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                             "vote3_skipped": quality.get("vote3_skipped"),
+                                            "vote3_partial": quality.get("vote3_partial"),
                                            "emotions_error": quality.get("emotions_error"),
                                            "interaction_error": quality.get("interaction_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),
@@ -1428,31 +1491,15 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
         context = sqlite_target["context"]
         with store._transaction():
             if workflow_request_id:
-                import storage
-                row = store.db.execute(
-                    "SELECT source, context_json, state, recording_id FROM workflow_requests WHERE request_id=?",
-                    (workflow_request_id,)).fetchone()
-                if (row is None or row["state"] not in ("starting", "running", "interrupted")
-                        or row["recording_id"] is not None
-                        or storage._loads(row["context_json"]) != context
-                        or recordings.normalize_location(row["source"]) != recordings.normalize_location(src)):
-                    raise RuntimeError("workflow request no longer permits this worker result")
+                import workflow
+                workflow.check_worker_result_allowed(store, workflow_request_id, context, src)
             result = recordings.commit_worker_result(
                 store, data, src, sqlite_target["root_id"], context,
                 recording_id=recording_id, operation_id=operation_id,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 document_paths=sqlite_target["paths"])
             if workflow_request_id:
-                now = storage._now()
-                store.db.execute("UPDATE workflow_requests SET recording_id=?, state='processed', updated_at=? "
-                                 "WHERE request_id=?", (recording_id, now, workflow_request_id))
-                store.db.execute("UPDATE workflow_runs SET state='completed', updated_at=? "
-                                 "WHERE request_id=? AND kind='asr' AND state='running'",
-                                 (now, workflow_request_id))
-                store.db.execute("UPDATE workflow_steps SET state='completed', result_json=?, updated_at=? "
-                                 "WHERE run_id IN (SELECT run_id FROM workflow_runs "
-                                 "WHERE request_id=? AND kind='asr') AND state='running'",
-                                 (storage._json({"recording_id": recording_id}), now, workflow_request_id))
+                workflow.link_worker_result(store, workflow_request_id, recording_id)
         status.set(recording_id=recording_id, source_revision=result["source_revision"],
                    review_revision=result["review_revision"], document_revision=result["document_revision"],
                    document_sync=result["document_sync"])
