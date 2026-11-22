@@ -192,7 +192,10 @@ Whisper). Multilingual второй сохраняет времена слов; 
   по имени `model`, только CPU, `quant` → `asr_third_quant_cpu`, `null` — fp32). Общие поля:
   `mode` (`all` или `doubt`) → `asr_third_mode`, `max_repeat` → `asr_third_max_repeat`
   (действует только на Whisper), `long_chunks` → `asr_third_long_chunks` (только для Whisper).
-  Явная `model`, совпадающая с основной или второй, — ошибка: конвейер такую третью пропускает.
+  Ошибка — явная `model` у `engine: onnx`, совпадающая с основной или второй, у которой явно
+  `backend: onnx-cpu` и та же точность (`quant` основной роли; вторая наследует его): конвейер такую
+  третью пропускает. С другой точностью или движком она считается; если движок или точность
+  берутся из `config.json` песочницы, решает конвейер при запуске (`asr3_skipped`).
 - `settings` — прочие настройки `settings.py` (опечатка в имени — ошибка). Нельзя менять
   настройки общих этапов и заданные лабораторией: `diar_*`, `torch_threads`, `voices`,
   `voices_debug`, `default_group`, `pipeline`, `recording_backend`, `emotions`,

@@ -328,8 +328,20 @@ class ThirdModelEngineChoiceTests(unittest.TestCase):
         self.assertEqual(timing["asr3_model"], self.WHISPER)
 
     def test_whisper_name_check_ignores_case(self):
-        _, events, _, _, _, _ = self.run_pass("Org/Whisper-Small", {"asr_third_backend": "whisper-ct2"})
+        # faster-whisper умеет только large-v3-turbo (с 22.11.2026 другой Whisper он пропускает),
+        # поэтому регистр проверяется на имени этой модели
+        _, events, _, _, _, _ = self.run_pass("Org/Whisper-Large-V3-Turbo", {"asr_third_backend": "whisper-ct2"})
         self.assertEqual(events[0], "whisper-ct2")
+
+    def test_other_whisper_skips_ct2_but_keeps_openvino(self):
+        result, events, made, timing, _, err = self.run_pass(
+            "Org/Whisper-Small", {"asr_third_backend": "whisper-ct2", "asr_third_device": "GPU"})
+        self.assertEqual(result, ["ok"])
+        self.assertEqual(events, ["whisper-ov", "onnx-cpu"])     # OpenVINO Whisper грузит модель по имени
+        self.assertEqual(made[0]["asr_model"], "Org/Whisper-Small")
+        lines = [x for x in err.splitlines() if "пропущен" in x]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("whisper-ct2", lines[0])
 
 
 class ThirdModelTranscriptLabelTests(unittest.TestCase):

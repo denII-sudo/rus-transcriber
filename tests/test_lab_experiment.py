@@ -191,10 +191,12 @@ class ExperimentFile(unittest.TestCase):
             # вторая модель без времён слов и третья, совпадающая с другой ролью, конвейер пропускает
             "whisper second": {"roles": {"primary": {"model": "m"},
                                          "second": {"model": "onnx-community/whisper-large-v3-turbo"}}},
-            "third same as second": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
-                                               "third": {"engine": "onnx", "model": "s"}}},
-            "third same as primary": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
-                                                "third": {"engine": "onnx", "model": "m"}}},
+            "third same as second": {"roles": {"primary": {"model": "m", "quant": None},
+                                               "second": {"model": "s", "backend": "onnx-cpu"},
+                                               "third": {"engine": "onnx", "model": "s", "quant": None}}},
+            "third same as primary": {"roles": {"primary": {"model": "m", "backend": "onnx-cpu", "quant": "int8"},
+                                                "second": {"model": "s"},
+                                                "third": {"engine": "onnx", "model": "m", "quant": "int8"}}},
             "long chunks not whisper": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
                                                   "third": {"engine": "onnx", "model": "q",
                                                             "long_chunks": True}}},
@@ -204,6 +206,20 @@ class ExperimentFile(unittest.TestCase):
             bad["configurations"][0].update(change)
             with self.subTest(name), self.assertRaises(lab_spec.SpecError):
                 lab_spec.parse(json.dumps(bad))
+        # та же модель третьей, но другая точность или движок (или они берутся из config.json) — допустимо
+        allowed = {
+            "other quant": {"primary": {"model": "m", "backend": "onnx-cpu", "quant": None}, "second": {"model": "s"},
+                            "third": {"engine": "onnx", "model": "m", "quant": "int8"}},
+            "other engine": {"primary": {"model": "m", "backend": "openvino", "quant": None},
+                             "second": {"model": "s"}, "third": {"engine": "onnx", "model": "m", "quant": None}},
+            "from config": {"primary": {"model": "m"}, "second": {"model": "s"},
+                            "third": {"engine": "onnx", "model": "s"}},
+        }
+        for name, roles in allowed.items():
+            ok = json.loads(json.dumps(good))
+            ok["configurations"][0]["roles"] = roles
+            with self.subTest(name):
+                lab_spec.parse(json.dumps(ok))
         import settings
         typo = json.loads(json.dumps(good))
         typo["configurations"][0]["settings"] = {"asr_thrid_mode": "all"}
@@ -632,7 +648,7 @@ class CaptureWithRealPipeline(unittest.TestCase):
             voice_ctx={"cents": {"L": [1]}}, allowed=[], genders_by_name={}, vocab=None,
             quality={"speaker_fixes": [], "vocab_fixes": []}, no_profile=False, group="g",
             t_diar=1.0, t_voice=0.5, diar_info={})
-        cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "whisper",
+        cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "onnx-community/whisper-large-v3-turbo",
                "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2", "asr_third_mode": "all",
                "asr_third_long_chunks": False, "asr_third_quant_cpu": "int8", "asr_third_batch": 4,
                "emotions": False, "review_missed": False, "interaction": False}

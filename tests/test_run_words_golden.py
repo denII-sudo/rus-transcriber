@@ -230,8 +230,9 @@ SCENARIOS = {
     # ошибка основного прохода на втором куске
     "primary_chunk_error": dict(primary_errors=(1,)),
     # faster-whisper с ошибкой на куске, повтор на onnx-cpu удался; второй проход на своём устройстве
+    # (третья модель названа large-v3-turbo: faster-whisper умеет только её, другой Whisper он пропускает)
     "ct2_retry": dict(cfg_extra={"asr_third_backend": "whisper-ct2", "asr_third_long_chunks": False,
-                                 "asr_second_device": "GPU"},
+                                 "asr_second_device": "GPU", "asr_third_model": "whisper-large-v3-turbo"},
                       whisper={"whisper-ct2": {"errors": (1,)}}),
     # Whisper на видеокарте: ошибка загрузки GPU, затем onnx-cpu с пустым куском; голосование
     # пропущено только на отрезке пустого куска (отпечаток снят заново 22.11.2026, vote3_partial)
@@ -245,6 +246,8 @@ SCENARIOS = {
 # модель — «второй проход распознавания (second)» у синтетической модели «second» вместо прежнего
 # «(CTC)»; у GigaAM CTC подпись прежняя. Другого отличия нет: обратная замена подписи в каноническом
 # виде даёт прежние отпечатки всех сценариев (second_fails подписи не содержит и не изменился).
+# 22.11.2026 (faster-whisper только для large-v3-turbo): в ct2_retry третья модель названа
+# «whisper-large-v3-turbo» вместо «whisper»; обратная замена имени даёт прежний отпечаток.
 EXPECTED = {
     "three_models": "64cfb7584947c48cf95bdad005071cf5afa5a5cae23a718e93b0a9d18738f91a",
     "second_fails": "e2638ce9942cac3ec1c3a64bee7520d84b18ee61d8c6b8f7af9ad2e4650ad259",
@@ -252,7 +255,7 @@ EXPECTED = {
     "whisper_doubt": "92038eaee5f3008d319cc89afe0b0ed17b07f83700181aeb176e9a384d03f459",
     "whisper_off": "764331baf52406f6b793edab08e5671c12914de2157b279fa485f9880c45fb2c",
     "primary_chunk_error": "e4641671fac09839fb4fde37e7400145be00506a318323ba52c29c02eae2483d",
-    "ct2_retry": "bc9e3ec6b809d7c18d926aad764eba4a9c0a34f3db619ada84f0e3d085e945f8",
+    "ct2_retry": "0463b5c880afe2eb213ab94ec41e64fcaf874b0ad74c6fa78fb726f992897f06",
     "gpu_then_cpu": "3f2c02aec99d7491e74b98cf2ac707ae8ef73541c4d3d9eb63d8c0665f58027d",
     "args_override": "52289a92987d8ebde448dc33484744dd2b5fe58170c73b51897c3462f81f3adf",
 }

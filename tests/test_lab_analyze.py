@@ -103,7 +103,7 @@ def run_pair(conf_id, fail=None, combine=None):
     import words
     roles = CONFS[conf_id]
     cfg = {"asr_model": roles["primary"]["model"], "asr_second_model": roles["second"]["model"],
-           "asr_third_model": "whisper", "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2",
+           "asr_third_model": "onnx-community/whisper-large-v3-turbo", "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2",
            "asr_third_mode": roles["third"]["mode"] if roles["third"] else "off",
            "asr_third_long_chunks": False, "asr_third_quant_cpu": "int8", "asr_third_batch": 4,
            "asr_third_max_repeat": 3, "emotions": False, "review_missed": False, "interaction": False}

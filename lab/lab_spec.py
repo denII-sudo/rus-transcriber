@@ -55,6 +55,23 @@ def _check_keys(where, value, allowed, required=()):
             raise SpecError(f"{where}: нужно поле {key}")
 
 
+def _third_loads_like(third, primary, second):
+    """Третья модель заведомо совпадает с основной или второй по правилу конвейера
+    (worker._third_same_model): то же имя модели, тот же движок onnx-cpu и та же точность.
+
+    Решается только то, что видно из файла опыта: третья — engine=onnx (она всегда считается на
+    onnx-cpu с точностью quant, null — fp32), у другой роли явно backend=onnx-cpu и известна
+    точность — quant основной роли (вторая наследует его, так устроен конвейер). Если что-то
+    берётся из config.json песочницы, решает сам конвейер при запуске (asr3_skipped)."""
+    if third.get("engine") != "onnx" or not third.get("model") or "quant" not in primary:
+        return False
+    for role in (primary, second):
+        if role.get("model") == third["model"] and role.get("backend") == "onnx-cpu" and \
+                primary.get("quant") == third.get("quant"):
+            return True
+    return False
+
+
 def parse(text):
     """Текст файла опыта -> проверенный словарь. Ошибка формата — SpecError."""
     try:
@@ -116,9 +133,10 @@ def parse(text):
                 if third.get("long_chunks") and "whisper" not in str(third["model"]).lower():
                     raise SpecError(f"{where}: third.long_chunks — только для Whisper; другой модели "
                                     "конвейер даёт куски основного прохода")
-            if third.get("model") and third["model"] in (roles["primary"]["model"], second["model"]):
-                raise SpecError(f"{where}: третья модель совпадает с основной или второй — конвейер её "
-                                "пропустит (голос без новой информации)")
+            if _third_loads_like(third, roles["primary"], second):
+                raise SpecError(f"{where}: третья модель совпадает с основной или второй и загружается "
+                                "так же (onnx-cpu, та же точность) — конвейер её пропустит (голос без "
+                                "новой информации); другая точность или движок допустимы")
             if third.get("mode", "all") not in THIRD_MODES:
                 raise SpecError(f"{where}: third.mode — all или doubt")
         settings = conf.get("settings", {})

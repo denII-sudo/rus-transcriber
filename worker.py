@@ -525,7 +525,11 @@ def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
     Вторая модель может быть любой, если она отдаёт времена слов (transcript.asr_model_caps): по ним
     голосование ставит её слова на место и исключает сбойные отрезки. Модель без времён (Whisper)
     вторым номером не считается — одна ясная строка в журнале и quality["asr2_skipped"], без подмены
-    модели; модель, совпадающая с основной, новой гипотезы не дала бы — тоже asr2_skipped."""
+    модели; модель, совпадающая с основной, новой гипотезы не дала бы — тоже asr2_skipped.
+
+    Совпадение второй с основной — по имени, как раньше (в отличие от третьей, _third_same_model):
+    точность вторая наследует у основной (asr_quant, asr_quant_cpu), отличаться может лишь движок
+    или устройство, а решение владельца 22.11.2026 касалось только третьей модели."""
     second = cfg.get("asr_second_model", "v3_e2e_ctc")
     if not second:
         return None
@@ -575,23 +579,52 @@ def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
         return None
 
 
+def _engine_key(name):
+    """Имя движка загруженной модели -> (движок, устройство, точность) без размера пакета.
+    «cpu:b4:int8» -> ("cpu", "int8"), «openvino:GPU:b8» -> ("openvino", "GPU"), «cpu» (fp32) -> ("cpu",).
+    Формат имени — backends.OnnxASR.name; размер пакета на загруженную модель не влияет."""
+    return tuple(p for p in str(name or "").split(":") if p and not re.fullmatch(r"b\d+", p))
+
+
+def _third_engine_key(third, cfg):
+    """Движок, на котором будет загружена третья модель не из семейства Whisper: только onnx-cpu
+    с точностью asr_third_quant_cpu (whisper_pass) -> ключ как у _engine_key; для Whisper — None."""
+    if transcript.asr_model_caps(third)["whisper"]:
+        return None
+    quant = cfg.get("asr_third_quant_cpu", "int8")
+    return ("cpu", quant) if quant else ("cpu",)
+
+
 def _third_same_model(third, cfg, quality):
     """Третья модель совпадает с основной или второй -> причина пропуска (голос без новой информации).
 
-    Та же модель по тем же кускам повторила бы гипотезу: совпадая с основной, она всегда
-    поддерживала бы её и снимала бы метки расхождения со второй; совпадая со второй, удваивала бы
-    её голос. Поэтому третий проход не считается, сводятся две модели (как при asr_third_mode=off)."""
-    if third == cfg.get("asr_model"):
-        reason = "same_as_primary"
-    elif cfg.get("asr_second_model") and third == cfg.get("asr_second_model"):
-        reason = "same_as_second"
-    else:
+    «Совпадает» — то же имя модели и та же фактическая загрузка: движок, устройство и точность
+    (квантование), с которыми основная или вторая модель действительно загружена (её движок
+    в quality["asr_diagnostics"], с учётом откатов), против движка третьей (onnx-cpu,
+    asr_third_quant_cpu). Размер пакета не в счёт. Такая третья повторила бы гипотезу: совпадая
+    с основной, всегда поддерживала бы её и снимала бы метки расхождения со второй; совпадая со
+    второй, удваивала бы её голос. Тогда третий проход не считается, сводятся две модели (как при
+    asr_third_mode=off). Если отличается хоть что-то — модель, движок, устройство или точность —
+    третья считается (решение владельца 22.11.2026)."""
+    if quality is None:
         return None
-    if quality is not None:
-        quality["asr3_skipped"] = {"reason": reason, "model": third}
+    mine = _third_engine_key(third, cfg)
+    if mine is None:
+        return None
+    diag = quality.get("asr_diagnostics") or {}
+    reason = None
+    for role, key, why in (("primary", "asr_model", "same_as_primary"),
+                           ("second", "asr_second_model", "same_as_second")):
+        if cfg.get(key) and third == cfg.get(key) and \
+                _engine_key((diag.get(role) or {}).get("backend")) == mine:
+            reason = why
+            break
+    if reason is None:
+        return None
+    quality["asr3_skipped"] = {"reason": reason, "model": third, "engine": ":".join(mine)}
     print(f"[words] третья модель {third} совпадает с " + ("основной" if reason == "same_as_primary" else "второй")
-          + ": третий проход пропущен — он не дал бы нового голоса; сверяются основная и вторая модели",
-          file=sys.stderr, flush=True)
+          + f" и загружалась бы так же ({':'.join(mine)}): третий проход пропущен — он не дал бы нового "
+          "голоса; сверяются основная и вторая модели", file=sys.stderr, flush=True)
     return reason
 
 
@@ -712,8 +745,8 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
     Для самого onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается.
     Если третья модель — не Whisper (например multilingual_large_ctc), движки faster-whisper и OpenVINO
     Whisper пропускаются (они умеют только Whisper), считает общий onnx-cpu. faster-whisper грузит только
-    large-v3-turbo: для другого Whisper он остаётся в очереди, но с предупреждением в журнале
-    (transcript.asr_model_caps, ключ ct2)."""
+    large-v3-turbo: для другого Whisper он тоже пропускается (transcript.asr_model_caps, ключ ct2),
+    а OpenVINO Whisper и onnx-cpu грузят выбранную модель по имени."""
     from backends import normalize_device
     third, pieces = plan["model"], plan["pieces"]
     dev = normalize_device(cfg.get("asr_third_device", "CPU"))
@@ -736,10 +769,12 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
                 f"движки {', '.join(skipped)} пропущены — они умеют только Whisper")
                 + "; считаю общим движком onnx-cpu", file=sys.stderr, flush=True)
     elif not caps["ct2"] and tries[0][0] == "whisper-ct2":
-        # faster-whisper здесь грузит только large-v3-turbo; отказ от него для другого Whisper —
-        # решение владельца (вопрос в отчёте задачи), пока — предупреждение в журнале, не молча
-        print(f"[words] третья модель {third}: движок whisper-ct2 считает Whisper large-v3-turbo, "
-              "а не эту модель", file=sys.stderr, flush=True)
+        # faster-whisper здесь грузит только large-v3-turbo: другой Whisper он подменил бы
+        # (решение владельца 22.11.2026 — движок пропускается). OpenVINO Whisper (whisper-ov)
+        # грузит модель по имени, поэтому для любого Whisper остаётся в очереди
+        tries = tries[1:]
+        print(f"[words] третья модель {third}: движок whisper-ct2 пропущен — он умеет только "
+              "Whisper large-v3-turbo; считаю движком с выбранной моделью", file=sys.stderr, flush=True)
     outer_attempts = []
     for backend, device, quant in tries:
         try:

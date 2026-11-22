@@ -304,25 +304,72 @@ class SecondWithoutWordTimes(unittest.TestCase):
 
 # ---------- 6. одинаковые модели ----------
 class SameModels(unittest.TestCase):
+    """Третья пропускается, только если совпадают имя модели и фактическая загрузка (движок,
+    устройство, точность) с основной или второй; если отличается хоть что-то — считается."""
+
     def words_of(self, data):
         return [(w["w"], w["s"], w.get("alt"), w.get("flags")) for seg in data["segments"] for w in seg["words"]]
 
-    def test_third_same_as_second_is_skipped(self):
-        off, _ = G.run_scenario({"asr_third_mode": "off"})
-        with contextlib.redirect_stderr(io.StringIO()):
-            same, calls = G.run_scenario({"asr_third_model": "second"})
-        self.assertEqual(same["quality"]["asr3_skipped"], {"reason": "same_as_second", "model": "second"})
+    def run_case(self, engines, cfg_extra):
+        """run_scenario, где у синтетических моделей имена движков как у backends.OnnxASR
+        (engines: {"primary": ..., "second": ...}); вторая умеет и текст — на случай третьей."""
+        class Fake(G.FakeTimestamped):
+            def __init__(self, name, script, *a, **kw):
+                super().__init__(name, script, *a, **kw)
+                self.name = engines.get(name, name)
+
+            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                self.calls.models.append(("texts", self.name, [len(p) for p in pieces]))
+                diagnostics.extend({"index": i, "state": "ok", "attempts": [{"result": "ok", "batch": [i]}]}
+                                   for i in range(len(pieces)))
+                return ["".join(t for t, _ in self.script[i]).strip() if i < len(self.script) else ""
+                        for i in range(len(pieces))]
+
+        err = io.StringIO()
+        with mock.patch.object(G, "FakeTimestamped", Fake), contextlib.redirect_stderr(err):
+            data, calls = G.run_scenario(cfg_extra)
+        return data, calls, err.getvalue()
+
+    SAME = {"primary": "cpu:b8", "second": "cpu:b1:int8"}       # основная fp32, вторая int8
+
+    def test_engine_key(self):
+        self.assertEqual(worker._engine_key("cpu:b4:int8"), ("cpu", "int8"))
+        self.assertEqual(worker._engine_key("openvino:GPU:b8"), ("openvino", "GPU"))
+        self.assertEqual(worker._engine_key("cpu"), ("cpu",))
+        self.assertEqual(worker._third_engine_key(ML, {"asr_third_quant_cpu": ""}), ("cpu",))
+        self.assertEqual(worker._third_engine_key(ML, {}), ("cpu", "int8"))
+        self.assertIsNone(worker._third_engine_key(WHISPER, {}))
+
+    def test_third_same_as_second_same_load_is_skipped(self):
+        off, _, _ = self.run_case(self.SAME, {"asr_third_mode": "off"})
+        same, calls, err = self.run_case(self.SAME, {"asr_third_model": "second", "asr_third_quant_cpu": "int8"})
+        self.assertEqual(same["quality"]["asr3_skipped"],
+                         {"reason": "same_as_second", "model": "second", "engine": "cpu:int8"})
         self.assertNotIn("whisper", same["quality"]["asr_diagnostics"])
         self.assertNotIn("vote", same["quality"])
         self.assertEqual(self.words_of(same), self.words_of(off))      # как без третьей модели
         self.assertEqual(len([m for m in calls.models if m[0] == "texts"]), 0)
+        self.assertEqual(len([x for x in err.splitlines() if "третий проход пропущен" in x]), 1)
 
-    def test_third_same_as_primary_is_skipped(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            same, _ = G.run_scenario({"asr_third_model": "primary"})
+    def test_third_same_name_other_quant_is_counted(self):
+        data, calls, err = self.run_case(self.SAME, {"asr_third_model": "second", "asr_third_quant_cpu": ""})
+        self.assertNotIn("asr3_skipped", data["quality"])
+        self.assertEqual([c["state"] for c in data["quality"]["asr_diagnostics"]["whisper"]["chunks"]],
+                         ["ok", "ok"])
+        self.assertIn("vote", data["quality"])
+        self.assertNotIn("третий проход пропущен", err)
+
+    def test_third_same_as_primary_same_load_is_skipped(self):
+        same, _, _ = self.run_case({"primary": "cpu:b8:int8"}, {"asr_third_model": "primary"})
         self.assertEqual(same["quality"]["asr3_skipped"]["reason"], "same_as_primary")
         md = transcript.render_md({**same, "file": "x.wav", "duration": "00:00:30"})
-        self.assertIn("_Третья модель (primary) совпадает с основной и не считалась", md)
+        self.assertIn("_Третья модель (primary) совпадает с основной (та же модель, движок и точность) "
+                      "и не считалась", md)
+
+    def test_third_same_name_other_engine_is_counted(self):
+        data, _, _ = self.run_case({"primary": "openvino:GPU:b8:int8"}, {"asr_third_model": "primary"})
+        self.assertNotIn("asr3_skipped", data["quality"])
+        self.assertIn("whisper", data["quality"]["asr_diagnostics"])
 
     def test_second_same_as_primary_is_explicit(self):
         err = io.StringIO()
@@ -383,33 +430,50 @@ class EngineChoice(unittest.TestCase):
         self.assertIn("torch", self.tried("v3_e2e_ctc"))
         self.assertIn("torch", self.tried(ML))           # у пакета gigaam Multilingual есть
 
-    def test_other_whisper_on_ct2_is_not_silent(self):
+    def ct2_run(self, model, cfg_extra=None):
         err, events = io.StringIO(), []
 
-        class Fake:
-            name = "fake"
+        def engine(name):
+            class Fake:
+                def __init__(self, *a, **kw):
+                    events.append((name, a[0] if a else kw.get("model")))
+                    self.name = name
 
-            def __init__(self, *a, **kw):
-                events.append("whisper-ct2")
+                def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                    diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                    return ["ok" for _ in pieces]
+            return Fake
 
-            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
-                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
-                return ["ok" for _ in pieces]
+        def make_asr(cfg):
+            asr = engine("onnx-cpu")(cfg["asr_model"])            # запись в events — здесь
+            return asr, None
 
-        plan = {"model": "org/whisper-small", "mode": "all", "max_repeat": 3, "selected": [0],
+        plan = {"model": model, "mode": "all", "max_repeat": 3, "selected": [0],
                 "chunks": [{"a": 0, "b": 1, "own": (0, 1)}], "pieces": [np.zeros(SR, dtype=np.float32)]}
-        quality = {"asr_diagnostics": {}, "asr_run": {"models": {}}}
-        with mock.patch.object(backends, "WhisperCT2", Fake), contextlib.redirect_stderr(err):
-            worker.whisper_pass(plan, [], {"asr_third_backend": "whisper-ct2"}, SimpleNamespace(set=lambda **k: None),
-                                quality, None, lambda lo, hi, name: (lambda d, t: None), {})
-        self.assertEqual(events, ["whisper-ct2"])
-        self.assertIn("считает Whisper large-v3-turbo, а не эту модель", err.getvalue())
-        err2 = io.StringIO()
-        plan["model"] = WHISPER
-        with mock.patch.object(backends, "WhisperCT2", Fake), contextlib.redirect_stderr(err2):
-            worker.whisper_pass(plan, [], {"asr_third_backend": "whisper-ct2"}, SimpleNamespace(set=lambda **k: None),
-                                quality, None, lambda lo, hi, name: (lambda d, t: None), {})
-        self.assertNotIn("а не эту модель", err2.getvalue())
+        quality, timing = {"asr_diagnostics": {}, "asr_run": {"models": {}}}, {}
+        with mock.patch.object(backends, "WhisperCT2", engine("whisper-ct2")), \
+                mock.patch.object(backends, "WhisperOV", engine("whisper-ov")), contextlib.redirect_stderr(err):
+            worker.whisper_pass(plan, [], {"asr_third_backend": "whisper-ct2", **(cfg_extra or {})},
+                                SimpleNamespace(set=lambda **k: None), quality, make_asr,
+                                lambda lo, hi, name: (lambda d, t: None), timing)
+        return events, timing, err.getvalue()
+
+    def test_other_whisper_skips_ct2(self):
+        events, timing, err = self.ct2_run("org/whisper-small")
+        self.assertEqual(events, [("onnx-cpu", "org/whisper-small")])        # подмены модели нет
+        self.assertEqual(timing["asr3_device"], "onnx-cpu:CPU:int8")
+        self.assertEqual(len([x for x in err.splitlines() if "whisper-ct2 пропущен" in x]), 1)
+
+    def test_other_whisper_on_gpu_uses_openvino_with_its_name(self):
+        events, timing, _ = self.ct2_run("org/whisper-small", {"asr_third_device": "GPU"})
+        self.assertEqual(events, [("whisper-ov", "org/whisper-small")])      # OpenVINO грузит по имени
+        self.assertEqual(timing["asr3_device"], "whisper-ov:GPU:fp16")
+
+    def test_default_whisper_keeps_ct2_first(self):
+        events, timing, err = self.ct2_run(WHISPER)
+        self.assertEqual([e[0] for e in events], ["whisper-ct2"])
+        self.assertEqual(timing["asr3_device"], "whisper-ct2:CPU:int8")
+        self.assertNotIn("пропущен", err)
 
 
 if __name__ == "__main__":

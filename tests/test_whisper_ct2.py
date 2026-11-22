@@ -78,7 +78,7 @@ class WhisperCT2WorkerTests(unittest.TestCase):
         def make_asr(cfg):
             return (CPU() if cfg.get("asr_backend") == "onnx-cpu" else Main()), None
 
-        cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "whisper",
+        cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "onnx-community/whisper-large-v3-turbo",
                "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2", "asr_third_mode": "all",
                "asr_third_long_chunks": False, "asr_third_quant_cpu": "int8", "asr_third_batch": 4,
                "emotions": False, "review_missed": False}
