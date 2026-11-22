@@ -174,5 +174,55 @@ class WhisperFallbackTests(unittest.TestCase):
         self.assertEqual(data["review"][0]["asr_problem"]["words_from"], ["primary"])
 
 
+class ThirdModelStageLabelTests(unittest.TestCase):
+    """Подпись этапа третьей модели в статусе называет настоящую модель."""
+
+    def stages(self, model, cfg_extra=None):
+        seen = []
+
+        class Recorder:
+            def set(self, **kwargs):
+                if "stage" in kwargs:
+                    seen.append(kwargs["stage"])
+
+        class Fake:
+            name = "fake-third"
+
+            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                progress(1, 1)
+                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                return ["ok" for _ in pieces]
+
+        def prog(lo, hi, name):
+            return lambda done, total: seen.append(name)
+
+        st = Recorder()
+        plan = {"model": model, "mode": "all", "max_repeat": 3, "chunks": [{"a": 0, "b": 1, "own": (0, 1)}],
+                "selected": [0], "pieces": [np.zeros(16000, dtype=np.float32)]}
+        cfg = {"asr_third_device": "CPU", **(cfg_extra or {})}
+        quality = {"asr_diagnostics": {}, "asr_run": {"models": {}}}
+        result = worker.whisper_pass(plan, [], cfg, st, quality, lambda c: (Fake(), None), prog, {})
+        self.assertEqual(result, ["ok"])
+        self.assertNotIn("asr3_errors", quality)
+        return seen
+
+    def test_label_names(self):
+        self.assertEqual(worker._third_label("onnx-community/whisper-large-v3-turbo"), "Whisper")
+        self.assertEqual(worker._third_label("multilingual_large_ctc"), "Multilingual large")
+        self.assertEqual(worker._third_label("some_other_model"), "some_other_model")
+        self.assertEqual(worker._third_label("multilingual_large_ctc", "whisper-ct2"), "Whisper")
+
+    def test_whisper_stage_text_is_unchanged(self):
+        seen = self.stages("onnx-community/whisper-large-v3-turbo")
+        self.assertIn("третья модель: загрузка Whisper (CPU)", seen)
+        self.assertIn("третья модель (Whisper, CPU)", seen)
+
+    def test_multilingual_stage_text_names_real_model(self):
+        seen = self.stages("multilingual_large_ctc")
+        self.assertIn("третья модель: загрузка Multilingual large (CPU)", seen)
+        self.assertIn("третья модель (Multilingual large, CPU)", seen)
+        self.assertFalse([s for s in seen if "Whisper" in s])
+
+
 if __name__ == "__main__":
     unittest.main()

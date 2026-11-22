@@ -570,6 +570,16 @@ def whisper_plan(audio, regions, chunks, cfg, a, words, alt):
             "pieces": pieces}
 
 
+def _third_label(third, backend=""):
+    """Короткое название третьей модели для статуса обработки: Whisper, Multilingual large или имя модели."""
+    name = str(third or "")
+    if backend.startswith("whisper-") or "whisper" in name.lower():
+        return "Whisper"
+    if name == "multilingual_large_ctc":
+        return "Multilingual large"
+    return name
+
+
 def _load_whisper(backend, device, quant, third, cfg, make_asr):
     """Третья модель выбранным движком -> (модель, откаты движка)."""
     if backend == "whisper-ov":
@@ -594,7 +604,7 @@ def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cf
                            "asr_language": "ru", "asr_batch": int(cfg.get("asr_third_batch", 4))})
         cpu_diag = []
         cpu_texts = cpu.transcribe_texts([pieces[i] for i in failed_indices], diagnostics=cpu_diag,
-                                        progress=prog(74, 74, "повтор Whisper на CPU"))
+                                        progress=prog(74, 74, f"повтор {_third_label(third)} на CPU"))
         if len(cpu_texts) != len(failed_indices) or len(cpu_diag) != len(failed_indices):
             raise ValueError("неверное количество результатов CPU")
         for pos, i in enumerate(failed_indices):
@@ -658,13 +668,14 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
     for backend, device, quant in tries:
         try:
             t3 = time.time()
-            st.set(stage=f"третья модель: загрузка Whisper ({device})", progress=68)
+            label = _third_label(third, backend)
+            st.set(stage=f"третья модель: загрузка {label} ({device})", progress=68)
             asr3, errs3 = _load_whisper(backend, device, quant, third, cfg, make_asr)
             t_load = time.time() - t3
             compile_sec, name3 = getattr(asr3, "compile_sec", None), getattr(asr3, "name", None)
             whisper_diag = []
             _register_pass(quality, "whisper", third, asr3.name, whisper_diag)
-            texts = asr3.transcribe_texts(pieces, progress=prog(68, 74, f"третья модель (Whisper, {device})"),
+            texts = asr3.transcribe_texts(pieces, progress=prog(68, 74, f"третья модель ({label}, {device})"),
                                           diagnostics=whisper_diag)
             del asr3
             for rec in whisper_diag:
