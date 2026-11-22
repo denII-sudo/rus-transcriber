@@ -233,7 +233,8 @@ SCENARIOS = {
     "ct2_retry": dict(cfg_extra={"asr_third_backend": "whisper-ct2", "asr_third_long_chunks": False,
                                  "asr_second_device": "GPU"},
                       whisper={"whisper-ct2": {"errors": (1,)}}),
-    # Whisper на видеокарте: ошибка загрузки GPU, затем onnx-cpu с пустым куском
+    # Whisper на видеокарте: ошибка загрузки GPU, затем onnx-cpu с пустым куском; голосование
+    # пропущено только на отрезке пустого куска (отпечаток снят заново 22.11.2026, vote3_partial)
     "gpu_then_cpu": dict(cfg_extra={"asr_third_device": "GPU", "asr_third_long_chunks": False},
                          whisper={"whisper-ov": {"fail_load": True}, "onnx-cpu": {"empty": (0,)}}),
     # ограничения из аргументов запуска: без ограничения повторов, Whisper только в местах расхождения
@@ -248,7 +249,7 @@ EXPECTED = {
     "whisper_off": "6da72866aa7e965d4e27d478d1d7209d525aff76f16d9443940df227d1e0b6d6",
     "primary_chunk_error": "68a6adf67d3f089127f29d5401f4daf7121be1a4e662f78571fa402867ef3315",
     "ct2_retry": "7cda80af0b5a47d051729fa76b6492a36b3233989d09acd2f2730c7b1d1c2de1",
-    "gpu_then_cpu": "26d25ba2b34eab9eb670b31db0277255120cad80ca5e29eb6692082ad0a86e80",
+    "gpu_then_cpu": "6977fae86a717ea39d383b3eb11d3ef7764cc282a2ffb5148142596b41ebd178",
     "args_override": "ed4dd3dafd09eeab4b1e6e29775549f036e79036fb4bd23b0eb2a2b2f7bf5347",
 }
 
@@ -334,6 +335,231 @@ class CombineHypothesesTests(unittest.TestCase):
         self.assertEqual(self.main, before)
         self.assertEqual(got, {"quality": {"asr_incomplete_chunks": 1},
                                "evidence": {"whisper": [], "other": [(0.0, 15.15, "second", "error", ["primary"])]}})
+
+
+# --- частичное исключение отрезков из голосования: синтетическая запись 0–10 с, слово в секунду ---
+TEN = ["один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять", "десять"]
+
+
+def wd(text, s):
+    return {"w": text, "s": float(s), "e": float(s) + 0.3, "c": 0.9}
+
+
+def chunks(*spans, state="ok", **extra):
+    return {"chunks": [{"state": state, "own_span": list(span), **extra} for span in spans]}
+
+
+class PartialVoteTests(unittest.TestCase):
+    """Сбойный кусок третьей или второй модели исключает из vote3 только свой отрезок own_span."""
+
+    def setUp(self):
+        self.main = [wd(t, i) for i, t in enumerate(TEN)]
+        # CTC: «дважды» вместо «два» (с Whisper против RNN-T), «четверо» вместо «четыре»,
+        # «кошка» после «пять» и «ещё» после «восемь» — слова, которых нет у RNN-T
+        self.ctc = [wd(t, i) for i, t in enumerate(TEN)]
+        self.ctc[1]["w"], self.ctc[3]["w"] = "дважды", "четверо"
+        self.ctc[5:5] = [wd("кошка", 4.5)]
+        self.ctc[9:9] = [wd("ещё", 7.5)]
+        self.ok = {"primary": chunks((0.0, 10.0)), "second": chunks((0.0, 10.0))}
+
+    def whisper_without(self, *spans):
+        """Текст Whisper: «дважды» и «ещё» как у CTC, «четыре» как у RNN-T, «кошка» не слышит;
+        без слов на сбойных отрезках (времена нужны только тесту, Whisper их не даёт)."""
+        heard = [("четыре" if w["w"] == "четверо" else w["w"], w["s"]) for w in self.ctc if w["w"] != "кошка"]
+        return [t for t, s in heard if not any(a <= s < b for a, b in spans)]
+
+    def whisper_diag(self, bad, state="empty_unknown", **extra):
+        good = [(a, b) for a, b in ((0.0, bad[0]), (bad[1], 10.0)) if b > a]
+        rec = chunks(bad, state=state, **extra)["chunks"] + chunks(*good)["chunks"]
+        return {"chunks": sorted(rec, key=lambda r: r["own_span"])}
+
+    def expected(self, spans, whisper):
+        """Эталон: vote3 по словам вне отрезков, mark_alt внутри, сборка по времени."""
+        def inside(w):
+            return any(a <= w["s"] < b for a, b in spans)
+        main, ctc = copy.deepcopy(self.main), copy.deepcopy(self.ctc)
+        keep = [w for w in main if not inside(w)]
+        stats = words.vote3(keep, [w for w in ctc if not inside(w)], list(whisper))
+        parts = []
+        for a, b in spans:
+            mp = [w for w in main if a <= w["s"] < b]
+            words.mark_alt(mp, [w for w in ctc if a <= w["s"] < b])
+            parts.append((a, mp))
+        out = list(keep)
+        for a, mp in reversed(parts):
+            pos = next((i for i, w in enumerate(out) if w["s"] >= a), len(out))
+            out[pos:pos] = mp
+        return out, stats
+
+    def combine(self, whisper, diagnostics):
+        return words.combine_hypotheses({"primary": self.main, "second": self.ctc, "whisper": whisper},
+                                        diagnostics)
+
+    def assert_time_order(self):
+        self.assertEqual([w["s"] for w in self.main], sorted(w["s"] for w in self.main))
+
+    def test_whisper_failure_in_the_middle(self):
+        whisper = self.whisper_without((3.0, 6.0))
+        diag = {**self.ok, "whisper": self.whisper_diag((3.0, 6.0))}
+        want, stats = self.expected([(3.0, 6.0)], whisper)
+        whole = copy.deepcopy(self.main)
+        words.mark_alt(whole, self.ctc)
+        got = self.combine(whisper, diag)
+        self.assertEqual(self.main, want)
+        self.assert_time_order()
+        quality = got["quality"]
+        self.assertEqual(quality["vote"], stats)
+        self.assertEqual(quality["vote3_partial"], {"reason": "whisper_incomplete", "spans": 1, "seconds": 3.0})
+        self.assertNotIn("vote3_skipped", quality)
+        self.assertNotIn("asr_incomplete_chunks", quality)
+        # вне отрезка голосование заменяет и вставляет слова
+        self.assertEqual(quality["asr_votes"], [{"t": 1.0, "t2": 1.0, "model": "два", "to": "дважды"},
+                                                {"t": 7.5, "t2": 7.5, "model": "", "to": "ещё"}])
+        self.assertEqual([w["w"] for w in self.main],
+                         ["один", "дважды", "три", "четыре", "пять", "шесть", "семь", "восемь", "ещё",
+                          "девять", "десять"])
+        # на отрезке — то же, что дала бы сверка двух моделей по всей записи (включая alt_ins)
+        span = [w for w in self.main if 3.0 <= w["s"] < 6.0]
+        self.assertEqual(span, [w for w in whole if 3.0 <= w["s"] < 6.0])
+        self.assertEqual((span[0]["alt"], span[0]["agree"]), ("четверо", False))
+        self.assertEqual(span[2]["alt_ins"], "кошка")
+        self.assertEqual(got["evidence"], {"whisper": [(3.0, 6.0, "empty_unknown", ["primary", "second"])],
+                                           "other": []})
+
+    def test_whisper_failure_at_the_start(self):
+        whisper = self.whisper_without((0.0, 3.0))
+        want, stats = self.expected([(0.0, 3.0)], whisper)
+        quality = self.combine(whisper, {**self.ok, "whisper": self.whisper_diag((0.0, 3.0))})["quality"]
+        self.assertEqual(self.main, want)
+        self.assert_time_order()
+        self.assertEqual(quality["vote"], stats)
+        self.assertEqual(quality["vote3_partial"]["spans"], 1)
+        self.assertEqual([w["w"] for w in self.main][:3], ["один", "два", "три"])   # «два» не заменено
+        self.assertEqual((self.main[1]["alt"], self.main[1]["agree"]), ("дважды", False))
+        self.assertNotIn("voted", self.main[1])
+        self.assertIn("ещё", [w["w"] for w in self.main])
+
+    def test_whisper_failure_at_the_end(self):
+        whisper = self.whisper_without((7.0, 10.0))
+        want, stats = self.expected([(7.0, 10.0)], whisper)
+        quality = self.combine(whisper, {**self.ok, "whisper": self.whisper_diag((7.0, 10.0))})["quality"]
+        self.assertEqual(self.main, want)
+        self.assert_time_order()
+        self.assertEqual(quality["vote"], stats)
+        self.assertEqual(self.main[1]["w"], "дважды")
+        self.assertNotIn("ещё", [w["w"] for w in self.main])      # на отрезке без Whisper не вставляем
+        self.assertEqual(self.main[-3]["w"], "восемь")
+        self.assertEqual((self.main[-2]["w"], self.main[-2]["alt_ins"]), ("девять", "ещё"))
+
+    def test_two_separate_failed_spans(self):
+        spans = [(1.0, 3.0), (6.0, 8.0)]
+        whisper = self.whisper_without(*spans)
+        diag = {**self.ok, "whisper": {"chunks": [
+            {"state": "ok", "own_span": [0.0, 1.0]}, {"state": "error", "own_span": [1.0, 3.0]},
+            {"state": "ok", "own_span": [3.0, 6.0]}, {"state": "empty_unknown", "own_span": [6.0, 8.0]},
+            {"state": "ok", "own_span": [8.0, 10.0]}]}}
+        want, stats = self.expected(spans, whisper)
+        quality = self.combine(whisper, diag)["quality"]
+        self.assertEqual(self.main, want)
+        self.assert_time_order()
+        self.assertEqual(quality["vote3_partial"], {"reason": "whisper_incomplete", "spans": 2, "seconds": 4.0})
+        self.assertEqual(quality["asr_incomplete_chunks"], 1)
+        self.assertNotIn("vote3_skipped", quality)
+        self.assertEqual(self.main[1]["w"], "два")               # на первом отрезке — только сверка
+        self.assertEqual(self.main[1]["alt"], "дважды")
+        # вне отрезков — «два из трёх»: Whisper поддержал RNN-T против CTC
+        self.assertEqual((self.main[3]["w"], self.main[3]["agree"]), ("четыре", True))
+        self.assertNotIn("alt", self.main[3])
+        self.assertEqual(quality["vote"]["agree2"], 1)
+
+    def test_adjacent_failed_chunks_form_one_span(self):
+        whisper = self.whisper_without((3.0, 6.0))
+        diag = {**self.ok, "whisper": {"chunks": [
+            {"state": "ok", "own_span": [0.0, 3.0]}, {"state": "error", "own_span": [3.0, 4.5]},
+            {"state": "error", "own_span": [4.5, 6.0]}, {"state": "ok", "own_span": [6.0, 10.0]}]}}
+        quality = self.combine(whisper, diag)["quality"]
+        self.assertEqual(quality["vote3_partial"], {"reason": "whisper_incomplete", "spans": 1, "seconds": 3.0})
+
+    def test_filtered_whisper_chunk_is_excluded_like_a_failure(self):
+        whisper = self.whisper_without((3.0, 6.0))
+        want, stats = self.expected([(3.0, 6.0)], whisper)
+        diag = {**self.ok, "whisper": self.whisper_diag((3.0, 6.0), state="ok", filtered_all=True)}
+        got = self.combine(whisper, diag)
+        self.assertEqual(self.main, want)
+        self.assertEqual(got["quality"]["vote3_partial"]["reason"], "whisper_incomplete")
+        self.assertEqual(got["evidence"]["whisper"], [(3.0, 6.0, "filtered", ["primary", "second"])])
+
+    def test_second_model_failure_excludes_only_its_span(self):
+        self.ctc = [w for w in self.ctc if not 3.0 <= w["s"] < 6.0]      # там у CTC слов нет
+        whisper = self.whisper_without()                                  # Whisper слышит всё
+        diag = {"primary": chunks((0.0, 10.0)),
+                "second": {"chunks": [{"state": "ok", "own_span": [0.0, 3.0]},
+                                      {"state": "error", "own_span": [3.0, 6.0]},
+                                      {"state": "ok", "own_span": [6.0, 10.0]}]},
+                "whisper": chunks((0.0, 10.0))}
+        want, stats = self.expected([(3.0, 6.0)], whisper)
+        whole = copy.deepcopy(self.main)
+        words.mark_alt(whole, self.ctc)
+        got = self.combine(whisper, diag)
+        self.assertEqual(self.main, want)
+        self.assert_time_order()
+        quality = got["quality"]
+        self.assertEqual(quality["vote"], stats)
+        self.assertEqual(quality["vote3_partial"], {"reason": "asr_incomplete", "spans": 1, "seconds": 3.0})
+        self.assertEqual(quality["asr_incomplete_chunks"], 1)
+        self.assertNotIn("vote3_skipped", quality)
+        self.assertEqual(self.main[1]["w"], "дважды")
+        span = [w for w in self.main if 3.0 <= w["s"] < 6.0]
+        self.assertEqual(span, [w for w in whole if 3.0 <= w["s"] < 6.0])
+        self.assertTrue(all(w["agree"] is False for w in span))
+        self.assertEqual(got["evidence"]["other"], [(3.0, 6.0, "second", "error", ["primary"])])
+
+    def test_primary_failure_still_disables_vote_for_whole_record(self):
+        self.main = [w for w in self.main if not 3.0 <= w["s"] < 6.0]
+        whole = copy.deepcopy(self.main)
+        words.mark_alt(whole, self.ctc)
+        diag = {"primary": {"chunks": [{"state": "ok", "own_span": [0.0, 3.0]},
+                                       {"state": "error", "own_span": [3.0, 6.0]},
+                                       {"state": "ok", "own_span": [6.0, 10.0]}]},
+                "second": chunks((0.0, 10.0)), "whisper": chunks((0.0, 10.0))}
+        quality = self.combine(self.whisper_without(), diag)["quality"]
+        self.assertEqual(self.main, whole)
+        self.assertEqual(quality, {"vote3_skipped": "asr_incomplete", "asr_incomplete_chunks": 1})
+
+    def test_nothing_left_outside_spans_disables_vote(self):
+        whole = copy.deepcopy(self.main)
+        words.mark_alt(whole, self.ctc)
+        diag = {**self.ok, "whisper": chunks((0.0, 10.0), state="empty_unknown")}
+        quality = self.combine([], diag)["quality"]
+        self.assertEqual(self.main, whole)
+        self.assertEqual(quality, {"vote3_skipped": "whisper_incomplete"})
+
+    def test_word_on_span_boundary(self):
+        # слово ровно на начале отрезка исключено, ровно на конце — голосует
+        self.ctc[3]["w"] = "четыре"
+        self.ctc[7]["w"] = "семью"                    # индекс 7 — «семь» (6,0 с) после вставки «кошка»
+        whisper = [t if t != "семь" else "семью" for t in self.whisper_without((3.0, 6.0))]
+        self.main[3]["w"] = "черыре"                  # 3,0 с — на отрезке: только сверка с CTC
+        quality = self.combine(whisper, {**self.ok, "whisper": self.whisper_diag((3.0, 6.0))})["quality"]
+        self.assert_time_order()
+        at = {w["s"]: w for w in self.main}
+        self.assertEqual((at[3.0]["w"], at[3.0]["alt"], at[3.0]["agree"]), ("черыре", "четыре", False))
+        self.assertNotIn("voted", at[3.0])
+        self.assertEqual((at[6.0]["w"], at[6.0]["voted"], at[6.0]["model"]), ("семью", "ctc+whisper", "семь"))
+        self.assertIn({"t": 6.0, "t2": 6.0, "model": "семь", "to": "семью"}, quality["asr_votes"])
+
+    def test_words_heard_only_by_second_on_empty_primary_span(self):
+        # на сбойном отрезке Whisper основная модель слов не дала, вторая — дала: как в mark_alt,
+        # они становятся alt_ins следующего слова основной модели
+        self.main = [w for w in self.main if not 3.0 <= w["s"] < 6.0]
+        self.ctc = [w for w in self.ctc if not 3.0 <= w["s"] < 6.0] + [wd("кошка", 4.0)]
+        self.ctc.sort(key=lambda w: w["s"])
+        whisper = self.whisper_without((3.0, 6.0))
+        quality = self.combine(whisper, {**self.ok, "whisper": self.whisper_diag((3.0, 6.0))})["quality"]
+        self.assert_time_order()
+        nxt = next(w for w in self.main if w["s"] >= 6.0)
+        self.assertEqual((nxt["w"], nxt["alt_ins"], nxt["agree"]), ("семь", "кошка", False))
+        self.assertIn("vote3_partial", quality)
 
 
 if __name__ == "__main__":

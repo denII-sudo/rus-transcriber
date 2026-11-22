@@ -114,7 +114,15 @@ class WhisperFallbackTests(unittest.TestCase):
         self.assertEqual(quality["asr_incomplete_chunks"], 1)
         self.assertEqual(quality["asr_diagnostics"]["whisper"]["chunks"][0]["state"], "error")
         self.assertEqual(data["review"][0]["asr_problem"]["words_from"], ["primary", "second"])
+        # голосование пропущено только на отрезке сбойного куска (0–1 с), на втором куске идёт
+        self.assertEqual(quality["vote3_partial"], {"reason": "whisper_incomplete", "spans": 1, "seconds": 1})
+        self.assertNotIn("vote3_skipped", quality)
+        self.assertEqual(quality["vote"], {})
+
+    def test_all_whisper_chunks_failed_disable_vote(self):
+        _, quality, _ = self.run_worker(load_fails=True)
         self.assertEqual(quality["vote3_skipped"], "whisper_incomplete")
+        self.assertNotIn("vote3_partial", quality)
         self.assertNotIn("vote", quality)
 
     def test_both_model_load_failures_report_each_chunk(self):
