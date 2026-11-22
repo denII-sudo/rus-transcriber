@@ -787,14 +787,16 @@ def restore_recording_revision(snapshot):
 CONFLICT_SCOPES = ("document", "conspect")
 CONFLICT_PREVIEW_CHARS = 20000        # знаков копии в предпросмотре
 CONFLICT_SHOWN_LINES, CONFLICT_SHOWN_CHARS = 200, 500   # строк различий и знаков в строке на показ
-CONFLICT_DIFF_CELLS = 90000    # сколько пар строк сравнивать точно; для большего участка потери считаются «с запасом»
-
+CONFLICT_DIFF_CELLS = 90000    # сколько пар строк сравнивать точно на одном участке; для большего ищутся опоры
+CONFLICT_DIFF_WORK = 2000000   # общий предел работы сравнения на весь файл; исчерпан — остаток считается «с запасом»
 
 def explain_error(ex):
     """Русское пояснение сбоя хранилища или базы для экрана; неизвестный сбой — с исходной причиной."""
     import storage
     text = str(ex)
     low = text.lower()
+    if isinstance(ex, storage.StorageError) and re.search("[А-Яа-яЁё]", text):
+        return text    # собственный отказ программы уже по-русски: прежний текст, не «ошибка базы»
     if "cannot open database" in low or "unable to open database" in low:
         return ("Не удалось открыть базу записей: проверьте, что папка данных на месте и база не занята другой "
                 f"программой (причина: {text}).")
@@ -1077,14 +1079,17 @@ def _decode_copy(data):
         except UnicodeDecodeError:
             pass
     try:
-        return data.decode("utf-8"), "utf-8", True
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("utf-8", errors="surrogateescape"), "unknown", False
+    if "\x00" in text:    # нулевые знаки в тексте — признак UTF-16 без метки: кодировку не угадываем
+        return text, "unknown", False
+    return text, "utf-8", True
 
 
 def _show_text(text):
-    """Текст для показа: недекодируемые байты — знаком замены."""
-    return re.sub("[\udc80-\udcff]", "�", text)
+    """Текст для показа: недекодируемые байты и нулевые знаки — знаком замены."""
+    return re.sub("[\udc80-\udcff\x00]", "�", text)
 
 
 def _anchors(a, b):
@@ -1112,9 +1117,11 @@ def _diff_lines(a, b):
     """Строки a, которых нет на своём месте в b (gone), и строки b, которых нет в a (came).
 
     Сравнение по порядку: перестановка и перенос строк — потеря. Значение — номер строки напротив
-    при замене одной строки другой или None. Очень большой участок без опор не сравнивается точно:
-    он целиком считается потерей и появлением, то есть число потерь только завышается."""
+    при замене одной строки другой или None. Работа ограничена одним общим пределом на весь файл
+    (CONFLICT_DIFF_WORK: и таблицы точного сравнения, и поиск опор): что в него не уложилось,
+    считается целиком потерей и появлением, то есть число потерь только завышается."""
     gone, came = {}, {}
+    budget = CONFLICT_DIFF_WORK
     work = [(0, len(a), 0, len(b))]
     while work:
         a1, a2, b1, b2 = work.pop()
@@ -1122,27 +1129,34 @@ def _diff_lines(a, b):
             a1, b1 = a1 + 1, b1 + 1
         while a1 < a2 and b1 < b2 and a[a2 - 1] == b[b2 - 1]:
             a2, b2 = a2 - 1, b2 - 1
-        if a1 == a2 or b1 == b2 or (a2 - a1) * (b2 - b1) > CONFLICT_DIFF_CELLS:
-            anchors = [] if a1 == a2 or b1 == b2 else _anchors(a[a1:a2], b[b1:b2])
-            if not anchors:
-                gone.update((i, None) for i in range(a1, a2))
-                came.update((j, None) for j in range(b1, b2))
-                continue
-            last_i, last_j = 0, 0
-            for i, j in anchors:
-                work.append((a1 + last_i, a1 + i, b1 + last_j, b1 + j))
-                last_i, last_j = i + 1, j + 1
-            work.append((a1 + last_i, a2, b1 + last_j, b2))
+        cells = (a2 - a1) * (b2 - b1)
+        if a1 < a2 and b1 < b2 and cells <= CONFLICT_DIFF_CELLS and cells <= budget:
+            budget -= cells
+            matcher = difflib.SequenceMatcher(None, a[a1:a2], b[b1:b2], autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                paired = min(i2 - i1, j2 - j1)
+                for k in range(i2 - i1):
+                    gone[a1 + i1 + k] = b1 + j1 + k if k < paired else None
+                for k in range(j2 - j1):
+                    came[b1 + j1 + k] = a1 + i1 + k if k < paired else None
             continue
-        matcher = difflib.SequenceMatcher(None, a[a1:a2], b[b1:b2], autojunk=False)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == "equal":
-                continue
-            paired = min(i2 - i1, j2 - j1)
-            for k in range(i2 - i1):
-                gone[a1 + i1 + k] = b1 + j1 + k if k < paired else None
-            for k in range(j2 - j1):
-                came[b1 + j1 + k] = a1 + i1 + k if k < paired else None
+        anchors = []
+        if a1 < a2 and b1 < b2:
+            cost = 5 * ((a2 - a1) + (b2 - b1))     # поиск опор тоже работа, и вложенные опоры не бесплатны
+            if cost <= budget:
+                anchors = _anchors(a[a1:a2], b[b1:b2])
+            budget -= cost
+        if not anchors:
+            gone.update((i, None) for i in range(a1, a2))
+            came.update((j, None) for j in range(b1, b2))
+            continue
+        last_i, last_j = 0, 0
+        for i, j in anchors:
+            work.append((a1 + last_i, a1 + i, b1 + last_j, b1 + j))
+            last_i, last_j = i + 1, j + 1
+        work.append((a1 + last_i, a2, b1 + last_j, b2))
     return gone, came
 
 
@@ -1203,8 +1217,8 @@ def _file_notes(mine, theirs, encoding):
         notes.append("Копия записана в кодировке UTF-16: программа показала её расшифрованной. "
                      "Скачивается копия без изменений, байт в байт.")
     elif encoding == "unknown":
-        notes.append("Копия записана не в UTF-8, и по ней нельзя точно определить кодировку, поэтому показ "
-                     "неточный: непонятные знаки заменены на «�». Скачивается копия без изменений, байт в байт.")
+        notes.append("Копия записана не в UTF-8 (или это UTF-16 без метки: в тексте есть нулевые знаки), "
+                     "и по ней нельзя точно определить кодировку, поэтому показ неточный: непонятные знаки заменены на «�». Скачивается копия без изменений, байт в байт.")
     if theirs is not None:
         if mine.startswith("﻿") != theirs.startswith("﻿"):
             notes.append("В начале файла есть невидимая метка BOM: " + (
@@ -1286,15 +1300,54 @@ def _is_journal_stop(ex):
     return isinstance(ex, ValueError) and "ручное восстановление" in str(ex)
 
 
-def _failure_reason(row, ex):
+def _journal_blockers(row):
+    """Файлы, из-за которых журнал свёртки не даёт продолжить запись: (имя, хэши журнала, имя журнала).
+
+    Журнал один на запись, поэтому мешать может и файл другой свёртки из той же папки."""
+    import conspect
+    folder = Path(row["root_path"]) / Path(row["relative_path"]).parent
+    found = []
+    try:
+        for journal in sorted(folder.glob("*.conspect.pending")):
+            record = json.loads(journal.read_text(encoding="utf-8"))
+            for item in record["files"]:
+                hashes = (item["old_hash"], item["new_hash"])
+                if conspect._digest(conspect._read_bytes(folder / item["name"])) not in hashes:
+                    found.append((item["name"], hashes, journal.name))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return found
+
+
+def _journal_reason(store, row):
+    """Почему журнал остановил запись: какой файл мешает и есть ли выход на этом экране."""
+    head = ("Запись файлов свёртки остановлена журналом: после прошлого сбоя файлы свёртки изменились, и программа "
+            "не продолжает сама, чтобы не затереть вашу правку. Сначала сохраните свою новую правку отдельно "
+            "(скопируйте файл в другое место). ")
+    blockers = _journal_blockers(row)
+    if not blockers:
+        return head + ("Какой файл мешает, определить не удалось, и выхода на этом экране нет: нужно "
+                       "ручное восстановление рядом с файлами записи.")
+    rows = _conflict_rows(store, row["scope"])
+    parts = []
+    for name, hashes, journal in blockers:
+        copies = [other for other in rows if Path(other["relative_path"]).name.casefold() == name.casefold()
+                  and other["preserved"] and other["observed_hash"] in hashes]
+        if copies:
+            parts.append(f"Мешает файл «{name}» (журнал «{journal}»): верните на его место его сохранённую копию "
+                         f"(скачайте её как «{_copy_name(copies[0])}» и переименуйте в «{name}») и нажмите «Повторить».")
+        else:
+            parts.append(f"Мешает файл «{name}» (журнал «{journal}»): он изменён после сбоя, а подходящей его копии "
+                         "у программы нет, поэтому выхода на этом экране нет: нужно ручное восстановление "
+                         "этого файла и журнала вне экрана.")
+    return head + " ".join(parts)
+
+
+def _failure_reason(store, row, ex):
     """Настоящая причина, по которой файл не записан, когда она известна по ошибке записи."""
     import storage
-    name = Path(row["relative_path"]).name
     if _is_journal_stop(ex):
-        return (f"Запись файлов свёртки остановлена: после прошлого сбоя они изменились, и программа не продолжает "
-                f"сама, чтобы не затереть вашу правку. Сохраните свою новую правку отдельно (скопируйте файл "
-                f"в другое место), верните на прежнее место скачанную копию под прежним именем «{name}» "
-                "и нажмите «Повторить».")
+        return _journal_reason(store, row)
     if isinstance(ex, storage.Busy) or (isinstance(ex, sqlite3.OperationalError)
                                         and ("locked" in str(ex).lower() or "busy" in str(ex).lower())):
         return ("База записей была занята другой операцией. Решение принято; подождите немного "
@@ -1303,8 +1356,15 @@ def _failure_reason(row, ex):
         return ("Файл не удалось записать: возможно, он открыт в другой программе или недоступен "
                 f"(причина: {ex}). Закройте программы, где он открыт, и нажмите «Повторить».")
     return ("При записи файла программа остановилась с ошибкой "
-            f"(причина: {type(ex).__name__}: {ex}). Файл не тронут. Нажмите «Повторить»; если ошибка "
-            "повторится, сообщите о ней.")
+            f"(причина: {type(ex).__name__}: {ex}). Нажмите «Повторить»; если ошибка повторится, сообщите о ней.")
+
+
+def _file_words(row, digest):
+    """Что сказать о файле по его сверенному содержимому, а не по догадке о том, дошла ли запись."""
+    if digest == row["observed_hash"]:
+        return " Файл по-прежнему такой, как ваша правка: версия программы в него не записана."
+    return (" Файл сейчас не совпадает ни с вашей правкой, ни с последней версией программы: часть записи могла "
+            "пройти. Сверьте его содержимое.")
 
 
 def _file_outcome(store, row, failure):
@@ -1328,12 +1388,25 @@ def _file_outcome(store, row, failure):
         reason = ("Файл сейчас нельзя прочитать: он занят другой программой, недоступен или на его месте папка "
                   "либо ссылка. Освободите его и нажмите «Повторить».")
     elif failure is not None:
-        reason = _failure_reason(row, failure)
+        reason = _failure_reason(store, row, failure) + _file_words(row, digest)
     else:
         reason = ("Программа не дописала этот файл: очередь записи остановилась, возможно, на другой записи "
                   "из той же папки. Нажмите «Повторить»; если не помогает, закройте программы, где открыты "
-                  "файлы этой записи.")
+                  "файлы этой записи." + _file_words(row, digest))
     return {"outcome": "not_written", "new_conflict_id": None, "reason": reason}
+
+
+def _verify_copies(store, row):
+    """До любой записи файлов: цела ли сохранённая копия правки в каждом файле объекта, который запись
+    могла бы затереть (файл сейчас равен этой правке). Иначе отказ: заменённый файл уже не вернуть."""
+    for other in _conflict_rows(store, row["scope"]):
+        if other["object"] != row["object"] or other["kind"].startswith("archive_"):
+            continue
+        state, digest = _file_at(store, other, other["relative_path"])
+        if state == "ok" and digest == other["observed_hash"] and _observed_bytes(store, other) is None:
+            raise CoreError(f"Копия вашей правки файла «{Path(other['relative_path']).name}» не сохранена (он был "
+                            "больше 8 МиБ), а запись заменила бы его: на этом экране выхода нет, файл остаётся "
+                            "на диске как есть.")
 
 
 def _write_and_report(store, row):
@@ -1364,6 +1437,7 @@ def _replace_file(store, row, snapshot=None):
     if snapshot is not None and facts["snapshot"] != snapshot:
         raise CoreError("Показанное сравнение устарело: конфликт или версия программы изменились. "
                         "Откройте сравнение заново.")
+    _verify_copies(store, row)
     try:
         result = getattr(store, f"resolve_{row['scope']}_conflict")(
             row["conflict_id"], str(uuid.uuid4()), recordings.operation_context(store, "human"))
@@ -1404,6 +1478,7 @@ def retry_conflict_file(recording_id, conflict_id, kind):
         if item["status"] == "resolved":
             raise CoreError("Повторять нечего: файл уже записан, или вы вернули на место свою копию, "
                             "или по этому файлу есть более новый конфликт.")
+        _verify_copies(store, row)
         return _write_and_report(store, row)
     finally:
         store.close()
