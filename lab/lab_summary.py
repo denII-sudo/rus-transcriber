@@ -86,6 +86,7 @@ def pair_metrics(data, hyps, calls, timing, duration_sec):
         "review_per_hour": round(review["total"] / hours, 1) if hours else None,
         "vote": {k: v for k, v in (quality.get("vote") or {}).items() if isinstance(v, (int, float))} or None,
         "vote3_skipped": quality.get("vote3_skipped"),
+        "vote3_partial": quality.get("vote3_partial"),
         "asr_votes": len(quality.get("asr_votes") or []),
         "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
         "asr_diagnostics": {role: {"backend": safe_name(d.get("backend")), "chunks": len(d.get("chunks") or []),

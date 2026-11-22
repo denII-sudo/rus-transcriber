@@ -145,6 +145,15 @@ def _f(x):
     return round(float(x), 3)
 
 
+def combine_rule(words_mod):
+    """Правило сведения гипотез в этой версии words.py (отметка в hypotheses_json).
+
+    vote3_partial — сбойный кусок второй или третьей модели исключает из голосования только свой
+    отрезок (PR №76); whole_record — прежнее правило: любой сбойный кусок отключал vote3 на всей
+    записи. В базах, записанных до появления отметки, её нет (lab_analyze различает по записи)."""
+    return "vote3_partial" if hasattr(words_mod, "_vote3_outside_spans") else "whole_record"
+
+
 class Capture:
     """Подмены на время одного вызова run_words: записывают гипотезы, конвейер не меняют.
 
@@ -204,7 +213,12 @@ class Capture:
             return orig_vote(main, ctc, whisper)
 
         def mark_alt(main, alt):
-            cap.vote = {"function": "mark_alt", "third_words": None}
+            # при частичном исключении (words.combine_hypotheses, vote3_partial) после vote3 вне
+            # отрезков идёт mark_alt на каждом исключённом отрезке: запись vote3 не затирается
+            if cap.vote and cap.vote.get("function") == "vote3":
+                cap.vote["mark_alt_spans"] = cap.vote.get("mark_alt_spans", 0) + 1
+            else:
+                cap.vote = {"function": "mark_alt", "third_words": None}
             return orig_mark(main, alt)
 
         class NoTorch:
@@ -241,7 +255,8 @@ class Capture:
             third = {"model": timing.get("asr3_model"), "backend": timing.get("asr3_device"),
                      "name": timing.get("asr3_name"), "mode": timing.get("asr3_mode"),
                      "pieces": timing.get("asr3_pieces"), "chunks": chunks}
-        return {"schema": HYP_SCHEMA, "primary": roles.get("primary"), "second": roles.get("second"),
+        return {"schema": HYP_SCHEMA, "combine_rule": combine_rule(self.W),
+                "primary": roles.get("primary"), "second": roles.get("second"),
                 "third": third, "vote": self.vote}
 
 

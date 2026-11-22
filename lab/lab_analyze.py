@@ -7,9 +7,10 @@
   * export/analysis.json — обезличенные числа: идентификаторы конфигураций, unit_id,
     названия моделей и числа; без текстов, имён и путей.
 
-Сведение пересчитывается штатными функциями words.vote3 и words.mark_alt, а выравнивание
-гипотез — words._ops, то есть тем же правилом, что в конвейере. Точные определения
-показателей — lab/README.md, раздел «Анализ».
+Сведение пересчитывается штатной функцией words.combine_hypotheses (она же выбирает vote3,
+частичное исключение сбойных отрезков или mark_alt) по гипотезам и диагностике кусков пары,
+а выравнивание гипотез — words._ops, то есть тем же правилом, что в конвейере. Точные
+определения показателей — lab/README.md, раздел «Анализ».
 """
 import copy
 import difflib
@@ -23,11 +24,14 @@ import lab_sandbox
 import lab_summary
 
 ANALYSIS_SCHEMA = "lab-analysis-1"
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2
 BASELINE = "a-current"
 NO_HUMAN = "решений человека нет: звук добавлен из файла вне базы записей"
-# состояния кусков, при которых конвейер отключает голосование «два из трёх» (worker.run_words)
+# состояния сбойных кусков (words.combine_hypotheses): исключают из голосования свой отрезок
+# или, у основной модели, отключают голосование целиком
 BAD_STATES = ("error", "empty_unknown")
+# отметка прежнего правила сведения в hypotheses_json (lab_run.combine_rule)
+OLD_RULE = "whole_record"
 # пригодность пары (bench-database-spec.md, раздел 8.3): пустой кусок при словах у соседа
 LOST_MIN_WORDS = 5            # у GigaAM-соседа на том же куске
 LOST_MIN_WORDS_THIRD = 10     # у основной модели на участке куска третьей модели
@@ -174,24 +178,52 @@ def chunk_states(result):
     return out
 
 
-def evidence(result):
-    """Свидетельства неполных проходов — то же правило, что в worker.run_words перед голосованием."""
-    diag = (result.get("quality") or {}).get("asr_diagnostics") or {}
-    whisper = [rec for rec in (diag.get("whisper") or {}).get("chunks") or []
-               if ("filtered" if rec.get("filtered_all") else rec.get("state")) in BAD_STATES + ("filtered",)]
-    other = [rec for name in ("primary", "second") for rec in (diag.get(name) or {}).get("chunks") or []
-             if rec.get("state") in BAD_STATES and rec.get("own_span")]
-    return {"whisper": len(whisper), "other": len(other)}
+def stage_diagnostics(result, stage):
+    """Диагностика кусков одного прохода из записи конвейера (quality.asr_diagnostics[stage]).
+
+    -> (диагностика, None) или (None, причина). Состояние куска берётся только из диагностики:
+    в hypotheses_json у кусков основной и второй моделей поля state нет, и «ok» не подставляется.
+    Пригодна, если у каждого куска есть state, а у сбойного — own_span (по нему
+    words.combine_hypotheses исключает отрезок)."""
+    diag = (result.get("quality") or {}).get("asr_diagnostics")
+    if not isinstance(diag, dict):
+        return None, "no_asr_diagnostics"
+    d = diag.get(stage)
+    if not isinstance(d, dict) or not isinstance(d.get("chunks"), list):
+        return None, f"no_{stage}_diagnostics"
+    for rec in d["chunks"]:
+        if not isinstance(rec, dict) or not rec.get("state"):
+            return None, f"{stage}_chunk_without_state"
+        bad = rec["state"] in BAD_STATES or (stage == "whisper" and rec.get("filtered_all"))
+        if bad and not (isinstance(rec.get("own_span"), list) and len(rec["own_span"]) == 2):
+            return None, f"{stage}_chunk_without_own_span"
+    return {"chunks": d["chunks"]}, None
 
 
-def role_bad(result, role):
-    """Есть ли у роли куски, которые отключили бы голосование, если её взять в сведение."""
-    diag = (result.get("quality") or {}).get("asr_diagnostics") or {}
-    for rec in (diag.get(role) or {}).get("chunks") or []:
-        state = "filtered" if rec.get("filtered_all") else rec.get("state")
-        if state in BAD_STATES or (role == "whisper" and state == "filtered"):
-            return True
-    return False
+def pair_diagnostics(result, stages):
+    """Диагностика нужных проходов пары для words.combine_hypotheses. -> (словарь, None) или (None, причина)."""
+    out = {}
+    for stage in stages:
+        d, why = stage_diagnostics(result, stage)
+        if d is None:
+            return None, why
+        out[stage] = d
+    return out, None
+
+
+def combine(W, primary, second, whisper, diagnostics):
+    """Сведение штатным words.combine_hypotheses — тем же правилом, что в worker.run_words.
+
+    Слова копируются: сохранённые гипотезы не меняются. -> {"main": слова основной после
+    сведения, "function": "vote3" | "mark_alt" | None, "stats", "skipped", "partial"}."""
+    main = [dict(w) for w in primary]
+    fused = W.combine_hypotheses({"primary": main,
+                                  "second": [dict(w) for w in second] if second is not None else None,
+                                  "whisper": list(whisper) if whisper is not None else None}, diagnostics)
+    q = fused["quality"]
+    fn = "vote3" if q.get("vote") is not None else ("mark_alt" if second is not None else None)
+    return {"main": main, "function": fn, "stats": q.get("vote"), "skipped": q.get("vote3_skipped"),
+            "partial": q.get("vote3_partial")}
 
 
 def third_tokens(third, W):
@@ -225,55 +257,9 @@ def estimate_places(words, gap=1):
     return places
 
 
-def run_vote(W, primary, alt, third, third_bad, other_bad, third_finished):
-    """Сведение по правилу worker.run_words: vote3, если есть вторая и третья и нет свидетельств
-    неполных проходов; иначе mark_alt. -> (основные слова после сведения, функция, статистика,
-    причина отключения vote3)."""
-    main = [dict(w) for w in primary]
-    if alt is not None and third is not None and not third_bad and not other_bad:
-        stats = W.vote3(main, [dict(w) for w in alt], list(third))
-        return main, "vote3", stats, None
-    if alt is None:
-        return main, None, None, None
-    skipped = None
-    if third_bad or (other_bad and third_finished):
-        skipped = "whisper_incomplete" if third_bad else "asr_incomplete"
-    W.mark_alt(main, [dict(w) for w in alt])
-    return main, "mark_alt", None, skipped
-
-
-def own_revote(p, W):
-    """Пересведение исходного набора пары и сверка с тем, что записал конвейер."""
-    h, result = p["hyps"], p["result"]
-    q = result.get("quality") or {}
-    prim = (h.get("primary") or {}).get("words")
-    if prim is None:
-        return {"state": "no_hypotheses"}
-    alt = (h.get("second") or {}).get("words") if h.get("second") else None
-    third, vote = h.get("third"), h.get("vote") or {}
-    finished = bool(third) and third.get("pieces") is not None
-    tokens, rebuilt = None, None
-    if third and finished and alt is not None:
-        if third.get("mode") == "doubt":
-            tokens = vote.get("third_words") if vote.get("function") == "vote3" else None
-        else:
-            rebuilt = tokens = third_tokens(third, W)
-    ev = evidence(result)
-    if finished and alt is not None and tokens is None and not ev["whisper"] and not ev["other"]:
-        return {"state": "not_reconstructible"}
-    main, fn, stats, skipped = run_vote(W, prim, alt, tokens if finished else None,
-                                        ev["whisper"] > 0, ev["other"] > 0, finished)
-    mism = []
-    if fn != vote.get("function"):
-        mism.append("function")
-    if (q.get("vote3_skipped") or None) != skipped:
-        mism.append("vote3_skipped")
-    if fn == "vote3":
-        rec = {k: v for k, v in (q.get("vote") or {}).items() if isinstance(v, (int, float))}
-        if rec != stats:
-            mism.append("vote_stats")
-        if rebuilt is not None and vote.get("third_words") is not None and rebuilt != vote["third_words"]:
-            mism.append("third_words")
+def flag_check(main, result, W):
+    """Пометка `asr` у слов стенограммы против «несогласия» слов после сведения.
+    -> (слов сверено, слов не найдено, расхождений пометки)."""
     checked = unmatched = flag_mism = 0
     pool = {}
     for w in main:
@@ -288,20 +274,107 @@ def own_revote(p, W):
             checked += 1
             if lst.pop(0) != ("asr" in (wd.get("flags") or [])):
                 flag_mism += 1
+    return checked, unmatched, flag_mism
+
+
+def old_rule_record(p, W, new, prim, alt):
+    """Сделана ли запись конвейера прежним правилом сведения (до PR №76: любой сбойный кусок
+    второй или третьей модели отключал голосование трёх на всей записи).
+
+    Отметка lab_run.combine_rule в гипотезах решает сразу: нынешнее правило — не прежнее. Без
+    отметки (база записана до её появления) прежнее правило признаётся, только если запись
+    в точности такая, какой её дало бы прежнее правило: нынешнее частично исключает отрезки
+    (vote3_partial), а записаны mark_alt по всей записи с vote3_skipped той же причины, без
+    итогов голосования, и пометки `asr` у всех слов совпали со сверкой mark_alt по всей записи."""
+    h, q = p["hyps"], p["result"].get("quality") or {}
+    if h.get("combine_rule") not in (None, OLD_RULE):
+        return False
+    if new["function"] != "vote3" or not new["partial"]:
+        return False
+    if (h.get("vote") or {}).get("function") != "mark_alt" or q.get("vote") or q.get("vote3_partial"):
+        return False
+    if q.get("vote3_skipped") != new["partial"].get("reason"):
+        return False
+    whole = [dict(w) for w in prim]
+    W.mark_alt(whole, [dict(w) for w in alt])
+    checked, _, mism = flag_check(whole, p["result"], W)
+    return checked > 0 and mism == 0
+
+
+def own_revote(p, W):
+    """Пересведение исходного набора пары нынешним правилом (words.combine_hypotheses) и сверка
+    с тем, что записал конвейер."""
+    h, result = p["hyps"], p["result"]
+    q = result.get("quality") or {}
+    program = (q.get("asr_run") or {}).get("program")
+    base = {"pipeline_program": program if isinstance(program, str) else None,
+            "combine_rule": h.get("combine_rule")}
+    prim = (h.get("primary") or {}).get("words")
+    if prim is None:
+        return {"state": "no_hypotheses", **base}
+    alt = (h.get("second") or {}).get("words") if h.get("second") else None
+    third, vote = h.get("third"), h.get("vote") or {}
+    finished = bool(third) and third.get("pieces") is not None
+    # диагностика — та же, что конвейер подал в combine_hypotheses: все записанные проходы и
+    # обязательно те, чьи гипотезы есть
+    stored = q.get("asr_diagnostics") if isinstance(q.get("asr_diagnostics"), dict) else {}
+    need = {"primary"} | ({"second"} if alt is not None else set()) | ({"whisper"} if finished else set())
+    stages = [s for s in ("primary", "second", "whisper") if s in need or s in stored]
+    diag, why = pair_diagnostics(result, stages)
+    if diag is None:
+        return {"state": "no_diagnostics", "detail": why, "primary_words": len(prim), **base}
+    tokens, rebuilt = None, None
+    if finished and alt is not None:
+        if third.get("mode") == "doubt":
+            tokens = vote.get("third_words") if vote.get("function") == "vote3" else None
+        else:
+            rebuilt = tokens = third_tokens(third, W)
+    whisper = tokens if finished else None
+    if finished and alt is not None and tokens is None:
+        # слов третьей модели нет (режим doubt, конвейер не голосовал). Если и нынешнее правило
+        # не голосовало бы, итог от них не зависит (mark_alt); иначе пересчитать нельзя.
+        if combine(W, prim, alt, [], diag)["function"] == "vote3":
+            return {"state": "not_reconstructible", "detail": "doubt_third_words_unknown",
+                    "primary_words": len(prim), **base}
+        whisper = []
+    new = combine(W, prim, alt, whisper, diag)
+    mism = []
+    if new["function"] != vote.get("function"):
+        mism.append("function")
+    if (q.get("vote3_skipped") or None) != new["skipped"]:
+        mism.append("vote3_skipped")
+    if (q.get("vote3_partial") or None) != new["partial"]:
+        mism.append("vote3_partial")
+    if new["function"] == "vote3":
+        rec = {k: v for k, v in (q.get("vote") or {}).items() if isinstance(v, (int, float))}
+        if rec != new["stats"]:
+            mism.append("vote_stats")
+        if rebuilt is not None and vote.get("third_words") is not None and rebuilt != vote["third_words"]:
+            mism.append("third_words")
+    checked, unmatched, flag_mism = flag_check(new["main"], result, W)
     if flag_mism:
         mism.append("word_flags")
-    disputed = sum(1 for w in main if not w.get("agree", True))
-    return {"state": "ok" if not mism else "mismatch", "mismatch": mism, "function": fn,
-            "stats": stats, "skipped": skipped, "disputed_words": disputed,
-            "places_estimate": estimate_places(main), "words_checked": checked,
-            "words_unmatched": unmatched, "word_flag_mismatch": flag_mism,
-            "primary_words": len(prim)}
+    state = "ok"
+    if mism:
+        state = "old_rule" if old_rule_record(p, W, new, prim, alt) else "mismatch"
+    main = new["main"]
+    out = {"state": state, "mismatch": mism, "function": new["function"], "stats": new["stats"],
+           "skipped": new["skipped"], "partial": new["partial"],
+           "disputed_words": sum(1 for w in main if not w.get("agree", True)),
+           "places_estimate": estimate_places(main), "words_checked": checked,
+           "words_unmatched": unmatched, "word_flag_mismatch": flag_mism, "primary_words": len(prim), **base}
+    if state == "old_rule":
+        out["recorded"] = {"function": vote.get("function"), "skipped": q.get("vote3_skipped")}
+    return out
 
 
 def vote_summary(p, own):
-    """Итоги голосования пары: из записи конвейера (vote3) или пересчётом (mark_alt)."""
+    """Итоги голосования пары: нынешним правилом — из записи конвейера (vote3) или пересчётом
+    (mark_alt; запись прежним правилом). Без пересчёта — как записал конвейер."""
     q = p["result"].get("quality") or {}
     prim = len(((p["hyps"].get("primary") or {}).get("words")) or [])
+    if own.get("state") == "old_rule" and own.get("function") == "vote3":
+        return {"function": "vote3", "source": "recomputed", "primary_words": prim, **own["stats"]}
     rec = {k: v for k, v in (q.get("vote") or {}).items() if isinstance(v, (int, float))}
     if rec:
         return {"function": "vote3", "source": "pipeline", "primary_words": prim, **rec}
@@ -383,6 +456,13 @@ def pair_fitness(p, W):
 
 # ── источники гипотез и пересведение ─────────────────────────────────────────────────────────────
 
+def _diag_fields(result, stage):
+    """Диагностика кусков прохода, давшего источник: она идёт в combine_hypotheses той роли,
+    в которой источник участвует в сочетании. diag None — диагностики нет (diag_missing — почему)."""
+    d, why = stage_diagnostics(result, stage)
+    return {"diag": d, "diag_missing": why}
+
+
 def pair_sources(p, W):
     """Гипотезы пары как источники для сведения: ключ «роль:модель» -> описание."""
     h, result = p["hyps"], p["result"]
@@ -391,12 +471,12 @@ def pair_sources(p, W):
     if prim and prim.get("words") is not None:
         out["primary:" + nm(prim.get("model"))] = {
             "kind": "timed", "role": "primary", "model": nm(prim.get("model")), "words": prim["words"],
-            "chunks": prim.get("chunks") or [], "bad": role_bad(result, "primary")}
+            "chunks": prim.get("chunks") or [], **_diag_fields(result, "primary")}
     sec = h.get("second")
     if sec and sec.get("words") is not None:
         out["second:" + nm(sec.get("model"))] = {
             "kind": "timed", "role": "second", "model": nm(sec.get("model")), "words": sec["words"],
-            "chunks": sec.get("chunks") or [], "bad": role_bad(result, "second")}
+            "chunks": sec.get("chunks") or [], **_diag_fields(result, "second")}
     third = h.get("third")
     if third and third.get("pieces") is not None:
         engine = str(third.get("backend") or "")
@@ -407,10 +487,10 @@ def pair_sources(p, W):
             out[f"third:{model}:doubt"] = {
                 "kind": "text", "role": "third", "model": model, "mode": "doubt", "tokens": tokens,
                 "bound_second": next((k for k in out if k.startswith("second:")), None),
-                "bad": role_bad(result, "whisper")}
+                **_diag_fields(result, "whisper")}
         else:
             out[f"third:{model}"] = {"kind": "text", "role": "third", "model": model, "mode": "all",
-                                     "tokens": third_tokens(third, W), "bad": role_bad(result, "whisper")}
+                                     "tokens": third_tokens(third, W), **_diag_fields(result, "whisper")}
     for src in out.values():
         src["pair"] = p
     return out
@@ -519,29 +599,39 @@ def revote_unit(canon, W, max_repeat):
             if bad:
                 out[key] = {"state": "invalid", "reason": bad}
                 continue
-            main, fn, stats, skipped = run_vote(W, P["words"], alt, None, False, P["bad"] or X["bad"], False)
-            out[key] = _combo_result(main, fn, stats, skipped, P, [X], text_second=X["kind"] != "timed")
+            if X["kind"] == "timed":
+                if P["diag"] is None or X["diag"] is None:
+                    out[key] = {"state": "invalid", "reason": "no_diagnostics"}
+                    continue
+                diag = {"primary": P["diag"], "second": X["diag"]}
+            else:
+                # вторая без времён слов (только пересведением): без третьей правило — mark_alt по
+                # всей записи, от сбойных кусков оно не зависит; отрезки по времени здесь не исключить
+                diag = {}
+            out[key] = _combo_result(combine(W, P["words"], alt, None, diag), P, [X],
+                                     text_second=X["kind"] != "timed")
             for yk in others:
                 Y = canon[yk]
                 if yk == xk or X["kind"] != "timed" or Y["model"] == X["model"]:
                     continue
                 key3 = combo_key(pk, xk, yk)
                 bad = combo_validity(P, X, Y)
+                if not bad and Y["diag"] is None:
+                    bad = "no_diagnostics"
                 if bad:
                     out[key3] = {"state": "invalid", "reason": bad}
                     continue
                 tokens = as_text_tokens(Y, W, max_repeat)
-                main, fn, stats, skipped = run_vote(W, P["words"], X["words"], tokens, Y["bad"],
-                                                    P["bad"] or X["bad"], True)
-                out[key3] = _combo_result(main, fn, stats, skipped, P, [X, Y],
-                                          approx=Y["kind"] == "timed")
+                out[key3] = _combo_result(combine(W, P["words"], X["words"], tokens, dict(diag, whisper=Y["diag"])),
+                                          P, [X, Y], approx=Y["kind"] == "timed")
     return out
 
 
-def _combo_result(main, fn, stats, skipped, P, others, text_second=False, approx=False):
+def _combo_result(res, P, others, text_second=False, approx=False):
+    main = res["main"]
     disputed = sum(1 for w in main if not w.get("agree", True))
-    return {"state": "ok", "function": fn, "stats": stats, "skipped": skipped,
-            "disputed_words": disputed, "places_estimate": estimate_places(main),
+    return {"state": "ok", "function": res["function"], "stats": res["stats"], "skipped": res["skipped"],
+            "partial": res["partial"], "disputed_words": disputed, "places_estimate": estimate_places(main),
             "primary_words": len(P["words"]), "text_second": text_second, "approx_third": approx,
             "fit": all(lab_fit(s["pair"]) for s in [P] + others)}
 
@@ -883,12 +973,29 @@ def unit_row(p, own, fit):
     m = p["metrics"]
     rev = review_categories(p["result"].get("review"))
     timing = m.get("timing") or {}
+    q = p["result"].get("quality") or {}
+    # отметки сведения — нынешним правилом: пересчётом, если он есть; иначе как записал конвейер
+    if own.get("state") in ("ok", "old_rule"):
+        skipped, partial = own.get("skipped"), own.get("partial")
+    else:
+        skipped, partial = q.get("vote3_skipped"), q.get("vote3_partial")
     return {"hours": round(p["hours"], 4), "words": m.get("words"), "review": rev,
-            "vote": vote_summary(p, own), "vote3_skipped": m.get("vote3_skipped"),
+            "vote": vote_summary(p, own), "vote3_skipped": skipped, "vote3_partial": partial,
             "chunk_states": chunk_states(p["result"]),
             "timing": {k: timing.get(k) for k in STAGES if _num(timing.get(k)) is not None},
             "fit": fit["fit"], "unfit_reasons": fit["reasons"],
             "revote_check": own.get("state")}
+
+
+def _add_partial(acc, partial):
+    """Добавить отметку vote3_partial записи к сумме: записей, отрезков, секунд, по причинам."""
+    if not isinstance(partial, dict):
+        return
+    acc["units"] += 1
+    acc["spans"] += int(partial.get("spans") or 0)
+    acc["seconds"] += float(partial.get("seconds") or 0)
+    reason = str(partial.get("reason"))
+    acc["by_reason"][reason] = acc["by_reason"].get(reason, 0) + 1
 
 
 def aggregate(rows):
@@ -899,6 +1006,8 @@ def aggregate(rows):
            "by_reason": {r: 0 for r in lab_summary.REASONS}}
     vote = {"agree3": 0, "agree2": 0, "replaced": 0, "inserted": 0, "disputed": 0, "primary_words": 0}
     fn_units, skipped, states, timing, tcount = {}, {}, {}, {}, {}
+    partial = {"units": 0, "spans": 0, "seconds": 0.0, "by_reason": {}}
+    checks = {}
     for r in rows:
         for k in rev:
             if k == "by_reason":
@@ -913,6 +1022,8 @@ def aggregate(rows):
                 vote[k] += v.get(k) or 0
         if r["vote3_skipped"]:
             skipped[r["vote3_skipped"]] = skipped.get(r["vote3_skipped"], 0) + 1
+        _add_partial(partial, r.get("vote3_partial"))
+        checks[str(r["revote_check"])] = checks.get(str(r["revote_check"]), 0) + 1
         for role, st in r["chunk_states"].items():
             dst = states.setdefault(role, {})
             for s, n in st.items():
@@ -928,6 +1039,9 @@ def aggregate(rows):
     agg["vote_share"] = {k: _share(vote[k], base) for k in ("agree3", "agree2", "replaced", "disputed")}
     agg["vote_function_units"] = fn_units
     agg["vote3_skipped"] = {"units": sum(skipped.values()), "by_reason": skipped}
+    partial["seconds"] = round(partial["seconds"], 1)
+    agg["vote3_partial"] = partial
+    agg["revote_check"] = checks
     agg["chunk_states"] = states
     # время на час — только по единицам, где этап измерен у всех; иначе «не измерено»
     agg["timing_per_hour"] = {k: (round(timing[k] / hours, 1) if tcount.get(k) == len(rows) and hours
@@ -999,6 +1113,7 @@ def aggregate_combos(per_unit, hours_by_unit, only_fit):
         for key, r in combos.items():
             a = out.setdefault(key, {"units": 0, "hours": 0.0, "disputed_words": 0, "places_estimate": 0,
                                      "primary_words": 0, "functions": {}, "vote3_skipped": {},
+                                     "vote3_partial": {"units": 0, "spans": 0, "seconds": 0.0, "by_reason": {}},
                                      "invalid": {}, "excluded_unfit": 0, "text_second": False,
                                      "approx_third": False})
             if r["state"] != "ok":
@@ -1015,10 +1130,12 @@ def aggregate_combos(per_unit, hours_by_unit, only_fit):
             a["functions"][str(r["function"])] = a["functions"].get(str(r["function"]), 0) + 1
             if r["skipped"]:
                 a["vote3_skipped"][r["skipped"]] = a["vote3_skipped"].get(r["skipped"], 0) + 1
+            _add_partial(a["vote3_partial"], r.get("partial"))
             a["text_second"] = a["text_second"] or r["text_second"]
             a["approx_third"] = a["approx_third"] or r["approx_third"]
     for a in out.values():
         a["hours"] = round(a["hours"], 3)
+        a["vote3_partial"]["seconds"] = round(a["vote3_partial"]["seconds"], 1)
         a["places_per_hour"] = _per_hour(a["places_estimate"], a["hours"])
         a["disputed_per_hour"] = _per_hour(a["disputed_words"], a["hours"])
         a["disputed_share"] = _share(a["disputed_words"], a["primary_words"])
@@ -1058,6 +1175,8 @@ def analyze(sandbox, units_doc, baseline=BASELINE, log=print):
         own = own_revote(p, W)
         rows_by_cfg.setdefault(cid, {})[uid] = unit_row(p, own, fit)
         checks[f"{uid}|{cid}"] = {k: own.get(k) for k in ("state", "mismatch", "function", "skipped",
+                                                           "partial", "detail", "recorded",
+                                                           "combine_rule", "pipeline_program",
                                                            "disputed_words", "places_estimate",
                                                            "words_checked", "words_unmatched",
                                                            "word_flag_mismatch")}
@@ -1241,7 +1360,11 @@ def render_report(a, labels):
         L += _table(["единица"] + [f"`{c}`" for c in order], rows)
     L += ["## Итоги голосования", "",
           "Доли — от числа слов основной модели (сумма по единицам). У конфигураций без третьей модели "
-          "согласие двух моделей пересчитано по сохранённым гипотезам.", ""]
+          "согласие двух моделей пересчитано по сохранённым гипотезам. Отметки сведения — нынешним "
+          "правилом (`words.combine_hypotheses`): «голосование отключилось» — на всей записи (сбой "
+          "куска основной модели или вне сбойных отрезков нет слов); «частично» — сбойные куски второй "
+          "или третьей модели исключены из голосования только на своих отрезках, там сверены две "
+          "модели. При частичном исключении счётчики голосования — только вне исключённых отрезков.", ""]
     rows = []
     for cid in order:
         ag = a["configs"][cid]["all"]
@@ -1252,9 +1375,19 @@ def render_report(a, labels):
         rows.append([f"`{cid}`", ag["vote"]["primary_words"], _pct(s["agree3"]), _pct(s["agree2"]),
                      _pct(s["replaced"]), ag["vote"]["inserted"], _pct(s["disputed"]),
                      f"{sk['units']} из {ag['units']}" + (" (" + ", ".join(f"{k}: {v}" for k, v in
-                                                            sk["by_reason"].items()) + ")" if sk["units"] else "")])
+                                                            sk["by_reason"].items()) + ")" if sk["units"] else ""),
+                     _partial_text(ag["vote3_partial"], ag["units"])])
     L += _table(["конфигурация", "слов основной", "согласны все три", "согласна одна", "заменено",
-                 "вставлено слов", "спорных слов", "голосование отключилось"], rows)
+                 "вставлено слов", "спорных слов", "голосование отключилось",
+                 "частично: записей (отрезков, секунд)"], rows)
+    old = {cid: a["configs"][cid]["all"].get("revote_check", {}).get("old_rule", 0) for cid in order
+           if not a["configs"][cid]["all"].get("not_measured")}
+    if any(old.values()):
+        L += ["Записей конвейера, сделанных прежним правилом сведения (до частичного исключения): "
+              + ", ".join(f"`{c}` — {n}" for c, n in old.items() if n) + ". Отметки и итоги голосования "
+              "в них пересчитаны нынешним правилом; места для разбора в таблицах выше — как записал "
+              "конвейер, то есть прежним правилом (оценка нынешним — в «Сверке», столбец «мест спора "
+              "(оценка)»).", ""]
     L += ["## Состояние кусков по моделям", "",
           "`ok` — есть текст, `empty_unknown` — пустой ответ, `error` — ошибка, `filtered` — у третьей "
           "модели весь текст убран фильтром ложных фраз.", ""]
@@ -1326,6 +1459,15 @@ def _conclusions(a):
     if bad:
         out.append(f"- **Внимание:** пересведение не совпало с конвейером в {len(bad)} парах — числа "
                    "пересведения в этих единицах недостоверны (раздел «Сверка»).")
+    old = [k for k, v in a["revote_check"].items() if v["state"] == "old_rule"]
+    if old:
+        out.append(f"- Запись конвейера сделана прежним правилом сведения в {len(old)} парах: это смена "
+                   "правила, а не ошибка данных; итоги сведения посчитаны нынешним правилом, места для "
+                   "разбора конвейера в них — прежним (раздел «Сверка»).")
+    nodiag = [k for k, v in a["revote_check"].items() if v["state"] in ("no_diagnostics", "not_reconstructible")]
+    if nodiag:
+        out.append(f"- Не пересчитано нынешним правилом: {len(nodiag)} пар (нет диагностики кусков или слов "
+                   "третьей модели) — в них отметки сведения взяты из записи конвейера (раздел «Сверка»).")
     unfit = [k for k, v in a["fitness"].items() if not v["fit"]]
     if unfit:
         out.append(f"- Пар с признаками технического сбоя: {len(unfit)} (раздел «Пригодность»).")
@@ -1365,8 +1507,9 @@ def _pairwise_section(a):
 def _revote_section(a):
     rv = a["revote"]
     L = ["## Пересведение сохранённых гипотез", "",
-         "Для каждой единицы сведение пересчитано штатными `words.vote3` (три модели) и `words.mark_alt` "
-         "(две) для всех сочетаний сохранённых гипотез. «Спорных слов» — слова, которые ушли бы "
+         "Для каждой единицы сведение пересчитано штатной `words.combine_hypotheses` (то же правило, что "
+         "в конвейере: `vote3`, частичное исключение сбойных отрезков или `mark_alt`) с диагностикой кусков "
+         "пар-источников для всех сочетаний сохранённых гипотез. «Спорных слов» — слова, которые ушли бы "
          "человеку как спор моделей; «мест (оценка)» — те же слова, сведённые в места правилом "
          "`review_items` без деления на реплики и без других причин. Числа сочетаний сравнимы между "
          "собой только на одинаковом наборе единиц (столбец «единиц»).", ""]
@@ -1384,6 +1527,8 @@ def _revote_section(a):
             notes.append("не сводится: " + ", ".join(f"{INVALID_TEXT.get(r, r)} ({n})" for r, n in t["invalid"].items()))
         if t["vote3_skipped"]:
             notes.append("голосование отключилось бы: " + ", ".join(f"{r} ({n})" for r, n in t["vote3_skipped"].items()))
+        if t["vote3_partial"]["units"]:
+            notes.append("частично: " + _partial_text(t["vote3_partial"], t["units"]))
         fo = rv["fit_only"].get(key) or {}
         rows.append([combo_label(key), t["units"], _fmt(t["hours"], 2), t["disputed_words"],
                      _pct(t["disputed_share"]), _fmt(t["places_per_hour"]),
@@ -1391,26 +1536,43 @@ def _revote_section(a):
     L += _table(["сочетание", "единиц", "часов", "спорных слов", "доля спорных", "мест (оценка) на час",
                  "то же без сбойных", "примечание"], rows)
     L += ["### Сверка пересведения с конвейером", "",
-          "Пересведение исходного набора каждой пары сравнивается с тем, что записал конвейер: функция "
-          "сведения, причина отключения, итоги голосования, слова третьей модели и пометка `asr` у каждого "
-          "слова стенограммы. Расхождение — признак недостоверности пересведения этой единицы.", ""]
+          "Пересведение исходного набора каждой пары нынешним правилом (`words.combine_hypotheses` с "
+          "диагностикой кусков пары) сравнивается с тем, что записал конвейер: функция сведения, "
+          "причины отключения и частичного исключения, итоги голосования, слова третьей модели и "
+          "пометка `asr` у каждого слова стенограммы. Несовпадение — признак недостоверности "
+          "пересведения этой единицы. «Прежнее правило» — не ошибка: запись сделана до частичного "
+          "исключения отрезков, и это подтверждено сверкой с прежним итогом; дальше она считается "
+          "нынешним правилом. «Нет диагностики» — пара не пересчитана (не выдаётся за совпадение).", ""]
     rows = []
     for k, v in sorted(a["revote_check"].items()):
         uid, cid = k.split("|")
-        rows.append([f"`{uid}`", f"`{cid}`", CHECK_TEXT.get(v["state"], v["state"]),
-                     ", ".join(v.get("mismatch") or []) or "—", v.get("words_checked"), v.get("words_unmatched"),
+        diff = ", ".join(v.get("mismatch") or []) or "—"
+        if v["state"] in ("no_diagnostics", "not_reconstructible") and v.get("detail"):
+            diff = v["detail"]
+        rows.append([f"`{uid}`", f"`{cid}`", CHECK_TEXT.get(v["state"], v["state"]), diff,
+                     v.get("words_checked"), v.get("words_unmatched"),
                      v.get("places_estimate"), v.get("pipeline_asr_places")])
-    L += _table(["единица", "конфигурация", "итог", "расхождения", "слов сверено", "слов не найдено (вставки)",
-                 "мест спора (оценка)", "мест спора у конвейера"], rows)
+    L += _table(["единица", "конфигурация", "итог", "расхождения (или причина)", "слов сверено",
+                 "слов не найдено (вставки)", "мест спора (оценка)", "мест спора у конвейера"], rows)
     return L
 
 
 INVALID_TEXT = {"diarization_differs": "разное разделение говорящих в парах",
                 "primary_differs": "основная модель дала в парах разные слова",
                 "doubt_needs_own_second": "режим doubt сводится только со своей второй моделью",
-                "doubt_not_reconstructible": "в режиме doubt голосование отключилось, нарезка непосчитанных кусков не сохранена"}
+                "doubt_not_reconstructible": "в режиме doubt голосование отключилось, нарезка непосчитанных кусков не сохранена",
+                "no_diagnostics": "у пары нет сохранённой диагностики кусков"}
 CHECK_TEXT = {"ok": "совпало", "mismatch": "НЕ совпало", "no_hypotheses": "нет гипотез",
-              "not_reconstructible": "не восстановить"}
+              "not_reconstructible": "не восстановить",
+              "old_rule": "запись конвейера сделана прежним правилом сведения",
+              "no_diagnostics": "нет диагностики кусков — не пересчитано"}
+
+
+def _partial_text(part, units):
+    """«N из M (отрезков K, X с)» для отметок vote3_partial."""
+    if not part or not part.get("units"):
+        return f"0 из {units}"
+    return f"{part['units']} из {units} (отрезков {part['spans']}, {_fmt(float(part['seconds']))} с)"
 
 
 def _human_section(a):

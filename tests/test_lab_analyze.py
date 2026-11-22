@@ -48,14 +48,19 @@ NAME = "Неизвестнов"
 
 
 class Main:
-    def __init__(self, model):
+    def __init__(self, model, fail=None):
         self.name, self.model_name = "fake-" + model, model
+        self.fail = fail or {}          # {номер куска: "error" | "empty_unknown"}
 
     def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
-        diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+        diagnostics.extend({"index": i, "state": self.fail.get(i, "ok"), "attempts": []}
+                           for i in range(len(pieces)))
         out = []
         for i, _ in enumerate(pieces):
-            toks = OUTPUT[self.model_name][i]
+            if self.fail.get(i) == "error":
+                out.append(None)
+                continue
+            toks = [] if self.fail.get(i) == "empty_unknown" else OUTPUT[self.model_name][i]
             out.append(SimpleNamespace(tokens=list(toks), timestamps=[0.1 + 0.4 * k for k in range(len(toks))],
                                        logprobs=[-0.1] * len(toks), text="".join(toks)))
         return out
@@ -63,17 +68,36 @@ class Main:
 
 class CT2:
     name, compile_sec = "fake-ct2", None
+    fail = {}                           # {номер куска: "empty_unknown"} — пустой ответ модели
 
     def __init__(self, *a, **kw):
         pass
 
     def transcribe_texts(self, pieces, progress=None, diagnostics=None):
-        diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
-        return [WHISPER[0] if len(p) <= 16000 else WHISPER[1] for p in pieces]
+        diagnostics.extend({"index": i, "state": self.fail.get(i, "ok"), "attempts": []}
+                           for i in range(len(pieces)))
+        return ["" if i in self.fail else (WHISPER[0] if len(p) <= 16000 else WHISPER[1])
+                for i, p in enumerate(pieces)]
 
 
-def run_pair(conf_id):
-    """Одна пара настоящим конвейером. -> (metrics, data, hyps)."""
+def old_rule_combine():
+    """Сведение по правилу до PR №76 (для синтетической базы «старого правила»): любой сбойный
+    кусок третьей модели отключал голосование трёх на всей записи (mark_alt, vote3_skipped)."""
+    import words
+    orig = words.combine_hypotheses
+
+    def combine(hypotheses, diagnostics):
+        bad = any(("filtered" if r.get("filtered_all") else r.get("state")) in ("error", "empty_unknown", "filtered")
+                  for r in (diagnostics.get("whisper") or {}).get("chunks", []))
+        if bad and hypotheses.get("second") is not None:
+            return orig(dict(hypotheses, whisper=None), diagnostics)   # whisper_incomplete, mark_alt
+        return orig(hypotheses, diagnostics)
+    return combine
+
+
+def run_pair(conf_id, fail=None, combine=None):
+    """Одна пара настоящим конвейером. fail — сбойные куски по моделям ({"whisper": {0: ...}});
+    combine — замена words.combine_hypotheses (прежнее правило). -> (metrics, data, hyps, cfg)."""
     import numpy as np
     import backends
     import words
@@ -93,17 +117,21 @@ def run_pair(conf_id):
         voice_ctx={"cents": {"L": [1]}}, allowed=[], genders_by_name={}, vocab=None,
         quality={"speaker_fixes": [], "vocab_fixes": []}, no_profile=False, group="g",
         t_diar=1.0, t_voice=0.5, diar_info={})
-    with mock.patch.object(backends, "make_asr", lambda c: (Main(c["asr_model"]), [])), \
-         mock.patch.object(backends, "WhisperCT2", CT2), \
+    fail = fail or {}
+    ct2 = type("CT2Fail", (CT2,), {"fail": dict(fail.get("whisper") or {})})
+    with mock.patch.object(backends, "make_asr", lambda c: (Main(c["asr_model"], fail.get(c["asr_model"])), [])), \
+         mock.patch.object(backends, "WhisperCT2", ct2), \
          mock.patch.object(words, "make_chunks", return_value=chunks), \
-         mock.patch.object(words, "assign_voices", return_value=0):
+         mock.patch.object(words, "assign_voices", return_value=0), \
+         mock.patch.object(words, "combine_hypotheses", combine or words.combine_hypotheses):
         data, hyps, calls, timing = engine.run_config(shared, cfg, {"id": conf_id, "roles": roles})
     data["speakers"] = [NAME]
     return lab_summary.pair_metrics(data, hyps, calls, timing, 3.0), data, hyps, cfg
 
 
-def make_sandbox(base, configs=tuple(CONFS), with_source=True):
-    """Песочница с базой результатов и (по желанию) копией базы записей с решениями человека."""
+def make_sandbox(base, configs=tuple(CONFS), with_source=True, fail=None, combine=None, mutate=None):
+    """Песочница с базой результатов и (по желанию) копией базы записей с решениями человека.
+    fail, combine — как в run_pair; mutate(config_id, data, hyps) правит запись пары до сохранения."""
     s = base / "sandbox"
     (s / "results").mkdir(parents=True)
     (s / "export").mkdir()
@@ -121,7 +149,9 @@ def make_sandbox(base, configs=tuple(CONFS), with_source=True):
     try:
         db.execute("INSERT INTO runs (run_id, started_utc, state) VALUES ('r1', 't', 'finished')")
         for cid in configs:
-            metrics, data, hyps, cfg = run_pair(cid)
+            metrics, data, hyps, cfg = run_pair(cid, fail=fail, combine=combine)
+            if mutate:
+                mutate(cid, data, hyps)
             sha = cid + "-sha"
             db.execute("INSERT INTO configs VALUES (?,?,?,?,?,?,?)",
                        (cid, sha, cid, json.dumps(CONFS[cid]), "{}", json.dumps(cfg), "r1"))
@@ -281,6 +311,107 @@ class AnalyzeSynthetic(unittest.TestCase):
     def test_sandbox_loads_for_cli(self):
         s, marker, units = lab_sandbox.load_sandbox(self.sandbox, env={})
         self.assertEqual(units["units"][0]["unit_id"], "u1")
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class AnalyzeCombineRule(unittest.TestCase):
+    """Пересчёт штатным words.combine_hypotheses: частичное исключение отрезка, полное отключение,
+    пара без диагностики и база, записанная прежним правилом сведения (до PR №76)."""
+    WHISPER_EMPTY = {"whisper": {0: "empty_unknown"}}     # пустой ответ третьей модели на [0–1 с]
+    PARTIAL = {"reason": "whisper_incomplete", "spans": 1, "seconds": 1.0}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-analyze-rule-")
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def analyze(self, **kw):
+        s, units = make_sandbox(self.base, configs=("a-current",), with_source=False, **kw)
+        a = lab_analyze.analyze(s, units, log=lambda m: None)
+        return a, a["revote_check"]["u1|a-current"], (s / "results" / "report.md").read_text(encoding="utf-8")
+
+    def test_partial_exclusion_matches_pipeline(self):
+        _, data, hyps, _ = run_pair("a-current", fail=self.WHISPER_EMPTY)
+        self.assertEqual(data["quality"]["vote3_partial"], self.PARTIAL)
+        self.assertNotIn("vote3_skipped", data["quality"])
+        # перехват: vote3 вне отрезка и mark_alt на отрезке — записано vote3 со словами третьей
+        self.assertEqual(hyps["vote"]["function"], "vote3")
+        self.assertEqual(hyps["vote"]["third_words"], ["три", "четыре", "семь"])
+        self.assertEqual(hyps["combine_rule"], "vote3_partial")
+        a, c, report = self.analyze(fail=self.WHISPER_EMPTY)
+        self.assertEqual((c["state"], c["function"], c["partial"], c["skipped"]), ("ok", "vote3", self.PARTIAL, None))
+        # вне отрезка: «три», «четыре» согласны все три, «пять» — спор; на отрезке «два» — спор двух
+        self.assertEqual(c["disputed_words"], 2)
+        ag = a["configs"]["a-current"]["all"]
+        self.assertEqual(ag["vote3_partial"], {"units": 1, "spans": 1, "seconds": 1.0,
+                                               "by_reason": {"whisper_incomplete": 1}})
+        self.assertEqual(ag["vote3_skipped"]["units"], 0)
+        self.assertEqual(ag["revote_check"], {"ok": 1})
+        self.assertEqual(a["revote"]["all"]["primary:v3_e2e_rnnt|second:v3_e2e_ctc|third:whisper-ct2"]
+                         ["vote3_partial"]["units"], 1)
+        self.assertIn("1 из 1 (отрезков 1, 1,0 с)", report)
+        self.assertNotIn("НЕ совпало", report)
+
+    def test_primary_failure_disables_vote_on_whole_record(self):
+        a, c, _ = self.analyze(fail={"v3_e2e_rnnt": {0: "error"}})
+        self.assertEqual((c["state"], c["function"], c["skipped"], c["partial"]),
+                         ("ok", "mark_alt", "asr_incomplete", None))
+        ag = a["configs"]["a-current"]["all"]
+        self.assertEqual(ag["vote3_skipped"], {"units": 1, "by_reason": {"asr_incomplete": 1}})
+        self.assertEqual(ag["vote3_partial"]["units"], 0)
+
+    def test_pair_without_diagnostics_is_marked(self):
+        def drop(cid, data, hyps):
+            data["quality"].pop("asr_diagnostics")
+        a, c, report = self.analyze(mutate=drop)
+        self.assertEqual((c["state"], c["detail"]), ("no_diagnostics", "no_asr_diagnostics"))
+        self.assertEqual(a["revote"]["units"]["u1"]["primary:v3_e2e_rnnt|second:v3_e2e_ctc"],
+                         {"state": "invalid", "reason": "no_diagnostics"})
+        self.assertIn("нет диагностики кусков", report)
+        self.assertIn("Не пересчитано нынешним правилом: 1 пар", report)
+
+    def test_chunk_state_is_not_assumed_ok(self):
+        def strip(cid, data, hyps):
+            for rec in data["quality"]["asr_diagnostics"]["whisper"]["chunks"]:
+                rec.pop("state")
+        _, c, _ = self.analyze(mutate=strip)
+        self.assertEqual((c["state"], c["detail"]), ("no_diagnostics", "whisper_chunk_without_state"))
+
+    @staticmethod
+    def as_old_db(cid, data, hyps):
+        hyps.pop("combine_rule")              # базы до отметки правила её не содержат
+
+    def test_old_rule_database_is_recomputed_by_new_rule(self):
+        a, c, report = self.analyze(fail=self.WHISPER_EMPTY, combine=old_rule_combine(), mutate=self.as_old_db)
+        self.assertEqual(c["state"], "old_rule", c)
+        self.assertEqual(c["recorded"], {"function": "mark_alt", "skipped": "whisper_incomplete"})
+        self.assertEqual((c["function"], c["partial"], c["skipped"]), ("vote3", self.PARTIAL, None))
+        ag = a["configs"]["a-current"]["all"]
+        self.assertEqual(ag["vote3_partial"]["units"], 1, "итог — нынешним правилом")
+        self.assertEqual(ag["vote3_skipped"]["units"], 0)
+        self.assertEqual(ag["vote"]["agree3"], 2)
+        self.assertEqual(ag["revote_check"], {"old_rule": 1})
+        self.assertIn("запись конвейера сделана прежним правилом сведения", report)
+        self.assertNotIn("НЕ совпало", report)
+
+    def test_new_rule_marker_turns_difference_into_mismatch(self):
+        # та же запись, но с отметкой нынешнего правила: расхождение — уже не смена правила
+        _, c, report = self.analyze(fail=self.WHISPER_EMPTY, combine=old_rule_combine())
+        self.assertEqual(c["state"], "mismatch")
+        self.assertIn("vote3_partial", c["mismatch"])
+        self.assertIn("НЕ совпало", report)
+
+    def test_old_rule_requires_old_result(self):
+        # без отметки, но пометки слов не от mark_alt по всей записи — не прежнее правило, а расхождение
+        def spoil(cid, data, hyps):
+            hyps.pop("combine_rule")
+            for seg in data["segments"]:
+                for w in seg["words"]:
+                    w["flags"] = []
+        _, c, _ = self.analyze(fail=self.WHISPER_EMPTY, combine=old_rule_combine(), mutate=spoil)
+        self.assertEqual(c["state"], "mismatch")
 
 
 @unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
