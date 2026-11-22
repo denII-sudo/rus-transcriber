@@ -360,6 +360,9 @@ class Answers(unittest.TestCase):
                 result = freeform.card_edits(item, {"text": text}, words, self.names)
                 self.assertFalse(result["edits"])
                 self.assertTrue(result["report"]["human"])
+        result = freeform.card_edits(item, {"text": "Анна: неверно"}, words, self.names)
+        self.assertEqual(result["edits"][0]["text"], "неверно")
+        self.assertEqual(result["edits"][0]["speaker"], "Анна")
 
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]

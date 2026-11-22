@@ -103,6 +103,61 @@ class WorkerSnapshotTests(unittest.TestCase):
                         if store:
                             store.close()
 
+    def test_negative_answers_remain_open_in_both_storage_modes(self):
+        negatives = ("неверно", "не верно", "неправильно", "не согласен")
+        item = {"id": "r1", "options": [{"label": "верный вариант", "decision": {"text": "другое"}}],
+                "recommended": 0}
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                db = root / "state.sqlite3"
+                audio = root / "sample.wav"
+                audio.write_bytes(b"synthetic")
+                data = self.worker_result()
+                data["file"] = str(audio)
+                layout = recordings.document_layout(audio)
+                layout["root"].mkdir()
+                store = None
+                with mock.patch.object(settings.paths, "STATE_DB", db):
+                    try:
+                        if backend == "sqlite":
+                            store = recordings.initialize_store(db, display_name="Тест")
+                            root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                            rid = str(uuid.uuid4())
+                            recordings.commit_worker_result(
+                                store, data, audio, root_id, recordings.operation_context(store, "model"),
+                                recording_id=rid, operation_id=str(uuid.uuid4()),
+                                generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                            recordings.materialize_recording(store, rid)
+                            jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                        else:
+                            jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
+                            transcript.save(data, jp, md)
+                        before = transcript.load(jp)
+                        card = dict(before["review"][0])
+                        card.pop("word_ids", None)
+                        man = {"items": [card], "recording_id": before.get("recording_id")}
+                        with mock.patch.object(review_pack, "manifest", return_value=man):
+                            for text in negatives:
+                                for mode in ("typed", "voice"):
+                                    with self.subTest(backend=backend, mode=mode, answer=text):
+                                        if mode == "voice":
+                                            self.assertEqual(review_pack.match(text, item)["kind"], "free")
+                                        result = review_pack.apply_free(jp, md, {"r1": {"text": text}})
+                                        self.assertTrue(result["left_to_human"])
+                                        self.assertIn("слово", result["left_to_human"][0]["why"])
+                                        self.assertEqual(transcript.load(jp), before)
+                        self.assertEqual(review_pack.match("Анна: неверно", item)["kind"], "free")
+                        self.assertNotEqual(review_pack.match("это неверно", item)["kind"], "recommended")
+                        self.assertEqual(review_pack.match("всё верно", item)["kind"], "recommended")
+                        with mock.patch.object(review_pack, "manifest", return_value=man):
+                            result = review_pack.apply_free(jp, md, {"r1": {"text": "Спикер 1: неверно"}})
+                        self.assertIn("r1", result["successful_ids"])
+                        self.assertEqual(transcript.load(jp)["segments"][0]["words"][0]["w"], "неверно")
+                    finally:
+                        if store:
+                            store.close()
+
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()
         before = copy.deepcopy(source)

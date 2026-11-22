@@ -33,6 +33,8 @@ DUP_SEC = 2.0                    # повтор: то же слово модел
 MIN_ANCHORS = 0.3
 AGREE = {"да", "верно", "так", "правильно", "все верно", "всё верно", "да верно", "ага", "угу", "так и есть",
          "как есть", "да так"}
+NEGATIVE = {"неверно", "не верно", "неправильно", "не правильно",
+            "не согласен", "не согласна", "не согласны"}
 WORD = re.compile(r"[\wЁё][\wЁё'-]*", re.U)
 
 _MORPH = None
@@ -51,6 +53,10 @@ def _morph():
 
 def norm(w):
     return re.sub(r"[^\wё-]", "", (w or "").lower().replace("ё", "е")).strip("-")   # ⟦…⟧ тоже убирается
+
+
+def negative_answer(text):
+    return " ".join(norm(x) for x in (text or "").split() if norm(x)) in NEGATIVE
 
 
 def tokens(text):
@@ -131,6 +137,8 @@ def classify(text, names):
     t = " ".join(norm(x) for x in (text or "").split() if norm(x))
     if not t:
         return {"kind": "skip"}
+    if negative_answer(text):
+        return {"kind": "negative"}
     if t in AGREE:
         return {"kind": "agree"}
     ws = t.split()
@@ -331,6 +339,9 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
            "proposed_delete": [], "deleted": [], "overlap": [], "human": None}
     if c["kind"] == "agree":
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
+    if c["kind"] == "negative":
+        rep["human"] = "впишите услышанное слово"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":
         rep["human"] = "указано только отрицание имени; выберите говорящего"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
@@ -376,6 +387,17 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         rep["kind"] = "missed"
         rep["inserted"] = [f"{spk}: {' '.join(ws)}" for spk, ws in replies]
         return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
+    # Явный ответ «Имя: слово» — услышанное слово, даже если это слово отрицания
+    # и не имеет опоры среди вариантов модели.
+    if len(place) == 1 and len(replies) == 1 and replies[0][0] and len(replies[0][1]) == 1:
+        speaker, answer_words = replies[0]
+        rep["kind"] = "place_text"
+        rep["applied"] = [f"«{place[0]['w']}» → «{answer_words[0]}»"]
+        edit = {"op": "place_text", "card": cid, "t1": place[0]["s"], "t2": place[0]["s"],
+                "text": answer_words[0], "speaker": speaker, "in_place": True}
+        if target_ids:
+            edit["word_ids"] = [place[0]["word_id"]]
+        return {"kind": "place_text", "edits": [edit], "covered": (place[0]["s"], place[0]["s"]), "report": rep}
     ans_raw, ans_spk = [], []
     last = None
     for spk, ws in replies:

@@ -369,6 +369,9 @@ def _norm(s):
 
 def match(text, item):
     """-> {"kind": option|recommended|human|skip|repeat|free, "option": n?}"""
+    import freeform
+    if freeform.negative_answer(text) or re.match(r"^\s*[^:]+:\s*\S", text or ""):
+        return {"kind": "free"}
     w = _norm(text)
     j = " ".join(w)
     if not w:
@@ -388,7 +391,8 @@ def match(text, item):
             for stem, n in _ORD:
                 if x.startswith(stem) and n < len(opts):
                     return {"kind": "option", "option": n}
-        if re.search(r"рекоменд|как предлож|согла|верно|правильно|^да$|^ага$|^угу$", j) and \
+        if j in {"рекомендую", "рекомендовано", "как предложено", "согласен", "согласна",
+                 "согласны", "верно", "правильно", "все верно", "да верно", "да", "ага", "угу"} and \
                 item.get("recommended") is not None:
             return {"kind": "recommended", "option": item["recommended"]}
     # совпадение по словам варианта (имена, слова текста): берём вариант с наибольшим числом
@@ -464,7 +468,11 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         for k in ("text", "audio", "heard", "by"):
             if a.get(k) is not None:
                 ans[k] = a[k]
-        if a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
+        import freeform
+        if a.get("text") and (freeform.negative_answer(a["text"]) or
+                              re.match(r"^\s*[^:]+:\s*\S", a["text"])) and not a.get("kind") and a.get("option") is None:
+            ans["kind"] = "free"
+        elif a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
             ans["kind"] = a["kind"]
             if a["kind"] == "recommended":
                 ans["option"] = it.get("recommended")
@@ -696,9 +704,11 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
             continue
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
-    if human and not dry_run:                     # не понятые ответы — человеку, с текстом ответа
+    negative_ids = {r["id"] for r in reports if r.get("kind") == "negative"}
+    mark_human = [h for h in human if h["id"] not in negative_ids]
+    if mark_human and not dry_run:                # отрицание оставляет место без изменений
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
-                                             "note": f"{h['why']}: «{h['answer']}»"} for h in human], by="human")
+                                             "note": f"{h['why']}: «{h['answer']}»"} for h in mark_human], by="human")
     return {**({"target_ids": {aid: sorted(ids) for aid, ids in targets.items()}} if dry_run else {}),
             "cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +
