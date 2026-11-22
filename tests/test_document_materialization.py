@@ -244,6 +244,21 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("Возможный пропуск речи", md)
         self.assertEqual(json.loads(prepared["json"])["review"]["review"][0]["gap"], [1.0, 3.0])
 
+    def test_partial_vote_skip_remains_visible(self):
+        partial = {"reason": "whisper_incomplete", "spans": 2, "seconds": 3.4}
+        source = dict(self.source, quality={"vote3_partial": partial})
+        review = {"review": [], "answers": {}}
+        prepared = documents.prepare(self.recording, 1, 1, 1, source, review, self.ctx, self.ctx, "now")
+        self.assertIn("пропущено на отрезках с неполным результатом распознавания: 2 (около 3,4 с)",
+                      prepared["md"].decode())
+        self.assertEqual(json.loads(prepared["json"])["transcript"]["quality"], {"vote3_partial": partial})
+        for bad in ("yes", {"reason": "other", "spans": 1, "seconds": 1.0}, {"reason": "asr_incomplete"},
+                    {"reason": "asr_incomplete", "spans": "1", "seconds": 1.0},
+                    {"reason": "asr_incomplete", "spans": 1, "seconds": -1.0}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                documents.prepare(self.recording, 1, 1, 1, dict(self.source, quality={"vote3_partial": bad}),
+                                  review, self.ctx, self.ctx, "now")
+
     def test_order_speaker_names_and_undo_projection(self):
         source = {"speakers": ["s1", "s2"], "speaker_names": {"s1": "Анна", "s2": "Борис"},
                   "names_source": "voices", "names_confirmed": False, "title": "Тест",

@@ -1329,6 +1329,7 @@ def main():
                                             "review_items": len(data.get("review", [])),
                                             "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                             "vote3_skipped": quality.get("vote3_skipped"),
+                                            "vote3_partial": quality.get("vote3_partial"),
                                            "emotions_error": quality.get("emotions_error"),
                                            "interaction_error": quality.get("interaction_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),
