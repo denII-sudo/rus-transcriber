@@ -3,7 +3,9 @@ import hashlib
 import json
 import uuid
 from types import SimpleNamespace
+from unittest import mock
 
+import conspect
 import core
 import recordings
 import storage
@@ -171,3 +173,22 @@ class WriteGuardTests(fixtures.ScreenCase):
         self.assertEqual(result["outcome"], "not_written")
         self.assertIn("копия", result["reason"].casefold())
         self.assertEqual(case.path.read_bytes(), case.saved)
+
+    def test_recovery_after_replacement_restores_edit_before_guard(self):
+        for kind in ("json", "md"):
+            with self.subTest(kind=kind):
+                case = self.conflict("conspect")
+                target = case.rec.conspect_files[kind]
+                original = conspect._replace_bytes
+
+                def fail_after_write(path, value):
+                    original(path, value)
+                    if fixtures.same_path(path, target):
+                        raise OSError("synthetic interruption after replacement")
+
+                with mock.patch.object(conspect, "_replace_bytes", side_effect=fail_after_write):
+                    self.replace(self.snapshot(case))
+                self.damage(case)
+                with self.assertRaises(storage.StorageError):
+                    self.materialize(case.rec, "conspect")
+                self.assertEqual(case.path.read_bytes(), case.saved)
