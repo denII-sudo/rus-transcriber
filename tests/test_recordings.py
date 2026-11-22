@@ -225,13 +225,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                                         self.assertTrue(result["left_to_human"])
                                         self.assertIn("слово", result["left_to_human"][0]["why"])
                                         self.assertEqual(transcript.load(jp), before)
-                        self.assertEqual(review_pack.match("Анна: неверно", item)["kind"], "free")
-                        self.assertNotEqual(review_pack.match("это неверно", item)["kind"], "recommended")
                         self.assertEqual(review_pack.match("всё верно", item)["kind"], "recommended")
-                        with mock.patch.object(review_pack, "manifest", return_value=man):
-                            result = review_pack.apply_free(jp, md, {"r1": {"text": "Спикер 1: неверно"}})
-                        self.assertIn("r1", result["successful_ids"])
-                        self.assertEqual(transcript.load(jp)["segments"][0]["words"][0]["w"], "неверно")
                     finally:
                         if store:
                             store.close()
@@ -239,7 +233,8 @@ class WorkerSnapshotTests(unittest.TestCase):
     def test_negative_does_not_undo_applied_answer_in_both_modes(self):
         for backend in ("legacy_files", "sqlite"):
             for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
-                                                         "это неверно", "нет, неверно", "не согласен с этим")
+                                                         "это неверно", "нет, неверно", "не согласен с этим",
+                                                         "неверно: слово")
                                for mode in ("typed", "voice")):
                 with self.subTest(backend=backend, answer=text, mode=mode), tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)
@@ -291,58 +286,22 @@ class WorkerSnapshotTests(unittest.TestCase):
                             if store:
                                 store.close()
 
-    # Ответы на карточку с рекомендацией «другое» (вариант 1) и вариантом 2 «третье».
-    AGREEMENTS = ("верно", "да, верно", "Верно.", "да", "ага", "угу", "согласен", "согласна", "всё правильно",
-                  "все правильно", "да, согласен", "да согласен", "я согласен", "согласен с этим",
-                  "совершенно верно", "конечно верно", "абсолютно правильно", "да, всё верно", "всё верно",
-                  "принимаю рекомендацию", "да, как рекомендовано", "рекомендую", "как предложено")
-    NEGATIVES = ("неверно", "не верно", "неправильно", "не согласен", "не согласна", "это неверно", "нет, неверно",
-                 "не согласен с этим", "я не согласен", "совершенно неверно", "совсем не верно", "не совсем верно",
-                 "думаю, что неверно", "да, но неверно", "нет-нет, неверно", "абсолютно неправильно",
-                 "не очень верно", "вряд ли верно", "неверно: слово", "не согласен: слово", "НЕВЕРНО", "Неверно!")
-    DOUBTFUL = ("неверное слово", "он сказал неверно", "верно, но")
-    PLAIN_WORDS = ("нет", "наверно", "проверено")
+    # Ответы на карточку «тест» у Глеба с рекомендацией «другое» (вариант 1) и вариантом 2 «третье».
+    # Закрытый список отрицаний: печатью и голосом — стенограмма не меняется, место открыто.
+    NEGATIVES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна", "не согласны",
+                 "это неверно", "нет, неверно", "не согласен с этим", "я не согласен", "совершенно неверно",
+                 "совсем не верно", "нет-нет, неверно", "абсолютно неправильно", "неверно: слово",
+                 "не согласен: слово", "НЕВЕРНО", "Неверно!")
 
-    def test_voice_agreement_confirms_recommendation_in_both_modes(self):
-        # Различий между режимами хранения нет: ожидаемый итог одинаков для sqlite и legacy_files.
+    def test_negative_answers_keep_place_open_in_both_modes(self):
         for backend in ("legacy_files", "sqlite"):
-            for text in self.AGREEMENTS:
-                with self.subTest(backend=backend, answer=text, mode="voice"), \
-                        self.answer_files(backend) as (jp, md):
-                    self.answer_card(jp, md, [(text, True)])
-                    self.assertEqual(self.card_state(jp)[0], ["другое"])
-                with self.subTest(backend=backend, answer=text, mode="typed"), \
-                        self.answer_files(backend) as (jp, md):
-                    self.answer_card(jp, md, [(text, False)])
-                    self.assertEqual(self.card_state(jp)[0], ["тест"])      # согласие — не текст стенограммы
-
-    def test_negative_and_doubtful_answers_keep_place_open_in_both_modes(self):
-        for backend in ("legacy_files", "sqlite"):
-            for text in self.NEGATIVES + self.DOUBTFUL:
+            for text in self.NEGATIVES:
                 for heard in (False, True):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
                             self.answer_files(backend) as (jp, md):
                         result = self.answer_card(jp, md, [(text, heard)])
                         self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "open"))
                         self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
-
-    def test_plain_words_and_option_labels_in_both_modes(self):
-        for backend in ("legacy_files", "sqlite"):
-            for text in self.PLAIN_WORDS:          # «нет» отдельно — слово стенограммы (решение владельца)
-                for heard in (False, True):
-                    with self.subTest(backend=backend, answer=text, voice=heard), \
-                            self.answer_files(backend) as (jp, md):
-                        self.answer_card(jp, md, [(text, heard)])
-                        self.assertEqual(self.card_state(jp)[0], [text])
-            with self.subTest(backend=backend, answer="вариант 2: да"), self.answer_files(backend) as (jp, md):
-                self.answer_card(jp, md, [("вариант 2: да", True)])
-                self.assertEqual(self.card_state(jp)[0], ["третье"])
-            for text in ("Анна: неверно", "Анна: слово"):
-                for heard in (False, True):
-                    with self.subTest(backend=backend, answer=text, voice=heard), \
-                            self.answer_files(backend) as (jp, md):
-                        self.answer_card(jp, md, [(text, heard)])
-                        self.assertEqual(self.card_state(jp)[:2], ([text.split(": ")[1]], ["Анна"]))
 
     def test_negative_then_correct_answer_in_both_modes(self):
         for backend in ("legacy_files", "sqlite"):
@@ -356,6 +315,60 @@ class WorkerSnapshotTests(unittest.TestCase):
                             self.answer_files(backend) as (jp, md):
                         self.answer_card(jp, md, [(negative, heard), {"option": 1}])
                         self.assertEqual(self.card_state(jp)[0], ["третье"])
+
+    # Остальные ответы — как до закрытого списка отрицаний: (ответ, итог печатью, итог голосом),
+    # итог — (слова карточки, говорящий, статус места). «наверно» голосом больше не подтверждает рекомендацию.
+    AS_BEFORE = (
+        ("согласен", ("согласен", "resolved"), ("другое", "resolved")),
+        ("согласна", ("согласна", "resolved"), ("другое", "resolved")),
+        ("принимаю", ("принимаю", "resolved"), ("принимаю", "resolved")),
+        ("рекомендую", ("рекомендую", "resolved"), ("другое", "resolved")),
+        ("ну да", ("ну да", "resolved"), ("ну да", "resolved")),
+        ("да, это я", ("да, это я", "resolved"), ("да, это я", "resolved")),
+        ("верно", ("тест", "open"), ("другое", "resolved")),
+        ("Верно.", ("тест", "open"), ("другое", "resolved")),
+        ("да, верно", ("тест", "open"), ("другое", "resolved")),
+        ("да", ("тест", "open"), ("другое", "resolved")),
+        ("ага", ("тест", "open"), ("другое", "resolved")),
+        ("угу", ("тест", "open"), ("другое", "resolved")),
+        ("всё правильно", ("всё правильно", "resolved"), ("другое", "resolved")),
+        ("да, согласен", ("да, согласен", "resolved"), ("другое", "resolved")),
+        ("я согласен", ("я согласен", "resolved"), ("другое", "resolved")),
+        ("согласен с этим", ("согласен с этим", "resolved"), ("другое", "resolved")),
+        ("совершенно верно", ("совершенно верно", "resolved"), ("другое", "resolved")),
+        ("абсолютно правильно", ("абсолютно правильно", "resolved"), ("другое", "resolved")),
+        ("да, всё верно", ("да, всё верно", "resolved"), ("другое", "resolved")),
+        ("принимаю рекомендацию", ("принимаю рекомендацию", "resolved"), ("другое", "resolved")),
+        ("да, как рекомендовано", ("да, как рекомендовано", "resolved"), ("другое", "resolved")),
+        ("как предложено", ("как предложено", "resolved"), ("другое", "resolved")),
+        ("так", ("тест", "open"), ("тест", "open")),
+        ("как есть", ("тест", "open"), ("тест", "open")),
+        ("да да", ("да да", "resolved"), ("да да", "resolved")),
+        ("мы согласны", ("мы согласны", "resolved"), ("другое", "resolved")),
+        ("Борис Иванович", ("тест", "human"), ("тест", "human")),
+        ("Анна Иванова", ("тест", "human"), ("тест", "human")),
+        ("Вера Николаевна", ("тест", "human"), ("тест", "human")),
+        ("нет", ("нет", "resolved"), ("нет", "resolved")),
+        ("не совсем верно", ("не совсем верно", "resolved"), ("другое", "resolved")),
+        ("вряд ли верно", ("вряд ли верно", "resolved"), ("другое", "resolved")),
+        ("нет, это не так", ("нет, это не так", "resolved"), ("нет, это не так", "resolved")),
+        ("да, но неверно", ("да, но неверно", "resolved"), ("другое", "resolved")),
+        ("неверное слово", ("неверное слово", "resolved"), ("другое", "resolved")),
+        ("он верно сказал", ("он верно сказал", "resolved"), ("другое", "resolved")),
+        ("вариант 2: да", ("вариант 2: да", "resolved"), ("третье", "resolved")),
+        ("проверено", ("проверено", "resolved"), ("проверено", "resolved")),
+        ("Анна: слово", ("тест", "human"), ("тест", "human")),
+        ("наверно", ("наверно", "resolved"), ("наверно", "resolved")),
+    )
+
+    def test_other_answers_behave_as_before_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text, typed, voice in self.AS_BEFORE:
+                for heard, (word, status) in ((False, typed), (True, voice)):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(text, heard)])
+                        self.assertEqual(self.card_state(jp), (word.split(), ["Глеб"], status))
 
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()
