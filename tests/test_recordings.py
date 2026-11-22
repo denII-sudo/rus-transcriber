@@ -291,6 +291,72 @@ class WorkerSnapshotTests(unittest.TestCase):
                             if store:
                                 store.close()
 
+    # Ответы на карточку с рекомендацией «другое» (вариант 1) и вариантом 2 «третье».
+    AGREEMENTS = ("верно", "да, верно", "Верно.", "да", "ага", "угу", "согласен", "согласна", "всё правильно",
+                  "все правильно", "да, согласен", "да согласен", "я согласен", "согласен с этим",
+                  "совершенно верно", "конечно верно", "абсолютно правильно", "да, всё верно", "всё верно",
+                  "принимаю рекомендацию", "да, как рекомендовано", "рекомендую", "как предложено")
+    NEGATIVES = ("неверно", "не верно", "неправильно", "не согласен", "не согласна", "это неверно", "нет, неверно",
+                 "не согласен с этим", "я не согласен", "совершенно неверно", "совсем не верно", "не совсем верно",
+                 "думаю, что неверно", "да, но неверно", "нет-нет, неверно", "абсолютно неправильно",
+                 "не очень верно", "вряд ли верно", "неверно: слово", "не согласен: слово", "НЕВЕРНО", "Неверно!")
+    DOUBTFUL = ("неверное слово", "он сказал неверно", "верно, но")
+    PLAIN_WORDS = ("нет", "наверно", "проверено")
+
+    def test_voice_agreement_confirms_recommendation_in_both_modes(self):
+        # Различий между режимами хранения нет: ожидаемый итог одинаков для sqlite и legacy_files.
+        for backend in ("legacy_files", "sqlite"):
+            for text in self.AGREEMENTS:
+                with self.subTest(backend=backend, answer=text, mode="voice"), \
+                        self.answer_files(backend) as (jp, md):
+                    self.answer_card(jp, md, [(text, True)])
+                    self.assertEqual(self.card_state(jp)[0], ["другое"])
+                with self.subTest(backend=backend, answer=text, mode="typed"), \
+                        self.answer_files(backend) as (jp, md):
+                    self.answer_card(jp, md, [(text, False)])
+                    self.assertEqual(self.card_state(jp)[0], ["тест"])      # согласие — не текст стенограммы
+
+    def test_negative_and_doubtful_answers_keep_place_open_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text in self.NEGATIVES + self.DOUBTFUL:
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, heard)])
+                        self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "open"))
+                        self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
+
+    def test_plain_words_and_option_labels_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text in self.PLAIN_WORDS:          # «нет» отдельно — слово стенограммы (решение владельца)
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(text, heard)])
+                        self.assertEqual(self.card_state(jp)[0], [text])
+            with self.subTest(backend=backend, answer="вариант 2: да"), self.answer_files(backend) as (jp, md):
+                self.answer_card(jp, md, [("вариант 2: да", True)])
+                self.assertEqual(self.card_state(jp)[0], ["третье"])
+            for text in ("Анна: неверно", "Анна: слово"):
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=text, voice=heard), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(text, heard)])
+                        self.assertEqual(self.card_state(jp)[:2], ([text.split(": ")[1]], ["Анна"]))
+
+    def test_negative_then_correct_answer_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for negative in ("неверно", "совсем не верно", "неверно: слово"):
+                for heard in (False, True):
+                    with self.subTest(backend=backend, answer=negative, voice=heard, then="text"), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), ("слово", False)])
+                        self.assertEqual(self.card_state(jp)[0], ["слово"])
+                    with self.subTest(backend=backend, answer=negative, voice=heard, then="option"), \
+                            self.answer_files(backend) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), {"option": 1}])
+                        self.assertEqual(self.card_state(jp)[0], ["третье"])
+
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()
         before = copy.deepcopy(source)

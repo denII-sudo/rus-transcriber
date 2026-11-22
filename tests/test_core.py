@@ -367,6 +367,31 @@ class Answers(unittest.TestCase):
         self.assertFalse(freeform.negative_answer("Анна: не согласен с этим"))
         self.assertFalse(freeform.negative_answer("время: всё верно"))
 
+    def test_one_verdict_for_agreement_and_negation(self):
+        # Один разбор согласия и отрицания для ответа текстом и голосом; отрицание проверяется раньше
+        c = freeform.classify
+        for text in ("да", "верно", "Верно.", "всё правильно", "да, согласен", "я согласен", "согласен с этим",
+                     "совершенно верно", "конечно верно", "абсолютно правильно", "принимаю рекомендацию",
+                     "да, всё верно", "так", "как есть"):
+            with self.subTest(text=text):
+                self.assertEqual(c(text, self.names), {"kind": "agree"})
+        for text in ("неверно", "совершенно неверно", "совсем не верно", "не совсем верно", "думаю, что неверно",
+                     "да, но неверно", "нет-нет, неверно", "абсолютно неправильно", "не очень верно",
+                     "вряд ли верно", "неверно: слово", "не согласен: слово", "Неверно!"):
+            with self.subTest(text=text):
+                self.assertEqual(c(text, self.names), {"kind": "negative"})
+                self.assertTrue(freeform.negative_answer(text))
+        # оценка, похожая и на речь из записи: ни согласие, ни текст — место остаётся открытым
+        for text in ("неверное слово", "он сказал неверно", "верно, но", "время: всё верно", "Анна, неверно"):
+            with self.subTest(text=text):
+                self.assertEqual(c(text, self.names), {"kind": "doubtful"})
+                self.assertTrue(freeform.holds_place(text, self.names))
+        # обычные слова: «нет» отдельно — слово стенограммы (решение владельца), «наверно», «проверено»
+        for text in ("нет", "наверно", "проверено", "итого: пять", "время 10:30", "Анна: неверно", "вариант 2: да"):
+            with self.subTest(text=text):
+                self.assertNotIn(c(text, self.names)["kind"], ("agree", "negative", "doubtful"))
+                self.assertFalse(freeform.holds_place(text, self.names))
+
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
         for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
