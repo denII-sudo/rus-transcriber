@@ -535,6 +535,7 @@ def decisions(json_path):
     применения (на карточке «Изменить ответ») — при наличии структурного снимка прежняя правка сначала
     отменяется, затем применяется новый ответ; без снимка изменение блокируется конфликтом. Ответ
     «отменить» только откатывает и снова открывает место."""
+    import freeform
     import transcript as T
     pd = pack_dir(json_path)
     man = manifest(json_path)
@@ -558,6 +559,11 @@ def decisions(json_path):
             continue
         src = f"разбор ({a['source']}, {a['ts']})"
         k = a["kind"]
+        if k == "free" and freeform.negative_answer(a.get("text")):
+            # Отрицание не отменяет даже ранее применённый ответ; подсказка
+            # формируется обычным разбором свободного ответа.
+            rep["free"].append({"id": aid, "text": a.get("text")})
+            continue
         if aid in applied:
             snapshot = (store.get("undo_snapshots") or {}).get(aid)
             if not snapshot:
@@ -614,10 +620,13 @@ def decisions(json_path):
 
 def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}."""
+    import freeform
     pd = pack_dir(json_path)
     store = _read_answers(json_path, {"answers": {}})
     applied = _applied_map(store)
-    return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and aid not in applied}
+    return {aid: a for aid, a in store.get("answers", {}).items()
+            if a.get("kind") == "free" and
+            (aid not in applied or freeform.negative_answer(a.get("text")))}
 
 
 def apply_free(json_path, md_path, free, dry_run=False):

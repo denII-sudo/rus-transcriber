@@ -158,6 +158,60 @@ class WorkerSnapshotTests(unittest.TestCase):
                         if store:
                             store.close()
 
+    def test_negative_does_not_undo_applied_answer_in_both_modes(self):
+        for backend in ("legacy_files", "sqlite"):
+            for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен")
+                               for mode in ("typed", "voice")):
+                with self.subTest(backend=backend, answer=text, mode=mode), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    db, audio = root / "state.sqlite3", root / "sample.wav"
+                    audio.write_bytes(b"synthetic")
+                    data = self.worker_result()
+                    data["file"] = str(audio)
+                    data["review"][0].pop("word_ids", None)
+                    layout = recordings.document_layout(audio)
+                    layout["root"].mkdir()
+                    store = None
+                    with mock.patch.object(settings.paths, "STATE_DB", db):
+                        try:
+                            if backend == "sqlite":
+                                store = recordings.initialize_store(db, display_name="Тест")
+                                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                                rid = str(uuid.uuid4())
+                                recordings.commit_worker_result(
+                                    store, data, audio, root_id, recordings.operation_context(store, "model"),
+                                    recording_id=rid, operation_id=str(uuid.uuid4()),
+                                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                                recordings.materialize_recording(store, rid)
+                                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                            else:
+                                jp = layout["root"] / layout["paths"]["json"]
+                                md = layout["root"] / layout["paths"]["md"]
+                                transcript.save(data, jp, md)
+                            question = {"id": "r1", "question": "Проверьте", "options": [
+                                {"label": "Другое", "decision": {"text": "другое"}}]}
+                            with mock.patch.object(review_pack, "cut_clip",
+                                                   side_effect=lambda _s, t1, _t2, _out: t1):
+                                pack = review_pack.build(jp, [question])
+                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "option": 0}],
+                                                    "local", trusted_actor="human")
+                            core.apply_answers_files(jp, md)
+                            before = transcript.load(jp)
+                            self.assertEqual(before["segments"][0]["words"][0]["w"], "другое")
+                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
+                                                          "text": text, "heard": mode == "voice"}],
+                                                    "local", trusted_actor="human")
+                            result = core.apply_answers_files(jp, md)
+                            after = transcript.load(jp)
+                            self.assertEqual(after["segments"], before["segments"])
+                            self.assertEqual(after["review"], before["review"])
+                            self.assertEqual(after["edits"], before["edits"])
+                            self.assertFalse(result["reverted"])
+                            self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
+                        finally:
+                            if store:
+                                store.close()
+
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()
         before = copy.deepcopy(source)
