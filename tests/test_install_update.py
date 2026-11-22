@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -14,6 +15,15 @@ def _shell():
         if found:
             return found
     return None
+
+
+def setUpModule():
+    """An inherited GIT_DIR (hooks, rebase --exec) overrides git -C: never write to that repository."""
+    environment = patch.dict(os.environ)
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
+    for name in [n for n in os.environ if n.upper().startswith("GIT_")]:
+        del os.environ[name]
 
 
 @unittest.skipUnless(_shell(), "PowerShell не найден")

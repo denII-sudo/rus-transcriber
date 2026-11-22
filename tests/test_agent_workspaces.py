@@ -560,5 +560,54 @@ class HousekeepingTests(unittest.TestCase):
                 self.g("worktree", "remove", str(empty))
 
 
+def setUpModule():
+    """An inherited GIT_DIR (hooks, rebase --exec) overrides git -C: never write to that repository."""
+    environment = patch.dict(os.environ)
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
+    for name in [n for n in os.environ if n.upper().startswith("GIT_")]:
+        del os.environ[name]
+
+
+GUARDED_CHILD = '''
+import importlib.util, subprocess, sys
+project, module, work = sys.argv[1:]
+sys.path.insert(0, project)
+spec = importlib.util.spec_from_file_location("guarded", module)
+guarded = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guarded)
+guarded.setUpModule()
+for args in (["init", "-q"], ["config", "user.name", "Leaked"],
+             ["config", "user.email", "leaked@example.invalid"],
+             ["commit", "-q", "--allow-empty", "-m", "test"]):
+    subprocess.run(["git", "-C", work, *args], check=True)
+'''
+
+
+class InheritedGitEnvironmentTests(unittest.TestCase):
+    def test_tests_that_write_git_never_touch_an_inherited_repository(self):
+        project = Path(__file__).resolve().parent.parent
+        for name in ("test_agent_workspaces", "test_buildinfo", "test_install_update"):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                victim, work = Path(tmp) / "victim", Path(tmp) / "work"
+                victim.mkdir()
+                work.mkdir()
+                aw.git(victim, "init", "-q")
+                aw.git(victim, "-c", "user.name=Victim", "-c", "user.email=victim@example.invalid",
+                       "commit", "-q", "--allow-empty", "-m", "base")
+                head = aw.git(victim, "rev-parse", "HEAD")
+                config = (victim / ".git/config").read_bytes()
+                environment = dict(os.environ, GIT_DIR=str(victim / ".git"),
+                                   GIT_INDEX_FILE=str(victim / ".git/index"))
+                done = subprocess.run(
+                    [sys.executable, "-B", "-c", GUARDED_CHILD, str(project),
+                     str(project / "tests" / f"{name}.py"), str(work)],
+                    env=environment, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(aw.git(victim, "rev-parse", "HEAD"), head)
+                self.assertEqual((victim / ".git/config").read_bytes(), config)
+
+
 if __name__ == "__main__":
     unittest.main()
