@@ -1450,6 +1450,186 @@ class LegacyPromiseTests(ScreenCase):
         self.assertRegex(self.listing()["reason"].casefold(), "перезапи|затира")
 
 
+class ConflictReadableTests(ScreenCase):
+    """Невидимое, кодировка, повреждённая строка и сбои названы словами."""
+
+    def damage(self, table, column, key, value):
+        """Испортить сохранённое в базе песочницы в обход её защиты от изменений."""
+        for found in self.store.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,)).fetchall():
+            self.store.db.execute(f'DROP TRIGGER "{found[0]}"')
+        self.store.db.execute(f"UPDATE {table} SET {column}=? WHERE {key}=?", (b"damaged", value))
+
+    def words(self, shown):
+        return " ".join(shown["removed_notes"] + shown["added_notes"] + shown["file_notes"]).casefold()
+
+    def test_invisible_difference_is_named(self):
+        line = "Анна: беру два"
+        variants = {
+            "bom": ("﻿" + line + "\n", "bom"),
+            "space": (line + "  \n", "пробел"),
+            "tab": (line + "\t\n", "табуляц"),
+            "nbsp": (line.replace(" ", " ") + "\n", "неразрывн"),
+            "zero width": (line.replace("беру", "бе​ру") + "\n", "нулев"),
+            "line endings": (line + "\r\n", "концы строк")}
+        for label, (mine, word) in variants.items():
+            with self.subTest(variant=label):
+                case = self.conspect_texts(line + "\n", mine)
+                self.assertIn(word, self.words(self.preview(case)))
+                self.assertEqual(self.copy(case), mine.encode("utf-8"))
+
+    def test_invisible_difference_is_named_in_ordinary_long_document(self):
+        lines = [f"**[{i:05d}]** реплика" for i in range(200)]
+        mine = "\n\n".join(line + " " for line in lines) + "\n"
+        shown = self.preview(self.conspect_texts("\n\n".join(lines) + "\n", mine))
+        self.assertIn("пробел", self.words(shown), "различие не видно и не названо")
+
+    def test_repeated_lines_do_not_make_comparison_unbounded(self):
+        mine, theirs = [], []
+        for part in range(200):     # около 0,27 МиБ; на пределе копии таких мест в тридцать раз больше
+            mine += [f"## {part}"] + ["Да.", "п"] * 149
+            theirs += [f"## {part}"] + ["Да.", "р"] * 149
+        case = self.conspect_texts("\n".join(theirs) + "\n", "\n".join(mine) + "\n")
+        started = time.monotonic()
+        shown = self.preview(case)
+        self.assertGreaterEqual(shown["removed_total"], 200 * 149)
+        self.assertLess(time.monotonic() - started, 10, "работа сравнения не ограничена")
+
+    def test_edit_in_long_line_next_to_another_edit_is_visible(self):
+        line = "реплика монолога " * 200
+        variants = {"inserted line before": "заметка\n" + line + "ВАЖНАЯ ПРАВКА\n",
+                    "invisible sign before": "﻿" + line + "ВАЖНАЯ ПРАВКА\n"}
+        for label, mine in variants.items():
+            with self.subTest(variant=label):
+                shown = self.preview(self.conspect_texts(line + "\n", mine))
+                self.assertTrue("ВАЖНАЯ ПРАВКА" in "\n".join(shown["removed"]),
+                                "правка в длинной строке не видна перед заменой")
+
+    def test_copy_not_in_utf8_is_named(self):
+        text = "Анна: моя правка\n"
+        variants = {"ansi": text.encode("cp1251"), "utf-16 le": b"\xff\xfe" + text.encode("utf-16-le"),
+                    "utf-16 be": b"\xfe\xff" + text.encode("utf-16-be"),
+                    "utf-16 without mark": text.encode("utf-16-le")}
+        for label, saved in variants.items():
+            with self.subTest(encoding=label):
+                case = self.conflict("conspect", saved)
+                shown = self.preview(case)
+                notes = " ".join(shown["file_notes"]).casefold()
+                self.assertIn("кодировк", notes)
+                if label in ("utf-16 le", "utf-16 be"):
+                    self.assertIn(text.rstrip(), shown["removed"])
+                else:
+                    self.assertIn("неточн", notes)
+                self.assertEqual(self.copy(case), saved)
+
+    def test_damaged_version_does_not_break_list_and_cannot_be_written(self):
+        for scope, table, key in (("document", "document_versions", "recording_id"),
+                                  ("conspect", "conspect_revisions", "conspect_id")):
+            with self.subTest(scope=scope):
+                bad, waiting, good = self.conflict(scope), self.conflict(scope), self.conflict(scope)
+                snapshot = self.snapshot(bad)
+                self.resolve_directly(waiting)
+                for case in (bad, waiting):
+                    self.damage(table, "md", key, case.rid if scope == "document" else case.rec.conspect_id)
+                for case in (bad, waiting):
+                    row = self.item(case)
+                    self.assertEqual(row["status"], "damaged")
+                    self.assertRegex(row["problem"], CYRILLIC)
+                    self.assertFalse(row["can_replace"] or row["can_retry"])
+                    self.assertIsNone(self.preview(case)["snapshot"])
+                    self.refused("api/conflict/retry", self.body(case))
+                    self.assertEqual(case.path.read_bytes(), case.saved)
+                    self.assertEqual(self.copy(case), case.saved)
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assert_untouched(bad, bad.saved)
+                self.assertIs(self.item(good)["can_replace"], True)
+                self.assertEqual(self.replace(self.snapshot(good))["outcome"], "replaced")
+
+    def test_damaged_copy_cannot_be_replaced(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        self.damage("document_conflicts", "observed_bytes", "conflict_id", case.id)
+        self.assertIsNone(self.preview(case)["snapshot"])
+        self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+        self.assert_untouched(case, case.saved)
+
+    def test_damaged_copy_is_not_lost_by_retry(self):
+        case = self.conflict("document")
+        self.resolve_directly(case)
+        self.damage("document_conflicts", "observed_bytes", "conflict_id", case.id)
+        status, _, _ = self.request("POST", "api/conflict/retry", self.body(case))
+        self.assertTrue(case.path.read_bytes() == case.saved,
+                        f"код {status}: файл заменён, а единственная его копия в базе повреждена")
+
+    def test_failures_are_explained_in_russian(self):
+        for error in (storage.StorageError("cannot open database"), storage.Busy("database is busy"),
+                      sqlite3.OperationalError("database is locked"), RuntimeError("synthetic bug")):
+            with self.subTest(error=str(error)), mock.patch.object(recordings, "open_store", side_effect=error):
+                status, _, raw = self.request("GET", "api/conflicts/all")
+                self.assertIn(status, (400, 500))
+                message = json.loads(raw)["error"]
+                self.assertRegex(message, CYRILLIC)
+                if isinstance(error, RuntimeError):
+                    self.assertIn(str(error), message)
+
+    def test_own_refusal_is_not_called_database_error(self):
+        with mock.patch.object(core, "workflow_confirm_verification",
+                               side_effect=storage.Conflict("снимок подтверждения устарел")):
+            status, _, raw = self.request("POST", "api/verify/confirm", {"snapshot": {}})
+        self.assertEqual(status, 400)
+        message = json.loads(raw)["error"]
+        self.assertIn("снимок подтверждения устарел", message)
+        self.assertNotIn("ошибка базы", message.casefold())
+
+    def test_names_keep_case_from_disk(self):
+        case = self.conflict("document")
+        before, row, shown = self.state(), self.item(case), self.preview(case)
+        self.assertEqual(row["title"], f"{case.rec.stem}.wav")
+        name = next(n for n in os.listdir(case.path.parent) if n.casefold() == case.path.name.casefold())
+        for found in (row["file"], shown["file"]):
+            self.assertEqual(Path(found).name, name)
+            self.assertIn(self.base.name, found)
+        self.assertEqual(self.preview(case)["snapshot"], shown["snapshot"])
+        self.assertEqual(self.state(), before)
+
+    def test_reason_does_not_call_overwritten_file_untouched(self):
+        for error in (RuntimeError("synthetic bug"), PermissionError(13, "synthetic busy file")):
+            with self.subTest(error=type(error).__name__):
+                rec = self.recording()
+                self.save_conspect(rec)
+                self.materialize(rec, "conspect")
+                rec.conspect_files["md"].write_bytes(LATE_EDIT)
+                for _ in range(2):
+                    self.save_conspect(rec)      # в очереди две версии программы
+                self.materialize(rec, "conspect")
+                case = self.open_case(rec, "conspect", "md")
+                snapshot = self.snapshot(case)
+                original, writes = os.replace, []
+
+                def replace(src, dst, *args, **kwargs):
+                    if same_path(dst, case.path):
+                        writes.append(dst)
+                        if len(writes) == 2:     # первая версия записана, вторая не записалась
+                            raise error
+                    return original(src, dst, *args, **kwargs)
+                with mock.patch("os.replace", replace):
+                    result = self.replace(snapshot)
+                self.assertNotEqual(case.path.read_bytes(), case.saved, "подготовка: правка уже заменена")
+                self.assertEqual(result["outcome"], "not_written")
+                self.assertNotIn("не тронут", result["reason"].casefold())
+
+    def test_journal_reason_names_file_that_stops_it(self):
+        case = self.conflict("conspect")
+        snapshot = self.snapshot(case)
+        with failing_replace(case.path):
+            self.replace(snapshot)
+        other = case.rec.conspect_files["json"]
+        other.write_bytes(LATE_EDIT)
+        reason = self.retry(case)["reason"].casefold()
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        self.assertTrue(other.name.casefold() in reason, f"мешает другой файл свёртки, а совет о другом: {reason}")
+
+
 # Страница в Node.js с маленькой подменой DOM: только то, что видит и нажимает человек.
 PAGE_RUNNER = r"""
 const vm = require("vm");
@@ -1528,9 +1708,16 @@ async function run(sc) {
     "api/conspects": {conspects: []}, "api/verify/prepare": {document: "d"},
     "api/restore/prepare": {document: "d", source_revision: 1, review_revision: 1},
     "api/restore/confirm": {materialized: false}, "api/history": {revisions: []}};
+  let offline = false;
   async function fetch(path) {
     const key = String(path).split("?")[0];
     requests.push(key);
+    if (key === sc.fail) {
+      if (sc.after) replies["api/conflicts/all"] = {available: true, reason: null, items: sc.after};
+      if (sc.offline) offline = true;
+      else return {ok: false, status: 400, json: async () => ({error: "отказ для проверки"})};
+    }
+    if (offline) throw new TypeError("Failed to fetch");
     const data = replies[key] || {};
     return {ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(data)), headers: {get: () => ""}};
   }
@@ -1558,6 +1745,7 @@ async function run(sc) {
   }
   if (card()) {
     out.card = card().textContent;
+    out.buttons = card().querySelectorAll("button").map(b => b.textContent);
     out.folded = false;
     for (let e = card(); e; e = e.parentNode) {
       if ((e.tagName === "DETAILS" && !e.open) || e.hidden) out.folded = true;
@@ -1567,6 +1755,12 @@ async function run(sc) {
     const look = card().querySelectorAll("button").find(b => /^(Заменить файл|Показать сравнение)/.test(b.textContent));
     await look.click();
     await settle();
+    if (sc.fail === "api/conflict/preview") {
+      out.left = every().filter(e => e.tagName === "BUTTON" && e.isConnected).map(b => b.textContent);
+      out.note = ids["conflicts-note"].textContent + ids["conflicts-list"].textContent;
+      out.shown = [...shown];
+      return out;
+    }
     const panel = card().querySelector(".panel");
     out.panel = panel.textContent;
     const ask = panel.querySelector(".ask");
@@ -1578,6 +1772,8 @@ async function run(sc) {
       await settle();
       out.afterConfirm = [...requests];
       out.shown = [...shown];
+      out.left = every().filter(e => e.tagName === "BUTTON" && e.isConnected).map(b => b.textContent);
+      out.note = ids["conflicts-note"].textContent + ids["conflicts-list"].textContent;
     }
   }
   return out;
@@ -1616,6 +1812,20 @@ def page_scenarios():
         "waiting": {"items": [{**item, "status": "not_written", "can_replace": False}]},
         "request": {"request": True, "items": [item]},
         "restore": {"request": True, "restore": True, "items": []},
+        "invisible": {"items": [item], "compare": True,
+                      "preview": {**shown, "file_notes": ["пометка о кодировке"],
+                                  "removed_notes": ["пометка о пробеле"], "added_notes": [""]}},
+        "damaged": {"items": [{**item, "status": "damaged", "can_replace": False,
+                               "problem": "версия повреждена"}]},
+        "refused preview": {"items": [item], "compare": True, "preview": shown, "fail": "api/conflict/preview",
+                            "after": [{**item, "status": "resolved", "can_replace": False}]},
+        "refused replace": {"items": [item], "confirm": True, "preview": shown, "fail": "api/conflict/resolve",
+                            "after": [{**item, "status": "resolved", "can_replace": False}]},
+        "offline": {"items": [item], "confirm": True, "preview": shown, "fail": "api/conflict/resolve",
+                    "offline": True},
+        "unchecked": {"items": [item], "confirm": True, "preview": shown,
+                      "result": {"outcome": "not_written", "new_conflict_id": None,
+                                 "reason": "Решение принято, но проверить, что лежит в файле, не удалось."}},
         "confirm": {"request": True, "confirm": True, "items": [item], "preview": shown,
                     "result": {"outcome": "replaced", "new_conflict_id": None, "reason": None}}}
 
@@ -1673,6 +1883,33 @@ class ConflictPageBehaviourTests(unittest.TestCase):
     def test_outcome_is_brought_into_view(self):
         self.assertTrue(any("заменён" in text for text in self.seen_in("confirm")["shown"]),
                         "итог остаётся за краем экрана")
+
+    def test_notes_are_shown(self):
+        panel = self.seen_in("invisible")["panel"]
+        self.assertIn("пометка о кодировке", panel)
+        self.assertIn("пометка о пробеле", panel)
+
+    def test_damaged_row_has_reason_and_no_replace(self):
+        seen = self.seen_in("damaged")
+        self.assertIn("версия повреждена", seen["card"])
+        self.assertFalse([b for b in seen["buttons"] if b.startswith(("Заменить", "Повторить"))])
+
+    def test_refusal_refreshes_list_and_stays_visible(self):
+        for name in ("refused preview", "refused replace"):
+            with self.subTest(action=name):
+                seen = self.seen_in(name)
+                self.assertFalse([b for b in seen["left"] if b.startswith(("Заменить файл", "Да,"))])
+                self.assertIn("отказ для проверки", seen["note"])
+                self.assertTrue(any("отказ для проверки" in text for text in seen["shown"]))
+
+    def test_lost_connection_is_russian_and_leaves_no_replace(self):
+        seen = self.seen_in("offline")
+        self.assertFalse([b for b in seen["left"] if b.startswith(("Заменить файл", "Да,"))])
+        self.assertIn("нет связи", seen["note"].casefold())
+        self.assertNotIn("failed to fetch", seen["note"].casefold())
+
+    def test_unchecked_outcome_is_not_called_not_replaced(self):
+        self.assertNotIn("НЕ заменён", self.seen_in("unchecked")["note"])
 
 
 class ConflictPageTests(unittest.TestCase):
