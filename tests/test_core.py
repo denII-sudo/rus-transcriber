@@ -355,7 +355,8 @@ class Answers(unittest.TestCase):
     def test_negative_answer_is_not_a_replacement(self):
         item = {"id": "r1", "t1": 0, "t2": 0}
         words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
-        for text in ("неверно", "не верно", "неправильно", "не согласен"):
+        for text in ("неверно", "не верно", "неправильно", "не согласен",
+                     "это неверно", "нет, неверно", "не согласен с этим", "это неправильно"):
             with self.subTest(text=text):
                 result = freeform.card_edits(item, {"text": text}, words, self.names)
                 self.assertFalse(result["edits"])
@@ -363,6 +364,8 @@ class Answers(unittest.TestCase):
         result = freeform.card_edits(item, {"text": "Анна: неверно"}, words, self.names)
         self.assertEqual(result["edits"][0]["text"], "неверно")
         self.assertEqual(result["edits"][0]["speaker"], "Анна")
+        self.assertFalse(freeform.negative_answer("Анна: не согласен с этим"))
+        self.assertFalse(freeform.negative_answer("время: всё верно"))
 
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]

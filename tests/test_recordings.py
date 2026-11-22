@@ -106,7 +106,8 @@ class WorkerSnapshotTests(unittest.TestCase):
                             store.close()
 
     def test_negative_answers_remain_open_in_both_storage_modes(self):
-        negatives = ("неверно", "не верно", "неправильно", "не согласен")
+        negatives = ("неверно", "не верно", "неправильно", "не согласен",
+                     "это неверно", "нет, неверно", "не согласен с этим")
         item = {"id": "r1", "options": [{"label": "верный вариант", "decision": {"text": "другое"}}],
                 "recommended": 0}
         for backend in ("legacy_files", "sqlite"):
@@ -162,7 +163,8 @@ class WorkerSnapshotTests(unittest.TestCase):
 
     def test_negative_does_not_undo_applied_answer_in_both_modes(self):
         for backend in ("legacy_files", "sqlite"):
-            for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен")
+            for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
+                                                         "это неверно", "нет, неверно", "не согласен с этим")
                                for mode in ("typed", "voice")):
                 with self.subTest(backend=backend, answer=text, mode=mode), tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)

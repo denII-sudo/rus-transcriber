@@ -33,8 +33,6 @@ DUP_SEC = 2.0                    # повтор: то же слово модел
 MIN_ANCHORS = 0.3
 AGREE = {"да", "верно", "так", "правильно", "все верно", "всё верно", "да верно", "ага", "угу", "так и есть",
          "как есть", "да так"}
-NEGATIVE = {"неверно", "не верно", "неправильно", "не правильно",
-            "не согласен", "не согласна", "не согласны"}
 WORD = re.compile(r"[\wЁё][\wЁё'-]*", re.U)
 
 _MORPH = None
@@ -56,7 +54,13 @@ def norm(w):
 
 
 def negative_answer(text):
-    return " ".join(norm(x) for x in (text or "").split() if norm(x)) in NEGATIVE
+    # Явная метка отделяет услышанную речь от оценки ответа.
+    if ":" in (text or ""):
+        return False
+    phrase = " ".join(norm(x) for x in (text or "").split() if norm(x))
+    return bool(re.match(r"^(?:(?:нет|это|я|думаю|считаю) )*"
+                         r"(?:неверно|не верно|неправильно|не правильно|не согласен|не согласна|не согласны)"
+                         r"(?: |$)", phrase))
 
 
 def tokens(text):
