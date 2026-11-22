@@ -4,14 +4,20 @@ on:
   workflow_run:
     workflows: ["Tests"]
     types: [completed]
+  # A draft marked ready is queued by the result its commit already has. This event has a
+  # write token also for forks: never add a checkout or run pull-request code here.
+  pull_request_target:
+    branches: [main]
+    types: [ready_for_review]
 
 permissions: {}
 
 jobs:
   queue:
     if: >-
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success'
+      github.event_name == 'pull_request_target' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     # watches the queued PR (WATCH_MINUTES) and waits for approved Tests runs
     timeout-minutes: 120
@@ -22,7 +28,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPOSITORY: ${{ github.repository }}
-      TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+      TESTED_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+      READY_PR: ${{ github.event.pull_request.number }}
     steps:
       # This privileged workflow deliberately does not check out or execute
       # pull-request code. It only updates a behind PR branch or enables
@@ -114,12 +121,38 @@ jobs:
             gh pr comment "$pr" --repo "$REPOSITORY" --body "$body"
           }
 
+          if [ -n "$READY_PR" ]; then
+            # Marked ready: go on only if Tests already passed on exactly this commit.
+            result="$(gh run list --repo "$REPOSITORY" --workflow tests.yml --commit "$TESTED_SHA" \
+              --event pull_request --limit 1 --json status,conclusion \
+              --jq '.[0] | if . == null then "none" elif .status != "completed" then .status else .conclusion end')"
+            case "$result" in
+              success) ;;
+              queued|in_progress|waiting|pending|requested)
+                echo "PR #${READY_PR}: Tests are ${result}; their completion will queue it."
+                exit 0
+                ;;
+              *)
+                echo "::warning::PR #${READY_PR}: Tests result is '${result}'; re-run Tests or push a fix."
+                exit 0
+                ;;
+            esac
+            # Right after the change GitHub still computes mergeability; "--auto" fails on a
+            # clean PR if it is asked before that is known.
+            for _ in $(seq 1 30); do
+              case "$(pr_field "$READY_PR" mergeStateStatus)" in
+                UNKNOWN|DRAFT) sleep 2 ;;
+                *) break ;;
+              esac
+            done
+          fi
+
           prs="$(gh pr list --repo "$REPOSITORY" --state open --base main --limit 1000 \
             --json number,headRefOid,isDraft \
             --jq ".[] | select(.headRefOid == \"${TESTED_SHA}\" and .isDraft == false) | .number")"
           if [ -z "$prs" ]; then
             # Draft PRs are left alone: GitHub refuses auto-merge for drafts.
-            # Marking a PR ready for review re-runs Tests, which queues it here.
+            # Marking a PR ready for review starts this workflow again (pull_request_target).
             echo "No open non-draft pull request for tested commit ${TESTED_SHA}."
             exit 0
           fi
