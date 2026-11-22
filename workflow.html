@@ -581,7 +581,7 @@ function confirmBox(box, panel, c, p) {
         "этот файл в других программах: сохранённое в этот миг может пропасть без копии. Если помешает другой файл той же записи, " +
         "замена отложится, и программа скажет почему.", "bad"));
   const yes = node("button", {wait: "Да, записать решение", stopped: "Да, записать решение",
-    close: "Да, закрыть конфликт", recopy: "Да, сохранить новую копию"}[effect] || "Да, заменить файл");
+    close: "Да, закрыть конфликт", recopy: "Да, записать решение"}[effect] || "Да, заменить файл");
   yes.onclick = guarded(box, async () => {
     const r = await post("api/conflict/resolve", {snapshot: p.snapshot, confirm: true});
     await loadConflicts();
@@ -604,7 +604,8 @@ function reportOutcome(c, r, also, closed = false) {
   } else if (r.outcome === "changed") {
     const fresh = conflictItems.find(i => i.conflict_id === r.new_conflict_id);
     conflictNoteShown(`Файл ${name} НЕ заменён: его изменили ещё раз, и он остался на диске как есть. ` +
-      (fresh && !fresh.preserved ? "Он больше 8 МиБ, копия не сохранена, а заменить его программа не может."
+      (!fresh ? "Не удалось проверить новую копию. Обновите список конфликтов; до проверки сохраните файл отдельно."
+        : !fresh.preserved ? "Он больше 8 МиБ, копия не сохранена, а заменить его программа не может."
         : "Программа сохранила его новую копию: она появилась в списке «Ждут вашего решения»."), "warn");
   } else {
     conflictNoteShown(`Решение принято, но замена файла ${name} не подтверждена. ${r.reason}`, "bad");

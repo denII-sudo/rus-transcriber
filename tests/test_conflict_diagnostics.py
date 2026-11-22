@@ -219,6 +219,22 @@ class WaitingJourneyTests(fixtures.ScreenCase):
                                           .replace("Решение нельзя отменить", "")
                                           .replace("Перенести правку файла в стенограмму здесь нельзя", ""), stage)
 
+    def test_changed_file_over_limit_confirmation_does_not_promise_a_copy(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                changed = b"x" * (documents.MAX_CONFLICT_BYTES + 1)
+                case.path.write_bytes(changed)
+                shown = self.preview(case)
+                self.assertEqual(shown["effect"], "recopy")
+                page = self.page(items=[self.item(case)], compare=True, preview=shown)
+                self.assertIn("Да, записать решение", page["question"])
+                self.assertNotIn("Да, сохранить новую копию", page["question"])
+                result = self.replace(shown["snapshot"])
+                self.assertEqual(result["outcome"], "changed")
+                self.assertIsNone(self.open_case(case.rec, scope, "md").saved)
+                self.assertEqual(case.path.read_bytes(), changed)
+
 
 @unittest.skipUnless(shutil.which("node"), "Node.js нужен для проверки JavaScript")
 class ChangedPageTests(unittest.TestCase):
@@ -232,6 +248,20 @@ class ChangedPageTests(unittest.TestCase):
         seen = json.loads(result.stdout)["changed"]
         self.assertIn("не больше 8 МиБ", seen["question"])
         self.assertEqual(seen["panel"].count("не больше 8 МиБ"), 2, "и строка состояния файла, и вопрос")
+
+    def test_missing_new_conflict_does_not_claim_copy_is_saved(self):
+        scenario = fixtures.page_scenarios()["changed"]
+        scenario.update(confirm=True, result={"outcome": "changed", "new_conflict_id": "new", "reason": None})
+        result = subprocess.run(
+            [shutil.which("node"), "-e", fixtures.PAGE_RUNNER],
+            input=json.dumps({"html": (fixtures.PROJECT / "workflow.html").read_text(encoding="utf-8"),
+                              "scenarios": {"changed": scenario}}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(result.stdout)["changed"]
+        self.assertNotIn("error", seen)
+        self.assertIn("не удалось проверить", seen["note"].casefold())
+        self.assertNotIn("Программа сохранила его новую копию", seen["note"])
 
 
 if __name__ == "__main__":
