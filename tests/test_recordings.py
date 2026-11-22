@@ -17,6 +17,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 import documents
+import freeform
 import recordings
 import review_pack
 import settings
@@ -46,6 +47,61 @@ class WorkerSnapshotTests(unittest.TestCase):
             "review_done": False,
             "edits": [],
         }
+
+    def test_names_and_labels_in_both_storage_modes(self):
+        cases = [
+            ("Спикер 1:", "name", "Спикер 1"),
+            ("Спикер 1", "name", "Спикер 1"),
+            ("Спикер 10", "name", "Спикер 10"),
+            ("Анна Петровна", "name", "Анна Петровна"),
+            ("Борис, не Анна", "name", "Борис"),
+            ("не Анна, а Вера", "name", "Вера"),
+            ("это не Анна", "unmatched", None),
+            ("Спикер 3: тест", "unmatched", None),
+        ]
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                db = root / "state.sqlite3"
+                audio = root / "sample.wav"
+                audio.write_bytes(b"synthetic")
+                data = self.worker_result()
+                data["file"] = str(audio)
+                data["speakers"] = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
+                layout = recordings.document_layout(audio)
+                layout["root"].mkdir()
+                store = None
+                with mock.patch.object(settings.paths, "STATE_DB", db):
+                    try:
+                        if backend == "sqlite":
+                            store = recordings.initialize_store(db, display_name="Тест")
+                            root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                            rid = str(uuid.uuid4())
+                            recordings.commit_worker_result(
+                                store, data, audio, root_id, recordings.operation_context(store, "model"),
+                                recording_id=rid, operation_id=str(uuid.uuid4()),
+                                generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                            recordings.materialize_recording(store, rid)
+                            jp = layout["root"] / targets["json"]
+                        else:
+                            jp = layout["root"] / layout["paths"]["json"]
+                            transcript.save(data, jp, layout["root"] / layout["paths"]["md"])
+                        loaded = transcript.load(jp)
+                        entry = dict(loaded["review"][0])
+                        man = {"items": [entry]}
+                        for text, kind, speaker in cases:
+                            with self.subTest(backend=backend, answer=text):
+                                edits, reports, _, _ = freeform.plan(
+                                    man, {"r1": {"text": text}}, loaded)
+                                self.assertEqual(reports[0]["kind"], kind)
+                                if speaker and speaker != "Спикер 1":
+                                    self.assertEqual(edits[0]["speaker"], speaker)
+                                if kind == "unmatched":
+                                    self.assertFalse(edits)
+                                    self.assertTrue(reports[0]["human"])
+                    finally:
+                        if store:
+                            store.close()
 
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()

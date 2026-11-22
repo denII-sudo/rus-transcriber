@@ -352,6 +352,29 @@ class Answers(unittest.TestCase):
         self.assertEqual(freeform.classify("Борис, не Анна", self.names),
                          {"kind": "name", "speaker": "Борис"})
 
+    def test_multiword_names_and_labels(self):
+        names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
+        for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
+                              ("Анна Петровна", "Анна Петровна"), ("не Анна, а Вера", "Вера")):
+            with self.subTest(text=text):
+                self.assertEqual(freeform.classify(text, names), {"kind": "name", "speaker": speaker})
+        self.assertEqual(freeform.split_replies("Спикер 1: привет Спикер 10: пока", names),
+                         [("Спикер 1", ["привет"]), ("Спикер 10", ["пока"])])
+        self.assertEqual(freeform.split_replies("Анна Петровна: привет", names),
+                         [("Анна Петровна", ["привет"])])
+        self.assertEqual(freeform.split_replies("время: пришло", names),
+                         [(None, ["время:", "пришло"])])
+
+    def test_negated_only_and_unknown_label_need_human(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
+        for text in ("это не Анна", "Спикер 3: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+
     def test_classify(self):
         c = freeform.classify
         self.assertEqual(c("да", self.names), {"kind": "agree"})
