@@ -348,6 +348,10 @@ class Gender(unittest.TestCase):
 class Answers(unittest.TestCase):
     names = ["Анна", "Борис", "Вера", "Глеб"]
 
+    def test_negated_name_is_not_selected(self):
+        self.assertEqual(freeform.classify("Борис, не Анна", self.names),
+                         {"kind": "name", "speaker": "Борис"})
+
     def test_classify(self):
         c = freeform.classify
         self.assertEqual(c("да", self.names), {"kind": "agree"})
