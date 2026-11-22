@@ -1,4 +1,5 @@
 """Housekeeping is exercised only on disposable Git repositories, never on user worktrees."""
+import copy
 import importlib.util
 import json
 import os
@@ -17,52 +18,73 @@ aw = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(aw)
 
 
+def remove_tree(path):
+    """Delete a disposable tree on Windows too: Git object files are read-only there."""
+    for parent, _, files in os.walk(path):
+        for name in files:
+            try:
+                (Path(parent) / name).chmod(0o666)
+            except OSError:
+                pass
+    shutil.rmtree(path)
+
+
 class HousekeepingTests(unittest.TestCase):
+    """Every test works on its own copy of one synthetic repository sample.
+
+    The sample (repository, task checkout, registry) is built once per class with real Git. Each
+    test then gets a fresh copy at the same path, so absolute paths recorded inside Git and in the
+    registry stay valid, and the copy is deleted after the test: nothing is shared between tests.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        holder = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(holder.cleanup)
+        cls.root = Path(holder.name) / "work"
+        cls.sample = Path(holder.name) / "sample"
+        cls.addClassCleanup(lambda: cls.sample.exists() and remove_tree(cls.sample))
+        cls.root.mkdir()
+        repo = cls.root / "repo"
+        repo.mkdir()
+
+        def g(*args):
+            return aw.git(repo, *args)
+        g("init", "-q", "-b", "main")
+        g("config", "user.name", "Synthetic")
+        g("config", "user.email", "synthetic@example.invalid")
+        (repo / ".gitignore").write_text(".claude/worktrees/\n.opencode/worktrees/\n*.scratch\n",
+                                         encoding="utf-8")
+        (repo / "file.txt").write_text("base\n", encoding="utf-8")
+        g("add", ".")
+        g("commit", "-qm", "base")
+        cls.base = g("rev-parse", "HEAD")
+        cwd = repo / ".claude/worktrees/task"
+        g("worktree", "add", "-b", "feature/test", str(cwd), "HEAD")
+        (cwd / "file.txt").write_text("task\n", encoding="utf-8")
+        aw.git(cwd, "add", ".")
+        aw.git(cwd, "commit", "-qm", "task")
+        cls.head = aw.git(cwd, "rev-parse", "HEAD")
+        cls.sample_config = {"state": str(cls.root / "registry"), "opencode": "synthetic-opencode",
+                             "repos": [{"root": str(repo), "github": "synthetic/example",
+                                        "excluded": []}]}
+        m = aw.Manager(cls.sample_config)
+        m.register("claude", "synthetic-session", str(cwd))
+        m.release("claude", "synthetic-session")
+        shutil.move(str(cls.root), str(cls.sample))
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        shutil.copytree(self.sample, self.root, symlinks=True)
+        self.addCleanup(remove_tree, self.root)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        self.g("init", "-q", "-b", "main")
-        self.g("config", "user.name", "Synthetic")
-        self.g("config", "user.email", "synthetic@example.invalid")
-        (self.repo / ".gitignore").write_text(".claude/worktrees/\n.opencode/worktrees/\n*.scratch\n",
-                                               encoding="utf-8")
-        (self.repo / "file.txt").write_text("base\n", encoding="utf-8")
-        self.g("add", ".")
-        self.g("commit", "-qm", "base")
-        self.base = self.g("rev-parse", "HEAD")
         self.cwd = self.repo / ".claude/worktrees/task"
-        self.g("worktree", "add", "-b", "feature/test", str(self.cwd), "HEAD")
-        (self.cwd / "file.txt").write_text("task\n", encoding="utf-8")
-        aw.git(self.cwd, "add", ".")
-        aw.git(self.cwd, "commit", "-qm", "task")
-        self.head = aw.git(self.cwd, "rev-parse", "HEAD")
-        self.config = {"state": str(self.root / "registry"), "opencode": "synthetic-opencode",
-                       "repos": [{"root": str(self.repo), "github": "synthetic/example", "excluded": []}]}
+        self.config = copy.deepcopy(self.sample_config)
         self.m = aw.Manager(self.config)
-        self.m.register("claude", "synthetic-session", str(self.cwd))
-        self.m.release("claude", "synthetic-session")
         self.path = self.m.record_path("claude", "synthetic-session")
         # A verified merged PR is injected for deletion tests, never a real API.
         self.pr = patch.object(self.m, "merged_pr", return_value={"number": 1})
         self.pr.start()
         self.addCleanup(self.pr.stop)
-        # Clean Git worktrees before TemporaryDirectory on Windows (Git files may be read-only).
-        self.addCleanup(self.cleanup_git)
-
-    def cleanup_git(self):
-        if self.cwd.exists():
-            subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force",
-                            str(self.cwd)], capture_output=True)
-        # TemporaryDirectory can remove Git object files after making them writable.
-        for parent, _, files in os.walk(self.root):
-            for name in files:
-                try:
-                    (Path(parent) / name).chmod(0o666)
-                except OSError:
-                    pass
 
     def g(self, *args):
         return aw.git(self.repo, *args)
