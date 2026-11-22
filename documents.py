@@ -505,9 +505,13 @@ def _public_transcript(transcript):
         if not isinstance(quality, dict):
             raise ValueError("invalid quality")
         result["quality"] = _select_scalars(
-            quality, {"asr_incomplete_chunks": (int,), "vote3_skipped": (bool,)})
+            quality, {"asr_incomplete_chunks": (int,), "vote3_skipped": (bool, str)})
         if result["quality"].get("asr_incomplete_chunks", 0) < 0:
             raise ValueError("invalid incomplete count")
+        # words.combine_hypotheses пишет причину строкой; логическое значение — прежний вид поля
+        skipped = result["quality"].get("vote3_skipped")
+        if isinstance(skipped, str) and skipped not in ("whisper_incomplete", "asr_incomplete"):
+            raise ValueError("invalid public field: vote3_skipped")
         if "vote3_partial" in quality:      # голосование пропущено только на части отрезков
             partial = quality["vote3_partial"]
             if not isinstance(partial, dict):

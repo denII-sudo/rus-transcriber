@@ -244,6 +244,20 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("Возможный пропуск речи", md)
         self.assertEqual(json.loads(prepared["json"])["review"]["review"][0]["gap"], [1.0, 3.0])
 
+    def test_full_vote_skip_reason_string_is_accepted(self):
+        # words.combine_hypotheses пишет в vote3_skipped причину строкой; старые записи могли хранить True
+        review = {"review": [], "answers": {}}
+        for value in ("whisper_incomplete", "asr_incomplete", True):
+            with self.subTest(value=value):
+                source = dict(self.source, quality={"vote3_skipped": value})
+                prepared = documents.prepare(self.recording, 1, 1, 1, source, review, self.ctx, self.ctx, "now")
+                self.assertIn("голосование трёх моделей было пропущено", prepared["md"].decode())
+                self.assertEqual(json.loads(prepared["json"])["transcript"]["quality"], {"vote3_skipped": value})
+        for bad in ("other", "", 1, ["asr_incomplete"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                documents.prepare(self.recording, 1, 1, 1, dict(self.source, quality={"vote3_skipped": bad}),
+                                  review, self.ctx, self.ctx, "now")
+
     def test_partial_vote_skip_remains_visible(self):
         partial = {"reason": "whisper_incomplete", "spans": 2, "seconds": 3.4}
         source = dict(self.source, quality={"vote3_partial": partial})
