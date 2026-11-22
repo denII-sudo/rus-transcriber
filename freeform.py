@@ -31,8 +31,6 @@ PAD_BEFORE, PAD_AFTER, SLACK = 3.5, 1.5, 1.0
 GROW, MAX_GROW = 4.0, 2          # расширение окна, если ответ шире него (с), и сколько раз
 DUP_SEC = 2.0                    # повтор: то же слово модели не дальше этого от вставки
 MIN_ANCHORS = 0.3
-AGREE = {"да", "верно", "так", "правильно", "все верно", "всё верно", "да верно", "ага", "угу", "так и есть",
-         "как есть", "да так"}
 WORD = re.compile(r"[\wЁё][\wЁё'-]*", re.U)
 
 _MORPH = None
@@ -53,14 +51,75 @@ def norm(w):
     return re.sub(r"[^\wё-]", "", (w or "").lower().replace("ё", "е")).strip("-")   # ⟦…⟧ тоже убирается
 
 
-def negative_answer(text):
-    # Явная метка отделяет услышанную речь от оценки ответа.
-    if ":" in (text or ""):
+# ---------- 0. оценка ответа: согласие, отрицание или речь ----------
+# Один разбор для ответа текстом (classify) и голосом (review_pack.match, _add_answers, decisions).
+# Слова оценки: «верно», «правильно», «согласен» и их отрицания, «рекомендую», «принимаю».
+_EVAL = re.compile(r"(?:не)?(?:верно|правильно)|(?:не)?соглас(?:ен|на|ны|ился|илась|ились)|неверн\w*|"
+                   r"неправильн\w*|(?:не)?рекоменд\w*|(?:не)?принима\w*")
+_NEGATORS = {"не", "нет", "нет-нет", "ни", "неа", "вряд"}
+# слова, которые могут окружать отрицание, не делая ответ речью: «думаю, что совсем не верно»
+_NEG_WORDS = _NEGATORS | {"это", "я", "мы", "думаю", "считаю", "кажется", "мне", "по-моему", "что", "совершенно",
+                          "совсем", "абсолютно", "вообще", "очень", "точно", "конечно", "ли", "да", "но", "все",
+                          "так", "ну", "тут", "здесь", "а", "и", "с", "этим", "уж", "же", "наверно", "наверное",
+                          "вариант", "вариантом", "рекомендацией"}
+# слова вокруг согласия: «да, я совершенно согласен с этим», «да, как рекомендовано»
+_AGREE_WORDS = {"да", "ну", "вот", "все", "это", "я", "мы", "совершенно", "абсолютно", "конечно", "точно",
+                "полностью", "вполне", "именно", "с", "этим", "вариантом", "рекомендацией", "предложением", "как",
+                "по"}
+_AGREE_CORE = re.compile(r"верно|правильно|соглас(?:ен|на|ны)|рекоменд\w*|принимаю|да|ага|угу")
+# «оставить как есть»: согласие со стенограммой, но не с рекомендованным вариантом
+KEEP = {"так", "так и есть", "как есть", "да так"}
+AGREE_MAX_WORDS = DOUBT_MAX_WORDS = 6
+
+
+def _verdict_words(ws):
+    if not ws:
+        return None
+    if " ".join(ws) in KEEP:
+        return "keep"
+    evals = [w for w in ws if _EVAL.fullmatch(w)]
+    negated = any(w in _NEGATORS or (w.startswith("не") and _EVAL.fullmatch(w)) for w in ws)
+    if evals and negated and all(w in _NEG_WORDS or _EVAL.fullmatch(w) for w in ws):
+        return "negative"
+    core = [w for w in ws if _AGREE_CORE.fullmatch(w) or (re.fullmatch(r"предлож\w*|предлага\w*", w) and "как" in ws)]
+    if core and not negated and len(ws) <= AGREE_MAX_WORDS and all(w in _AGREE_WORDS or w in core for w in ws):
+        return "agree"
+    if evals and len(ws) <= DOUBT_MAX_WORDS:
+        return "doubtful"            # оценка вперемешку с другими словами: «неверное слово», «верно, но»
+    return None
+
+
+def labelled_answer(text, names):
+    """«Имя: слова» — слева от первого двоеточия известное имя или метка «Спикер N»: справа речь, не оценка."""
+    if ":" not in (text or ""):
         return False
-    phrase = " ".join(norm(x) for x in (text or "").split() if norm(x))
-    return bool(re.match(r"^(?:(?:нет|это|я|думаю|считаю) )*"
-                         r"(?:неверно|не верно|неправильно|не правильно|не согласен|не согласна|не согласны)"
-                         r"(?: |$)", phrase))
+    left = text.split(":", 1)[0]
+    return bool(re.fullmatch(r"\s*Спикер\s+\d+\s*", left, re.I) or _name_mentions(left.split(), names or ()))
+
+
+def answer_verdict(text, names=()):
+    """-> "agree" | "keep" | "negative" | "doubtful" | None (речь).
+    Отрицание проверяется раньше согласия; согласие — только целой фразой из слов согласия. «Имя: слова» —
+    речь (None). Двоеточие без имени слева от проверки не освобождает: «неверно: слово» — отрицание.
+    Отдельное «нет», «наверно», «проверено» — речь (слово стенограммы)."""
+    text = text or ""
+    if labelled_answer(text, names):
+        return None
+    words = lambda s: [norm(x) for x in s.split() if norm(x)]
+    if ":" in text:
+        left = _verdict_words(words(text.split(":", 1)[0]))
+        if left in ("negative", "doubtful"):
+            return left
+    return _verdict_words(words(text.replace(":", " ")))
+
+
+def negative_answer(text, names=()):
+    return answer_verdict(text, names) == "negative"
+
+
+def holds_place(text, names=()):
+    """Ответ ничего не меняет и не подтверждает: место остаётся открытым и просит верное слово."""
+    return answer_verdict(text, names) in ("negative", "doubtful")
 
 
 def tokens(text):
@@ -172,9 +231,10 @@ def classify(text, names):
     t = " ".join(norm(x) for x in (text or "").split() if norm(x))
     if not t:
         return {"kind": "skip"}
-    if negative_answer(text):
-        return {"kind": "negative"}
-    if t in AGREE:
+    verdict = answer_verdict(text, names)
+    if verdict in ("negative", "doubtful"):
+        return {"kind": verdict}
+    if verdict in ("agree", "keep"):
         return {"kind": "agree"}
     ws = t.split()
     mentions = _name_mentions(ws, names)
@@ -377,6 +437,11 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "negative":
         rep["human"] = "впишите услышанное слово"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+    if c["kind"] == "doubtful":
+        # оценка вперемешку с другими словами («неверное слово», «верно, но»): не согласие и не текст
+        rep["human"] = ("ответ не понят ни как согласие, ни как отказ; впишите услышанное слово "
+                        "(«Имя: слово», если это речь) или выберите вариант")
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":
         rep["human"] = "указано только отрицание имени; выберите говорящего"

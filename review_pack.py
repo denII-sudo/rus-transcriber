@@ -367,11 +367,33 @@ def _norm(s):
     return re.sub(r"[^\wё ]+", " ", (s or "").lower().replace("ё", "е")).split()
 
 
-def match(text, item):
-    """-> {"kind": option|recommended|human|skip|repeat|free, "option": n?}"""
+def _speaker_names(data):
+    """Имена говорящих стенограммы — как в freeform.plan."""
+    return [n for n in (data.get("speakers") or []) if n] or \
+        sorted({s.get("speaker") for s in data.get("segments") or [] if s.get("speaker")})
+
+
+def _option_ref(text):
+    """«вариант 2», «2», «второй» — ссылка на вариант, а не имя говорящего."""
+    w = _norm(text)
+    return bool(w) and all(x in ("вариант", "номер") or x.isdigit() or any(x.startswith(s) for s, _ in _ORD)
+                           for x in w)
+
+
+def match(text, item, names=None):
+    """-> {"kind": option|recommended|human|skip|repeat|free, "option": n?}
+    names — говорящие стенограммы. Без них любой ответ «X: Y», где X не вариант и не оценка, считается
+    меткой «Имя: слова» (свободный ответ), как и раньше."""
     import freeform
-    if freeform.negative_answer(text) or re.match(r"^\s*[^:]+:\s*\S", text or ""):
-        return {"kind": "free"}
+    text = text or ""
+    if ":" in text:
+        if names is not None:
+            labelled = freeform.labelled_answer(text, names)
+        else:
+            left = text.split(":", 1)[0]
+            labelled = not _option_ref(left) and freeform.answer_verdict(left) is None
+        if labelled:
+            return {"kind": "free"}
     w = _norm(text)
     j = " ".join(w)
     if not w:
@@ -380,6 +402,9 @@ def match(text, item):
         return {"kind": "repeat"}
     if re.search(r"человек|оставь|оставить|не знаю|не уверен", j):
         return {"kind": "human"}
+    verdict = freeform.answer_verdict(text, names or ())
+    if verdict in ("negative", "doubtful"):        # отрицание раньше согласия: ничего не подтверждает
+        return {"kind": "free"}
     if re.search(r"пропус|дальше|следующ", j) and len(w) <= 3:
         return {"kind": "skip"}
     opts = item.get("options") or []
@@ -391,10 +416,8 @@ def match(text, item):
             for stem, n in _ORD:
                 if x.startswith(stem) and n < len(opts):
                     return {"kind": "option", "option": n}
-        if j in {"рекомендую", "рекомендовано", "как предложено", "согласен", "согласна",
-                 "согласны", "верно", "правильно", "все верно", "да верно", "да", "ага", "угу"} and \
-                item.get("recommended") is not None:
-            return {"kind": "recommended", "option": item["recommended"]}
+    if verdict == "agree" and item.get("recommended") is not None:   # согласие — целой фразой (freeform)
+        return {"kind": "recommended", "option": item["recommended"]}
     # совпадение по словам варианта (имена, слова текста): берём вариант с наибольшим числом
     # отличительных слов — тех, что есть только в нём
     sets = [set(_norm(o["label"])) for o in opts]
@@ -444,6 +467,14 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             a["text"] = heard.get(str(a["audio"]), "")
             a["heard"] = True
     rep = {"accepted": [], "rejected": [], "conflicts": [], "free": []}
+    import freeform
+    names = ()
+    if any(a.get("text") for a in answers):
+        try:
+            import transcript as T
+            names = _speaker_names(T.load(json_path))
+        except Exception:                 # без имён match считает меткой любое «X: Y» (как раньше)
+            names = None
     for a in answers:
         aid = a.get("id")
         it = by_id.get(aid)
@@ -468,10 +499,9 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         for k in ("text", "audio", "heard", "by"):
             if a.get(k) is not None:
                 ans[k] = a[k]
-        import freeform
-        if a.get("text") and (freeform.negative_answer(a["text"]) or
-                              re.match(r"^\s*[^:]+:\s*\S", a["text"])) and not a.get("kind") and a.get("option") is None:
-            ans["kind"] = "free"
+        if a.get("text") and not a.get("kind") and a.get("option") is None and \
+                (freeform.holds_place(a["text"], names) or freeform.labelled_answer(a["text"], names)):
+            ans["kind"] = "free"            # отрицание и «Имя: слова» — не вариант и не согласие
         elif a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
             ans["kind"] = a["kind"]
             if a["kind"] == "recommended":
@@ -479,7 +509,7 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         elif a.get("option") is not None:
             ans.update(kind="option", option=int(a["option"]))
         elif a.get("heard"):                     # голос: «второй», «да», имя из варианта…
-            ans.update(match(a.get("text"), it))
+            ans.update(match(a.get("text"), it, names))
         else:                                     # набранный текст: вариант — только при точном совпадении
             t = " ".join(_norm(a.get("text")))
             hit = [n for n, o in enumerate(it["options"]) if " ".join(_norm(o["label"])) == t and t]
@@ -559,7 +589,7 @@ def decisions(json_path):
             continue
         src = f"разбор ({a['source']}, {a['ts']})"
         k = a["kind"]
-        if k == "free" and freeform.negative_answer(a.get("text")):
+        if k == "free" and freeform.holds_place(a.get("text"), _speaker_names(data)):
             # Отрицание не отменяет даже ранее применённый ответ; подсказка
             # формируется обычным разбором свободного ответа.
             rep["free"].append({"id": aid, "text": a.get("text")})
@@ -624,9 +654,13 @@ def free_answers(json_path):
     pd = pack_dir(json_path)
     store = _read_answers(json_path, {"answers": {}})
     applied = _applied_map(store)
+    names = []
+    if any(a.get("kind") == "free" and aid in applied for aid, a in store.get("answers", {}).items()):
+        import transcript as T
+        names = _speaker_names(T.load(json_path))
     return {aid: a for aid, a in store.get("answers", {}).items()
             if a.get("kind") == "free" and
-            (aid not in applied or freeform.negative_answer(a.get("text")))}
+            (aid not in applied or freeform.holds_place(a.get("text"), names))}
 
 
 def apply_free(json_path, md_path, free, dry_run=False):
@@ -713,7 +747,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
             continue
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
-    negative_ids = {r["id"] for r in reports if r.get("kind") == "negative"}
+    negative_ids = {r["id"] for r in reports if r.get("kind") in ("negative", "doubtful")}
     mark_human = [h for h in human if h["id"] not in negative_ids]
     if mark_human and not dry_run:                # отрицание оставляет место без изменений
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
