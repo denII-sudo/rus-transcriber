@@ -831,17 +831,33 @@ def list_document_conflicts(recording_id: str) -> str:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
 
 
-def _replace_window(what, waits, blocked):
-    """Действие и первая строка окна замены: обещать только то, что произойдёт после «Да»."""
-    if not waits:
+def _replace_window(what, plan):
+    """Действие и строки окна замены: обещать только то, что произойдёт после «Да»."""
+    effect = plan["effect"]
+    if effect == "close":
+        return (f"Закрыть конфликт: файл {what} уже равен версии программы",
+                ["Файл на диске не изменится; решение нельзя отменить.",
+                 "Прежняя копия правки остаётся в базе программы."])
+    if effect == "recopy":
+        return (f"Отметить прежнюю копию решённой: изменённый файл {what} не будет заменён",
+                ["Файл изменили после того, как копия была сохранена. Программа покажет новый конфликт; "
+                 "новую копию она сохранит, если файл не больше 8 МиБ.",
+                 "Прежняя копия остаётся в базе программы; решение по ней нельзя отменить."])
+    kept = ["Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
+            "Строки различий это окно не показывает; их показывает локальный экран.",
+            "Пока идёт замена, не сохраняйте этот файл в других программах: правка может пропасть без копии."]
+    if effect == "replace":
         return (f"Заменить файл {what} версией программы",
-                "Заменить файл на диске версией программы: правка в нём пропадёт.")
-    names = ", ".join(f"«{name}»" for name in waits)
+                ["Заменить файл на диске версией программы: правка в нём пропадёт.", *kept])
+    names = ", ".join(f"«{name}»" for name in (plan["waits"] if effect == "wait" else plan["stops"]))
+    cause = (f"Он ждёт решения по другому файлу: {names}. " if effect == "wait"
+             else f"Запись остановит повреждённая копия файла {names}. ")
+    if plan["blocked"]:
+        cause += "Тот файл здесь и на экране решить нельзя: нужен ручной разбор. "
+    later = ("этот изменённый файл не заменит, а покажет новый конфликт." if plan["changed"]
+             else "заменит этот сама, если он не менялся, и правка в нём пропадёт.")
     return (f"Записать решение о замене файла {what}: сейчас файл не изменится",
-            f"Он ждёт решения по другому файлу: {names}. "
-            + ("Тот файл здесь и на экране решить нельзя: нужен ручной разбор. " if blocked else "")
-            + "Решение нельзя отменить. Если тот файл будет решён, программа заменит этот сама, если он не менялся, "
-              "и правка в нём пропадёт.")
+            [cause + "Решение нельзя отменить. Если тот файл будет решён, программа " + later, *kept])
 
 
 @mcp.tool()
@@ -858,14 +874,11 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
         if not row["preserved"]:
             return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
         action, effect = _replace_window(
-            "документа", *core.replacement_waits(recording_id, conflict_id, "document"))
+            "документа", core.replacement_effect(recording_id, conflict_id, "document"))
         return await _gated(
             action,
             {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
-            lambda: [effect,
-                     "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
-                     "Строки различий это окно не показывает; их показывает локальный экран.",
-                     "Пока идёт замена, не сохраняйте этот файл в других программах: правка может пропасть без копии.",
+            lambda: [*effect,
                      f"Запись: {recording_id}; файл: {row['relative_path']}",
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_document_conflict(recording_id, conflict_id), require_human=True)
@@ -885,14 +898,11 @@ async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
         if not row["preserved"]:
             return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
         action, effect = _replace_window(
-            "конспекта", *core.replacement_waits(recording_id, conflict_id, "conspect"))
+            "конспекта", core.replacement_effect(recording_id, conflict_id, "conspect"))
         return await _gated(
             action,
             {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
-            lambda: [effect,
-                     "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
-                     "Строки различий это окно не показывает; их показывает локальный экран.",
-                     "Пока идёт замена, не сохраняйте этот файл в других программах: правка может пропасть без копии.",
+            lambda: [*effect,
                      f"Запись: {recording_id}; конспект: {row['name']}",
                      f"Файл: {row['relative_path']}",
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],

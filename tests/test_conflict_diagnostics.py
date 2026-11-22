@@ -220,5 +220,19 @@ class WaitingJourneyTests(fixtures.ScreenCase):
                                           .replace("Перенести правку файла в стенограмму здесь нельзя", ""), stage)
 
 
+@unittest.skipUnless(shutil.which("node"), "Node.js нужен для проверки JavaScript")
+class ChangedPageTests(unittest.TestCase):
+    def test_new_copy_is_promised_only_within_the_size_limit(self):
+        result = subprocess.run(
+            [shutil.which("node"), "-e", fixtures.PAGE_RUNNER],
+            input=json.dumps({"html": (fixtures.PROJECT / "workflow.html").read_text(encoding="utf-8"),
+                              "scenarios": {"changed": fixtures.page_scenarios()["changed"]}}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(result.stdout)["changed"]
+        self.assertIn("не больше 8 МиБ", seen["question"])
+        self.assertEqual(seen["panel"].count("не больше 8 МиБ"), 2, "и строка состояния файла, и вопрос")
+
+
 if __name__ == "__main__":
     unittest.main()

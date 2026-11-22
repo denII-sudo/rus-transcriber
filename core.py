@@ -974,7 +974,8 @@ def _conflict_item(store, row, rows, cache):
             "title": _real_case(row["location"], cache).name, "name": row["name"], "kind": row["kind"],
             "relative_path": row["relative_path"], "file": str(_shown_file(row, cache)),
             "observed_size": row["observed_size"], "preserved": row["preserved"], "status": "open",
-            "can_replace": False, "can_retry": False, "problem": None, "wait_reason": None}
+            "can_replace": False, "can_retry": False, "problem": None,
+            "copy_problem": None, "next_effect": None, "next_step": None}
     try:
         same_object = [other for other in rows if other["object"] == row["object"]]
         status = "resolved" if row["resolved"] else "open"
@@ -989,8 +990,12 @@ def _conflict_item(store, row, rows, cache):
         item.update(status=status,
                     can_replace=status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
                     can_retry=status == "not_written" and not any(not other["resolved"] for other in same_object))
-        if status == "not_written" and not item["can_retry"]:
-            item["wait_reason"] = _unresolvable_wait(row, same_object)
+        if status in ("open", "not_written"):    # у истории копии не читаются: их проверит скачивание
+            item["copy_problem"] = _copy_problem(store, row)
+            if item["copy_problem"]:
+                item["can_replace"] = False
+        if status == "not_written":
+            item["next_effect"], item["next_step"] = _next_step(store, row, same_object, item["copy_problem"])
     except (CoreError, storage.StorageError, sqlite3.Error, ValueError, KeyError, TypeError, OSError) as ex:
         item.update(status="damaged", can_replace=False, can_retry=False,
                     problem=str(ex) if isinstance(ex, CoreError) else
@@ -1054,7 +1059,8 @@ def _also_replaced(store, row, program):
     found = []
     for kind, other in decided.items():
         state, digest = _file_at(store, other, other["relative_path"])
-        if state == "ok" and digest == other["observed_hash"] and digest != documents._digest(program[kind]):
+        if (state == "ok" and digest == other["observed_hash"] and digest != documents._digest(program[kind])
+                and not _copy_problem(store, other)):
             found.append(other["relative_path"])
     return sorted(found)
 
@@ -1066,16 +1072,81 @@ def _waits_for(row, rows):
                    and not other["resolved"]})
 
 
-def replacement_waits(recording_id, conflict_id, kind):
-    """Чего будет ждать замена, если подтвердить её сейчас: (имена файлов, есть ли среди них неразрешимый
-    на экране); ничего не записывает."""
+def _copy_problem(store, row):
+    """Почему сохранённая копия непригодна; None — цела или её не сохраняли."""
+    if not row["preserved"]:
+        return None
+    try:
+        _observed_bytes(store, row)
+    except CoreError as ex:
+        return str(ex)
+    return None
+
+
+def _damaged_stops(store, row, rows, program):
+    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row."""
+    import documents
+    decided = {}
+    for other in rows:
+        if (other["object"] != row["object"] or not other["resolved"] or other["revision"] > row["revision"]
+                or other["kind"] not in program):
+            continue
+        same_file = (other["revision"], other["relative_path"]) == (row["revision"], row["relative_path"])
+        if same_file and not row["resolved"]:
+            continue    # новое решение заменит прежнее решение по этому же файлу
+        decided[(other["revision"], other["relative_path"])] = other
+    table, column, revision = (("document_outbox", "recording_id", "document_revision") if row["scope"] == "document"
+                               else ("conspect_outbox", "conspect_id", "revision"))
+    found, order = set(), None
+    for other in decided.values():
+        if row["scope"] == "document" and other["revision"] == row["revision"]:
+            if order is None:    # файлы документа пишутся по очереди: позднейший предыдущему не мешает
+                order = list(documents.current_paths_from_document(
+                    store.get_document(row["recording_id"], row["revision"]), row["recording_id"]))
+            if order.index(other["kind"]) > order.index(row["kind"]):
+                continue
+        state, digest = _file_at(store, other, other["relative_path"])
+        if state != "ok" or digest != other["observed_hash"] or digest == documents._digest(program[other["kind"]]):
+            continue
+        if store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
+                            (row["object"][1], other["revision"])).fetchone() and _copy_problem(store, other):
+            found.add(Path(other["relative_path"]).name)
+    return sorted(found)
+
+
+def _effect(row, state, waits, stops):
+    """Что случится с файлом при записи по решению:
+    replace — заменён; close — уже равен версии программы; recopy — изменён, будет новый конфликт;
+    wait — ждёт другого конфликта; stopped — сейчас записать нельзя."""
+    if state == "program":
+        return "close"
+    if waits:
+        return "wait"
+    if state in ("missing", "unavailable"):
+        return "stopped"
+    if state == "changed" and (row["scope"] == "conspect" or not stops):
+        return "recopy"    # у свёртки внешние правки ищутся раньше проверки копий
+    return "stopped" if stops else "replace"
+
+
+def replacement_effect(recording_id, conflict_id, kind):
+    """Для окна MCP: что произойдёт после «Да»; если заменять нельзя — отказ до окна. Ничего не записывает."""
     import recordings
     store = recordings.open_store()
     try:
         store.current_identity()
         row = _conflict_row(store, recording_id, conflict_id, kind)
-        rows = _conflict_rows(store, kind)
-        return _waits_for(row, rows), bool(_unresolvable_wait(row, rows))
+        problem = _copy_problem(store, row)
+        if problem:
+            raise CoreError(problem + " Заменить такой файл нельзя: нужен отдельный ручной разбор.")
+        if _file_at(store, row, row["relative_path"])[0] == "missing":
+            raise CoreError(_missing_text(row, "затем повторите."))
+        facts = _conflict_facts(store, row)
+        if not facts["can_replace"]:
+            raise CoreError(facts["reason"])
+        blocked = bool(_unresolvable_wait(store, row, _conflict_rows(store, kind)))
+        return {"effect": facts["effect"], "waits": facts["waits_for"], "stops": facts["stops_for"],
+                "changed": facts["file_state"] == "changed", "blocked": blocked}
     finally:
         store.close()
 
@@ -1096,13 +1167,17 @@ def _conflict_facts(store, row):
              else "same" if digest == row["observed_hash"] else "changed")
     reason = _refusal(row, state) or problem
     also = [] if reason else _also_replaced(store, row, program)
-    waits = [] if reason else _waits_for(row, _conflict_rows(store, row["scope"]))
+    rows = [] if reason else _conflict_rows(store, row["scope"])
+    waits = [] if reason else _waits_for(row, rows)
+    stops = [] if reason else _damaged_stops(store, row, rows, program)
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
-            "also_replaces": also, "waits_for": waits, "can_replace": reason is None, "reason": reason,
+            "also_replaces": also, "waits_for": waits, "stops_for": stops,
+            "effect": None if reason else _effect(row, state, waits, stops), "can_replace": reason is None, "reason": reason,
             "snapshot": None if reason else {
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
-                "program_hash": program_hash, "also_replaces": also, "waits_for": waits}}
+                "program_hash": program_hash, "also_replaces": also, "waits_for": waits,
+                "stops_for": stops}}
 
 
 def _lines(text):
@@ -1309,7 +1384,7 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
             if comparison["approximate"]:
                 notes.append("Сравнение огрублено: число строк — оценка сверху, а не точное число изменений. "
                              "В списки могли попасть совпадающие строки. Сохранённая копия доступна целиком.")
-        waits = _unresolvable_wait(row, _conflict_rows(store, row["scope"])) if can_replace else None
+        waits = _unresolvable_wait(store, row, _conflict_rows(store, row["scope"])) if can_replace else None
         if waits:
             notes.append(waits)
         removed, removed_notes, whole_removed = _present(mine, gone, theirs)
@@ -1328,6 +1403,8 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "comparison_approximate": comparison["approximate"],
                 "also_replaces": facts["also_replaces"] if can_replace else [],
                 "waits_for": facts["waits_for"] if can_replace else [], "waits_blocked": bool(waits),
+                "stops_for": facts["stops_for"] if can_replace else [],
+                "effect": facts["effect"] if can_replace else None,
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
         store.close()
@@ -1447,17 +1524,61 @@ def _file_words(row, digest):
             "Причину изменения по этой проверке установить нельзя. Сверьте его содержимое.")
 
 
-def _unresolvable_wait(row, rows):
+def _unresolvable_wait(store, row, rows):
     """Открытый конфликт того же объекта, который на экране не решить, но запись этого файла его ждёт."""
     stuck = sorted({Path(other["relative_path"]).name for other in rows
                     if other["object"] == row["object"] and other["conflict_id"] != row["conflict_id"]
-                    and not other["resolved"] and (not other["preserved"] or other["kind"].startswith("archive_"))})
+                    and not other["resolved"] and (not other["preserved"] or other["kind"].startswith("archive_")
+                                                   or _copy_problem(store, other))})
     if not stuck:
         return None
     names = ", ".join(f"«{name}»" for name in stuck)
     return (f"Запись этого файла ждёт решения по другому файлу той же записи: {names}. Но решить его на этом экране "
-            "нельзя (файл больше 8 МиБ или это архив), нужен отдельный ручной разбор. До него этот файл останется "
-            "как есть, даже если решение о замене принято.")
+            "нельзя (файл больше 8 МиБ, это архив или его копия повреждена), нужен отдельный ручной разбор. До него "
+            "этот файл останется как есть, даже если решение о замене принято.")
+
+
+def _next_step(store, row, rows, problem):
+    """Карточка принятого, но не записанного решения: (что будет с файлом, слова человеку)."""
+    import documents
+    program = _program_version(store, row)[1]
+    found, digest = _file_at(store, row, row["relative_path"])
+    state = found if found != "ok" else "same" if digest == row["observed_hash"] else "changed"
+    waits = _waits_for(row, rows)
+    stops = _damaged_stops(store, row, rows, program)
+    effect = _effect(row, state, waits, stops)
+    waiting = ""
+    if waits:
+        waiting = _unresolvable_wait(store, row, rows) or (
+            "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения).")
+    if problem:
+        if state == "missing":
+            text = ("Файла на прежнем месте нет, а его сохранённая копия повреждена, скачать её нельзя: "
+                    "нужен ручной разбор вне экрана.")
+        elif state == "same":
+            text = ("Сохранённая копия повреждена, поэтому файл заменён не будет"
+                    + (", даже когда ожидание другого файла кончится. " if waits else ". ") + documents.DAMAGED_EXIT)
+        elif state == "changed":
+            text = ("Сохранённая копия повреждена, но файл уже изменён. Заменён он не будет: когда запись дойдёт "
+                    "до него, программа покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+        else:
+            text = "Сохранённая копия повреждена, а файл сейчас не читается: освободите его и обновите список."
+        return effect, f"{waiting} {text}".strip()
+    if waits:
+        return effect, (waiting + " Если тот файл будет решён, программа допишет этот, если вы его с тех пор "
+                        "не меняли; если меняли, появится новый конфликт.")
+    if state == "missing":
+        return effect, _missing_text(row, "и нажмите «Повторить».")
+    if state == "unavailable":
+        return effect, "Файл сейчас нельзя прочитать, записать его программа не может. Освободите его и повторите."
+    if effect == "recopy":
+        return effect, ("Файл изменён после принятого решения, поэтому заменён не будет: при повторе программа "
+                        "покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+    if effect == "stopped":
+        return effect, ("Этот файл не будет записан, пока не разобрана повреждённая копия: "
+                        + ", ".join(f"«{name}»" for name in stops) + ". Выход указан в карточке того файла.")
+    return effect, ("Принятое решение программа может довести и сама, при любой следующей записи файлов этой записи, "
+                    "не спрашивая снова, если файл не меняли и другие файлы записи не помешают.")
 
 
 def _file_outcome(store, row, failure):
@@ -1471,8 +1592,12 @@ def _file_outcome(store, row, failure):
              and other["relative_path"] == row["relative_path"]]
     if fresh:
         return {"outcome": "changed", "new_conflict_id": fresh[-1]["conflict_id"], "reason": None}
-    if any(not other["resolved"] for other in rows):
-        reason = _unresolvable_wait(row, rows) or (
+    waiting = any(not other["resolved"] for other in rows)
+    problem = _copy_problem(store, row) if waiting or state == "missing" else None
+    if problem:
+        reason = _next_step(store, row, rows, problem)[1]
+    elif waiting:
+        reason = _unresolvable_wait(store, row, rows) or (
             "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
             "Если тот файл будет решён, программа допишет этот, если вы его с тех пор не меняли; "
             "если меняли, появится новый конфликт.")
