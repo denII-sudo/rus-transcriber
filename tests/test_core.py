@@ -352,6 +352,15 @@ class Answers(unittest.TestCase):
         self.assertEqual(freeform.classify("Борис, не Анна", self.names),
                          {"kind": "name", "speaker": "Борис"})
 
+    def test_negative_answer_is_not_a_replacement(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
+        for text in ("неверно", "не верно", "неправильно", "не согласен"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
         for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
