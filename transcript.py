@@ -41,6 +41,18 @@ def hms(t):
     return f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}"
 
 
+# Почему вторая или третья модель не считалась (quality.asr2_skipped / asr3_skipped, worker.run_words)
+SKIPPED_RU = {
+    ("asr2_skipped", "same_as_primary"): "Вторая модель ({model}) совпадает с основной и не считалась: "
+                                         "сверки и голосования моделей нет",
+    ("asr2_skipped", "no_word_times"): "Вторая модель ({model}) не даёт времён слов и вторым номером не "
+                                       "используется: сверки и голосования моделей нет",
+    ("asr3_skipped", "same_as_primary"): "Третья модель ({model}) совпадает с основной и не считалась: "
+                                         "голосования нет, сверены основная и вторая модели",
+    ("asr3_skipped", "same_as_second"): "Третья модель ({model}) совпадает со второй и не считалась: "
+                                        "голосования нет, сверены основная и вторая модели",
+}
+
 DOUBT_OPEN, DOUBT_CLOSE = "⟦", "⟧"
 DOUBT_LEGEND = ("_⟦…⟧ — сомнительное место, ещё не решено: слова могут быть распознаны или подписаны неверно "
                 "(подробно — review_items). В цитаты конспекта такие места не брать без проверки._")
@@ -105,19 +117,58 @@ def _seg_line(seg, marks=None):
 
 
 def is_whisper_model(model):
-    """Третья модель — Whisper: в имени есть «whisper» (без учёта регистра)."""
+    """Модель — Whisper: в имени есть «whisper» (без учёта регистра)."""
     return "whisper" in str(model or "").lower()
 
 
-def third_model_label(model, backend=""):
-    """Короткое название третьей модели для людей: Whisper, Multilingual large или имя модели.
-    Одно правило для подписи этапа обработки (worker) и варианта в стенограмме."""
+# Возможности моделей распознавания — одно место для всего конвейера (worker.run_words, подписи
+# стенограммы, выбор движков в backends.make_asr). Логика второго и третьего места спрашивает их,
+# а не имя модели. Ключ — имя модели, как в config.json (asr_model, asr_second_model, asr_third_model).
+#   label       — короткое название для людей (статус обработки, варианты в стенограмме, заметки);
+#   word_times  — модель отдаёт времена слов: True, False или None (неизвестно, проверит сам проход);
+#                 без них модель не может стоять вторым номером — голосование ставит её слова на место
+#                 по времени и исключает сбойные отрезки по времени;
+#   punctuation — текст с пунктуацией и регистром (сравнение слов от них не зависит: words.norm_word);
+#   whisper     — семейство Whisper: окно 30 с (свои куски до 28 с, asr_third_long_chunks), чистка
+#                 «субтитров» и зацикливания (words.clean_whisper), движки OpenVINO Whisper (whisper-ov);
+#   ct2         — модель есть у движка faster-whisper (whisper-ct2: он грузит только large-v3-turbo);
+#   torch       — модель есть в пакете gigaam (запасной движок PyTorch в make_asr).
+ASR_MODELS = {
+    "v3_e2e_rnnt": {"label": "RNN-T", "word_times": True, "punctuation": True, "torch": True},
+    "v3_rnnt": {"label": "RNN-T", "word_times": True, "punctuation": False, "torch": True},
+    "v3_e2e_ctc": {"label": "CTC", "word_times": True, "punctuation": True, "torch": True},
+    "v3_ctc": {"label": "CTC", "word_times": True, "punctuation": False, "torch": True},
+    # GigaAM Multilingual: CTC, текст строчными без пунктуации
+    "multilingual_ctc": {"label": "Multilingual", "word_times": True, "punctuation": False, "torch": True},
+    "multilingual_large_ctc": {"label": "Multilingual large", "word_times": True, "punctuation": False,
+                               "torch": True},
+}
+
+
+def asr_model_caps(model):
+    """Возможности модели распознавания (см. ASR_MODELS). Whisper узнаётся по имени; неизвестная
+    модель — по имени, времена слов и пунктуация неизвестны, запасной движок PyTorch не исключён."""
     name = str(model or "")
-    if str(backend or "").startswith("whisper-") or is_whisper_model(name):
+    if is_whisper_model(name):
+        return {"label": "Whisper", "word_times": False, "punctuation": True, "whisper": True,
+                "ct2": name.lower().endswith("whisper-large-v3-turbo"), "torch": False}
+    known = ASR_MODELS.get(name)
+    if known:
+        return {**known, "whisper": False, "ct2": False}
+    return {"label": name, "word_times": None, "punctuation": None, "whisper": False, "ct2": False,
+            "torch": True}
+
+
+def model_label(model, backend=""):
+    """Короткое название модели для людей: Whisper, CTC, Multilingual large или имя модели.
+    Одно правило для подписи этапа обработки (worker) и вариантов в стенограмме. Движок Whisper
+    (backend «whisper-…») — всегда Whisper: в старых результатах он подменял другую модель."""
+    if str(backend or "").startswith("whisper-"):
         return "Whisper"
-    if name == "multilingual_large_ctc":
-        return "Multilingual large"
-    return name
+    return asr_model_caps(model)["label"]
+
+
+third_model_label = model_label        # прежнее имя (PR №82): подпись третьей модели
 
 
 def _third_name(data):
@@ -128,14 +179,22 @@ def _third_name(data):
     if not model:
         return "Whisper"
     backend = str(timing.get("asr3_device") or "").split(":")[0]
-    return third_model_label(model, backend) or "Whisper"
+    return model_label(model, backend) or "Whisper"
 
 
-def _item_line(it, third_name="Whisper"):
+def _second_name(data):
+    """Подпись варианта второй модели (alt_ctc) по timing результата; нет сведений — «CTC»."""
+    timing = data.get("timing") if isinstance(data, dict) else None
+    timing = timing if isinstance(timing, dict) else {}
+    model = timing.get("asr2_model")
+    return (model_label(model) or "CTC") if model else "CTC"
+
+
+def _item_line(it, third_name="Whisper", second_name="CTC"):
     why = ", ".join(REASON_RU.get(r, r) for r in it.get("reasons", []))
     s = f"- {hms(it['t'])} {it['speaker']}: «{it['text']}» — {why}"
     if it.get("alt_ctc"):
-        s += f"; CTC: «{it['alt_ctc']}»"
+        s += f"; {second_name}: «{it['alt_ctc']}»"
     if it.get("alt_whisper"):
         s += f"; {third_name}: «{it['alt_whisper']}»"
     if it.get("voices") and "voice" in it.get("reasons", []):
@@ -162,6 +221,11 @@ def render_md(data, text_only=False):
         lines.append(f"_Голосование трёх моделей пропущено на отрезках с неполным результатом ASR: "
                      f"{p.get('spans')} (около {str(p.get('seconds')).replace('.', ',')} с); "
                      "там сверены только две модели._\n")
+    for key in ("asr2_skipped", "asr3_skipped"):
+        skipped = q0.get(key)
+        note = SKIPPED_RU.get((key, skipped.get("reason"))) if isinstance(skipped, dict) else None
+        if note:
+            lines.append("_" + note.format(model=model_label(skipped.get("model"))) + "._\n")
     if q0.get("group_doubt"):
         lines.append(f"_Внимание: {q0['group_doubt']['note']}._\n")
     if q0.get("names_outside_vocab"):
@@ -204,11 +268,12 @@ def render_md(data, text_only=False):
                 lines.append(f"- {hms(r['t'])} {r['speaker']}: {r['reason']}")
         lines.append("")
     if data.get("review"):
-        third_name = _third_name(data)
+        third_name, second_name = _third_name(data), _second_name(data)
         if data.get("review_done"):
             human = [i for i in data["review"] if i.get("status") == "human"]
             if human:
-                lines += ["## Проверить человеку", ""] + [_item_line(i, third_name) for i in human] + [""]
+                lines += ["## Проверить человеку", ""] + [_item_line(i, third_name, second_name)
+                                                         for i in human] + [""]
             if data.get("edits"):
                 lines += ["## Правки после распознавания", ""]
                 for e in data["edits"]:
@@ -222,7 +287,8 @@ def render_md(data, text_only=False):
                                  + (f" — {e['note']}" if e.get("note") else ""))
                 lines.append("")
         else:
-            lines += ["## Сомнительные места", ""] + [_item_line(i, third_name) for i in data["review"]] + [""]
+            lines += ["## Сомнительные места", ""] + [_item_line(i, third_name, second_name)
+                                                      for i in data["review"]] + [""]
     return "\n".join(lines)
 
 
@@ -588,6 +654,8 @@ def review_list(json_path, offset=0, limit=40, reasons=None, min_sec=0.0, brief=
         res["hint"] = ("Решения: apply_review(job_id, decisions). Выбирать из вариантов (текст основной модели, "
                        "alt_ctc, alt_whisper, говорящие из voices); свой текст — только для явной ошибки окончания "
                        "или слова из словаря, с note. Много мест — brief=True и фильтры reasons/min_sec.")
+        # какая модель дала варианты: ключи alt_ctc и alt_whisper — прежние, модели — любые
+        res["alt_models"] = {"alt_ctc": _second_name(data), "alt_whisper": _third_name(data)}
     return res
 
 
