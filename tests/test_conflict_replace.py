@@ -21,7 +21,9 @@ POST api/conflict/preview {recording_id, conflict_id, kind: scope}; ничего
         file_state: "program" — равен последней версии программы | "same" — равен копии | "changed" |
                     "missing" — файла нет | "unavailable" — не читается, не файл, ссылка;
         removed, added — строки копии, которые пропадут, и строки последней версии программы, которые
-                    появятся (по порядку, без переводов строк);
+                    появятся (по порядку, без переводов строк). Сравнение учитывает место строки:
+                    перестановка и перенос — тоже потеря. Длинную строку сокращать можно лишь так,
+                    чтобы изменённое место осталось видно;
         removed_total, added_total, shown_all — строки и списки можно сокращать, тогда shown_all=false;
                     слишком долгое сравнение можно огрубить, но не занижая число пропадающих строк;
         newlines_only — отличаются только CRLF/CR/LF и перевод строки в конце;
@@ -47,7 +49,12 @@ POST api/conflict/retry {recording_id, conflict_id, kind: scope}
      -> открытый или чужой конфликт — 400; иначе только прежняя запись файлов, без новых ревизий
         и решений; ответ как у resolve.
 
+Причина not_written называет настоящую причину; при журнале свёртки — выход «вернуть копию на
+место и повторить». Отказ и причина «файла нет» называют имя, под которым нужно положить копию.
+
 MCP: окна двух resolve_*_conflict говорят «заменить файл»; нет файла — отказ до записи решения.
+Остальное у MCP прежнее: состав ответа {recording_id, document_revision | conspect_id, revision;
+materialized}, materialized — ревизия дописана целиком, сбой записи — «Ошибка: …» с причиной.
 """
 import asyncio
 import gc
@@ -59,6 +66,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -292,6 +300,14 @@ class ScreenCase(unittest.TestCase):
             self.save_conspect(rec)
         self.materialize(rec, scope)
         return self.open_case(rec, scope, kind)
+
+    def conspect_texts(self, program, mine):
+        """Конфликт свёртки с заданным текстом программы и заданной правкой человека."""
+        rec = self.recording()
+        self.save_conspect(rec, md=program.encode("utf-8"))
+        rec.conspect_files["md"].write_bytes(mine.encode("utf-8"))
+        self.materialize(rec, "conspect")
+        return self.open_case(rec, "conspect", "md")
 
     def both_conspect_files(self):
         rec = self.recording()
@@ -1289,6 +1305,376 @@ class LegacyWithDatabaseTests(ScreenCase):
         self.assertEqual(self.item(case)["status"], "open")
 
 
+class ConflictTruthTests(ScreenCase):
+    """Сравнение не прячет потерь, а причина и отказ не уводят человека по ложному пути."""
+
+    def test_moved_lines_are_losses(self):
+        program = "Анна: да\nБорис: нет\nАнна: беру\nБорис: жду\n"
+        variants = {
+            "swap": ("Борис: нет\nАнна: да\nАнна: беру\nБорис: жду\n", 1),
+            "move": ("Борис: нет\nАнна: беру\nБорис: жду\nАнна: да\n", 1),
+            "move and edit": ("Борис: нет\nАнна: беру два\nБорис: жду\nАнна: да\n", 2)}
+        for label, (mine, at_least) in variants.items():
+            with self.subTest(variant=label):
+                shown = self.preview(self.conspect_texts(program, mine))
+                self.assertGreaterEqual(shown["removed_total"], at_least)
+                self.assertTrue(set(shown["removed"]) <= set(mine.split("\n")), shown["removed"])
+                self.assertTrue(shown["added"])
+                self.assertIs(shown["newlines_only"], False)
+
+    def test_replica_moved_to_another_speaker_is_loss(self):
+        shown = self.preview(self.conspect_texts("Анна:\nкогда\nБорис:\nзавтра\n",
+                                                 "Анна:\nзавтра\nБорис:\nкогда\n"))
+        self.assertGreater(shown["removed_total"], 0)
+        self.assertTrue(shown["removed"])
+
+    def test_edit_inside_long_line_is_visible(self):
+        line = "реплика монолога " * 500
+        variants = {"end": line + "ВАЖНАЯ ПРАВКА", "middle": line[:4000] + "ВАЖНАЯ ПРАВКА" + line[4000:]}
+        for label, mine in variants.items():
+            with self.subTest(place=label):
+                shown = self.preview(self.conspect_texts(line + "\n", mine + "\n"))
+                self.assertTrue("ВАЖНАЯ ПРАВКА" in "\n".join(shown["removed"]),
+                                "правка в длинной строке не видна перед заменой")
+
+    def test_missing_file_names_where_to_put_the_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                case.path.unlink()
+                self.assertIn(case.path.name, self.preview(case)["reason"])
+                status, _, raw = self.request("POST", "api/conflict/resolve",
+                                              {"snapshot": snapshot, "confirm": True})
+                self.assertEqual(status, 400)
+                self.assertIn(case.path.name, json.loads(raw)["error"])
+                self.resolve_directly(case)
+                self.assertIn(case.path.name, self.retry(case)["reason"])
+
+    def test_journal_reason_gives_the_way_out(self):
+        case = self.conflict("conspect")
+        snapshot = self.snapshot(case)
+        with failing_replace(case.path):
+            self.replace(snapshot)
+        case.path.write_bytes(LATE_EDIT)
+        reason = self.retry(case)["reason"].casefold()
+        self.assertNotIn("открыт в другой программе", reason)
+        self.assertRegex(reason, "верн|полож")
+        self.assertIn("копи", reason)
+
+    def test_busy_database_is_named(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        with mock.patch.object(recordings, "materialize_recording",
+                               side_effect=storage.Busy("database is busy")):
+            result = self.replace(snapshot)
+        self.assertEqual(result["outcome"], "not_written")
+        self.assertRegex(result["reason"].casefold(), r"\bбаз")
+        self.assertNotIn("открыт в другой программе", result["reason"])
+
+    def test_program_error_is_not_blamed_on_editor(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        with mock.patch.object(recordings, "materialize_recording", side_effect=RuntimeError("synthetic bug")):
+            result = self.replace(snapshot)
+        self.assertEqual(result["outcome"], "not_written")
+        self.assertIn("ошибк", result["reason"].casefold())
+        self.assertNotIn("открыт в другой программе", result["reason"])
+
+    def test_outcome_is_returned_if_database_fails_after_decision(self):
+        for label, error in (("busy", storage.Busy("database is busy")),
+                             ("sqlite", sqlite3.OperationalError("disk I/O error"))):
+            with self.subTest(error=label):
+                case = self.conflict("document")
+                snapshot = self.snapshot(case)
+                original = storage.Store.get_document
+                decided = []
+
+                def get_document(store, *args, **kwargs):
+                    if decided:
+                        raise error
+                    return original(store, *args, **kwargs)
+                with self.after_decision("document", lambda: decided.append(True)), \
+                        mock.patch.object(storage.Store, "get_document", get_document):
+                    try:
+                        status, _, raw = self.request("POST", "api/conflict/resolve",
+                                                      {"snapshot": snapshot, "confirm": True})
+                    except (http.client.HTTPException, ConnectionError) as ex:
+                        self.fail(f"решение записано, а ответа нет: {type(ex).__name__}")
+                self.assertFalse(self.is_open(case))
+                self.assertEqual(status, 200, f"решение записано, а ответ — отказ: {raw[:200]!r}")
+                result = json.loads(raw)
+                self.assertEqual(result["outcome"], "not_written")
+                self.assertRegex(result["reason"], CYRILLIC)
+                self.assertEqual(case.path.read_bytes(), case.saved)
+
+
+class ConflictMCPCompatibilityTests(ScreenCase):
+    """У MCP по плану меняются только текст окна и отказ при пропавшем файле."""
+
+    def resolve(self, case):
+        with mock.patch.object(confirm, "require", return_value="dialog"):
+            return asyncio.run(getattr(server, f"resolve_{case.scope}_conflict")(case.rid, case.id))
+
+    def test_response_keeps_shape(self):
+        fields = {"document": {"recording_id", "document_revision", "materialized"},
+                  "conspect": {"conspect_id", "revision", "materialized"}}
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                answer = json.loads(self.resolve(self.conflict(scope)))
+                self.assertEqual(set(answer), fields[scope])
+                self.assertIs(answer["materialized"], True)
+
+    def test_materialized_still_means_whole_revision(self):
+        case = self.conflict("document", kind="json")
+        case.rec.files["md"].write_bytes(LATE_EDIT)
+        self.assertIs(json.loads(self.resolve(case))["materialized"], False)
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "json"))
+        self.assertEqual([row["kind"] for row in core.list_document_conflicts(case.rid)], ["md"])
+
+    def test_failed_write_is_still_error_with_cause(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                with failing_replace(case.path):
+                    answer = self.resolve(case)
+                self.assertTrue(answer.startswith("Ошибка:"), answer)
+                self.assertIn("synthetic busy file", answer)
+
+
+class LegacyPromiseTests(ScreenCase):
+    backend = "legacy_files"
+    with_database = False
+
+    def test_legacy_mode_does_not_promise_protection(self):
+        self.assertRegex(self.listing()["reason"].casefold(), "перезапи|затира")
+
+
+# Страница в Node.js с маленькой подменой DOM: только то, что видит и нажимает человек.
+PAGE_RUNNER = r"""
+const vm = require("vm");
+const {html, scenarios} = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const script = /<script>([\s\S]*)<\/script>/.exec(html)[1];
+
+async function run(sc) {
+  const shown = [], requests = [];
+  class El {
+    constructor(tag) {
+      Object.assign(this, {tagName: tag.toUpperCase(), children: [], parentNode: null, own: "", html: "",
+        className: "", dataset: {}, style: {}, hidden: false, open: false, value: "", checked: false, root: false});
+      this.classList = {add: () => {}, remove: () => {}, toggle: () => {}, contains: () => false};
+    }
+    get childNodes() { return this.children; }
+    get firstChild() { return this.children[0] || null; }
+    get parentElement() { return this.parentNode; }
+    get isConnected() { return this.root || !!(this.parentNode && this.parentNode.isConnected); }
+    set textContent(t) { this.children = []; this.html = ""; this.own = String(t ?? ""); }
+    get textContent() { return this.own + this.html + this.children.map(c => c.textContent).join("\n"); }
+    get innerText() { return this.textContent; }
+    set innerHTML(t) { this.children = []; this.own = ""; this.html = String(t); }
+    get innerHTML() { return this.html; }
+    append(...xs) {
+      for (let x of xs) {
+        if (!(x instanceof El)) { const t = new El("text"); t.own = String(x); x = t; }
+        if (x.parentNode) x.remove();
+        x.parentNode = this;
+        this.children.push(x);
+      }
+    }
+    appendChild(x) { this.append(x); return x; }
+    prepend(...xs) { this.append(...xs); }
+    insertBefore(x) { this.append(x); return x; }
+    replaceChildren(...xs) {
+      this.children.forEach(c => { c.parentNode = null; });
+      this.children = []; this.own = ""; this.html = "";
+      this.append(...xs);
+    }
+    remove() {
+      if (!this.parentNode) return;
+      this.parentNode.children = this.parentNode.children.filter(c => c !== this);
+      this.parentNode = null;
+    }
+    all() { return this.children.flatMap(c => [c, ...c.all()]); }
+    querySelectorAll(q) {
+      return this.all().filter(e => q[0] === "." ? String(e.className).split(" ").includes(q.slice(1))
+        : e.tagName === q.toUpperCase());
+    }
+    querySelector(q) { return this.querySelectorAll(q)[0] || null; }
+    closest() { return null; }
+    setAttribute(k, v) { this[k === "class" ? "className" : k] = v === "" ? true : v; }
+    removeAttribute(k) { this[k] = false; }
+    addEventListener(k, f) { this["on" + k] = f; }
+    scrollIntoView() { shown.push(this.textContent); }
+    focus() { shown.push(this.textContent); }
+    click() { if (!this.disabled && this.onclick) return this.onclick({target: this, preventDefault() {}}); }
+  }
+  const ids = {};
+  for (const m of html.matchAll(/<(\w+)[^>]*?\bid="([^"]+)"/g)) {
+    ids[m[2]] = new El(m[1]);
+    ids[m[2]].root = true;
+  }
+  const body = new El("body");
+  body.root = true;
+  const every = () => [...Object.values(ids), body].flatMap(e => [e, ...e.all()]);
+  const document = {body, createElement: t => new El(t), getElementById: id => ids[id] || null,
+    createTextNode: t => { const e = new El("text"); e.own = t; return e; },
+    querySelector: q => q[0] === "#" ? ids[q.slice(1)] || null : null,
+    querySelectorAll: () => [], addEventListener: () => {}};
+  const replies = {
+    "api/requests": {requests: []}, "api/conflicts/all": {available: true, reason: null, items: sc.items || []},
+    "api/conflict/preview": sc.preview, "api/conflict/resolve": sc.result, "api/conflict/retry": sc.result,
+    "api/status": {request_id: "q", state: "completed", readiness: {}}, "api/questions": {questions: []},
+    "api/result": {recording_id: "r", segments: [], doubts: [], speakers: [], files: {}},
+    "api/conspects": {conspects: []}, "api/verify/prepare": {document: "d"},
+    "api/restore/prepare": {document: "d", source_revision: 1, review_revision: 1},
+    "api/restore/confirm": {materialized: false}, "api/history": {revisions: []}};
+  async function fetch(path) {
+    const key = String(path).split("?")[0];
+    requests.push(key);
+    const data = replies[key] || {};
+    return {ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(data)), headers: {get: () => ""}};
+  }
+  const context = {document, fetch, setTimeout, clearTimeout, console, encodeURIComponent, decodeURIComponent,
+    requestAnimationFrame: f => setTimeout(f, 0), location: {pathname: "/t/"}, URL, confirm: () => false};
+  context.window = context;
+  vm.createContext(context);
+  vm.runInContext(script, context);
+  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setTimeout(r, 0)); };
+  await settle();
+  const out = {};
+  const card = () => every().find(e => String(e.className).split(" ").includes("conflict"));
+  if (sc.request) {
+    requests.length = 0;
+    context.openRequest("q");
+    await settle();
+    out.afterOpen = [...requests];
+  }
+  if (sc.restore) {
+    await context.prepareRestore("transcript", 1, 1, 1);
+    requests.length = 0;
+    await every().find(e => e.tagName === "BUTTON" && e.textContent === "Подтвердить возврат").click();
+    await settle();
+    out.afterRestore = [...requests];
+  }
+  if (card()) {
+    out.card = card().textContent;
+    out.folded = false;
+    for (let e = card(); e; e = e.parentNode) {
+      if ((e.tagName === "DETAILS" && !e.open) || e.hidden) out.folded = true;
+    }
+  }
+  if (sc.compare || sc.confirm) {
+    const look = card().querySelectorAll("button").find(b => /^(Заменить файл|Показать сравнение)/.test(b.textContent));
+    await look.click();
+    await settle();
+    const panel = card().querySelector(".panel");
+    out.panel = panel.textContent;
+    const ask = panel.querySelector(".ask");
+    out.question = ask ? ask.textContent : "";
+    if (sc.confirm) {
+      requests.length = 0;
+      shown.length = 0;
+      await ask.querySelectorAll("button").find(b => b.textContent !== "Отмена").click();
+      await settle();
+      out.afterConfirm = [...requests];
+      out.shown = [...shown];
+    }
+  }
+  return out;
+}
+
+(async () => {
+  const out = {};
+  for (const [name, sc] of Object.entries(scenarios)) {
+    try { out[name] = await run(sc); } catch (e) { out[name] = {error: String(e.stack || e)}; }
+  }
+  process.stdout.write(JSON.stringify(out), () => process.exit(0));
+})();
+"""
+
+
+def page_scenarios():
+    item = {"conflict_id": "c", "scope": "document", "recording_id": "r", "title": "встреча.wav", "name": None,
+            "kind": "md", "relative_path": "Встреча.transcript.md", "file": "c:/x/Встреча.transcript.md",
+            "observed_size": 10, "preserved": True, "status": "open", "can_replace": True, "can_retry": False}
+    shown = {"conflict_id": "c", "kind": "md", "relative_path": item["relative_path"], "file": item["file"],
+             "preserved": True, "preview": "моя правка", "truncated": False, "file_state": "same",
+             "removed": ["моя правка"], "added": ["версия"], "removed_total": 1, "added_total": 1,
+             "shown_all": True, "newlines_only": False, "also_replaces": [], "can_replace": True,
+             "reason": None, "snapshot": {"any": 1}}
+    closed = {"can_replace": False, "snapshot": None}
+    return {
+        "open": {"items": [item]},
+        "changed": {"items": [item], "compare": True, "preview": {**shown, "file_state": "changed"}},
+        "big": {"items": [{**item, "preserved": False, "can_replace": False, "observed_size": 9000000}],
+                "compare": True,
+                "preview": {**shown, **closed, "preserved": False, "preview": None, "removed": [], "added": [],
+                            "removed_total": 0, "added_total": 0, "reason": "Файл больше 8 МиБ."}},
+        "archive": {"items": [{**item, "kind": "archive_md", "can_replace": False}]},
+        "resolved": {"items": [{**item, "status": "resolved", "can_replace": False}], "compare": True,
+                     "preview": {**shown, **closed, "file_state": "program", "reason": "Уже решён."}},
+        "waiting": {"items": [{**item, "status": "not_written", "can_replace": False}]},
+        "request": {"request": True, "items": [item]},
+        "restore": {"request": True, "restore": True, "items": []},
+        "confirm": {"request": True, "confirm": True, "items": [item], "preview": shown,
+                    "result": {"outcome": "replaced", "new_conflict_id": None, "reason": None}}}
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js нужен для проверки JavaScript")
+class ConflictPageBehaviourTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        given = json.dumps({"html": (PROJECT / "workflow.html").read_text(encoding="utf-8"),
+                            "scenarios": page_scenarios()}, ensure_ascii=False)
+        done = subprocess.run([shutil.which("node"), "-e", PAGE_RUNNER], input=given, capture_output=True,
+                              text=True, encoding="utf-8", timeout=60)
+        cls.seen = json.loads(done.stdout) if done.returncode == 0 and done.stdout else {}
+        cls.failure = done.stderr
+
+    def seen_in(self, name):
+        self.assertIn(name, self.seen, self.failure)
+        self.assertNotIn("error", self.seen[name], self.seen[name].get("error"))
+        return self.seen[name]
+
+    def test_question_does_not_promise_replace_of_changed_file(self):
+        question = self.seen_in("changed")["question"]
+        self.assertTrue(question, "вопрос перед действием остаётся")
+        self.assertNotIn("будет заменён версией программы", question)
+
+    def test_unsaved_big_file_is_not_called_equal_to_copy(self):
+        self.assertNotIn("равен вашей сохранённой копии", self.seen_in("big")["panel"])
+
+    def test_dead_end_does_not_advise_to_repeat_edit(self):
+        for name in ("big", "archive"):
+            with self.subTest(conflict=name):
+                self.assertNotIn("повторите", self.seen_in(name)["card"].casefold())
+
+    def test_open_conflict_tells_how_edit_reaches_transcript(self):
+        self.assertIn("карточ", self.seen_in("open")["card"].casefold())
+
+    def test_resolved_copy_is_not_described_as_future_replace(self):
+        self.assertNotIn("при замене", self.seen_in("resolved")["panel"].casefold())
+
+    def test_waiting_for_second_file_is_not_called_failed_write(self):
+        self.assertNotIn("не удалось", self.seen_in("waiting")["card"].casefold())
+
+    def test_saved_copies_are_folded(self):
+        self.assertTrue(self.seen_in("resolved")["folded"], "решённые копии отодвигают форму запуска")
+
+    def test_opening_request_refreshes_conflicts(self):
+        self.assertIn("api/conflicts/all", self.seen_in("request")["afterOpen"])
+
+    def test_restore_refreshes_conflicts(self):
+        self.assertIn("api/conflicts/all", self.seen_in("restore")["afterRestore"])
+
+    def test_replace_refreshes_open_request(self):
+        self.assertIn("api/status", self.seen_in("confirm")["afterConfirm"])
+
+    def test_outcome_is_brought_into_view(self):
+        self.assertTrue(any("заменён" in text for text in self.seen_in("confirm")["shown"]),
+                        "итог остаётся за краем экрана")
+
+
 class ConflictPageTests(unittest.TestCase):
     """Только видимое без браузера; поведение страницы проверяется в браузере."""
 
@@ -1310,6 +1696,10 @@ class ConflictPageTests(unittest.TestCase):
         conflicts = self.html.index('id="conflicts"')
         self.assertLess(conflicts, self.html.index('id="audio"'))
         self.assertLess(conflicts, self.html.index('id="detail"'))
+
+    def test_section_does_not_promise_protection_outside_database(self):
+        section = self.html[self.html.index('id="conflicts"'):]
+        self.assertIn("вне базы", section[:section.index("</section>")].casefold())
 
     def test_page_uses_common_list(self):
         self.assertTrue("api/conflicts/all" in self.html, "страница не читает общий список конфликтов")
