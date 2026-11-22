@@ -55,6 +55,45 @@ class MatchSectionsTests(unittest.TestCase):
         self.assertEqual(hotspots.match_sections(sections, [a, gap, b, low], min_score=.5),
                          [[a], [], [], [b]])
 
+    def test_fractional_tie_and_distinct_overlap(self):
+        sections = [section(.2, .4, "later"), section(0, .2, "earlier")]
+        tied = place(.1, .3, .8, "tie")
+        later = place(.1, .300001, .8, "later")
+        self.assertEqual(hotspots.match_sections(sections, [tied, later], top_n=2),
+                         [[later], [tied]])
+        self.assertEqual(hotspots.match_sections(list(reversed(sections)), [tied], min_score=0),
+                         [[tied], []])
+
+    def test_equal_strength_uses_input_order_at_cutoff(self):
+        sections = [section(0, 10, "a")]
+        first = place(4, 5, .7, "first")
+        second = place(1, 2, .7, "second")
+        self.assertEqual(hotspots.match_sections(sections, [first, second], top_n=1), [[first]])
+        self.assertEqual(hotspots.match_sections(sections, [second, first], top_n=1), [[second]])
+
+    def test_every_place_is_validated_before_selection(self):
+        good = place(1, 2, .8, "good")
+        invalid = [
+            None, {}, place("1", 2, .5, "bad"), place(1, None, .5, "bad"),
+            place(float("nan"), 2, .5, "bad"), place(1, float("inf"), .5, "bad"),
+            place(-1, 2, .5, "bad"), place(2, 2, .5, "bad"),
+            place(3, 2, .5, "bad"), place(1, 2, "0.5", "bad"),
+            place(1, 2, float("nan"), "bad"), place(1, 2, float("inf"), "bad"),
+            place(1, 2, -.1, "bad"), place(1, 2, 1.1, "bad"),
+            place(True, 2, .5, "bad"), place(1, 2, False, "bad"),
+        ]
+        for bad in invalid:
+            for options in ({"top_n": 0}, {"top_n": 1}, {"min_score": .9}):
+                with self.subTest(bad=bad, options=options):
+                    with self.assertRaisesRegex(ValueError, "место 1"):
+                        hotspots.match_sections([section(0, 10, "a")], [good, bad], **options)
+
+    def test_valid_score_endpoints(self):
+        zero = place(0, 1, 0, "zero")
+        one = place(1, 2, 1, "one")
+        self.assertEqual(hotspots.match_sections([section(0, 2, "a")], [zero, one], min_score=0),
+                         [[zero, one]])
+
     def test_selection_mode_validation(self):
         for options in ({}, {"top_n": 1, "min_score": .5}, {"top_n": -1},
                         {"top_n": True}, {"min_score": float("nan")}):

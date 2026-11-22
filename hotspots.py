@@ -433,8 +433,11 @@ def match_sections(sections, places, *, top_n=None, min_score=None):
     При равной силе раньше выбирается место, идущее раньше во входном списке.
 
     Место относится только к одному разделу с наибольшей длиной пересечения;
-    при равенстве — к разделу с более ранним началом, а при одинаковом начале
-    — к первому во входе. Касание границ не считается пересечением. Разделы
+    при равенстве с учётом погрешности float (четыре ULP границ) — к разделу
+    с более ранним началом, а при одинаковом начале — к первому во входе.
+    Время места — конечные числа 0 <= t1 < t2, score — конечное число от 0 до 1;
+    все места проверяются до отбора, иначе ValueError с номером места.
+    Касание границ не считается пересечением. Разделы
     без времени или нулевой длины остаются пустыми. Места внутри каждого
     раздела идут в исходном порядке; входные данные не изменяются.
     """
@@ -445,6 +448,15 @@ def match_sections(sections, places, *, top_n=None, min_score=None):
     if min_score is not None and not _num(min_score):
         raise ValueError("min_score должен быть конечным числом")
 
+    for i, place in enumerate(places):
+        if not isinstance(place, dict):
+            raise ValueError(f"место {i}: ожидается словарь")
+        start, end, score = place.get("t1"), place.get("t2"), place.get("score")
+        if not _num(start) or not _num(end) or not 0 <= start < end:
+            raise ValueError(f"место {i}: ожидаются конечные времена 0 <= t1 < t2")
+        if not _num(score) or not 0 <= score <= 1:
+            raise ValueError(f"место {i}: score должен быть конечным числом от 0 до 1")
+
     if top_n is not None:
         selected = sorted(range(len(places)), key=lambda i: -places[i]["score"])[:top_n]
         selected.sort()
@@ -454,14 +466,18 @@ def match_sections(sections, places, *, top_n=None, min_score=None):
     result = [[] for _ in sections]
     for i in selected:
         place = places[i]
-        best_index, best_overlap, best_start = None, 0, None
+        best_index, best_overlap, best_start, best_tolerance = None, 0, None, 0
         for j, section in enumerate(sections):
             start, end = section.get("t1"), section.get("t2")
             if not _num(start) or not _num(end) or end <= start:
                 continue
             overlap = min(end, place["t2"]) - max(start, place["t1"])
-            if overlap > best_overlap or (overlap > 0 and overlap == best_overlap and start < best_start):
-                best_index, best_overlap, best_start = j, overlap, start
+            if overlap <= 0:
+                continue
+            tolerance = 4 * max(math.ulp(v) for v in (start, end, place["t1"], place["t2"]))
+            tied = best_index is not None and abs(overlap - best_overlap) <= max(tolerance, best_tolerance)
+            if best_index is None or (tied and start < best_start) or (not tied and overlap > best_overlap):
+                best_index, best_overlap, best_start, best_tolerance = j, overlap, start, tolerance
         if best_index is not None:
             result[best_index].append(place)
     return result
