@@ -1,5 +1,6 @@
 import copy
 import asyncio
+import contextlib
 import json
 import os
 import http.client
@@ -17,6 +18,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 import documents
+import freeform
 import recordings
 import review_pack
 import settings
@@ -46,6 +48,137 @@ class WorkerSnapshotTests(unittest.TestCase):
             "review_done": False,
             "edits": [],
         }
+
+    NAME_SPEAKERS = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера", "Глеб"]
+
+    def answer_result(self, word_ids=False):
+        """Результат с одним словом «тест» у Глеба: любой названный в ответе говорящий — это правка."""
+        data = self.worker_result()
+        data["speakers"] = list(self.NAME_SPEAKERS)
+        data["segments"][0]["speaker"] = "Глеб"
+        data["review"][0]["speaker"] = "Глеб"
+        if word_ids:
+            data["segments"][0]["words"][0]["word_id"] = "w1"
+            data["review"][0]["word_ids"] = ["w1"]
+        else:                     # старый вид карточки: без номеров слов (пустой список — не старый вид)
+            data["review"][0].pop("word_ids", None)
+        return data
+
+    @contextlib.contextmanager
+    def answer_files(self, backend, data=None):
+        """Пара файлов стенограммы в выбранном режиме хранения: (jp, md). Папка и база — временные."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db, audio = root / "state.sqlite3", root / "sample.wav"
+            audio.write_bytes(b"synthetic")
+            data = copy.deepcopy(data or self.answer_result())
+            data["file"] = str(audio)
+            layout = recordings.document_layout(audio)
+            layout["root"].mkdir()
+            store = None
+            with mock.patch.object(settings.paths, "STATE_DB", db), \
+                    mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
+                try:
+                    if backend == "sqlite":
+                        store = recordings.initialize_store(db, display_name="Тест")
+                        root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                        rid = str(uuid.uuid4())
+                        recordings.commit_worker_result(
+                            store, data, audio, root_id, recordings.operation_context(store, "model"),
+                            recording_id=rid, operation_id=str(uuid.uuid4()),
+                            generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                        recordings.materialize_recording(store, rid)
+                        jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                    else:
+                        jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
+                        transcript.save(data, jp, md)
+                    yield jp, md
+                finally:
+                    if store:
+                        store.close()
+
+    @staticmethod
+    def answer_card(jp, md, answers, recommended=0):
+        """Собрать пакет, по очереди сохранить и применить ответы человека: [(текст, голос?)] | {"option": n}.
+        -> отчёт последнего применения."""
+        question = {"id": "r1", "question": "Проверьте", "recommended": recommended, "options": [
+            {"label": "Другое слово", "decision": {"text": "другое"}},
+            {"label": "Третье слово", "decision": {"text": "третье"}}]}
+        pack = review_pack.build(jp, [question])
+        result = None
+        for answer in answers:
+            row = {"id": "r1", "version": pack["version"]}
+            if isinstance(answer, dict):
+                row.update(answer)
+            else:
+                row.update(text=answer[0], heard=answer[1])
+            review_pack.add_answers(jp, [row], "local", trusted_actor="human")
+            result = core.apply_answers_files(jp, md)
+        return result
+
+    @staticmethod
+    def card_state(jp):
+        d = transcript.load(jp)
+        return ([w["w"] for s in d["segments"] for w in s["words"]],
+                [s["speaker"] for s in d["segments"]], d["review"][0].get("status"))
+
+    def test_names_and_labels_in_both_storage_modes(self):
+        # Различий между режимами хранения в разборе ответа нет: один и тот же ожидаемый итог для обоих.
+        cases = [
+            ("Спикер 1:", "name", "Спикер 1"),
+            ("Спикер 1", "name", "Спикер 1"),
+            ("Спикер 10", "name", "Спикер 10"),
+            ("Анна", "name", "Анна"),
+            ("Анна Петровна", "name", "Анна Петровна"),
+            ("Борис, не Анна", "name", "Борис"),
+            ("не Анна, а Вера", "name", "Вера"),
+            ("это не Анна", "unmatched", None),
+            ("нет, не Анна", "unmatched", None),
+            ("не Анна и не Борис", "unmatched", None),
+            ("ни Анна, ни Борис", "unmatched", None),
+            ("не Анна: тест", "unmatched", None),
+            ("ни Анна: тест", "unmatched", None),
+            ("нет, Анна: тест", "unmatched", None),
+            ("не Спикер 1: тест", "unmatched", None),
+            ("Спикер 3: тест", "unmatched", None),
+        ]
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), self.answer_files(backend) as (jp, _md):
+                loaded = transcript.load(jp)
+                man = {"items": [dict(loaded["review"][0])]}
+                for text, kind, speaker in cases:
+                    with self.subTest(backend=backend, answer=text):
+                        edits, reports, _, _ = freeform.plan(man, {"r1": {"text": text}}, loaded)
+                        self.assertEqual(reports[0]["kind"], kind)
+                        if speaker:
+                            self.assertEqual([e["speaker"] for e in edits], [speaker])
+                        if kind == "unmatched":
+                            self.assertFalse(edits)
+                            self.assertTrue(reports[0]["human"])
+
+    def test_name_answers_applied_in_both_storage_modes(self):
+        # Сквозной путь: ответ сохранён и применён. Итог одинаков для sqlite и legacy_files.
+        named = [("Спикер 1:", "Спикер 1"), ("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),
+                 ("Анна", "Анна"), ("Анна Петровна", "Анна Петровна"), ("Борис, не Анна", "Борис"),
+                 ("не Анна, а Вера", "Вера"), ("нет, не Анна, а Вера", "Вера")]
+        to_human = ["это не Анна", "нет, не Анна", "не Анна и не Борис", "ни Анна, ни Борис",
+                    "не Анна: тест", "нет, Анна: тест", "Спикер 3: тест"]
+        for backend in ("legacy_files", "sqlite"):
+            for ids in (False, True):
+                for text, speaker in named:
+                    with self.subTest(backend=backend, word_ids=ids, answer=text), \
+                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
+                        self.answer_card(jp, md, [(text, False)])
+                        self.assertEqual(self.card_state(jp)[:2], (["тест"], [speaker]))
+                        if "не Анна" in text:      # отрицаемое имя не назначено ни одной правкой
+                            edits = transcript.load(jp).get("edits") or []
+                            self.assertNotIn("Анна", json.dumps(edits, ensure_ascii=False).replace(text, ""))
+                for text in to_human:
+                    with self.subTest(backend=backend, word_ids=ids, answer=text), \
+                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, False)])
+                        self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "human"))
+                        self.assertTrue(result["free_text"]["left_to_human"])
 
     def test_maps_worker_output_and_preserves_runtime_metadata(self):
         source = self.worker_result()

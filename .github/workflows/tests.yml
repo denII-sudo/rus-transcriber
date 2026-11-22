@@ -50,11 +50,15 @@ jobs:
           python -m pip install --disable-pip-version-check
           torch==2.15.0
           --index-url https://download.pytorch.org/whl/cpu
+      # Набор идёт один раз, с подробным выводом (при падении в журнале виден полный разбор).
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
-      # так же, как self_check у пользователя после обновления: свои временные папки и данные
-      - name: Run self-check like an installed copy
-        run: python -B selfcheck.py
+      # Остальные проверки самопроверки установленной копии (файлы на личные данные, морфология,
+      # сведения о сборке) без повторного запуска набора: selfcheck.py без --no-tests прогонял бы
+      # те же тесты второй раз (около 2,5 минут). Сама самопроверка с тестами проверяется
+      # tests/test_selfcheck.py и при установке (шаг 10 install.ps1).
+      - name: Run self-check checks without repeating the unit tests
+        run: python -B rt.py self-check --no-tests
       # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,
       # по одному в строке. Журнал публичный: --hide-words выводит только файл и строку, без слова.
       # PR из форков секрет не получают — там проверка пропускается с пометкой.

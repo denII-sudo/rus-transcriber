@@ -117,6 +117,47 @@ def similar(a, b):
 
 
 # ---------- 1–2. вид ответа и реплики ----------
+def _name_at(toks, pos, names):
+    """Имя из целых слов; при совпадении префиксов выбирается самое длинное."""
+    candidates = sorted(((tuple(norm(x) for x in n.split()), n) for n in names if n),
+                        key=lambda pair: len(pair[0]), reverse=True)
+    for parts, name in candidates:
+        if tuple(norm(x) for x in toks[pos:pos + len(parts)]) == parts:
+            return name, len(parts)
+    return None, 0
+
+
+NAME_NEGATIONS = {"не", "ни"}
+# служебные слова ответа «только имя»: «это Вера», «не Анна, а Вера», «Вера говорит»
+NAME_FILLER = {"это", "не", "а", "говорит", "был", "была", "тут", "здесь"}
+# в ответе с отрицаемым именем служебными считаются и «нет», «ни», «и»: «нет, не Анна», «ни Анна, ни Борис»
+NEGATED_NAME_FILLER = NAME_FILLER | {"нет", "ни", "и"}
+
+
+def _negated_name(toks, pos):
+    """Единое правило отрицания имени: имя, перед которым стоит «не» или «ни», не назначается.
+    Его используют и ответ «только имя» (classify), и метка «Имя:» (split_replies, card_edits)."""
+    return bool(pos) and norm(toks[pos - 1]) in NAME_NEGATIONS
+
+
+def _name_mentions(toks, names):
+    """-> [(позиция, число слов, имя, отрицается)] — все имена ответа слева направо."""
+    out, i = [], 0
+    while i < len(toks):
+        name, count = _name_at(toks, i, names)
+        if name:
+            out.append((i, count, name, _negated_name(toks, i)))
+            i += count
+        else:
+            i += 1
+    return out
+
+
+def _negated_label(toks, pos, names):
+    name, count = _name_at(toks, pos, names)
+    return bool(name and _negated_name(toks, pos) and toks[pos + count - 1].rstrip().endswith(":"))
+
+
 def classify(text, names):
     t = " ".join(norm(x) for x in (text or "").split() if norm(x))
     if not t:
@@ -124,38 +165,50 @@ def classify(text, names):
     if t in AGREE:
         return {"kind": "agree"}
     ws = t.split()
-    low = {norm(n): n for n in names}
-    named = [low[w] for w in ws if w in low]
-    rest = [w for w in ws if w not in low and w not in {"это", "не", "а", "говорит", "был", "была", "тут", "здесь"}]
-    if named and not rest:
-        return {"kind": "name", "speaker": named[-1]}      # «не Анна, а Вера» — последнее имя
-    return {"kind": "text"}
+    mentions = _name_mentions(ws, names)
+    if not mentions:
+        return {"kind": "text"}
+    filler = NEGATED_NAME_FILLER if any(neg for *_, neg in mentions) else NAME_FILLER
+    covered = {k for pos, count, _, _ in mentions for k in range(pos, pos + count)}
+    rest = [w for k, w in enumerate(ws) if k not in covered and w not in filler]
+    named = [name for _, _, name, neg in mentions if not neg]
+    if rest:
+        return {"kind": "text"}
+    if named:
+        return {"kind": "name", "speaker": named[-1]}
+    return {"kind": "unmatched"}      # все названные имена отрицаются — выбрать говорящего должен человек
 
 
 def split_replies(text, names):
     """-> [(говорящий | None, [слова])]. Метка — «Имя:» или имя в начале фразы перед словом с заглавной."""
     toks = (text or "").replace("…", "... ").split()
-    nameset = {norm(n): n for n in names}
     out, cur, spk = [], [], None
-    for i, raw in enumerate(toks):
-        n = norm(raw)
+    i = 0
+    while i < len(toks):
+        raw = toks[i]
+        name, count = _name_at(toks, i, names)
         is_label = False
-        if n in nameset:
-            colon = raw.rstrip().endswith(":")
+        if name:
+            last = toks[i + count - 1]
+            colon = last.rstrip().endswith(":")
             prev_end = i == 0 or re.search(r"[.!?…:]$", toks[i - 1]) is not None
-            nxt = toks[i + 1] if i + 1 < len(toks) else ""
-            if colon or (prev_end and nxt[:1].isupper() and not raw.rstrip().endswith(",")):
+            nxt = toks[i + count] if i + count < len(toks) else ""
+            if not _negated_label(toks, i, names) and \
+                    (colon or (prev_end and nxt[:1].isupper() and not last.rstrip().endswith(","))):
                 is_label = True
         if is_label:
             if cur:
                 out.append((spk, cur))
-            spk, cur = nameset[n], []
+            spk, cur = name, []
+            i += count
             continue
         if re.fullmatch(r"\.{2,}|…", raw.strip()):
+            i += 1
             continue
         raw = re.sub(r"(\.{3}|…)$", "", raw)
         if norm(raw):
             cur.append(raw)
+        i += 1
     if cur:
         out.append((spk, cur))
     return out
@@ -303,21 +356,44 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
     c = classify(text, names)
     rep = {"id": cid, "answer": text, "kind": c["kind"], "applied": [], "inserted": [], "typos": [],
            "proposed_delete": [], "deleted": [], "overlap": [], "human": None}
+    label_tokens = text.split()
+    if any(_negated_label(label_tokens, i, names) for i in range(len(label_tokens))):
+        rep["kind"] = "unmatched"
+        rep["human"] = "отрицательная метка неоднозначна; укажите говорящего и слова отдельно"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "agree":
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
+    if c["kind"] == "unmatched":
+        rep["human"] = "указано только отрицание имени; выберите говорящего"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "name":
         eds = [{"op": "relabel", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "speaker": c["speaker"], "card": cid, "in_place": True}
                for w in place if w.get("_spk") != c["speaker"]]
         rep["applied"] = [f"{' '.join(w['w'] for w in place)} → {c['speaker']}"]
         span = (place[0]["s"], place[-1]["s"]) if place else None
         return {"kind": "name", "edits": eds, "covered": span, "report": rep}
+    for label in re.finditer(r"(?<!\w)Спикер\s+\d+\s*:", text, re.I):
+        label_words = label.group().split()
+        name, count = _name_at(label_words, 0, names)
+        if not name or count != len(label_words):
+            rep["kind"] = "unmatched"
+            rep["human"] = "неизвестная метка говорящего; выберите имя"
+            return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     replies = split_replies(text, names)
+    if len(replies) > 1 and replies[0][0] is None and replies[1][0] and \
+            all(norm(x) == "нет" for x in replies[0][1]):
+        # «нет, Анна: слово» — «нет» здесь скорее поправка к карточке, чем речь из записи; угадывать
+        # не будем: ни «нет» в стенограмму, ни смену говорящего — место остаётся человеку
+        rep["kind"] = "unmatched"
+        rep["human"] = "перед меткой «Имя:» стоит только «нет»; напишите «Имя: точные слова» без «нет»"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if item.get("answer_mode") == "speaker":
         # Карточка подтверждения говорящего: пояснение («Вера говорит только слово …») не должно
         # молча стать текстом реплики. Слова принимаются лишь в явной форме «Имя: точные слова».
-        label = re.match(r"\s*([^\s:]+)\s*:", text)
-        known = {norm(n) for n in names}
-        if not (label and norm(label.group(1)) in known and replies and all(spk for spk, _ in replies)):
+        label = re.match(r"\s*([^:]+)\s*:", text)
+        label_words = label.group(1).split() if label else []
+        name, count = _name_at(label_words, 0, names)
+        if not (name and count == len(label_words) and replies and all(spk for spk, _ in replies)):
             rep["kind"] = "speaker"
             rep["human"] = ("на карточке подтверждения говорящего свой ответ не понят как решение "
                             "о говорящем (нужно имя или «Имя: точные слова»)")
