@@ -5,6 +5,7 @@ import uuid
 from types import SimpleNamespace
 from unittest import mock
 
+import confirm
 import conspect
 import core
 import documents
@@ -397,3 +398,124 @@ class WriteGuardTests(fixtures.ScreenCase):
         self.damage(case, "observed_size")
         status, _, _ = self.request("POST", "api/conflict/copy", self.body(case))
         self.assertEqual(status, 400)
+
+
+class PromiseTests(fixtures.ScreenCase):
+    """Обещание равно делу: что сказано перед «Да» и в карточке, то программа потом и делает с файлом."""
+
+    damage = WriteGuardTests.damage
+    duplicate = WriteGuardTests.duplicate
+    ACTION = {"replace": "заменить файл", "close": "закрыть конфликт", "recopy": "не будет заменён",
+              "wait": "сейчас файл не изменится", "stopped": "сейчас файл не изменится"}
+
+    def prepare(self, scope, kind, state, neighbour):
+        """Открытый конфликт файла kind; neighbour — другой файл того же объекта."""
+        target = self.conflict(scope, body=lambda original: original + b"xy", kind=kind)
+        if neighbour:
+            paths = target.rec.files if scope == "document" else target.rec.conspect_files
+            other_kind = "json" if kind == "md" else "md"
+            saved = paths[other_kind].read_bytes() + b"other"
+            paths[other_kind].write_bytes(saved)
+            other = self.duplicate(
+                target, kind=other_kind, relative_path=paths[other_kind].relative_to(target.rec.root).as_posix(),
+                observed_bytes=saved, observed_size=len(saved), observed_hash=hashlib.sha256(saved).hexdigest())
+            other.kind = other_kind
+            if neighbour == "open damaged":
+                self.damage(other)
+            elif neighbour in ("decided", "decided damaged"):
+                self.resolve_directly(other)
+                if neighbour == "decided damaged":
+                    self.damage(other)
+        if state == "changed":
+            target.path.write_bytes(fixtures.LATE_EDIT)
+        elif state == "program":
+            target.path.write_bytes(self.program(target.rec, scope, kind))
+        return target
+
+    def happened(self, case, before, outcome):
+        now = case.path.read_bytes()
+        if outcome == "changed":
+            self.assertEqual(now, before)
+            return "recopy"
+        if outcome == "replaced":
+            self.assertEqual(now, self.program(case.rec, case.scope, case.kind))
+            return "close" if now == before else "replace"
+        self.assertEqual(now, before)
+        return "unchanged"
+
+    def test_promise_before_yes_is_what_happens(self):
+        for scope in fixtures.SCOPES:
+            for kind in ("md", "json"):
+                for state in ("same", "changed", "program"):
+                    for neighbour in (None, "open", "open damaged", "decided", "decided damaged"):
+                        with self.subTest(scope=scope, kind=kind, state=state, neighbour=neighbour):
+                            case = self.prepare(scope, kind, state, neighbour)
+                            _, asked = fixtures.ConflictMCPTests.mcp_resolve(
+                                self, case, side_effect=confirm.NotConfirmed("проба текста"))
+                            action, _, lines = asked.call_args.args
+                            shown = self.preview(case)
+                            promised = shown.get("effect")
+                            before = case.path.read_bytes()
+                            done = self.happened(case, before, self.replace(shown["snapshot"])["outcome"])
+                            self.assertEqual("unchanged" if promised in ("wait", "stopped") else promised, done)
+                            self.assertIn(self.ACTION[promised], action.casefold())
+                            if promised != "replace":
+                                self.assertNotIn("заменить файл на диске", "\n".join(lines).casefold())
+
+    def test_card_promise_is_what_retry_does(self):
+        for scope in fixtures.SCOPES:
+            for kind in ("md", "json"):
+                for state in ("same", "changed"):
+                    for damaged in (False, True):
+                        for neighbour in (None, "decided", "decided damaged"):
+                            with self.subTest(scope=scope, kind=kind, state=state, damaged=damaged,
+                                              neighbour=neighbour):
+                                case = self.prepare(scope, kind, state, neighbour)
+                                self.resolve_directly(case)
+                                if damaged:
+                                    self.damage(case)
+                                card = self.item(case)
+                                self.assertEqual(bool(card.get("copy_problem")), damaged)
+                                self.assertTrue(card["can_retry"])
+                                promised = card.get("next_effect")
+                                before = case.path.read_bytes()
+                                done = self.happened(case, before, self.retry(case)["outcome"])
+                                self.assertEqual("unchanged" if promised == "stopped" else promised, done)
+                                self.assertEqual("может довести" in card["next_step"], done == "replace")
+
+    def test_waiting_damaged_copy_never_promises_a_later_replacement(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.prepare(scope, "md", "same", "open")
+                reason = self.replace(self.snapshot(case))["reason"]
+                self.assertIn("допишет", reason)
+                self.damage(case)
+                card = self.item(case)
+                self.assertTrue(card["copy_problem"])
+                self.assertNotIn("допишет", card["next_step"])
+                self.assertNotIn("может довести", card["next_step"])
+
+    def test_open_damaged_copy_is_refused_before_the_window(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.damage(case)
+                card = self.item(case)
+                self.assertTrue(card.get("copy_problem"))
+                self.assertFalse(card["can_replace"])
+                response, asked = fixtures.ConflictMCPTests.mcp_resolve(self, case)
+                asked.assert_not_called()
+                self.assertIn("повреждена", response)
+                self.assertTrue(self.is_open(case))
+
+    def test_missing_file_with_damaged_copy_does_not_advise_downloading_it(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                self.damage(case)
+                case.path.unlink()
+                for text in (self.item(case).get("next_step") or "нет пояснения", self.retry(case)["reason"]):
+                    self.assertNotIn("Скачайте копию", text)
+                    self.assertIn("повреждена", text)
+
