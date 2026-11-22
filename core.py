@@ -1057,6 +1057,25 @@ def _also_replaced(store, row, program):
     return sorted(found)
 
 
+def _waits_for(row, rows):
+    """Другие открытые конфликты того же объекта: пока они есть, подтверждение файл не меняет."""
+    return sorted({Path(other["relative_path"]).name for other in rows
+                   if other["object"] == row["object"] and other["conflict_id"] != row["conflict_id"]
+                   and not other["resolved"]})
+
+
+def replacement_waits(recording_id, conflict_id, kind):
+    """Чего будет ждать замена, если подтвердить её сейчас: имена файлов; ничего не записывает."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, recording_id, conflict_id, kind)
+        return _waits_for(row, _conflict_rows(store, kind))
+    finally:
+        store.close()
+
+
 def _conflict_facts(store, row):
     """Что известно о конфликте без чтения текста: файл, версия программы, можно ли заменить, снимок."""
     import documents
@@ -1073,12 +1092,13 @@ def _conflict_facts(store, row):
              else "same" if digest == row["observed_hash"] else "changed")
     reason = _refusal(row, state) or problem
     also = [] if reason else _also_replaced(store, row, program)
+    waits = [] if reason else _waits_for(row, _conflict_rows(store, row["scope"]))
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
-            "also_replaces": also, "can_replace": reason is None, "reason": reason,
+            "also_replaces": also, "waits_for": waits, "can_replace": reason is None, "reason": reason,
             "snapshot": None if reason else {
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
-                "program_hash": program_hash, "also_replaces": also}}
+                "program_hash": program_hash, "also_replaces": also, "waits_for": waits}}
 
 
 def _lines(text):
@@ -1303,6 +1323,7 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "encoding": encoding, "file_notes": notes, "copy_problem": copy_problem,
                 "comparison_approximate": comparison["approximate"],
                 "also_replaces": facts["also_replaces"] if can_replace else [],
+                "waits_for": facts["waits_for"] if can_replace else [],
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
         store.close()
