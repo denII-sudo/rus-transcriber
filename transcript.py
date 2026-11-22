@@ -104,13 +104,40 @@ def _seg_line(seg, marks=None):
     return f"**[{hms(seg['start'])}] {seg['speaker']}**{tag}: {text}"
 
 
-def _item_line(it):
+def is_whisper_model(model):
+    """Третья модель — Whisper: в имени есть «whisper» (без учёта регистра)."""
+    return "whisper" in str(model or "").lower()
+
+
+def third_model_label(model, backend=""):
+    """Короткое название третьей модели для людей: Whisper, Multilingual large или имя модели.
+    Одно правило для подписи этапа обработки (worker) и варианта в стенограмме."""
+    name = str(model or "")
+    if str(backend or "").startswith("whisper-") or is_whisper_model(name):
+        return "Whisper"
+    if name == "multilingual_large_ctc":
+        return "Multilingual large"
+    return name
+
+
+def _third_name(data):
+    """Подпись варианта третьей модели в стенограмме по timing результата; нет сведений — «Whisper»."""
+    timing = data.get("timing") if isinstance(data, dict) else None
+    timing = timing if isinstance(timing, dict) else {}
+    model = timing.get("asr3_model")
+    if not model:
+        return "Whisper"
+    backend = str(timing.get("asr3_device") or "").split(":")[0]
+    return third_model_label(model, backend) or "Whisper"
+
+
+def _item_line(it, third_name="Whisper"):
     why = ", ".join(REASON_RU.get(r, r) for r in it.get("reasons", []))
     s = f"- {hms(it['t'])} {it['speaker']}: «{it['text']}» — {why}"
     if it.get("alt_ctc"):
         s += f"; CTC: «{it['alt_ctc']}»"
     if it.get("alt_whisper"):
-        s += f"; Whisper: «{it['alt_whisper']}»"
+        s += f"; {third_name}: «{it['alt_whisper']}»"
     if it.get("voices") and "voice" in it.get("reasons", []):
         top = list(it["voices"].items())[:2]
         s += "; голоса: " + ", ".join(f"{n} {v:.2f}" for n, v in top)
@@ -177,10 +204,11 @@ def render_md(data, text_only=False):
                 lines.append(f"- {hms(r['t'])} {r['speaker']}: {r['reason']}")
         lines.append("")
     if data.get("review"):
+        third_name = _third_name(data)
         if data.get("review_done"):
             human = [i for i in data["review"] if i.get("status") == "human"]
             if human:
-                lines += ["## Проверить человеку", ""] + [_item_line(i) for i in human] + [""]
+                lines += ["## Проверить человеку", ""] + [_item_line(i, third_name) for i in human] + [""]
             if data.get("edits"):
                 lines += ["## Правки после распознавания", ""]
                 for e in data["edits"]:
@@ -194,7 +222,7 @@ def render_md(data, text_only=False):
                                  + (f" — {e['note']}" if e.get("note") else ""))
                 lines.append("")
         else:
-            lines += ["## Сомнительные места", ""] + [_item_line(i) for i in data["review"]] + [""]
+            lines += ["## Сомнительные места", ""] + [_item_line(i, third_name) for i in data["review"]] + [""]
     return "\n".join(lines)
 
 

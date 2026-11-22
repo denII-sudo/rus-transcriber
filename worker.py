@@ -571,13 +571,9 @@ def whisper_plan(audio, regions, chunks, cfg, a, words, alt):
 
 
 def _third_label(third, backend=""):
-    """Короткое название третьей модели для статуса обработки: Whisper, Multilingual large или имя модели."""
-    name = str(third or "")
-    if backend.startswith("whisper-") or "whisper" in name.lower():
-        return "Whisper"
-    if name == "multilingual_large_ctc":
-        return "Multilingual large"
-    return name
+    """Короткое название третьей модели для статуса обработки: Whisper, Multilingual large или имя модели
+    (правило общее со стенограммой — transcript.third_model_label)."""
+    return transcript.third_model_label(third, backend)
 
 
 def _load_whisper(backend, device, quant, third, cfg, make_asr):
@@ -647,23 +643,38 @@ def _whisper_words(plan, texts, whisper_diag, words):
     return wh_words, removed
 
 
+WHISPER_ONLY_ENGINES = ("whisper-ct2", "whisper-ov")     # движки, умеющие только Whisper
+
+
 def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
     """Третий проход (Whisper, только текст) -> слова-строки или None, если не удался ни один движок.
 
     Движки по очереди: faster-whisper (если выбран тестом скорости, asr_third_backend=whisper-ct2),
     видеокарта Arc (OpenVINO, fp16), процессор (int8). Ошибочные фрагменты повторяются на onnx-cpu:
     для Arc (GPU) это повтор на CPU, для faster-whisper (whisper-ct2) — возврат к прежнему движку.
-    Для самого onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается."""
+    Для самого onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается.
+    Если третья модель — не Whisper (например multilingual_large_ctc), движки faster-whisper и OpenVINO
+    Whisper пропускаются (они умеют только Whisper), считает общий onnx-cpu."""
     from backends import normalize_device
     third, pieces = plan["model"], plan["pieces"]
     dev = normalize_device(cfg.get("asr_third_device", "CPU"))
     if dev not in ("GPU", "CPU"):
-        print(f"[words] Whisper: устройство {dev} не поддерживается, считаю на CPU",
+        print(f"[words] {_third_label(third)}: устройство {dev} не поддерживается, считаю на CPU",
               file=sys.stderr, flush=True)
         dev = "CPU"
     tries = ([("whisper-ct2", "CPU", "int8")] if cfg.get("asr_third_backend", "") == "whisper-ct2" else []) \
         + ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
         + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
+    if not transcript.is_whisper_model(third):
+        # whisper-ct2 и whisper-ov грузят только Whisper и имя модели игнорируют: для другой модели
+        # (например multilingual_large_ctc) они молча подменили бы её Whisper
+        skipped = [t[0] for t in tries if t[0] in WHISPER_ONLY_ENGINES]
+        tries = [t for t in tries if t[0] not in WHISPER_ONLY_ENGINES]
+        if skipped:
+            print(f"[words] третья модель {third}: " + (
+                f"движок {skipped[0]} пропущен — он умеет только Whisper" if len(skipped) == 1 else
+                f"движки {', '.join(skipped)} пропущены — они умеют только Whisper")
+                + "; считаю общим движком onnx-cpu", file=sys.stderr, flush=True)
     outer_attempts = []
     for backend, device, quant in tries:
         try:
@@ -696,7 +707,8 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
             outer_attempts.append({"result": "error", "backend": backend + ":" + device,
                                    "error_type": type(ex).__name__})
             quality.setdefault("asr3_errors", []).append(f"{backend}:{device}: {type(ex).__name__}: {ex}"[:300])
-            print(f"[words] Whisper ({backend}:{device}) не выполнен: {ex}", file=sys.stderr, flush=True)
+            print(f"[words] {_third_label(third, backend)} ({backend}:{device}) не выполнен: {ex}",
+                  file=sys.stderr, flush=True)
     _register_pass(quality, "whisper", third, None, _failed_records(plan["chunks"], outer_attempts, plan["selected"]))
     return None
 
