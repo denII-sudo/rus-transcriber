@@ -779,36 +779,343 @@ def restore_recording_revision(snapshot):
         store.close()
 
 
-def preview_conflict(recording_id, conflict_id, kind="document"):
-    """Показать сохранённые внешние байты конфликта документа или конспекта до решения человека."""
-    import recordings
+# ---------- конфликты внешней правки: копия человека и явная замена файла ----------
+CONFLICT_SCOPES = ("document", "conspect")
+CONFLICT_PREVIEW_CHARS = 20000        # знаков копии в предпросмотре
+CONFLICT_SHOWN_LINES, CONFLICT_SHOWN_CHARS = 200, 500   # строк различий и знаков в строке на показ
+_CONFLICT_COLUMNS = ("f.kind, f.relative_path, f.observed_bytes IS NOT NULL AS preserved, f.observed_hash, "
+                     "f.observed_size, f.resolution_operation_id IS NOT NULL AS resolved, f.rowid AS seq, "
+                     "o.root_id, (SELECT path FROM allowed_roots WHERE root_id=o.root_id) AS root_path, "
+                     "rec.location")
+_CONFLICT_SQL = {
+    "document": ("SELECT f.conflict_id, f.recording_id, f.document_revision AS revision, NULL AS conspect_id, "
+                 "NULL AS name, " + _CONFLICT_COLUMNS + " FROM document_conflicts f "
+                 "JOIN document_outbox o ON o.recording_id=f.recording_id "
+                 "AND o.document_revision=f.document_revision "
+                 "JOIN recordings rec ON rec.recording_id=f.recording_id"),
+    "conspect": ("SELECT f.conflict_id, c.recording_id, f.revision, f.conspect_id, c.name, "
+                 + _CONFLICT_COLUMNS + " FROM conspect_conflicts f "
+                 "JOIN conspects c ON c.conspect_id=f.conspect_id "
+                 "JOIN conspect_outbox o ON o.conspect_id=f.conspect_id AND o.revision=f.revision "
+                 "JOIN recordings rec ON rec.recording_id=c.recording_id")}
+
+
+def _conflict_rows(store, scope, where="", args=()):
+    """Конфликты одной области без самих байт: при просмотре списка копии не читаются."""
+    rows = []
+    for found in store.db.execute(_CONFLICT_SQL[scope] + where + " ORDER BY f.rowid", args):
+        row = dict(found, scope=scope, preserved=bool(found["preserved"]), resolved=bool(found["resolved"]))
+        row["object"] = (scope, row["conspect_id"] or row["recording_id"])
+        rows.append(row)
+    return rows
+
+
+def _conflict_row(store, recording_id, conflict_id, scope):
     import storage
+    storage._uuid(recording_id)
     storage._uuid(conflict_id)
-    if kind not in ("document", "conspect"):
-        raise CoreError("некорректный тип конфликта")
+    if scope not in CONFLICT_SCOPES:
+        raise CoreError("Неизвестный вид конфликта.")
+    rows = _conflict_rows(store, scope, " WHERE f.conflict_id=?", (conflict_id,))
+    if not rows or rows[0]["recording_id"] != recording_id:
+        raise CoreError("Конфликт не найден для этой записи.")
+    return rows[0]
+
+
+def _observed_bytes(store, row):
+    """Сохранённая копия человека целиком или None, если файл был слишком велик."""
+    import documents
+    found = store.db.execute(f"SELECT observed_bytes FROM {row['scope']}_conflicts WHERE conflict_id=?",
+                             (row["conflict_id"],)).fetchone()[0]
+    if found is None:
+        return None
+    found = bytes(found)
+    if documents._digest(found) != row["observed_hash"]:
+        raise CoreError("Сохранённая копия повреждена: её контрольная сумма не совпала.")
+    return found
+
+
+def _program_version(store, row):
+    """Последняя версия программы для файлов объекта конфликта: (ревизия, {вид файла: байты})."""
+    if row["scope"] == "document":
+        revision = store.db.execute("SELECT max(document_revision) FROM document_versions WHERE recording_id=?",
+                                    (row["recording_id"],)).fetchone()[0]
+        saved = store.get_document(row["recording_id"], revision)
+        return revision, {kind: bytes(saved[kind]) for kind in ("md", "json", "manifest")}
+    saved = store.get_conspect(row["conspect_id"])
+    return saved["revision"], {kind: bytes(saved[kind]) for kind in ("md", "json")}
+
+
+def _file_at(store, row, relative):
+    """Файл на диске без записи и без создания папок: (missing|unavailable|ok, sha256 или None)."""
+    import documents
+    import storage
+    try:
+        root = documents._authorized_root(store, row["root_id"], row["root_path"])
+        path, exists = documents._read_only_target(root, relative)
+        return ("ok", documents._file_digest(path)[0]) if exists else ("missing", None)
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, ValueError, storage.StorageError):
+        return "unavailable", None
+
+
+def _queue_unfinished(store, row):
+    """Есть ли у объекта конфликта запись файлов, которую программа не довела до конца."""
+    table, column = (("document_outbox", "recording_id") if row["scope"] == "document"
+                     else ("conspect_outbox", "conspect_id"))
+    return store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND state!='synced'",
+                            (row["object"][1],)).fetchone() is not None
+
+
+def _conflict_item(store, row, rows):
+    """Строка общего списка; rows — все конфликты той же области."""
+    import documents
+    same_object = [other for other in rows if other["object"] == row["object"]]
+    status = "resolved" if row["resolved"] else "open"
+    last_of_file = row["seq"] == max(other["seq"] for other in same_object
+                                     if other["relative_path"] == row["relative_path"])
+    if row["resolved"] and last_of_file and _queue_unfinished(store, row):
+        program = _program_version(store, row)[1].get(row["kind"])
+        if program is not None and _file_at(store, row, row["relative_path"])[1] != documents._digest(program):
+            status = "not_written"
+    return {"conflict_id": row["conflict_id"], "scope": row["scope"], "recording_id": row["recording_id"],
+            "title": Path(row["location"]).name, "name": row["name"], "kind": row["kind"],
+            "relative_path": row["relative_path"], "file": str(Path(row["root_path"]) / row["relative_path"]),
+            "observed_size": row["observed_size"], "preserved": row["preserved"], "status": status,
+            "can_replace": status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
+            "can_retry": status == "not_written" and not any(not other["resolved"] for other in same_object)}
+
+
+def list_all_conflicts():
+    """Открытые и решённые конфликты всей базы для экрана; ничего не пишет и не требует запроса."""
+    import paths
+    import recordings
+    if not Path(paths.STATE_DB).is_file():
+        return {"available": False, "items": [],
+                "reason": "Базы записей ещё нет: конфликтов нет, показывать нечего."}
     store = recordings.open_store()
     try:
         store.current_identity()
-        if kind == "document":
-            row = store.db.execute(
-                "SELECT recording_id, kind, relative_path, observed_hash, observed_size, observed_bytes "
-                "FROM document_conflicts WHERE conflict_id=?", (conflict_id,)).fetchone()
+        by_scope = {scope: _conflict_rows(store, scope) for scope in CONFLICT_SCOPES}
+        return {"available": True, "reason": None,
+                "items": [_conflict_item(store, row, rows) for rows in by_scope.values() for row in rows]}
+    finally:
+        store.close()
+
+
+def _refusal(row, state):
+    """Почему заменять нельзя (None — можно)."""
+    if row["resolved"]:
+        return "Этот конфликт уже решён: заменять нечего. Копию можно скачать."
+    if row["kind"].startswith("archive_"):
+        return ("Это архивная копия прежней версии: программа записывает её один раз и не меняет, поэтому "
+                "заменить её здесь нельзя. Свою версию можно скачать.")
+    if not row["preserved"]:
+        return ("Файл больше 8 МиБ, поэтому программа не сохранила его копию и не заменяет его: он остаётся "
+                "на диске как есть. Разберите его вручную.")
+    if state == "missing":
+        return ("Файла на прежнем месте нет. Положите на его место скачанную копию («Скачать мою правку»), "
+                "обновите список, и замена станет доступна.")
+    if state == "unavailable":
+        return ("Файл сейчас нельзя прочитать: он занят другой программой, недоступен или на его месте папка "
+                "либо ссылка. Освободите его и обновите список.")
+    return None
+
+
+def _also_replaced(store, row, program):
+    """Другие файлы объекта, которые это подтверждение запишет заново по прежнему решению:
+    они равны решённой копии и не равны версии программы."""
+    import documents
+    decided = {}
+    for other in _conflict_rows(store, row["scope"]):
+        if (other["object"] == row["object"] and other["revision"] == row["revision"] and other["resolved"]
+                and other["kind"] != row["kind"] and other["kind"] in program):
+            decided[other["kind"]] = other    # последнее решение вида: так выбирает и запись файлов
+    found = []
+    for kind, other in decided.items():
+        state, digest = _file_at(store, other, other["relative_path"])
+        if state == "ok" and digest == other["observed_hash"] and digest != documents._digest(program[kind]):
+            found.append(other["relative_path"])
+    return sorted(found)
+
+
+def _conflict_facts(store, row):
+    """Что известно о конфликте без чтения текста: файл, версия программы, можно ли заменить, снимок."""
+    import documents
+    archive = row["kind"].startswith("archive_")
+    revision, program = (None, None) if archive else _program_version(store, row)
+    program_hash = None if archive else documents._digest(program[row["kind"]])
+    found, digest = _file_at(store, row, row["relative_path"])
+    state = (found if found != "ok" else "program" if digest == program_hash
+             else "same" if digest == row["observed_hash"] else "changed")
+    reason = _refusal(row, state)
+    also = [] if reason else _also_replaced(store, row, program)
+    return {"program": None if archive else program[row["kind"]], "file_state": state, "also_replaces": also,
+            "can_replace": reason is None, "reason": reason,
+            "snapshot": None if reason else {
+                "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
+                "observed_hash": row["observed_hash"], "program_revision": revision,
+                "program_hash": program_hash, "also_replaces": also}}
+
+
+def _lines(data):
+    """Строки по CRLF, CR, LF (не str.splitlines: она прячет U+2028 и разрыв страницы)."""
+    found = re.split(rb"\r\n|\r|\n", data)
+    return found[:-1] if found[-1] == b"" else found
+
+
+def _extra(mine, other):
+    """Строки mine, которых нет в other (с учётом повторов), по порядку. Порядок строк не сравнивается."""
+    left = {}
+    for line in other:
+        left[line] = left.get(line, 0) + 1
+    extra = []
+    for line in mine:
+        if left.get(line):
+            left[line] -= 1
         else:
-            row = store.db.execute(
-                "SELECT c.recording_id, f.kind, f.relative_path, f.observed_hash, f.observed_size, "
-                "f.observed_bytes FROM conspect_conflicts f JOIN conspects c USING(conspect_id) "
-                "WHERE f.conflict_id=?", (conflict_id,)).fetchone()
-        if row is None or row["recording_id"] != recording_id:
-            raise CoreError("конфликт не найден для этой записи")
-        preview = None
-        preserved = row["observed_bytes"] is not None
-        if preserved:
-            text = bytes(row["observed_bytes"]).decode("utf-8", errors="replace")
-            preview = text[:20000]
+            extra.append(line)
+    return extra
+
+
+def _shown(lines):
+    """Строки для показа и признак, что показано всё: число строк и их длина ограничены."""
+    text = [line.decode("utf-8", errors="replace") for line in lines[:CONFLICT_SHOWN_LINES]]
+    whole = len(text) == len(lines) and all(len(line) <= CONFLICT_SHOWN_CHARS for line in text)
+    return [line[:CONFLICT_SHOWN_CHARS] for line in text], whole
+
+
+def preview_conflict(recording_id, conflict_id, kind="document"):
+    """Показать копию человека и сравнение с последней версией программы; ничего не записывает.
+
+    kind — область конфликта: document или conspect."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, recording_id, conflict_id, kind)
+        facts = _conflict_facts(store, row)
+        observed, program = _observed_bytes(store, row), facts["program"]
+        text = None if observed is None else observed.decode("utf-8", errors="replace")
+        removed = added = []
+        newlines_only = False
+        if observed is not None and program is not None:
+            mine, theirs = _lines(observed), _lines(program)
+            removed, added = _extra(mine, theirs), _extra(theirs, mine)
+            newlines_only = observed != program and mine == theirs
+        shown_removed, whole_removed = _shown(removed)
+        shown_added, whole_added = _shown(added)
         return {"conflict_id": conflict_id, "kind": row["kind"], "relative_path": row["relative_path"],
                 "observed_hash": row["observed_hash"], "observed_size": row["observed_size"],
-                "preserved": preserved, "preview": preview,
-                "truncated": bool(preserved) and row["observed_size"] > 20000}
+                "preserved": row["preserved"],
+                "preview": None if text is None else text[:CONFLICT_PREVIEW_CHARS],
+                "truncated": text is not None and len(text) > CONFLICT_PREVIEW_CHARS,
+                "file": str(Path(row["root_path"]) / row["relative_path"]), "file_state": facts["file_state"],
+                "removed": shown_removed, "added": shown_added, "removed_total": len(removed),
+                "added_total": len(added), "shown_all": whole_removed and whole_added,
+                "newlines_only": newlines_only, "also_replaces": facts["also_replaces"],
+                "can_replace": facts["can_replace"], "reason": facts["reason"], "snapshot": facts["snapshot"]}
+    finally:
+        store.close()
+
+
+def conflict_copy(recording_id, conflict_id, kind):
+    """Сохранённые байты копии человека целиком и имя для скачивания; ничего не меняет и не читает файл."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, recording_id, conflict_id, kind)
+        data = _observed_bytes(store, row)
+        if data is None:
+            raise CoreError("Копия не сохранена: файл был больше 8 МиБ. Заберите его прямо из папки записи.")
+        path = Path(row["relative_path"])
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", f"{path.stem} (моя правка){path.suffix}")
+        return {"data": data, "name": name}
+    finally:
+        store.close()
+
+
+def _write_and_report(store, row):
+    """Довести запись файлов объекта и сообщить итог по самому файлу, а не по очереди."""
+    import documents
+    import recordings
+    write = recordings.materialize_recording if row["scope"] == "document" else recordings.materialize_conspects
+    try:
+        write(store, row["recording_id"])
+    except Exception:    # решение уже записано, и ответ всегда по факту: что лежит в файле
+        pass
+    state, digest = _file_at(store, row, row["relative_path"])
+    if digest == documents._digest(_program_version(store, row)[1][row["kind"]]):
+        return {"outcome": "replaced", "new_conflict_id": None, "reason": None}
+    rows = [other for other in _conflict_rows(store, row["scope"]) if other["object"] == row["object"]]
+    fresh = [other for other in rows if not other["resolved"] and other["seq"] > row["seq"]
+             and other["relative_path"] == row["relative_path"]]
+    if fresh:
+        return {"outcome": "changed", "new_conflict_id": fresh[-1]["conflict_id"], "reason": None}
+    if any(not other["resolved"] for other in rows):
+        reason = ("Запись этого файла ждёт решения по другому файлу той же записи: решите его, "
+                  "и программа допишет и этот.")
+    elif state == "missing":
+        reason = ("Файла на прежнем месте нет. Положите на его место скачанную копию («Скачать мою правку») "
+                  "и нажмите «Повторить».")
+    elif state == "unavailable":
+        reason = ("Файл сейчас нельзя прочитать: он занят другой программой, недоступен или на его месте папка "
+                  "либо ссылка. Освободите его и нажмите «Повторить».")
+    else:
+        reason = ("Программа не смогла записать файл: возможно, он открыт в другой программе, или запись "
+                  "остановилась на другой записи из той же папки. Закройте файлы и нажмите «Повторить».")
+    return {"outcome": "not_written", "new_conflict_id": None, "reason": reason}
+
+
+def _replace_file(store, row, snapshot=None):
+    """Записать решение «заменить файл версией программы» и довести запись. Файл проверяется до решения."""
+    import recordings
+    import storage
+    facts = _conflict_facts(store, row)
+    if not facts["can_replace"]:
+        raise CoreError(facts["reason"])
+    if snapshot is not None and facts["snapshot"] != snapshot:
+        raise CoreError("Показанное сравнение устарело: конфликт или версия программы изменились. "
+                        "Откройте сравнение заново.")
+    try:
+        result = getattr(store, f"resolve_{row['scope']}_conflict")(
+            row["conflict_id"], str(uuid.uuid4()), recordings.operation_context(store, "human"))
+    except (OSError, ValueError, storage.StorageError) as ex:
+        raise CoreError("Решение не записано, файл не тронут: конфликт уже решён или база занята.") from ex
+    return {**result, **_write_and_report(store, row)}
+
+
+def replace_conflict_file(snapshot):
+    """Экран: заменить файл, только если человек видел сравнение (snapshot из preview_conflict) и оно не устарело."""
+    import recordings
+    if not isinstance(snapshot, dict):
+        raise CoreError("Нет сравнения, которое видел человек: откройте его и проверьте, что пропадёт.")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, snapshot.get("recording_id"), snapshot.get("conflict_id"),
+                            snapshot.get("scope"))
+        return _replace_file(store, row, snapshot)
+    finally:
+        store.close()
+
+
+def retry_conflict_file(recording_id, conflict_id, kind):
+    """Повторить только запись файлов по уже принятому решению: без новых решений и ревизий."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, recording_id, conflict_id, kind)
+        status = _conflict_item(store, row, _conflict_rows(store, kind))["status"]
+        if status == "open":
+            raise CoreError("Конфликт ещё не решён: повторять нечего. Сначала выберите, что делать с файлом.")
+        if status == "resolved":
+            raise CoreError("Повторять нечего: файл уже записан, или вы вернули на место свою копию, "
+                            "или по этому файлу есть более новый конфликт.")
+        return _write_and_report(store, row)
     finally:
         store.close()
 
@@ -1143,47 +1450,27 @@ def list_document_conflicts(recording_id):
         store.close()
 
 
-def resolve_document_conflict(recording_id, conflict_id):
+def _resolve_for_agent(scope, recording_id, conflict_id):
+    """MCP: после подтверждения в окне заменить файл версией программы; итог — по самому файлу."""
     import recordings
     import storage
     store = recordings.open_store()
     try:
         store.current_identity()
-        row = store.db.execute("SELECT recording_id FROM document_conflicts WHERE conflict_id=?",
-                               (conflict_id,)).fetchone()
-        if row is None or row["recording_id"] != recording_id:
-            raise CoreError("конфликт не найден для этой записи")
-        result = store.resolve_document_conflict(
-            conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
-        completed = recordings.materialize_recording(store, recording_id)
-        result["materialized"] = (recording_id, result["document_revision"]) in completed
-        return result
+        result = _replace_file(store, _conflict_row(store, recording_id, conflict_id, scope))
+        return {**result, "materialized": result["outcome"] == "replaced"}
     except (OSError, ValueError, storage.StorageError) as ex:
-        raise CoreError(f"конфликт не разрешён или формирование не завершено: {ex}") from ex
+        raise CoreError(f"Конфликт не разрешён: {ex}") from ex
     finally:
         store.close()
+
+
+def resolve_document_conflict(recording_id, conflict_id):
+    return _resolve_for_agent("document", recording_id, conflict_id)
 
 
 def resolve_conspect_conflict(recording_id, conflict_id):
-    import recordings
-    import storage
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        row = store.db.execute(
-            "SELECT c.recording_id FROM conspect_conflicts f JOIN conspects c USING(conspect_id) "
-            "WHERE f.conflict_id=?", (conflict_id,)).fetchone()
-        if row is None or row["recording_id"] != recording_id:
-            raise CoreError("конфликт не найден для этой записи")
-        result = store.resolve_conspect_conflict(
-            conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
-        completed = recordings.materialize_conspects(store, recording_id)
-        result["materialized"] = (result["conspect_id"], result["revision"]) in completed
-        return result
-    except (OSError, ValueError, storage.StorageError) as ex:
-        raise CoreError(f"конфликт не разрешён или формирование не завершено: {ex}") from ex
-    finally:
-        store.close()
+    return _resolve_for_agent("conspect", recording_id, conflict_id)
 
 
 # ---------- чтение стенограммы ----------

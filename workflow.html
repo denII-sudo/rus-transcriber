@@ -11,9 +11,25 @@ td,th{border:1px solid #ddd;padding:4px;text-align:left;vertical-align:top;font-
 .muted{color:#666;font-size:12px}
 pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overflow-x:auto}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.conflict{border-top:1px solid #ddd;padding:6px 0}
+.conflict p{margin:4px 0}
+.ask{border:1px solid #b3261e;border-radius:6px;padding:8px;margin-top:6px}
+.lines{max-height:240px;overflow:auto}
 </style>
 <h1>rus-transcriber: обработка записи</h1>
 <div id="msg" class="muted"></div>
+
+<section id="conflicts">
+  <h2>Файлы, которые изменили вне программы</h2>
+  <p class="muted">Если вы правите файл записи в Блокноте или другой программе, а программа потом собирается
+    записать в него свою версию, она не затирает вашу правку молча: сохраняет вашу копию у себя и ждёт вашего
+    решения. Перенести правку в стенограмму здесь нельзя. «Скачать мою правку» только отдаёт копию и ничего не
+    меняет (браузер кладёт её в папку загрузок, программа её потом не удаляет). «Заменить файл версией программы»
+    сначала показывает, что пропадёт, и спрашивает ещё раз.</p>
+  <div class="bar"><button id="conflicts-refresh">Обновить список</button></div>
+  <div id="conflicts-note" class="muted" role="status"></div>
+  <div id="conflicts-list"></div>
+</section>
 
 <section>
   <h2>Новый запрос</h2>
@@ -65,11 +81,6 @@ pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overfl
   </div>
   <table id="history"><tr><th>Ревизия</th><th>Когда</th><th>Кто</th><th></th></tr></table>
   <div id="revision-view"></div>
-</section>
-
-<section>
-  <h2>Конфликты документов</h2>
-  <div id="conflicts"></div>
 </section>
 </div>
 
@@ -156,7 +167,7 @@ function renderResult(d) {
       <ul>${doubts.map(x => `<li>${esc(x.text || x.id)}</li>`).join("")}</ul>` : ""}
     ${lines}`;
   recordingId = d.recording_id;
-  loadConspects(); loadConflicts();
+  loadConspects();
 }
 
 const fmtDur = sec => (sec === null || sec === undefined) ? "" :
@@ -271,46 +282,221 @@ async function prepareRestore(kind, rev, sourceRevision, reviewRevision) {
   } catch (ex) { say(ex.message, true); }
 }
 
+// ---------- файлы, изменённые вне программы ----------
+let conflictItems = [], conflictGen = 0, conflictLoad = 0;
+
+function node(tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text) n.textContent = text;
+  if (cls) n.className = cls;
+  return n;
+}
+function conflictNote(text, cls) { $("conflicts-note").textContent = text || ""; $("conflicts-note").className = cls || "muted"; }
+function conflictKind(kind) {
+  if (kind.startsWith("archive_")) return "архивная копия прежней версии";
+  return {md: "читаемый текст", json: "файл данных", manifest: "служебный список файлов"}[kind] || "файл";
+}
+const conflictScope = {document: "Стенограмма", conspect: "Конспект"};
+const conflictGroups = [
+  ["open", "Ждут вашего решения", ""],
+  ["not_written", "Решение принято, но файл не записан", ""],
+  ["resolved", "Сохранённые копии", "Копии вашей правки, которые программа хранит у себя (до 8 МиБ на файл)."]];
+
 async function loadConflicts() {
-  const root = $("conflicts");
+  const mine = ++conflictLoad;
   try {
-    const d = await call(`api/conflicts?recording_id=${encodeURIComponent(recordingId)}`);
-    const items = [...d.documents.map(x => ({...x, scope: "document"})),
-                   ...d.conspects.map(x => ({...x, scope: "conspect"}))];
-    if (!items.length) { root.innerHTML = '<p class="muted">Конфликтов нет.</p>'; return; }
-    root.innerHTML = "";
-    for (const c of items) {
-      const div = document.createElement("div");
-      div.innerHTML = `<p><b>Конфликт</b> (${esc(c.scope === "document" ? "документ" : "конспект")}):
-        ${esc(c.relative_path || c.kind)} · размер ${esc(c.observed_size)}
-        ${c.preserved ? "· внешние байты сохранены" : '· файл крупный, остался на диске'}</p>`;
-      const pv = document.createElement("button");
-      pv.textContent = "Предпросмотр внешней правки";
-      pv.onclick = async () => {
-        try {
-          const p = await post("api/conflict/preview", {recording_id: recordingId,
-            conflict_id: c.conflict_id, kind: c.scope});
-          const pre = document.createElement("pre");
-          pre.textContent = p.preview || "(байты не сохранены — разбирайте файл на диске)";
-          div.appendChild(pre);
-          if (p.truncated) { const m = document.createElement("p"); m.className = "muted"; m.textContent = "Показаны первые символы."; div.appendChild(m); }
-        } catch (ex) { say(ex.message, true); }
-      };
-      const rs = document.createElement("button");
-      rs.textContent = "Сохранить внешнюю правку";
-      rs.onclick = async () => {
-        if (!confirm("Сохранить внешнюю правку как текущую?")) return;
-        try {
-          await post("api/conflict/resolve", {recording_id: recordingId, conflict_id: c.conflict_id,
-                                              kind: c.scope, confirm: true});
-          say("Конфликт разрешён, файлы формируются заново.");
-          loadStatus();
-        } catch (ex) { say(ex.message, true); }
-      };
-      div.append(pv, rs);
-      root.appendChild(div);
+    const d = await call("api/conflicts/all");
+    if (mine !== conflictLoad) return;
+    conflictGen++;            // всё показанное раньше (сравнения, вопросы) устарело и убирается вместе со списком
+    conflictItems = d.items || [];
+    const parts = [];
+    if (!d.available) parts.push(node("p", d.reason, "muted"));
+    else if (!conflictItems.length) parts.push(node("p", "Конфликтов нет. Программа замечает правку файла лишь тогда, " +
+      "когда сама записывает его заново; правки, о которых она ещё не знает, здесь не видны.", "muted"));
+    for (const [status, title, hint] of conflictGroups) {
+      const items = conflictItems.filter(i => i.status === status);
+      if (!items.length) continue;
+      parts.push(node("h3", `${title}: ${items.length}`));
+      if (hint) parts.push(node("p", hint, "muted"));
+      items.forEach(c => parts.push(conflictCard(c)));
     }
-  } catch (ex) { root.innerHTML = `<p class="muted">Конфликты недоступны: ${esc(ex.message)}</p>`; }
+    $("conflicts-list").replaceChildren(...parts);
+  } catch (ex) {
+    if (mine !== conflictLoad) return;
+    conflictGen++;
+    $("conflicts-list").replaceChildren(node("p", `Список недоступен: ${ex.message}`, "bad"));
+  }
+}
+
+// Действие карточки: пока оно идёт, кнопки выключены, а второе нажатие ничего не делает.
+function guarded(box, action) {
+  return async () => {
+    if (box.dataset.busy) return;
+    box.dataset.busy = "1";
+    const buttons = box.querySelectorAll("button");
+    buttons.forEach(b => b.disabled = true);
+    try { await action(); }
+    catch (ex) { box.querySelector(".panel").replaceChildren(node("p", ex.message, "bad")); }
+    finally { delete box.dataset.busy; buttons.forEach(b => b.disabled = false); }
+  };
+}
+
+function conflictCard(c) {
+  const box = node("div", "", "conflict");
+  const panel = node("div", "", "panel");
+  const head = node("p");
+  head.append(node("b", `${conflictScope[c.scope]}${c.name ? " «" + c.name + "»" : ""}: ${conflictKind(c.kind)}`));
+  box.append(head, node("p", `Запись: ${c.title}. Файл: ${c.relative_path}`, "muted"),
+    node("p", `Полный путь: ${c.file}`, "muted"));
+  box.append(c.preserved
+    ? node("p", `Ваша копия сохранена в программе: ${Number(c.observed_size).toLocaleString("ru-RU")} байт.`)
+    : node("p", "Копия не сохранена: файл больше 8 МиБ, он остаётся на диске как есть.", "warn"));
+  const bar = node("div", "", "bar");
+  if (c.preserved) {
+    const get = node("button", "Скачать мою правку");
+    get.onclick = guarded(box, () => downloadCopy(c));
+    bar.append(get);
+  }
+  if (c.status === "open") {
+    box.append(node("p", "Пока конфликт не решён, программа может отклонять новые правки этой записи. " +
+      "Если вашу правку отклонили, повторите её после решения.", "warn"));
+    if (c.kind.startsWith("archive_")) box.append(node("p", "Это архивная копия прежней версии: заменить её здесь нельзя.", "warn"));
+    else if (!c.preserved) box.append(node("p", "Заменить такой файл здесь нельзя: у программы нет его копии.", "warn"));
+  }
+  const look = node("button", c.can_replace ? "Заменить файл версией программы…" : "Показать сравнение");
+  look.onclick = guarded(box, () => showCompare(box, panel, c));
+  bar.append(look);
+  if (c.status === "not_written") {
+    box.append(node("p", "Файл в папке не равен версии программы: решение принято, но записать её не удалось.", "warn"),
+      node("p", "Если вы успели изменить файл после этого, сохраните его копию сами: программа знает только прежнюю копию."));
+    if (c.can_retry) {
+      const again = node("button", "Повторить");
+      again.onclick = guarded(box, async () => {
+        const r = await post("api/conflict/retry", {recording_id: c.recording_id, conflict_id: c.conflict_id, kind: c.scope});
+        await loadConflicts();
+        reportOutcome(c, r, []);
+      });
+      bar.append(again);
+    } else {
+      box.append(node("p", "Эта запись ждёт решения по другому файлу той же записи (он выше, среди ждущих решения): " +
+        "после него программа допишет и этот.", "warn"));
+    }
+  }
+  box.append(bar, panel);
+  return box;
+}
+
+async function downloadCopy(c) {
+  const res = await fetch("api/conflict/copy", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({recording_id: c.recording_id, conflict_id: c.conflict_id, kind: c.scope})});
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    throw new Error(d.error || ("не удалось скачать копию, код " + res.status));
+  }
+  const blob = await res.blob();
+  const named = /filename\*=UTF-8''([^;]+)/.exec(res.headers.get("Content-Disposition") || "");
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = named ? decodeURIComponent(named[1]) : "моя правка";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+  conflictNote(`Копия «${link.download}» передана браузеру: ищите её в папке загрузок.`);
+}
+
+function fileStateText(state, open) {
+  return {
+    program: "Файл в папке сейчас равен версии программы." + (open ? " Подтверждение лишь закроет конфликт." : ""),
+    same: "Файл в папке сейчас равен вашей сохранённой копии.",
+    changed: open
+      ? "Файл в папке изменили после того, как копия была сохранена: он не равен ни копии, ни версии программы. " +
+        "Если подтвердить замену, этот файл заменён НЕ будет: программа сохранит новую копию его нынешнего " +
+        "содержимого и спросит снова. Различия ниже показаны для прежней копии."
+      : "Файл в папке сейчас не равен ни этой копии, ни версии программы.",
+    missing: "Файла в папке сейчас нет.",
+    unavailable: "Файл в папке сейчас нельзя прочитать: он занят другой программой, недоступен, или на его месте папка либо ссылка."
+  }[state] || "";
+}
+
+function lineBlock(title, lines, total) {
+  const box = node("div");
+  box.append(node("p", total ? `${title}: ${total}${lines.length < total ? ` (показано ${lines.length})` : ""}` : `${title}: ничего.`));
+  if (lines.length) box.append(node("pre", lines.map(l => l === "" ? "(пустая строка)" : l).join("\n"), "lines"));
+  return box;
+}
+
+async function showCompare(box, panel, c) {
+  const gen = conflictGen;
+  const p = await post("api/conflict/preview", {recording_id: c.recording_id, conflict_id: c.conflict_id, kind: c.scope});
+  if (gen !== conflictGen || !box.isConnected) return;     // список обновился: старое сравнение не показываем
+  const open = c.status === "open", archive = c.kind.startsWith("archive_");
+  const parts = archive ? [] : [node("p", fileStateText(p.file_state, open && p.can_replace))];
+  if (p.preserved) {
+    if (archive) {
+      parts.push(node("p", "Для архивной копии сравнение не строится: программа хранит её как есть и не заменяет.", "muted"));
+    } else if (p.newlines_only) {
+      parts.push(node("p", "Тексты совпадают построчно: отличаются только невидимые знаки конца строки " +
+        "(так их ставят разные программы). Слов при замене вы не потеряете.", "ok"));
+    } else {
+      parts.push(lineBlock("Пропадёт из файла при замене (есть в вашей копии, нет в версии программы)", p.removed, p.removed_total),
+        lineBlock("Появится в файле (есть в версии программы, нет в вашей копии)", p.added, p.added_total),
+        node("p", "Сравнение построчное и не учитывает порядок строк.", "muted"));
+      if (!p.removed_total && !p.added_total) {
+        parts.push(node("p", "Построчных различий не найдено, но файлы не одинаковы: отличаются порядок строк, " +
+          "их повторы или пустые строки. Все подробности — в скачанной копии.", "warn"));
+      }
+      if (!p.shown_all) {
+        parts.push(node("p", "Показаны не все строки: список ограничен, а длинные строки сокращены. " +
+          "Остальное смотрите в скачанной копии («Скачать мою правку»).", "warn"));
+      }
+    }
+    const whole = node("details");
+    whole.append(node("summary", "Ваша копия (начало)"), node("pre", p.preview === "" ? "(копия пуста)" : p.preview, "lines"));
+    if (p.truncated) whole.append(node("p", "Показаны только первые 20 000 знаков; полностью — «Скачать мою правку».", "muted"));
+    parts.push(whole);
+  }
+  if (p.also_replaces.length) {
+    parts.push(node("p", "Это же подтверждение запишет заново и другие файлы: " + p.also_replaces.join(", ") +
+      ". По вашему прежнему решению они тоже будут заменены версией программы (сейчас в них ваша сохранённая копия); " +
+      "их различия здесь не показаны. Копии остаются в разделе «Сохранённые копии».", "warn"));
+  }
+  if (!open) parts.push(node("p", "Это только просмотр: он ничего не меняет.", "muted"));
+  else if (!p.can_replace) parts.push(node("p", p.reason, "warn"));
+  else parts.push(confirmBox(box, panel, c, p));
+  panel.replaceChildren(...parts);
+}
+
+function confirmBox(box, panel, c, p) {
+  const ask = node("div", "", "ask");
+  ask.append(node("p", `Файл «${c.relative_path}» будет заменён версией программы. Это нельзя отменить: ваша правка пропадёт ` +
+    "из файла (её копия останется в программе). В стенограмму правка не переносится. Пока идёт замена, не сохраняйте " +
+    "этот файл в других программах: сохранённое в этот миг может пропасть без копии.", "bad"));
+  const yes = node("button", "Да, заменить файл");
+  yes.onclick = guarded(box, async () => {
+    const r = await post("api/conflict/resolve", {snapshot: p.snapshot, confirm: true});
+    await loadConflicts();
+    reportOutcome(c, r, p.also_replaces);
+  });
+  const no = node("button", "Отмена");
+  no.onclick = () => panel.replaceChildren();
+  ask.append(yes, no);
+  return ask;
+}
+
+function reportOutcome(c, r, also) {
+  const name = `«${c.relative_path}»`;
+  if (r.outcome === "replaced") {
+    conflictNote(`Файл ${name} заменён версией программы. Ваша копия лежит в разделе «Сохранённые копии».` +
+      (also.length ? " Итог относится только к этому файлу: остальные проверьте в списке." : ""), "ok");
+  } else if (r.outcome === "changed") {
+    const fresh = conflictItems.find(i => i.conflict_id === r.new_conflict_id);
+    conflictNote(`Файл ${name} НЕ заменён: его изменили ещё раз, и он остался на диске как есть. ` +
+      (fresh && !fresh.preserved ? "Он больше 8 МиБ, копия не сохранена, а заменить его программа не может."
+        : "Программа сохранила его новую копию: она появилась в списке «Ждут вашего решения»."), "warn");
+  } else {
+    conflictNote(`Решение принято, но файл ${name} НЕ заменён. ${r.reason}`, "bad");
+  }
 }
 
 async function loadStatus() {
@@ -371,5 +557,7 @@ $("backup").onclick = async () => {
       Проверка копии: ${esc(d.report.integrity)}, схема ${esc(d.report.schema_version)}.</p>`;
   } catch (ex) { $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
 };
+$("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
+loadConflicts();
 loadRequests();
 </script>

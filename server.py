@@ -81,7 +81,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.22.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.22.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -829,7 +829,8 @@ def list_document_conflicts(recording_id: str) -> str:
 
 @mcp.tool()
 async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
-    """После подтверждения сохранить внешние байты и восстановить документ из БД."""
+    """После подтверждения человеком заменить файл документа версией программы. Правка человека пропадает
+    из файла; её копия остаётся в базе и в стенограмму не переносится. Без файла на месте — отказ до решения."""
     try:
         row = next((item for item in core.list_document_conflicts(recording_id)
                     if item["conflict_id"] == conflict_id), None)
@@ -840,11 +841,13 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
         if not row["preserved"]:
             return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
         return await _gated(
-            "Разрешить конфликт документа",
+            "Заменить файл документа версией программы",
             {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
-            lambda: ["Внешняя редакция сохранена в БД; файл может быть заменён версией из БД.",
+            lambda: ["Заменить файл на диске версией программы: правка в нём пропадёт.",
+                     "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
+                     "Строки различий это окно не показывает; их показывает локальный экран.",
                      f"Запись: {recording_id}; файл: {row['relative_path']}",
-                     f"Размер: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
+                     f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_document_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
@@ -852,7 +855,8 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
 
 @mcp.tool()
 async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
-    """После подтверждения сохранить внешние байты и восстановить версию конспекта из БД."""
+    """После подтверждения человеком заменить файл конспекта версией программы. Правка человека пропадает
+    из файла; её копия остаётся в базе и в стенограмму не переносится. Без файла на месте — отказ до решения."""
     try:
         conflicts = core.list_conspect_conflicts(recording_id)
         row = next((item for item in conflicts if item["conflict_id"] == conflict_id), None)
@@ -861,13 +865,14 @@ async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
         if not row["preserved"]:
             return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
         return await _gated(
-            "Разрешить конфликт конспекта",
+            "Заменить файл конспекта версией программы",
             {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
-            lambda: ["Внешняя редакция сохранена в БД; файл может быть заменён версией из БД.",
+            lambda: ["Заменить файл на диске версией программы: правка в нём пропадёт.",
+                     "Копия правки остаётся в базе программы; в стенограмму правка не переносится.",
+                     "Строки различий это окно не показывает; их показывает локальный экран.",
                      f"Запись: {recording_id}; конспект: {row['name']}",
                      f"Файл: {row['relative_path']}",
-                     f"Тип файла: {row['kind']}; размер: {row['observed_size']} байт.",
-                     f"SHA-256 внешней редакции: {row['observed_hash']}"],
+                     f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_conspect_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
