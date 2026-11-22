@@ -52,18 +52,22 @@ try {
   assert.equal(execFileSync("git", ["-C", native, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
   assert.equal(execFileSync("git", ["-C", native, "branch", "--show-current"], { encoding: "utf8" }).trim(),
     "opencode/native-child")
-  assert.equal((await strategy.list())[0].directory, native)
+  assert.equal((await strategy.list(repo))[0].directory, native)
   directory = native
   await hooks["tool-execute.before"]({ sessionID: "ses_native", tool: "shell" })
   await strategy.remove({ directory: native, force: false })
-  assert.deepEqual(await strategy.list(), [])
+  assert.deepEqual(await strategy.list(repo), [])
   execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(repo, "missing-remote")])
   const offline = path.join(repo, ".opencode", "worktrees", "offline-child")
-  await assert.rejects(strategy.create({ sourceDirectory: repo, directory: offline }), /cannot refresh origin/)
-  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(path.dirname(repo), "remote.git")])
+  await strategy.create({ sourceDirectory: repo, directory: offline })
+  assert.equal(execFileSync("git", ["-C", offline, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base)
+  await strategy.remove({ directory: offline, force: false })
   directory = repo
+  // Offline ensure() must still isolate the session and warn it, using the
+  // last fetched origin/main rather than the possibly older local branch.
   await hooks.workspace({ sessionID: "ses_synthetic" })
-  if (config.expect_offline) assert.equal(warnings, 1)
+  assert.equal(warnings, 1)
+  execFileSync("git", ["-C", repo, "remote", "set-url", "origin", path.join(path.dirname(repo), "remote.git")])
   const first = directory
   await hooks.prompt({ sessionID: "ses_synthetic" })
   assert.equal(directory, first)

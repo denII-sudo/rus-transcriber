@@ -30,10 +30,14 @@ export default {
           const directory = path.resolve(input.directory)
           if (!same(input.sourceDirectory, repo.root) || !same(path.dirname(directory), root))
             throw new Error("Workspace creation is limited to the configured repository and worktree root.")
+          let fresh = true
           try {
             await exec("git", ["-C", repo.root, "fetch", "origin"], { windowsHide: true, timeout: 30_000 })
           } catch {
-            throw new Error("Workspace creation stopped: cannot refresh origin; no checkout was created.")
+            // Keep offline work possible, but never fall back to the local branch:
+            // it can lag behind the last fetched origin/main.
+            fresh = false
+            console.warn("Workspace: fetch failed; using the last fetched origin/main.")
           }
           const ref = input.branch || "origin/main"
           if (ref.startsWith("-")) throw new Error("Invalid workspace starting ref.")
@@ -41,10 +45,15 @@ export default {
             { windowsHide: true, timeout: 10_000 })).stdout.trim()
           if (!/^[0-9a-f]{40,64}$/i.test(base)) throw new Error("Workspace base is not a commit.")
           const branch = `opencode/${path.basename(directory)}`
+          const branchExists = await exec("git", ["-C", repo.root, "rev-parse", "--verify", "--quiet",
+            `refs/heads/${branch}`], { windowsHide: true, timeout: 10_000 }).then(() => true, () => false)
+          if (branchExists)
+            throw new Error(`Workspace branch ${branch} already exists; no checkout was created.`)
           await exec("git", ["-C", repo.root, "worktree", "add", "-b", branch, directory, base],
             { windowsHide: true, timeout: 30_000 })
           const key = `owned-worktree:${directory.toLowerCase()}`
-          await ctx.storage.set(key, { directory })
+          await ctx.storage.set(key, { directory, fresh })
+          if (!fresh) await ctx.storage.set(`workspace-stale:${directory.toLowerCase()}`, true)
           const head = (await exec("git", ["-C", directory, "rev-parse", "HEAD"],
             { windowsHide: true, timeout: 10_000 })).stdout.trim()
           if (head !== base) throw new Error("Workspace base mismatch; checkout was preserved.")
@@ -63,7 +72,8 @@ export default {
           await exec("git", [...args, directory], { windowsHide: true, timeout: 30_000 })
           await ctx.storage.remove(key)
         },
-        async list() {
+        async list(sourceDirectory) {
+          if (!same(sourceDirectory, repo.root)) return []
           const found = []
           let after
           do {
@@ -108,6 +118,18 @@ export default {
           await ctx.storage.set(key, created)
         } else {
           await access(path.join(created.directory, ".git"))
+        }
+        const staleKey = `workspace-stale:${created.directory.toLowerCase()}`
+        if (await ctx.storage.get(staleKey)) {
+          await ctx.storage.remove(staleKey)
+          try {
+            await ctx.session.synthetic({
+              sessionID,
+              text: "Не удалось обновить origin/main по сети; рабочая копия создана от последней загруженной origin/main.",
+            })
+          } catch {
+            console.warn("Workspace: could not deliver the stale-base warning to the session.")
+          }
         }
         if (!created.prepared) {
           const status = await exec("git", ["-C", created.directory, "status", "--porcelain",
