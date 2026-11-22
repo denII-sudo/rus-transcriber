@@ -127,6 +127,12 @@ def _name_at(toks, pos, names):
     return None, 0
 
 
+def _negated_label(toks, pos, names):
+    name, count = _name_at(toks, pos, names)
+    return bool(name and pos and norm(toks[pos - 1]) == "не" and
+                toks[pos + count - 1].rstrip().endswith(":"))
+
+
 def classify(text, names):
     t = " ".join(norm(x) for x in (text or "").split() if norm(x))
     if not t:
@@ -167,7 +173,8 @@ def split_replies(text, names):
             colon = last.rstrip().endswith(":")
             prev_end = i == 0 or re.search(r"[.!?…:]$", toks[i - 1]) is not None
             nxt = toks[i + count] if i + count < len(toks) else ""
-            if colon or (prev_end and nxt[:1].isupper() and not last.rstrip().endswith(",")):
+            if not _negated_label(toks, i, names) and \
+                    (colon or (prev_end and nxt[:1].isupper() and not last.rstrip().endswith(","))):
                 is_label = True
         if is_label:
             if cur:
@@ -329,6 +336,11 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
     c = classify(text, names)
     rep = {"id": cid, "answer": text, "kind": c["kind"], "applied": [], "inserted": [], "typos": [],
            "proposed_delete": [], "deleted": [], "overlap": [], "human": None}
+    label_tokens = text.split()
+    if any(_negated_label(label_tokens, i, names) for i in range(len(label_tokens))):
+        rep["kind"] = "unmatched"
+        rep["human"] = "отрицательная метка неоднозначна; укажите говорящего и слова отдельно"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "agree":
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":

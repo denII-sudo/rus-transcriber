@@ -57,6 +57,8 @@ class WorkerSnapshotTests(unittest.TestCase):
             ("Борис, не Анна", "name", "Борис"),
             ("не Анна, а Вера", "name", "Вера"),
             ("это не Анна", "unmatched", None),
+            ("не Анна: тест", "unmatched", None),
+            ("не Спикер 1: тест", "unmatched", None),
             ("Спикер 3: тест", "unmatched", None),
         ]
         for backend in ("legacy_files", "sqlite"):

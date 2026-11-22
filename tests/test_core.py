@@ -375,6 +375,17 @@ class Answers(unittest.TestCase):
                 self.assertFalse(result["edits"])
                 self.assertTrue(result["report"]["human"])
 
+    def test_negated_label_cannot_assign_speaker_or_insert_negation(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Борис"}]
+        for text in ("не Анна: слово", "это не Анна: слово", "Борис: слово не Анна: слово"):
+            with self.subTest(text=text):
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertEqual(result["kind"], "unmatched")
+                self.assertFalse(result["edits"])
+                self.assertTrue(result["report"]["human"])
+                self.assertNotIn("Анна", [speaker for speaker, _ in freeform.split_replies(text, self.names)])
+
     def test_classify(self):
         c = freeform.classify
         self.assertEqual(c("да", self.names), {"kind": "agree"})
