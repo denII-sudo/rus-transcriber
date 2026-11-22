@@ -1,0 +1,1319 @@
+"""Конфликт внешней правки: копия человека и явная замена файла версией программы.
+
+Проверяется только наблюдаемое: байты файлов, строки базы, ответы локального экрана и MCP.
+
+Договор HTTP (адреса после секретного префикса; все POST — JSON с Origin экрана):
+
+GET  api/conflicts/all -> {available, reason, items}
+     Нет файла базы: 200, available=false, reason по-русски, items=[]; ничего не создаётся.
+     items — открытые и решённые конфликты всей базы:
+       conflict_id, scope ("document"|"conspect"), recording_id, title (по имени записи),
+       name (у свёртки), kind (вид файла), relative_path, file (полный путь), observed_size,
+       preserved (bool), status ("open"|"not_written"|"resolved"), can_replace (bool), can_retry (bool).
+     not_written — решён, это последний конфликт этого файла, очередь записи объекта не доведена,
+       а в файле не последняя версия программы. can_retry — not_written и очередь объекта не ждёт
+       решения другого конфликта.
+
+POST api/conflict/preview {recording_id, conflict_id, kind: scope}; ничего не меняет
+     -> прежние поля (conflict_id, kind, relative_path, observed_hash, observed_size, preserved,
+        preview, truncated) и
+        file;
+        file_state: "program" — равен последней версии программы | "same" — равен копии | "changed" |
+                    "missing" — файла нет | "unavailable" — не читается, не файл, ссылка;
+        removed, added — строки копии, которые пропадут, и строки последней версии программы, которые
+                    появятся (по порядку, без переводов строк);
+        removed_total, added_total, shown_all — строки и списки можно сокращать, тогда shown_all=false;
+                    слишком долгое сравнение можно огрубить, но не занижая число пропадающих строк;
+        newlines_only — отличаются только CRLF/CR/LF и перевод строки в конце;
+        also_replaces — relative_path других файлов того же объекта, которые заменятся этим же
+                    подтверждением по прежнему решению;
+        can_replace, reason, snapshot (null, если заменять нельзя).
+
+POST api/conflict/copy {recording_id, conflict_id, kind: scope}; ничего не меняет
+     -> сохранённые байты целиком: application/octet-stream, Content-Disposition attachment
+        с filename*=UTF-8''<имя с прежним расширением>. Байты не сохранены — 400.
+
+POST api/conflict/resolve {snapshot, confirm: true}
+     -> 400, конфликт остаётся открытым: нет подтверждения или снимка; снимок изменён или устарел
+        (сам конфликт, последняя версия программы); файла нет, он не читается, не обычный файл или
+        путь стал ссылкой; архив; копия не сохранена.
+        Изменение файла после показа отказом не является: решение записывается, файл остаётся цел.
+     -> 200 {outcome, new_conflict_id, reason}:
+        replaced — в файле последняя версия программы (даже если не записался другой файл);
+        changed — появился открытый конфликт этого же файла (new_conflict_id);
+        not_written — всё остальное после записи решения (reason по-русски).
+
+POST api/conflict/retry {recording_id, conflict_id, kind: scope}
+     -> открытый или чужой конфликт — 400; иначе только прежняя запись файлов, без новых ревизий
+        и решений; ответ как у resolve.
+
+MCP: окна двух resolve_*_conflict говорят «заменить файл»; нет файла — отказ до записи решения.
+"""
+import asyncio
+import gc
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+from urllib.parse import unquote, urlsplit
+
+import confirm
+import core
+import documents
+import migrate
+import paths
+import recordings
+import settings
+import storage
+import workflow_page
+
+with mock.patch.object(migrate, "run"):
+    import server
+
+PROJECT = Path(__file__).resolve().parent.parent
+SCOPES = ("document", "conspect")
+REVISION_TABLES = ("transcript_revisions", "review_revisions", "document_versions", "conspect_revisions")
+CYRILLIC = re.compile("[А-Яа-яЁё]")
+LATE_EDIT = "правка, сохранённая после показа\n".encode("utf-8")
+
+
+def same_path(left, right):
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def only_in(left, right):
+    """Строки left, которых нет в right; в подготовленных здесь текстах это и есть различие."""
+    def lines(data):
+        found = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        return found[:-1] if found[-1] == "" else found
+    other = set(lines(right))
+    return [line for line in lines(left) if line not in other]
+
+
+def edited(data):
+    return data.replace("альфа".encode("utf-8"), "альфа, моя правка".encode("utf-8"))
+
+
+def failing_replace(target):
+    """Файл занят: не удаётся замена именно этого файла, остальные пишутся как обычно."""
+    original = os.replace
+
+    def replace(src, dst, *args, **kwargs):
+        if same_path(dst, target):
+            raise PermissionError(13, "synthetic busy file", str(dst))
+        return original(src, dst, *args, **kwargs)
+    return mock.patch("os.replace", replace)
+
+
+class ScreenCase(unittest.TestCase):
+    backend = "sqlite"
+    with_database = True
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="conflict-replace-")).resolve()
+
+        def remove():
+            # соединения SQLite обработчиков экрана держат файл базы в Windows
+            gc.collect()
+            shutil.rmtree(self.base, ignore_errors=True)
+        self.addCleanup(remove)
+        self.database = self.base / "state.sqlite3"
+        for patcher in (mock.patch.object(paths, "STATE_DB", self.database),
+                        mock.patch.object(settings, "recording_backend", return_value=self.backend)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.count = 0
+        if self.with_database:
+            self.store = storage.initialize(self.database, initial_display_name="Тест")
+            self.addCleanup(self.store.close)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = min(probe.getsockname()[1], 65535 - 20)  # make_server перебирает 20 портов вверх
+        self.srv, url, _ = workflow_page.make_server(port)
+        self.prefix = urlsplit(url).path
+        self.host = f"127.0.0.1:{self.srv.server_port}"
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+
+    # ---------- HTTP ----------
+    def request(self, method, path, body=None, *, origin="screen", prefix=None, host=None,
+                ctype="application/json"):
+        payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        lines = [f"{method} {self.prefix if prefix is None else prefix}{path} HTTP/1.1",
+                 f"Host: {host or self.host}", f"Content-Length: {len(payload)}", "Connection: close"]
+        if method == "POST":
+            lines.append(f"Content-Type: {ctype}")
+            if origin is not None:
+                lines.append("Origin: " + (f"http://{self.host}" if origin == "screen" else origin))
+        # заголовки и тело одной отправкой: отказ до чтения тела в Windows иначе рвёт соединение
+        with socket.create_connection(("127.0.0.1", self.srv.server_port), timeout=90) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + payload)
+            response = http.client.HTTPResponse(sock, method=method)
+            try:
+                response.begin()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                response.close()
+
+    def ok(self, method, path, body=None):
+        status, _, raw = self.request(method, path, body)
+        self.assertEqual(status, 200, f"{method} {path}: {raw[:300].decode('utf-8', 'replace')}")
+        data = json.loads(raw)
+        self.assertFalse(data.get("error"), data)
+        return data
+
+    def refused(self, path, body):
+        status, _, raw = self.request("POST", path, body)
+        self.assertEqual(status, 400, f"{path}: {raw[:300].decode('utf-8', 'replace')}")
+        self.assertRegex(json.loads(raw)["error"], CYRILLIC)
+
+    def body(self, case, **changes):
+        return {"recording_id": case.rid, "conflict_id": case.id, "kind": case.scope, **changes}
+
+    def listing(self):
+        return self.ok("GET", "api/conflicts/all")
+
+    def item(self, case):
+        found = [row for row in self.listing()["items"] if row["conflict_id"] == case.id]
+        self.assertEqual(len(found), 1, "конфликт должен быть в общем списке один раз")
+        return found[0]
+
+    def preview(self, case):
+        shown = self.ok("POST", "api/conflict/preview", self.body(case))
+        self.assertIn("snapshot", shown, "предпросмотр должен готовить сравнение и снимок")
+        return shown
+
+    def snapshot(self, case):
+        found = self.preview(case)["snapshot"]
+        self.assertTrue(found, "заменяемый конфликт должен получить снимок")
+        return found
+
+    def replace(self, snapshot):
+        return self.ok("POST", "api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+
+    def retry(self, case):
+        return self.ok("POST", "api/conflict/retry", self.body(case))
+
+    def copy(self, case):
+        status, _, raw = self.request("POST", "api/conflict/copy", self.body(case))
+        self.assertEqual(status, 200, f"копия: {raw[:300].decode('utf-8', 'replace')}")
+        return raw
+
+    # ---------- выдуманные записи ----------
+    def recording(self, *, root=None, ident=None):
+        self.count += 1
+        source = self.base / f"Встреча пример {self.count}.wav"
+        source.write_bytes(b"synthetic")
+        layout = recordings.document_layout(source)
+        root = root or layout["root"]
+        root.mkdir(exist_ok=True)
+        root_id, relatives = recordings.prepare_new_layout(self.store, root, layout["paths"])
+        ident = ident or str(uuid.uuid4())
+        segments = [{"start": i * 2, "end": i * 2 + 2, "speaker": "Спикер 1",
+                     "words": [{"w": word, "s": i * 2, "e": i * 2 + 1}]}
+                    for i, word in enumerate(("альфа", "бета", "гамма"))]
+        data = {"file": str(source), "duration": "00:00:06", "speakers": ["Спикер 1"], "quality": {},
+                "review": [], "review_done": False, "segments": segments}
+        recordings.commit_worker_result(
+            self.store, data, source, root_id, recordings.operation_context(self.store, "model"),
+            recording_id=ident, operation_id=str(uuid.uuid4()),
+            generated_at="2026-01-01T00:00:00Z", document_paths=relatives)
+        recordings.materialize_recording(self.store, ident)
+        return SimpleNamespace(rid=ident, root=root, root_id=root_id, stem=source.stem,
+                               files={kind: root / relative for kind, relative in relatives.items()},
+                               conspect_id=str(uuid.uuid4()), conspect_revision=0,
+                               conspect_files={kind: root / f"{source.stem}.Краткий.conspect.{kind}"
+                                               for kind in ("json", "md")})
+
+    def change_text(self, rec, word):
+        current = self.store.get_current(rec.rid)
+        transcript = current["transcript"]["payload"]
+        transcript["segments"][1]["words"][0]["w"] = word
+        transcript["segments"][1]["text"] = word
+        return self.store.commit_change_with_document(
+            rec.rid, {"source_revision": current["transcript"]["revision"],
+                      "review_revision": current["review"]["revision"]},
+            str(uuid.uuid4()), recordings.operation_context(self.store, "human"), transcript=transcript,
+            review=current["review"]["payload"], root_id=rec.root_id,
+            generated_at="2026-01-01T00:01:00Z")
+
+    def save_conspect(self, rec, md=None):
+        revision = rec.conspect_revision + 1
+        payload = {"name": "Краткий", "recording_id": rec.rid, "synthetic_revision": revision}
+        self.store.save_conspect(
+            rec.rid, rec.conspect_id, "Краткий", self.store.get_current(rec.rid)["transcript"]["revision"],
+            rec.conspect_revision or None, payload, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            md or f"# Краткий\n\nальфа бета\n\nревизия {revision}\n".encode("utf-8"),
+            rec.conspect_files["json"].name, rec.conspect_files["md"].name, rec.root_id,
+            str(uuid.uuid4()), recordings.operation_context(self.store, "human"))
+        rec.conspect_revision = revision
+
+    def program(self, rec, scope, kind):
+        if scope == "document":
+            revision = self.store.db.execute(
+                "SELECT max(document_revision) FROM document_versions WHERE recording_id=?",
+                (rec.rid,)).fetchone()[0]
+            return bytes(self.store.get_document(rec.rid, revision)[kind])
+        return bytes(self.store.get_conspect(rec.conspect_id, rec.conspect_revision)[kind])
+
+    def materialize(self, rec, scope):
+        if scope == "document":
+            return recordings.materialize_recording(self.store, rec.rid)
+        return recordings.materialize_conspects(self.store, rec.rid)
+
+    def conflict(self, scope, body=None, *, kind="md", rec=None):
+        """Открытый конфликт; body — байты, сохранённые человеком, или функция от прежних."""
+        rec = rec or self.recording()
+        if scope == "conspect":
+            self.save_conspect(rec)
+            self.materialize(rec, scope)
+        path = (rec.files if scope == "document" else rec.conspect_files)[kind]
+        original = path.read_bytes()
+        if body is None:
+            saved = edited(original) if kind == "md" else original + b"\n"
+        else:
+            saved = body(original) if callable(body) else body
+        self.assertNotEqual(saved, original)
+        path.write_bytes(saved)
+        if scope == "conspect":
+            self.save_conspect(rec)
+        self.materialize(rec, scope)
+        return self.open_case(rec, scope, kind)
+
+    def both_conspect_files(self):
+        rec = self.recording()
+        self.save_conspect(rec)
+        self.materialize(rec, "conspect")
+        for path in rec.conspect_files.values():
+            path.write_bytes(b"my edit\n")
+        self.save_conspect(rec)
+        self.materialize(rec, "conspect")
+        return self.open_case(rec, "conspect", "md"), self.open_case(rec, "conspect", "json")
+
+    def open_rows(self, rec, scope):
+        if scope == "document":
+            return core.list_document_conflicts(rec.rid)
+        return core.list_conspect_conflicts(rec.rid)
+
+    def open_case(self, rec, scope, kind):
+        rows = [row for row in self.open_rows(rec, scope) if row["kind"] == kind]
+        self.assertEqual(len(rows), 1, "подготовка теста: нужен один открытый конфликт файла")
+        found = self.store.db.execute(f"SELECT observed_bytes FROM {scope}_conflicts WHERE conflict_id=?",
+                                      (rows[0]["conflict_id"],)).fetchone()[0]
+        return SimpleNamespace(rec=rec, rid=rec.rid, id=rows[0]["conflict_id"], scope=scope, kind=kind,
+                               relative=rows[0]["relative_path"], path=rec.root / rows[0]["relative_path"],
+                               saved=None if found is None else bytes(found))
+
+    def is_open(self, case):
+        return self.store.db.execute(
+            f"SELECT resolution_operation_id FROM {case.scope}_conflicts WHERE conflict_id=?",
+            (case.id,)).fetchone()[0] is None
+
+    def resolve_directly(self, case):
+        """Решение записано, а файлы не формировались: так остаётся после прежней версии или сбоя."""
+        getattr(self.store, f"resolve_{case.scope}_conflict")(
+            case.id, str(uuid.uuid4()), recordings.operation_context(self.store, "human"))
+
+    def after_decision(self, scope, action):
+        """Выполнить action сразу после записи решения, до формирования файлов."""
+        name = f"resolve_{scope}_conflict"
+        original = getattr(storage.Store, name)
+
+        def resolve(store, *args, **kwargs):
+            result = original(store, *args, **kwargs)
+            action()
+            return result
+        return mock.patch.object(storage.Store, name, resolve)
+
+    # ---------- состояние ----------
+    def counts(self, *tables):
+        return {table: self.store.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in tables}
+
+    def state(self):
+        """Вся база построчно и все файлы песочницы побайтно."""
+        db = sqlite3.connect(self.database)
+        try:
+            rows = hashlib.sha256()
+            for line in db.iterdump():
+                rows.update(line.encode("utf-8", "surrogatepass"))
+        finally:
+            db.close()
+        files = {}
+        for path in self.base.rglob("*"):
+            if not path.name.startswith(self.database.name):
+                files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "dir"
+        return rows.hexdigest(), files
+
+    def assert_untouched(self, case, content):
+        self.assertTrue(case.path.read_bytes() == content, "файл человека изменён")
+        self.assertTrue(self.is_open(case), "конфликт помечен решённым")
+
+
+class ConflictListTests(ScreenCase):
+    def test_list_shows_conflicts_of_recordings_without_request(self):
+        cases = [self.conflict(scope) for scope in SCOPES]
+        self.assertEqual(core.workflow_list(), [])
+        data = self.listing()
+        self.assertIs(data["available"], True)
+        self.assertEqual({row["conflict_id"] for row in data["items"]}, {case.id for case in cases})
+        for case in cases:
+            row = self.item(case)
+            self.assertEqual((row["scope"], row["recording_id"], row["kind"], row["relative_path"]),
+                             (case.scope, case.rid, "md", case.relative))
+            self.assertIn(case.rec.stem.casefold(), row["title"].casefold())
+            self.assertTrue(same_path(row["file"], case.path), row["file"])
+            self.assertEqual(row["observed_size"], len(case.saved))
+            self.assertIs(row["preserved"], True)
+            self.assertEqual((row["status"], row["can_replace"], row["can_retry"]), ("open", True, False))
+            if case.scope == "conspect":
+                self.assertEqual(row["name"], "Краткий")
+
+    def test_database_without_conflicts_has_empty_list(self):
+        self.recording()
+        data = self.listing()
+        self.assertEqual((data["available"], data["items"]), (True, []))
+
+    def test_resolved_conflicts_stay_with_downloadable_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.replace(self.snapshot(case))
+                row = self.item(case)
+                self.assertEqual((row["status"], row["can_replace"], row["can_retry"]),
+                                 ("resolved", False, False))
+                self.assertEqual(self.copy(case), case.saved)
+                self.assertEqual(self.open_rows(case.rec, scope), [])
+
+    def test_copy_left_by_previous_decision_is_listed(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                self.materialize(case.rec, scope)
+                self.assertEqual(self.item(case)["status"], "resolved")
+                self.assertEqual(self.copy(case), case.saved)
+
+    def test_decided_but_unwritten_file_is_not_shown_as_done(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                row = self.item(case)
+                self.assertEqual((row["status"], row["can_replace"], row["can_retry"]),
+                                 ("not_written", False, True))
+
+    def test_list_and_copy_work_when_folder_is_gone(self):
+        opened, decided = self.conflict("document"), self.conflict("conspect")
+        self.resolve_directly(decided)
+        for case in (opened, decided):
+            os.rename(case.rec.root, case.rec.root.with_name(case.rec.root.name + "-away"))
+        self.assertEqual(self.item(opened)["status"], "open")
+        self.assertEqual(self.item(decided)["status"], "not_written")
+        self.assertEqual(self.copy(opened), opened.saved)
+        self.assertEqual(self.copy(decided), decided.saved)
+        shown = self.preview(opened)
+        self.assertIn(shown["file_state"], ("missing", "unavailable"))
+        self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
+
+    def test_list_changes_nothing(self):
+        self.conflict("document")
+        self.resolve_directly(self.conflict("conspect"))
+        before = self.state()
+        self.listing()
+        self.assertEqual(self.state(), before)
+
+
+class ConflictCopyTests(ScreenCase):
+    def test_copy_is_byte_exact(self):
+        bodies = {"long": "\n".join(f"строка правки {i}" for i in range(3000)).encode("utf-8"),
+                  "crlf-bom": "﻿моя правка\r\nвторая\r\n".encode("utf-8"),
+                  "not-utf8": "моя правка".encode("cp1251") + b"\x00\xff",
+                  "empty": b""}
+        for scope in SCOPES:
+            for label, body in bodies.items():
+                with self.subTest(scope=scope, body=label):
+                    self.assertTrue(self.copy(self.conflict(scope, body)) == body, "копия не побайтная")
+
+    def test_copy_at_size_limit_is_whole(self):
+        body = b"x" * documents.MAX_CONFLICT_BYTES
+        self.assertTrue(self.copy(self.conflict("document", body)) == body, "копия не целая")
+
+    def test_copy_is_attachment_with_safe_name(self):
+        for scope in SCOPES:
+            for kind in ("md", "json"):
+                with self.subTest(scope=scope, kind=kind):
+                    case = self.conflict(scope, kind=kind)
+                    status, headers, raw = self.request("POST", "api/conflict/copy", self.body(case))
+                    self.assertEqual((status, raw), (200, case.saved))
+                    self.assertEqual(headers["Content-Type"].split(";")[0], "application/octet-stream")
+                    self.assertEqual(headers["Cache-Control"], "no-store")
+                    self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                    disposition = headers["Content-Disposition"]
+                    self.assertTrue(disposition.startswith("attachment"), disposition)
+                    self.assertTrue(disposition.isascii(), disposition)
+                    found = re.search(r"filename\*=UTF-8''([^;]+)", disposition)
+                    self.assertIsNotNone(found, disposition)
+                    name = unquote(found.group(1))
+                    self.assertTrue(name.endswith("." + kind), name)
+                    self.assertFalse(set(name) & set('/\\:*?"<>|\r\n'), name)
+                    self.assertNotIn(self.prefix.strip("/"), str(headers))
+
+    def test_copy_changes_nothing(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                before = self.state()
+                self.copy(case)
+                self.assertEqual(self.state(), before)
+
+    def test_copy_does_not_need_the_file(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                case.path.unlink()
+                self.assertEqual(self.copy(case), case.saved)
+                self.assertFalse(case.path.exists())
+
+    def test_copy_not_saved_over_limit_is_refused(self):
+        case = self.conflict("document", b"x" * (documents.MAX_CONFLICT_BYTES + 1))
+        self.assertIsNone(case.saved)
+        self.refused("api/conflict/copy", self.body(case))
+
+    def test_copy_of_another_recording_or_kind_is_refused(self):
+        case = self.conflict("document")
+        self.copy(case)
+        for changes in ({"recording_id": str(uuid.uuid4())}, {"kind": "conspect"}, {"kind": "непонятно"},
+                        {"conflict_id": str(uuid.uuid4())}, {"conflict_id": "не идентификатор"}):
+            with self.subTest(changes=changes):
+                self.refused("api/conflict/copy", self.body(case, **changes))
+
+
+class ConflictPreviewTests(ScreenCase):
+    def test_truncation_counts_characters_not_bytes(self):
+        for size, cut in ((12000, False), (20000, False), (20001, True)):
+            with self.subTest(size=size):
+                case = self.conflict("document", ("я" * size).encode("utf-8"))
+                shown = core.preview_conflict(case.rid, case.id, "document")
+                self.assertEqual((len(shown["preview"]), shown["truncated"]), (min(size, 20000), cut))
+
+    def test_preview_shows_lines_that_go_and_come(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                program = self.program(case.rec, scope, "md")
+                shown = self.preview(case)
+                self.assertEqual(shown["removed"], only_in(case.saved, program))
+                self.assertEqual(shown["added"], only_in(program, case.saved))
+                self.assertIn("альфа, моя правка", "\n".join(shown["removed"]))
+                self.assertEqual((shown["removed_total"], shown["added_total"]),
+                                 (len(shown["removed"]), len(shown["added"])))
+                self.assertEqual((shown["shown_all"], shown["newlines_only"], shown["also_replaces"]),
+                                 (True, False, []))
+                self.assertEqual((shown["kind"], shown["file_state"], shown["can_replace"]), ("md", "same", True))
+                self.assertTrue(same_path(shown["file"], case.path))
+                self.assertTrue(shown["snapshot"])
+
+    def test_preview_changes_nothing(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                before = self.state()
+                self.snapshot(case)
+                self.assertEqual(self.state(), before)
+
+    def test_preview_compares_with_latest_program_version(self):
+        rec = self.recording()
+        self.change_text(rec, "вторая версия")
+        self.change_text(rec, "третья версия")
+        rec.files["md"].write_bytes(edited(rec.files["md"].read_bytes()))
+        self.materialize(rec, "document")
+        document = self.open_case(rec, "document", "md")
+
+        other = self.recording()
+        self.save_conspect(other)
+        self.save_conspect(other)
+        other.conspect_files["md"].write_bytes("моя свёртка\n".encode("utf-8"))
+        self.materialize(other, "conspect")
+        conspect = self.open_case(other, "conspect", "md")
+
+        for case in (document, conspect):
+            with self.subTest(scope=case.scope):
+                latest = self.program(case.rec, case.scope, "md")
+                shown = self.preview(case)
+                self.assertEqual(shown["added"], only_in(latest, case.saved))
+                self.assertEqual(self.replace(shown["snapshot"])["outcome"], "replaced")
+                self.assertEqual(case.path.read_bytes(), latest)
+
+    def test_only_line_endings_are_named_separately(self):
+        variants = {"crlf": lambda data: data.replace(b"\n", b"\r\n"),
+                    "cr": lambda data: data.replace(b"\n", b"\r"),
+                    "final": lambda data: data[:-1] if data.endswith(b"\n") else data + b"\n"}
+        for label, change in variants.items():
+            with self.subTest(variant=label):
+                shown = self.preview(self.conflict("document", change))
+                self.assertIs(shown["newlines_only"], True)
+                self.assertEqual((shown["removed"], shown["added"], shown["removed_total"], shown["added_total"]),
+                                 ([], [], 0, 0))
+                self.assertIs(shown["can_replace"], True)
+
+    def test_line_endings_do_not_hide_real_edit(self):
+        case = self.conflict("document", lambda data: edited(data).replace(b"\n", b"\r\n"))
+        program = self.program(case.rec, "document", "md")
+        shown = self.preview(case)
+        self.assertIs(shown["newlines_only"], False)
+        self.assertEqual(shown["removed"], only_in(case.saved, program))
+        self.assertEqual(shown["added"], only_in(program, case.saved))
+
+    def test_invisible_edits_are_not_called_line_endings(self):
+        variants = {"bom": lambda data: b"\xef\xbb\xbf" + data,
+                    "form-feed": lambda data: data.replace(b"\n", b"\x0c", 1),
+                    "line-separator": lambda data: data.replace(b"\n", " ".encode("utf-8"), 1),
+                    "space": lambda data: data.replace(b"\n", b" \n", 1)}
+        for label, change in variants.items():
+            with self.subTest(variant=label):
+                shown = self.preview(self.conflict("document", change))
+                self.assertIs(shown["newlines_only"], False)
+                self.assertGreater(shown["removed_total"], 0)
+                self.assertTrue(shown["removed"])
+
+    def test_all_removed_lines_are_counted(self):
+        body = "".join(f"моя строка {i}\n" for i in range(300)).encode("utf-8")
+        case = self.conflict("document", body)
+        expected = only_in(body, self.program(case.rec, "document", "md"))
+        shown = self.preview(case)
+        self.assertEqual(shown["removed_total"], len(expected))
+        self.assertGreaterEqual(len(shown["removed"]), 100)
+        self.assertEqual(shown["removed"], expected[:len(shown["removed"])])
+        self.assertEqual(shown["shown_all"], len(shown["removed"]) == len(expected)
+                         and len(shown["added"]) == shown["added_total"])
+
+    def test_large_text_is_compared_in_reasonable_time(self):
+        variants = {"repeated": "да\nнет\nугу\n\n" * 1000,
+                    "long": "".join(f"реплика {i}\n\n" for i in range(10000))}
+        for label, text in variants.items():
+            with self.subTest(variant=label):
+                case = self.conflict("document", text.encode("utf-8"))
+                started = time.monotonic()
+                shown = self.preview(case)
+                self.assertLess(time.monotonic() - started, 30)
+                self.assertGreater(shown["removed_total"], 0)
+
+    def test_many_scattered_edits_are_compared_in_reasonable_time(self):
+        # «заменить все» в Блокноте: изменена каждая вторая строка длинного файла
+        lines = [f"реплика {i}" for i in range(60000)]
+        rec = self.recording()
+        self.save_conspect(rec, md=("\n".join(lines) + "\n").encode("utf-8"))
+        changed = [line + "!" if i % 2 else line for i, line in enumerate(lines)]
+        rec.conspect_files["md"].write_bytes(("\n".join(changed) + "\n").encode("utf-8"))
+        self.materialize(rec, "conspect")
+        case = self.open_case(rec, "conspect", "md")
+        started = time.monotonic()
+        shown = self.preview(case)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertGreaterEqual(shown["removed_total"], 30000)
+        self.assertIs(shown["shown_all"], len(shown["removed"]) == shown["removed_total"]
+                      and len(shown["added"]) == shown["added_total"])
+
+    def test_limit_sized_copy_does_not_flood_preview(self):
+        case = self.conflict("document", b"x" * documents.MAX_CONFLICT_BYTES)
+        status, _, raw = self.request("POST", "api/conflict/preview", self.body(case))
+        self.assertEqual(status, 200)
+        self.assertLess(len(raw), 4 * 1024 * 1024)
+        shown = json.loads(raw)
+        self.assertIn("snapshot", shown, "предпросмотр должен готовить сравнение и снимок")
+        self.assertIs(shown["shown_all"], False)
+        self.assertTrue(shown["snapshot"])
+        self.assertLess(len(json.dumps(shown["snapshot"])), 16 * 1024)
+
+    def test_preview_tells_that_file_differs_from_shown_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                program = self.program(case.rec, scope, "md")
+                case.path.write_bytes(LATE_EDIT)
+                shown = self.preview(case)
+                self.assertEqual((shown["file_state"], shown["can_replace"]), ("changed", True))
+                self.assertEqual(shown["removed"], only_in(case.saved, program))
+                case.path.write_bytes(program)
+                self.assertEqual(self.preview(case)["file_state"], "program")
+
+    def test_preview_without_file_explains_and_gives_no_snapshot(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                case.path.unlink()
+                shown = self.preview(case)
+                self.assertEqual((shown["file_state"], shown["can_replace"], shown["snapshot"]),
+                                 ("missing", False, None))
+                self.assertRegex(shown["reason"], CYRILLIC)
+                self.assertTrue(shown["removed"])
+
+    def test_resolved_copy_is_view_only(self):
+        case = self.conflict("document")
+        self.replace(self.snapshot(case))
+        shown = self.preview(case)
+        self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
+
+    def test_preview_names_file_waiting_for_this_confirmation(self):
+        first, second = self.both_conspect_files()
+        self.assertEqual(self.preview(second)["also_replaces"], [])
+        self.replace(self.snapshot(first))
+        self.assertEqual(self.preview(second)["also_replaces"], [first.relative])
+
+    def test_preview_names_returned_copy_that_goes_with_other_file(self):
+        first = self.conflict("document")
+        self.resolve_directly(first)
+        self.materialize(first.rec, "document")
+        # человек вернул скачанную копию на место и поправил второй файл той же записи
+        first.path.write_bytes(first.saved)
+        first.rec.files["json"].write_bytes(b"{}\n")
+        self.materialize(first.rec, "document")
+        second = self.open_case(first.rec, "document", "json")
+        self.assertEqual(self.preview(second)["also_replaces"], [first.relative])
+
+
+class ConflictReplaceTests(ScreenCase):
+    def test_replace_writes_program_version_and_keeps_copy(self):
+        for scope in SCOPES:
+            for kind in ("md", "json"):
+                with self.subTest(scope=scope, kind=kind):
+                    case = self.conflict(scope, kind=kind)
+                    snapshot = self.snapshot(case)
+                    before = self.counts("operations", *REVISION_TABLES)
+                    result = self.replace(snapshot)
+                    self.assertEqual((result["outcome"], result["new_conflict_id"]), ("replaced", None))
+                    self.assertEqual(case.path.read_bytes(), self.program(case.rec, scope, kind))
+                    self.assertFalse(self.is_open(case))
+                    self.assertEqual(self.copy(case), case.saved)
+                    self.assertEqual(self.counts("operations", *REVISION_TABLES),
+                                     {**before, "operations": before["operations"] + 1},
+                                     "правка не переносится в стенограмму, новых ревизий нет")
+
+    def test_empty_file_can_be_replaced(self):
+        case = self.conflict("document", b"")
+        self.assertEqual(self.replace(self.snapshot(case))["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "md"))
+
+    def test_edit_works_after_replace(self):
+        case = self.conflict("document")
+        with self.assertRaises(storage.Conflict):
+            self.change_text(case.rec, "омега")
+        self.replace(self.snapshot(case))
+        self.change_text(case.rec, "омега")
+        self.materialize(case.rec, "document")
+        self.assertIn("омега".encode("utf-8"), case.path.read_bytes())
+
+    def test_replace_without_snapshot_is_refused(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                bodies = [{**self.body(case), "confirm": True}]
+                for snapshot in (None, {}, [], "снимок", 1, self.body(case)):
+                    bodies.append({**self.body(case), "confirm": True, "snapshot": snapshot})
+                for body in bodies:
+                    self.refused("api/conflict/resolve", body)
+                    self.assert_untouched(case, case.saved)
+
+    def test_replace_needs_literal_confirmation(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        for value in (None, False, 0, 1, "true", "false", [True]):
+            with self.subTest(confirm=value):
+                body = {"snapshot": snapshot}
+                if value is not None:
+                    body["confirm"] = value
+                self.refused("api/conflict/resolve", body)
+                self.assert_untouched(case, case.saved)
+
+    def test_altered_snapshot_is_refused(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                self.assertIsInstance(snapshot, dict)
+                for key, value in snapshot.items():
+                    for wrong in ({other: item for other, item in snapshot.items() if other != key},
+                                  {**snapshot, key: "x" if value != "x" else "y"}):
+                        self.refused("api/conflict/resolve", {"snapshot": wrong, "confirm": True})
+                        self.assert_untouched(case, case.saved)
+
+    def test_snapshot_cannot_be_moved_to_another_conflict(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                shown, hidden = self.conflict(scope), self.conflict(scope, b"another edit\n")
+                text = json.dumps(self.snapshot(shown))
+                text = text.replace(shown.id, hidden.id).replace(shown.rid, hidden.rid)
+                self.refused("api/conflict/resolve", {"snapshot": json.loads(text), "confirm": True})
+                self.assert_untouched(hidden, hidden.saved)
+
+    def test_snapshot_is_stale_after_new_program_version(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        # новая версия программы успела записаться в базу, пока человек смотрел на сравнение
+        with mock.patch.object(storage.Store, "_check_document_conflict", return_value=None):
+            self.change_text(case.rec, "новее показанного")
+        self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+        self.assert_untouched(case, case.saved)
+        self.assertEqual(self.replace(self.snapshot(case))["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "md"))
+
+    def test_repeated_confirmation_cannot_replace_returned_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                self.assertEqual(self.replace(snapshot)["outcome"], "replaced")
+                case.path.write_bytes(case.saved)
+                operations = self.counts("operations")
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assertEqual(case.path.read_bytes(), case.saved)
+                self.assertEqual(self.counts("operations"), operations)
+
+    def test_snapshot_is_stale_after_decision_elsewhere(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                self.resolve_directly(case)
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assertEqual(case.path.read_bytes(), case.saved)
+
+    def test_parallel_confirmations_make_one_decision(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                body = {"snapshot": self.snapshot(case), "confirm": True}
+                operations = self.counts("operations")["operations"]
+                barrier, answers = threading.Barrier(2), []
+
+                def send():
+                    barrier.wait(10)
+                    answers.append(self.request("POST", "api/conflict/resolve", body))
+                threads = [threading.Thread(target=send) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(100)
+                self.assertEqual(sorted(answer[0] for answer in answers), [200, 400])
+                self.assertEqual(self.counts("operations")["operations"], operations + 1)
+                won = json.loads(next(raw for status, _, raw in answers if status == 200))
+                # второй запрос мог на миг держать файл открытым для сверки; тогда нужен повтор
+                self.assertIn(won["outcome"], ("replaced", "not_written"))
+                if won["outcome"] == "not_written":
+                    self.assertEqual(self.retry(case)["outcome"], "replaced")
+                self.assertEqual(case.path.read_bytes(), self.program(case.rec, scope, "md"))
+
+    def test_missing_file_is_refused_before_decision(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                case.path.unlink()
+                before = self.state()
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assertEqual(self.state(), before)
+                # выход для человека: положить скачанную копию на место и заменить
+                case.path.write_bytes(self.copy(case))
+                self.assertEqual(self.replace(self.snapshot(case))["outcome"], "replaced")
+
+    def test_folder_instead_of_file_is_refused_before_decision(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                case.path.unlink()
+                case.path.mkdir()
+                shown = self.preview(case)
+                self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assertTrue(self.is_open(case))
+                self.assertTrue(case.path.is_dir())
+
+    @unittest.skipUnless(os.name == "nt", "соединения каталогов есть только в Windows")
+    def test_junction_is_refused_before_decision(self):
+        import _winapi
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                actual = case.rec.root.with_name(case.rec.root.name + "-actual")
+                os.rename(case.rec.root, actual)
+                _winapi.CreateJunction(str(actual), str(case.rec.root))
+                try:
+                    shown = self.preview(case)
+                    self.assertEqual((shown["file_state"], shown["can_replace"]), ("unavailable", False))
+                    self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                    self.assert_untouched(case, case.saved)
+                finally:
+                    os.rmdir(case.rec.root)
+                    os.rename(actual, case.rec.root)
+
+    @unittest.skipUnless(os.name == "nt", "запрет чтения блокировкой есть только в Windows")
+    def test_unreadable_file_is_refused_before_decision(self):
+        import msvcrt
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with open(case.path, "r+b") as held:
+                    msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, len(case.saved))
+                    try:
+                        shown = self.preview(case)
+                        self.assertEqual((shown["file_state"], shown["can_replace"]), ("unavailable", False))
+                        self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                        self.assertTrue(self.is_open(case))
+                    finally:
+                        held.seek(0)
+                        msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, len(case.saved))
+                self.assert_untouched(case, case.saved)
+
+    def test_over_limit_file_is_never_replaced(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                body = b"x" * (documents.MAX_CONFLICT_BYTES + 1)
+                case = self.conflict(scope, body)
+                row = self.item(case)
+                self.assertEqual((row["preserved"], row["can_replace"]), (False, False))
+                shown = self.preview(case)
+                self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
+                self.assertRegex(shown["reason"], CYRILLIC)
+                self.refused("api/conflict/resolve", {"snapshot": self.body(case), "confirm": True})
+                self.assert_untouched(case, body)
+
+    def test_archive_is_never_replaced_but_can_be_copied(self):
+        rec = self.recording()
+        self.change_text(rec, "вторая версия")
+        path = rec.root / "history" / rec.rid / "document-2" / "transcript.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"foreign archive\n")
+        self.materialize(rec, "document")
+        case = self.open_case(rec, "document", "archive_md")
+        self.assertIs(self.item(case)["can_replace"], False)
+        shown = self.preview(case)
+        self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
+        self.assertRegex(shown["reason"], CYRILLIC)
+        self.refused("api/conflict/resolve", {"snapshot": self.body(case), "confirm": True})
+        self.assert_untouched(case, b"foreign archive\n")
+        self.assertEqual(self.copy(case), b"foreign archive\n")
+
+    def test_file_changed_after_preview_gets_new_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                case.path.write_bytes(LATE_EDIT)
+                result = self.replace(snapshot)
+                self.assertEqual(result["outcome"], "changed")
+                self.assertEqual(case.path.read_bytes(), LATE_EDIT)
+                fresh = self.open_case(case.rec, scope, "md")
+                self.assertEqual(result["new_conflict_id"], fresh.id)
+                self.assertNotEqual(fresh.id, case.id)
+                self.assertEqual(self.copy(fresh), LATE_EDIT)
+                self.assertEqual(self.copy(case), case.saved)
+                old, new = self.item(case), self.item(fresh)
+                self.assertEqual((old["status"], old["can_retry"]), ("resolved", False))
+                self.assertEqual((new["status"], new["can_replace"]), ("open", True))
+                self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+                self.assert_untouched(fresh, LATE_EDIT)
+                self.assertEqual(self.replace(self.snapshot(fresh))["outcome"], "replaced")
+
+    def test_file_changed_between_decision_and_write_is_kept(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with self.after_decision(scope, lambda: case.path.write_bytes(LATE_EDIT)):
+                    result = self.replace(snapshot)
+                self.assertEqual(result["outcome"], "changed")
+                self.assertEqual(case.path.read_bytes(), LATE_EDIT)
+                fresh = self.open_case(case.rec, scope, "md")
+                self.assertEqual((result["new_conflict_id"], fresh.saved), (fresh.id, LATE_EDIT))
+
+    def test_file_changed_to_over_limit_is_kept_without_claiming_copy(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        big = b"x" * (documents.MAX_CONFLICT_BYTES + 1)
+        case.path.write_bytes(big)
+        result = self.replace(snapshot)
+        self.assertEqual(result["outcome"], "changed")
+        self.assertTrue(case.path.read_bytes() == big, "файл человека изменён")
+        fresh = self.open_case(case.rec, "document", "md")
+        row = self.item(fresh)
+        self.assertEqual((result["new_conflict_id"], row["preserved"], row["can_replace"]),
+                         (fresh.id, False, False))
+
+    def test_file_deleted_between_decision_and_write_is_reported(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with self.after_decision(scope, case.path.unlink):
+                    result = self.replace(snapshot)
+                self.assertEqual((result["outcome"], result["new_conflict_id"]), ("not_written", None))
+                self.assertRegex(result["reason"], CYRILLIC)
+                self.assertFalse(case.path.exists())
+                self.assertEqual(self.item(case)["status"], "not_written")
+
+    def test_failed_write_is_not_reported_as_replaced(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with failing_replace(case.path):
+                    result = self.replace(snapshot)
+                self.assertEqual((result["outcome"], result["new_conflict_id"]), ("not_written", None))
+                self.assertRegex(result["reason"], CYRILLIC)
+                self.assertEqual(case.path.read_bytes(), case.saved)
+                row = self.item(case)
+                self.assertEqual((row["status"], row["can_retry"], row["can_replace"]),
+                                 ("not_written", True, False))
+                self.assertEqual(self.copy(case), case.saved)
+
+    @unittest.skipUnless(os.name == "nt", "открытый файл мешает замене только в Windows")
+    def test_file_held_by_another_program_waits_for_retry(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with open(case.path, "rb"):
+                    self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
+                    self.assertEqual(self.item(case)["status"], "not_written")
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+                self.assertEqual(case.path.read_bytes(), self.program(case.rec, scope, "md"))
+
+    def test_outcome_is_about_this_file_when_other_recording_fails(self):
+        root = self.base / "common"
+        mine = self.recording(root=root, ident="00000000-0000-4000-8000-000000000001")
+        other = self.recording(root=root, ident="ffffffff-0000-4000-8000-000000000001")
+        case = self.conflict("document", rec=mine)
+        snapshot = self.snapshot(case)
+        other.files["md"].unlink()
+        with failing_replace(other.files["md"]):
+            result = self.replace(snapshot)
+        self.assertEqual(result["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
+        self.assertEqual(self.item(case)["status"], "resolved")
+
+    def test_write_stopped_by_other_recording_can_be_retried(self):
+        root = self.base / "common"
+        other = self.recording(root=root, ident="00000000-0000-4000-8000-000000000001")
+        mine = self.recording(root=root, ident="ffffffff-0000-4000-8000-000000000001")
+        case = self.conflict("document", rec=mine)
+        snapshot = self.snapshot(case)
+        self.change_text(other, "другая запись")
+        with failing_replace(other.files["md"]):
+            self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        self.assertIs(self.item(case)["can_retry"], True)
+        self.assertEqual(self.retry(case)["outcome"], "replaced")
+
+    def test_document_replaced_while_second_file_waits(self):
+        case = self.conflict("document", kind="json")
+        snapshot = self.snapshot(case)
+        md = case.rec.files["md"]
+        md.write_bytes(LATE_EDIT)
+        self.assertEqual(self.replace(snapshot)["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "json"))
+        self.assertEqual(md.read_bytes(), LATE_EDIT)
+        self.assertEqual(self.item(case)["status"], "resolved")
+        self.assertEqual(self.item(self.open_case(case.rec, "document", "md"))["status"], "open")
+
+    def test_document_waiting_for_second_file_is_not_called_replaced(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        case.rec.files["json"].write_bytes(b"{}\n")
+        result = self.replace(snapshot)
+        self.assertEqual((result["outcome"], result["new_conflict_id"]), ("not_written", None))
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        row = self.item(case)
+        self.assertEqual((row["status"], row["can_retry"]), ("not_written", False))
+        second = self.open_case(case.rec, "document", "json")
+        self.assertEqual(self.replace(self.snapshot(second))["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "md"))
+        self.assertEqual(self.item(case)["status"], "resolved")
+
+    def test_conspect_waiting_for_second_file_is_not_called_replaced(self):
+        first, second = self.both_conspect_files()
+        result = self.replace(self.snapshot(first))
+        self.assertEqual((result["outcome"], result["new_conflict_id"]), ("not_written", None))
+        self.assertEqual(first.path.read_bytes(), first.saved)
+        row = self.item(first)
+        self.assertEqual((row["status"], row["can_retry"]), ("not_written", False))
+        self.assertEqual(self.replace(self.snapshot(second))["outcome"], "replaced")
+        for case in (first, second):
+            self.assertEqual(case.path.read_bytes(), self.program(case.rec, "conspect", case.kind))
+            self.assertEqual(self.item(case)["status"], "resolved")
+
+
+class ConflictRetryTests(ScreenCase):
+    def test_retry_finishes_failed_replace_without_new_revisions(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                snapshot = self.snapshot(case)
+                with failing_replace(case.path):
+                    self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
+                    self.assertEqual(self.retry(case)["outcome"], "not_written")
+                before = self.counts("operations", *REVISION_TABLES)
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+                self.assertEqual(case.path.read_bytes(), self.program(case.rec, scope, "md"))
+                self.assertEqual(self.counts("operations", *REVISION_TABLES), before)
+                row = self.item(case)
+                self.assertEqual((row["status"], row["can_retry"]), ("resolved", False))
+
+    def test_retry_never_decides_open_conflict(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                before = self.state()
+                self.refused("api/conflict/retry", self.body(case))
+                self.assertEqual(self.state(), before)
+
+    def test_retry_of_another_recording_is_refused(self):
+        case = self.conflict("document")
+        self.resolve_directly(case)
+        self.refused("api/conflict/retry", self.body(case, recording_id=str(uuid.uuid4())))
+        self.refused("api/conflict/retry", self.body(case, kind="conspect"))
+        self.assertEqual(case.path.read_bytes(), case.saved)
+        self.assertEqual(self.retry(case)["outcome"], "replaced")
+
+    def test_retry_waits_for_returned_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                case.path.unlink()
+                result = self.retry(case)
+                self.assertEqual(result["outcome"], "not_written")
+                self.assertRegex(result["reason"], CYRILLIC)
+                self.assertFalse(case.path.exists())
+                case.path.write_bytes(self.copy(case))
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+
+    def test_retry_keeps_document_edited_after_failure(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        with failing_replace(case.path):
+            self.replace(snapshot)
+        case.path.write_bytes(LATE_EDIT)
+        result = self.retry(case)
+        self.assertEqual(result["outcome"], "changed")
+        self.assertEqual(case.path.read_bytes(), LATE_EDIT)
+        fresh = self.open_case(case.rec, "document", "md")
+        self.assertEqual((result["new_conflict_id"], fresh.saved), (fresh.id, LATE_EDIT))
+
+    def test_retry_keeps_conspect_edited_after_failure(self):
+        case = self.conflict("conspect")
+        snapshot = self.snapshot(case)
+        with failing_replace(case.path):
+            self.replace(snapshot)
+        case.path.write_bytes(LATE_EDIT)
+        result = self.retry(case)
+        self.assertEqual(result["outcome"], "not_written")
+        self.assertRegex(result["reason"], CYRILLIC)
+        self.assertEqual(case.path.read_bytes(), LATE_EDIT)
+        case.path.write_bytes(self.copy(case))
+        self.assertEqual(self.retry(case)["outcome"], "replaced")
+
+    def test_repeated_retry_changes_nothing(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+                before = self.state()
+                status, _, raw = self.request("POST", "api/conflict/retry", self.body(case))
+                self.assertIn(status, (200, 400), raw[:300])
+                self.assertEqual(self.state(), before)
+
+    def test_retry_cannot_replace_returned_copy(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                self.resolve_directly(case)
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+                case.path.write_bytes(case.saved)
+                status, _, raw = self.request("POST", "api/conflict/retry", self.body(case))
+                self.assertIn(status, (200, 400), raw[:300])
+                if status == 200:
+                    self.assertNotEqual(json.loads(raw)["outcome"], "replaced")
+                self.assertEqual(case.path.read_bytes(), case.saved)
+
+
+class ConflictRequestProtectionTests(ScreenCase):
+    def test_posts_require_screen_origin_host_token_and_json(self):
+        case = self.conflict("document")
+        snapshot = self.snapshot(case)
+        bodies = {"preview": self.body(case), "copy": self.body(case), "retry": self.body(case),
+                  "resolve": {"snapshot": snapshot, "confirm": True}}
+        before = self.state()
+        for route, body in bodies.items():
+            for expected, options in ((403, {"origin": None}), (403, {"origin": "null"}),
+                                      (403, {"origin": "http://example.test"}),
+                                      (403, {"origin": f"http://localhost:{self.srv.server_port}"}),
+                                      (403, {"host": f"localhost:{self.srv.server_port}"}),
+                                      (403, {"prefix": "/not-the-session/"}),
+                                      (415, {"ctype": "text/plain"})):
+                with self.subTest(route=route, options=options):
+                    status, _, raw = self.request("POST", "api/conflict/" + route, body, **options)
+                    self.assertEqual(status, expected)
+                    self.assertNotIn("моя правка".encode("utf-8"), raw)
+        self.assertEqual(self.state(), before)
+
+    def test_copy_and_changes_are_not_available_by_get(self):
+        case = self.conflict("document")
+        self.copy(case)
+        before = self.state()
+        query = f"?recording_id={case.rid}&conflict_id={case.id}&kind=document"
+        for route in ("preview", "copy", "retry", "resolve"):
+            with self.subTest(route=route):
+                self.assertEqual(self.request("GET", f"api/conflict/{route}{query}")[0], 404)
+        self.assertEqual(self.state(), before)
+
+
+class ConflictMCPTests(ScreenCase):
+    def mcp_resolve(self, case, **answer):
+        with mock.patch.object(confirm, "require", **(answer or {"return_value": "dialog"})) as asked:
+            response = asyncio.run(getattr(server, f"resolve_{case.scope}_conflict")(case.rid, case.id))
+        return response, asked
+
+    def test_window_says_file_will_be_replaced(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                response, asked = self.mcp_resolve(case)
+                asked.assert_called_once()
+                action, args, lines = asked.call_args.args
+                text = "\n".join(lines)
+                self.assertIn("заменить файл", action.casefold())
+                self.assertIn("заменить файл", text.casefold())
+                self.assertIn(case.relative, text)
+                self.assertEqual((args["recording_id"], args["conflict_id"], args["hash"]),
+                                 (case.rid, case.id, hashlib.sha256(case.saved).hexdigest()))
+                self.assertIs(json.loads(response)["materialized"], True)
+
+    def test_missing_file_is_refused_before_decision(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                case.path.unlink()
+                response, _ = self.mcp_resolve(case)
+                self.assertTrue(self.is_open(case), "конфликт помечен решённым, хотя файла нет")
+                self.assertIn("файл", response.casefold())
+                self.assertFalse(case.path.exists())
+
+    def test_refused_window_changes_nothing(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                before = self.state()
+                response, _ = self.mcp_resolve(case, side_effect=confirm.NotConfirmed("отказ"))
+                self.assertIn("отказ", response)
+                self.assertEqual(self.state(), before)
+
+    def test_failed_write_stays_visible_on_screen(self):
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                with failing_replace(case.path):
+                    self.mcp_resolve(case)
+                row = self.item(case)
+                self.assertEqual((row["status"], row["can_retry"]), ("not_written", True))
+                self.assertEqual(self.retry(case)["outcome"], "replaced")
+
+    def test_sync_does_not_replace_open_conflict(self):
+        case = self.conflict("document")
+        json.loads(server.sync_recording_documents(case.rid))
+        self.assert_untouched(case, case.saved)
+
+    def test_existing_lists_keep_shape_and_only_open_rows(self):
+        common = {"conflict_id", "kind", "relative_path", "observed_hash", "observed_size", "preserved"}
+        fields = {"document": common | {"document_revision"},
+                  "conspect": common | {"conspect_id", "name", "revision"}}
+        for scope in SCOPES:
+            with self.subTest(scope=scope):
+                case = self.conflict(scope)
+                listed = getattr(server, f"list_{scope}_conflicts")
+                rows = json.loads(listed(case.rid))
+                self.assertEqual([row["conflict_id"] for row in rows], [case.id])
+                self.assertEqual(set(rows[0]), fields[scope])
+                self.assertIs(type(rows[0]["preserved"]), int)
+                self.resolve_directly(case)
+                self.assertEqual(json.loads(listed(case.rid)), [])
+
+
+class NoDatabaseTests(ScreenCase):
+    backend = "legacy_files"
+    with_database = False
+
+    def test_screen_list_explains_and_creates_nothing(self):
+        for backend in ("legacy_files", "sqlite"):
+            with self.subTest(backend=backend), \
+                    mock.patch.object(settings, "recording_backend", return_value=backend):
+                data = self.listing()
+                self.assertEqual((data["available"], data["items"]), (False, []))
+                self.assertRegex(data["reason"], CYRILLIC)
+                self.assertEqual(list(self.base.iterdir()), [])
+
+    def test_page_lists_and_actions_create_nothing(self):
+        self.assertEqual(self.request("GET", "")[0], 200)
+        ident = str(uuid.uuid4())
+        for scope in SCOPES:
+            self.assertIn("error", json.loads(getattr(server, f"list_{scope}_conflicts")(ident)))
+            body = {"recording_id": ident, "conflict_id": ident, "kind": scope}
+            for route in ("preview", "resolve", "copy", "retry"):
+                # прежде copy и retry не было вовсе (404); успехом ответ быть не может
+                self.assertIn(self.request("POST", "api/conflict/" + route, body)[0], (400, 404))
+        self.assertEqual(list(self.base.iterdir()), [])
+
+
+class LegacyWithDatabaseTests(ScreenCase):
+    backend = "legacy_files"
+
+    def test_existing_database_is_still_listed(self):
+        case = self.conflict("document")
+        self.assertEqual(self.item(case)["status"], "open")
+
+
+class ConflictPageTests(unittest.TestCase):
+    """Только видимое без браузера; поведение страницы проверяется в браузере."""
+
+    def setUp(self):
+        self.html = (PROJECT / "workflow.html").read_text(encoding="utf-8")
+
+    def test_page_offers_honest_actions(self):
+        for text in ("Скачать мою правку", "Заменить файл версией программы", "Повторить", "Сохранённые копии"):
+            with self.subTest(text=text):
+                self.assertTrue(text in self.html, f"на странице нет: {text}")
+        self.assertFalse("Сохранить внешнюю правку" in self.html, "осталась кнопка мнимого сохранения")
+
+    def test_page_asks_by_its_own_element(self):
+        dialogs = re.findall(r"(?<![\w.$])(?:(?:window|self|globalThis)\.)?(?:confirm|alert|prompt)\s*\(",
+                             self.html)
+        self.assertEqual(dialogs, [])
+
+    def test_conflicts_are_at_top_outside_request_detail(self):
+        conflicts = self.html.index('id="conflicts"')
+        self.assertLess(conflicts, self.html.index('id="audio"'))
+        self.assertLess(conflicts, self.html.index('id="detail"'))
+
+    def test_page_uses_common_list(self):
+        self.assertTrue("api/conflicts/all" in self.html, "страница не читает общий список конфликтов")
+
+
+if __name__ == "__main__":
+    unittest.main()
