@@ -14,6 +14,7 @@ const storage = new Map()
 let directory = repo, creates = 0, agent = "build"
 let delayed = false, pendingDirectory
 let archived = false, warnings = 0, strategy
+const refusals = []
 const ctx = {
   storage: { get: async (k) => storage.get(k), set: async (k, v) => storage.set(k, v),
     remove: async (k) => storage.delete(k),
@@ -28,7 +29,7 @@ const ctx = {
       else directory = x.directory
     },
     update: async (x) => { archived = x.archived },
-    synthetic: async () => { warnings++ },
+    synthetic: async (x) => { if (/detached HEAD/.test(x.text)) refusals.push(x.text); else warnings++ },
     hook: async (name, fn) => { hooks[name] = fn },
   },
   worktree: {
@@ -67,6 +68,13 @@ try {
   execFileSync("git", ["-C", repo, "worktree", "add", "--detach", detached, base])
   directory = detached
   await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_detached", tool: "shell" }),
+    /detached HEAD/)
+  // The prompt itself must not fail (a thrown hook error reaches clients as a
+  // generic HTTP 500): the cause goes into the session, tools stay blocked.
+  await hooks.prompt({ sessionID: "ses_detached" })
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /detached-child has a detached HEAD/)
+  await assert.rejects(hooks["tool-execute.before"]({ sessionID: "ses_detached", tool: "patch" }),
     /detached HEAD/)
   assert.equal(execFileSync("git", ["-C", detached, "branch", "--show-current"], { encoding: "utf8" }).trim(), "")
   execFileSync("git", ["-C", repo, "worktree", "remove", detached])

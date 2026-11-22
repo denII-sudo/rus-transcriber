@@ -8,6 +8,10 @@ const exec = promisify(execFile)
 const same = (a, b) =>
   path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase()
 
+// A refusal that has a known, user-readable cause. The prompt hook reports it into
+// the session instead of failing the whole request with a generic HTTP 500.
+class BlockedWorkspace extends Error {}
+
 // Installed explicitly by the owner, outside mutable feature checkouts.
 // No global auto-adoption: only repositories in the private local config.
 export default {
@@ -165,7 +169,7 @@ export default {
         const current = await exec("git", ["-C", directory, "branch", "--show-current"],
           { windowsHide: true, timeout: 10_000 })
         if (!current.stdout.trim())
-          throw new Error(`Workspace ${path.basename(directory)} has a detached HEAD, so it cannot be ` +
+          throw new BlockedWorkspace(`Workspace ${path.basename(directory)} has a detached HEAD, so it cannot be ` +
             "registered and build tools stay blocked. Not a permission problem: from a session outside " +
             "this copy, create a task branch in it from origin/main (only if it is clean and holds " +
             "no unique commits), or make a new workspace.")
@@ -181,7 +185,18 @@ export default {
       await pending.get(sessionID)
     }
     await ctx.session.hook("prompt", async (event) => {
-      await once(event.sessionID)
+      try {
+        await once(event.sessionID)
+      } catch (error) {
+        if (!(error instanceof BlockedWorkspace)) throw error
+        // Build tools stay blocked (tool.execute.before repeats this text); the
+        // prompt itself goes through so the session can see and explain the cause.
+        try {
+          await ctx.session.synthetic({ sessionID: event.sessionID, text: error.message })
+        } catch {
+          console.warn(`Workspace: could not deliver the refusal to the session: ${error.message}`)
+        }
+      }
     })
     await ctx.command.transform((editor) => {
       editor.add({
