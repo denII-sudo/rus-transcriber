@@ -169,6 +169,55 @@ def claude_owner():
     return int(out) if out.isdigit() else None
 
 
+def norm_path(p):
+    """Comparison key for reporting only; resolves short (8.3) names Git may print differently."""
+    try:
+        return os.path.normcase(str(Path(p).resolve()))
+    except OSError:
+        return os.path.normcase(str(Path(p).absolute()))
+
+
+def worktree_entries(repo_root):
+    """Parsed `git worktree list --porcelain`; the first entry is the main clone."""
+    entries = []
+    for block in git(repo_root, "worktree", "list", "--porcelain").split("\n\n"):
+        lines = [x for x in block.splitlines() if x.strip()]
+        if not lines or not lines[0].startswith("worktree "):
+            continue
+        entry = {"path": lines[0][len("worktree "):], "head": None, "branch": None,
+                 "detached": False, "locked": False}
+        for x in lines[1:]:
+            if x.startswith("HEAD "):
+                entry["head"] = x[5:]
+            elif x.startswith("branch "):
+                entry["branch"] = x[7:].removeprefix("refs/heads/")
+            elif x == "detached":
+                entry["detached"] = True
+            elif x.startswith("locked"):
+                entry["locked"] = True
+        entries.append(entry)
+    return entries
+
+
+def pr_state(repo, branch, head):
+    """Read-only GitHub state of the PR whose head is exactly this commit."""
+    raw = command(["gh", "pr", "list", "--repo", repo["github"], "--head", branch,
+                   "--state", "all", "--limit", "100",
+                   "--json", "state,headRefOid,isCrossRepository,baseRefName"])
+    rows = [p for p in json.loads(raw) if not p["isCrossRepository"]]
+    if not rows:
+        return "none"
+    same = [p for p in rows if p["headRefOid"] == head]
+    if not same:
+        return "head-differs"
+    states = {p["state"] for p in same}
+    if "OPEN" in states:
+        return "open"
+    if any(p["state"] == "MERGED" and p["baseRefName"] == "main" for p in same):
+        return "merged"
+    return "closed"
+
+
 class Manager:
     def __init__(self, config):
         self.config = config
@@ -419,8 +468,81 @@ class Manager:
         write_json(self.state / "last-sweep.result", {"time": time.time(), "results": results})
         return results
 
+    def inventory(self, github=True):
+        """Read-only survey of every worktree: never removes, moves or writes anything in Git.
+
+        `hint` is only a suggestion for a human: review-removal | keep | check | ok.
+        Any check that cannot be made leaves the worktree on keep/check, never on removal.
+        """
+        records = {}
+        for p in self.state.glob("*.json"):
+            try:
+                r = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(r, dict) and isinstance(r.get("cwd"), str) and not r.get("removed"):
+                records[norm_path(r["cwd"])] = r
+        rows = []
+        for repo in self.config["repos"]:
+            excluded = {norm_path(p) for p in repo.get("excluded", [])}
+            try:
+                entries = worktree_entries(repo["root"])
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                rows.append({"kind": "repo-unreadable", "worktree": repo["root"], "hint": "check"})
+                continue
+            for index, e in enumerate(entries):
+                path = e["path"]
+                exists = Path(path).exists()
+                try:
+                    managed = index > 0 and safe_checkout(repo["root"], path)
+                except OSError:
+                    managed = False
+                kind = "main-clone" if index == 0 else ("managed-root" if managed else "outside-roots")
+                changes = None
+                if exists:
+                    try:
+                        changes = len(git(path, "status", "--porcelain",
+                                          "--untracked-files=all").splitlines())
+                    except (OSError, RuntimeError, subprocess.SubprocessError):
+                        pass
+                key = norm_path(path)
+                record = records.get(key)
+                registration = ("-" if index == 0 else "excluded" if key in excluded
+                                else "registered" if record else "unregistered")
+                owner_active = False
+                if record and record.get("tool") == "claude" and record.get("owner"):
+                    try:
+                        owner_active = process_token(record["owner"]) == record.get("owner_token")
+                    except (OSError, RuntimeError, ValueError, TypeError):
+                        owner_active = True  # Unknown liveness is treated as alive.
+                pr = "-"
+                if github and index > 0 and e["branch"] and e["head"]:
+                    try:
+                        pr = pr_state(repo, e["branch"], e["head"])
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                            subprocess.SubprocessError):
+                        pr = "unknown"
+                if index == 0:
+                    hint = "ok" if e["branch"] == "main" and changes == 0 else "check"
+                elif not exists:
+                    hint = "check"
+                elif e["locked"] or owner_active or changes != 0:
+                    hint = "keep"
+                elif pr == "merged":
+                    hint = "review-removal"
+                else:
+                    hint = "keep"
+                rows.append({"kind": kind, "worktree": path, "branch": e["branch"],
+                             "head": (e["head"] or "")[:12], "detached": e["detached"],
+                             "locked": e["locked"], "missing": not exists, "changes": changes,
+                             "registration": registration, "owner_active": owner_active,
+                             "pr": pr, "hint": hint})
+        return rows
+
 
 REPORT_PREFIX = "AgentWorkspaceReport "
+INVENTORY_PREFIX = "AgentWorkspaceInventory "
+REPORT_PREFIXES = (REPORT_PREFIX, INVENTORY_PREFIX)
 REPORT_REASONS = {
     "outside allowed checkout roots", "not a checkout root", "different repository",
     "protected branch", "checkout locked or not registered", "linked sandbox",
@@ -439,36 +561,26 @@ REPORT_STATUS_REASONS = {
 }
 
 
-def write_report(path, apply, results, now=None):
-    """Append a single human-readable run; retain unknown lines and recent runs."""
+def append_report_line(path, prefix, entry, now):
+    """Append one run; drop only recognized own lines older than 30 days, keep every other line."""
     path = Path(path).absolute()
     if any(linked(p) for p in (path, *path.parents)):
         raise ValueError("linked report")
     path.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time() if now is None else now
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
     kept = []
     for line in lines:
-        if line.startswith(REPORT_PREFIX):
+        owned = next((p for p in REPORT_PREFIXES if line.startswith(p)), None)
+        if owned:
             try:
-                previous = json.loads(line[len(REPORT_PREFIX):])
+                previous = json.loads(line[len(owned):])
                 timestamp = datetime.fromisoformat(previous["time"]).timestamp()
                 if timestamp < now - 30 * 86400:
                     continue
             except (ValueError, TypeError, KeyError, OverflowError):
                 pass
         kept.append(line)
-    tasks = []
-    for result in results:
-        reason = result.get("reason")
-        if reason and reason not in REPORT_REASONS:
-            reason = "verification failed"
-        tasks.append({"branch": result.get("branch"), "worktree": result.get("cwd"),
-                      "status": result["status"],
-                      "reason": reason or REPORT_STATUS_REASONS.get(result["status"], "unknown")})
-    entry = {"time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
-             "mode": "apply" if apply else "dry-run", "tasks": tasks}
-    line = REPORT_PREFIX + json.dumps(entry, ensure_ascii=False) + "\n"
+    line = prefix + json.dumps(entry, ensure_ascii=False) + "\n"
     if len(kept) == len(lines):
         with path.open("a", encoding="utf-8", newline="") as f:
             f.write(line)
@@ -479,6 +591,33 @@ def write_report(path, apply, results, now=None):
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
+
+
+def write_report(path, apply, results, now=None):
+    """Append a single human-readable run; retain unknown lines and recent runs."""
+    now = time.time() if now is None else now
+    tasks = []
+    for result in results:
+        reason = result.get("reason")
+        if reason and reason not in REPORT_REASONS:
+            reason = "verification failed"
+        tasks.append({"branch": result.get("branch"), "worktree": result.get("cwd"),
+                      "status": result["status"],
+                      "reason": reason or REPORT_STATUS_REASONS.get(result["status"], "unknown")})
+    entry = {"time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+             "mode": "apply" if apply else "dry-run", "tasks": tasks}
+    append_report_line(path, REPORT_PREFIX, entry, now)
+
+
+def write_inventory_report(path, rows, now=None):
+    """Append one read-only survey of all worktrees. Paths and branch names are local data."""
+    now = time.time() if now is None else now
+    counts = {}
+    for row in rows:
+        counts[row["hint"]] = counts.get(row["hint"], 0) + 1
+    entry = {"time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+             "counts": counts, "worktrees": rows}
+    append_report_line(path, INVENTORY_PREFIX, entry, now)
 
 
 def main():
@@ -496,11 +635,21 @@ def main():
     p = sub.add_parser("sweep")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--report", type=Path)
+    p = sub.add_parser("inventory")
+    p.add_argument("--report", type=Path)
+    p.add_argument("--no-github", action="store_true")
     sub.add_parser("claude-hook")
     a = parser.parse_args()
     try:
         config = json.loads(Path(a.config).read_text(encoding="utf-8"))
         manager = Manager(config)
+        if a.action == "inventory":
+            # Read-only: no registry lock, so slow GitHub calls never block other hooks.
+            out = manager.inventory(github=not a.no_github)
+            if a.report:
+                write_inventory_report(a.report, out)
+            print(json.dumps(out))  # ASCII-escaped: safe on any console code page
+            return 0
         with registry_lock(manager.state):
             if a.action == "register":
                 out = manager.register(a.tool, a.session, a.cwd, project=a.project)
