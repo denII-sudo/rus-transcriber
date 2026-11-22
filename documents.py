@@ -505,9 +505,22 @@ def _public_transcript(transcript):
         if not isinstance(quality, dict):
             raise ValueError("invalid quality")
         result["quality"] = _select_scalars(
-            quality, {"asr_incomplete_chunks": (int,), "vote3_skipped": (bool,)})
+            quality, {"asr_incomplete_chunks": (int,), "vote3_skipped": (bool, str)})
         if result["quality"].get("asr_incomplete_chunks", 0) < 0:
             raise ValueError("invalid incomplete count")
+        # words.combine_hypotheses пишет причину строкой; логическое значение — прежний вид поля
+        skipped = result["quality"].get("vote3_skipped")
+        if isinstance(skipped, str) and skipped not in ("whisper_incomplete", "asr_incomplete"):
+            raise ValueError("invalid public field: vote3_skipped")
+        if "vote3_partial" in quality:      # голосование пропущено только на части отрезков
+            partial = quality["vote3_partial"]
+            if not isinstance(partial, dict):
+                raise ValueError("invalid public field: vote3_partial")
+            partial = _select_scalars(partial, {"reason": (str,), "spans": (int,), "seconds": (int, float)})
+            if (len(partial) != 3 or partial["reason"] not in ("whisper_incomplete", "asr_incomplete")
+                    or partial["spans"] < 0 or partial["seconds"] < 0):
+                raise ValueError("invalid public field: vote3_partial")
+            result["quality"]["vote3_partial"] = partial
     result["segments"] = []
     for segment in transcript.get("segments", []):
         public = _select_scalars(segment, {"segment_id": (str,), "speaker": (str, type(None)),
@@ -779,6 +792,10 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
         lines.extend([f"Внимание: технически не распознано фрагментов: {quality['asr_incomplete_chunks']}.", ""])
     if quality.get("vote3_skipped"):
         lines.extend(["Внимание: голосование трёх моделей было пропущено.", ""])
+    if quality.get("vote3_partial"):
+        partial = quality["vote3_partial"]
+        lines.extend([f"Внимание: голосование трёх моделей пропущено на отрезках с неполным результатом "
+                      f"распознавания: {partial['spans']} (около {str(partial['seconds']).replace('.', ',')} с).", ""])
     refs = {}
     for ref in _author_refs(payload):
         if ref["user_id"] is not None:

@@ -130,6 +130,11 @@ def render_md(data, text_only=False):
                      "завершение задачи не означает полноту стенограммы._\n")
     if q0.get("vote3_skipped"):
         lines.append("_Голосование трёх моделей отключено из-за неполного или неизвестного результата ASR._\n")
+    if q0.get("vote3_partial"):
+        p = q0["vote3_partial"]
+        lines.append(f"_Голосование трёх моделей пропущено на отрезках с неполным результатом ASR: "
+                     f"{p.get('spans')} (около {str(p.get('seconds')).replace('.', ',')} с); "
+                     "там сверены только две модели._\n")
     if q0.get("group_doubt"):
         lines.append(f"_Внимание: {q0['group_doubt']['note']}._\n")
     if q0.get("names_outside_vocab"):
