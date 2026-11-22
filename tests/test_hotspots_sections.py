@@ -64,6 +64,50 @@ class MatchSectionsTests(unittest.TestCase):
         self.assertEqual(hotspots.match_sections(list(reversed(sections)), [tied], min_score=0),
                          [[tied], []])
 
+    def test_fractional_tie_against_float_noise_goes_to_earlier(self):
+        # Место симметрично относительно границы: точные пересечения равны, а во float
+        # пересечение с поздним разделом выходит чуть больше (например 0.10000000000000003
+        # против 0.09999999999999998). Без допуска место ушло бы к позднему разделу.
+        for border, start, end in ((.3, .2, .4), (.7, .5, .9), (2.3, 2.1, 2.5), (.6, .3, .9)):
+            earlier, later = section(0, border, "earlier"), section(border, 200, "later")
+            tied = place(start, end, .8, "tie")
+            with self.subTest(border=border):
+                self.assertLess(border - start, end - border)
+                self.assertEqual(hotspots.match_sections([earlier, later], [tied], top_n=1),
+                                 [[tied], []])
+                self.assertEqual(hotspots.match_sections([later, earlier], [tied], min_score=0),
+                                 [[], [tied]])
+
+    def test_tiny_real_overlap_difference_is_not_a_tie(self):
+        # Допуск — несколько ULP (около 1e-12 при 3600 с); отличие 1e-9 настоящее.
+        earlier, later = section(3000, 3600.5, "earlier"), section(3600.5, 4000, "later")
+        wider_later = place(3600, 3601 + 1e-9, .8, "wider later")
+        self.assertGreater((wider_later["t2"] - 3600.5) - (3600.5 - 3600), 5e-10)
+        self.assertEqual(hotspots.match_sections([earlier, later], [wider_later], top_n=1),
+                         [[], [wider_later]])
+        self.assertEqual(hotspots.match_sections([later, earlier], [wider_later], top_n=1),
+                         [[wider_later], []])
+
+    def test_place_across_three_sections_goes_to_largest_overlap(self):
+        sections = [section(0, 10, "a"), section(10, 30, "b"), section(30, 40, "c")]
+        wide = place(5, 35, .8, "wide")
+        self.assertEqual(hotspots.match_sections(sections, [wide], top_n=1), [[], [wide], []])
+
+    def test_left_touch_is_not_overlap(self):
+        touching = place(9, 10, .8, "touch")
+        self.assertEqual(hotspots.match_sections([section(10, 20, "a")], [touching], top_n=1), [[]])
+        self.assertEqual(hotspots.match_sections([section(10, 20, "a"), section(0, 9.5, "b")],
+                                                  [touching], top_n=1), [[], [touching]])
+
+    def test_nested_sections(self):
+        outer, inner = section(0, 100, "outer"), section(40, 60, "inner")
+        inside = place(45, 55, .8, "inside")
+        across = place(35, 65, .8, "across")
+        self.assertEqual(hotspots.match_sections([inner, outer], [inside, across], top_n=2),
+                         [[], [inside, across]])
+        self.assertEqual(hotspots.match_sections([outer, inner], [inside, across], top_n=2),
+                         [[inside, across], []])
+
     def test_equal_strength_uses_input_order_at_cutoff(self):
         sections = [section(0, 10, "a")]
         first = place(4, 5, .7, "first")
