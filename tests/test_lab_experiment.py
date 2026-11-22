@@ -188,6 +188,16 @@ class ExperimentFile(unittest.TestCase):
             "onnx on gpu": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
                                       "third": {"engine": "onnx", "model": "q", "device": "GPU"}}},
             "bad id": {"id": "A B"},
+            # вторая модель без времён слов и третья, совпадающая с другой ролью, конвейер пропускает
+            "whisper second": {"roles": {"primary": {"model": "m"},
+                                         "second": {"model": "onnx-community/whisper-large-v3-turbo"}}},
+            "third same as second": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
+                                               "third": {"engine": "onnx", "model": "s"}}},
+            "third same as primary": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
+                                                "third": {"engine": "onnx", "model": "m"}}},
+            "long chunks not whisper": {"roles": {"primary": {"model": "m"}, "second": {"model": "s"},
+                                                  "third": {"engine": "onnx", "model": "q",
+                                                            "long_chunks": True}}},
         }
         for name, change in cases.items():
             bad = json.loads(json.dumps(good))

@@ -526,14 +526,17 @@ def unit_sources(unit_pairs, order, W):
 
 def as_text_tokens(src, W, max_repeat):
     """Источник как список слов третьей модели. Модель со временами слов подаётся как текст по
-    своим кускам через clean_whisper — так конвейер чистит текст любой третьей модели."""
+    своим кускам через words.third_text — тем же правилом, что в конвейере: чистка «субтитров» и
+    зацикливания только для Whisper (transcript.asr_model_caps), текст другой модели — как есть."""
     if src["kind"] == "text":
         return src.get("tokens")
+    import transcript              # путь к программе добавлен _words_module
+    whisper = transcript.asr_model_caps(src.get("model"))["whisper"]
     toks = []
     for ch in src.get("chunks") or []:
         s, e = ch["own"]
         text = " ".join(w["w"] for w in src["words"] if s - 1e-3 <= float(w["s"]) < e + 1e-3)
-        tx, _ = W.clean_whisper(text, max_repeat)
+        tx, _ = W.third_text(text, max_repeat, whisper)
         toks += [t for t in tx.split() if W.norm_word(t)]
     return toks
 

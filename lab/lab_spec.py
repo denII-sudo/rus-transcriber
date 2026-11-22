@@ -96,6 +96,10 @@ def parse(text):
             _check_keys(where + ": second", second, SECOND_KEYS, required=("model",))
             if second["model"] == roles["primary"]["model"]:
                 raise SpecError(f"{where}: вторая модель совпадает с основной — конвейер её пропустит")
+            # то же правило, что transcript.asr_model_caps (модуль чистый и программу не импортирует)
+            if "whisper" in str(second["model"]).lower():
+                raise SpecError(f"{where}: вторая модель должна давать времена слов, Whisper их не даёт — "
+                                "конвейер её пропустит; Whisper ставьте третьей")
         if third is not None:
             _check_keys(where + ": third", third, THIRD_KEYS, required=("engine",))
             if second is None:
@@ -109,6 +113,12 @@ def parse(text):
                 if str(third.get("device", "CPU")).upper() != "CPU":
                     raise SpecError(f"{where}: third.engine=onnx считается только на CPU "
                                     "(на GPU конвейер пробует путь Whisper для видеокарты)")
+                if third.get("long_chunks") and "whisper" not in str(third["model"]).lower():
+                    raise SpecError(f"{where}: third.long_chunks — только для Whisper; другой модели "
+                                    "конвейер даёт куски основного прохода")
+            if third.get("model") and third["model"] in (roles["primary"]["model"], second["model"]):
+                raise SpecError(f"{where}: третья модель совпадает с основной или второй — конвейер её "
+                                "пропустит (голос без новой информации)")
             if third.get("mode", "all") not in THIRD_MODES:
                 raise SpecError(f"{where}: third.mode — all или doubt")
         settings = conf.get("settings", {})
