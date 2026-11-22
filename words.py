@@ -248,7 +248,7 @@ def _span_j(bad, i1, i2):
 
 
 def disagreement_times(main, ctc):
-    """Времена, где RNN-T и CTC расходятся (только там Whisper может что-то решить в голосовании)."""
+    """Времена, где основная и вторая модели расходятся (только там третья может что-то решить в голосовании)."""
     a = [norm_word(w["w"]) for w in main]
     b = [norm_word(w["w"]) for w in ctc]
     _, bad = _ops(a, b)
@@ -264,11 +264,15 @@ _WH_JUNK = re.compile(r"(?i)\b(?:продолжение следует|субт�
                       r"|спасибо за просмотр)\b[^.!?…]*[.!?…]*")
 
 
-def clean_whisper(text, max_repeat=3):
+def clean_whisper(text, max_repeat=3, junk=True):
     """Текст Whisper без зацикливания и «субтитров»: фраза из 1–8 слов, повторённая подряд больше
-    max_repeat раз, сокращается до max_repeat повторов (0 — без ограничения). -> (текст, сколько слов убрано)."""
+    max_repeat раз, сокращается до max_repeat повторов (0 — без ограничения). -> (текст, сколько слов убрано).
+
+    junk=False — «субтитры» не убираются. Так, с max_repeat=0, подаётся текст третьей модели не из
+    семейства Whisper (third_text): у неё нет этих галлюцинаций, а правило «до конца предложения»
+    на тексте без пунктуации (GigaAM CTC, Multilingual) вырезало бы весь остаток куска."""
     n0 = len((text or "").split())
-    toks = _WH_JUNK.sub(" ", text or "").split()
+    toks = (_WH_JUNK.sub(" ", text or "") if junk else (text or "")).split()
     if max_repeat and max_repeat > 0:
         keys = [norm_word(t) for t in toks]
         out, ko = [], []
@@ -293,13 +297,57 @@ def clean_whisper(text, max_repeat=3):
     return " ".join(toks), n0 - len(toks)
 
 
-def vote3(main, ctc, whisper):
-    """Голосование «два из трёх»: RNN-T (main, со временами), CTC (со временами) и Whisper (только текст).
+def third_text(text, max_repeat, whisper):
+    """Текст куска третьей модели для голосования -> (текст, сколько слов убрано).
+    whisper — модель из семейства Whisper (transcript.asr_model_caps): только ей нужна чистка
+    «субтитров» и зацикливания; текст другой модели подаётся как есть (слова через пробел)."""
+    if whisper:
+        return clean_whisper(text, max_repeat)
+    return clean_whisper(text, 0, junk=False)
 
-    Слово RNN-T принимается, если с ним согласна хотя бы одна из двух других моделей. Если обе другие
-    согласны между собой и против RNN-T — берётся их вариант (слова и времена CTC), помечается voted.
-    Слова, которые слышат обе другие модели, а RNN-T нет, вставляются (времена CTC).
-    Где разошлись все три — метка asr и оба варианта (alt — CTC, alt_whisper — Whisper).
+
+def _fit_times(out):
+    """Слова, взятые голосованием у второй модели (voted), держатся по времени между соседями.
+
+    Голосование ставит их по порядку текста, а время берёт у второй модели. Если её времена смещены
+    относительно основной (другая сетка кадров или задержка CTC, другая модель — например GigaAM
+    Multilingual), слово получало время раньше предыдущего или позже следующего слова основной модели,
+    и слова итога шли не по времени. Тогда начало слова сдвигается к ближайшей допустимой границе:
+    не раньше предыдущего слова и не позже следующего слова основной модели. Согласованные времена
+    (как у GigaAM CTC той же семьи) не меняются. Изменяет слова на месте."""
+    nxt = None
+    following = [None] * len(out)           # начало ближайшего следующего слова основной модели
+    for k in range(len(out) - 1, -1, -1):
+        following[k] = nxt
+        if not out[k].get("voted"):
+            nxt = out[k]["s"]
+    prev = None
+    for k, w in enumerate(out):
+        if w.get("voted"):
+            s = w["s"]
+            if prev is not None and s < prev:
+                s = prev
+            if following[k] is not None and s > following[k]:
+                s = following[k]
+            if s != w["s"]:
+                dur = max(0.04, w["e"] - w["s"])
+                end = s + dur
+                if following[k] is not None and following[k] > s:
+                    end = min(end, following[k])
+                w["s"], w["e"] = round(s, 2), round(end, 2)
+        prev = w["s"]
+
+
+def vote3(main, ctc, whisper):
+    """Голосование «два из трёх»: основная модель (main, со временами; по умолчанию GigaAM RNN-T),
+    вторая (ctc, со временами; по умолчанию GigaAM CTC) и третья (whisper, только текст; по умолчанию
+    Whisper). Имена параметров прежние: на них опираются лаборатория и тесты.
+
+    Слово основной модели принимается, если с ним согласна хотя бы одна из двух других. Если обе другие
+    согласны между собой и против основной — берётся их вариант (слова и времена второй модели),
+    помечается voted. Слова, которые слышат обе другие модели, а основная нет, вставляются (времена
+    второй модели). Время такого слова держится между соседними словами основной (_fit_times).
+    Где разошлись все три — метка asr и оба варианта (alt — вторая модель, alt_whisper — третья).
     Изменяет main на месте. -> статистика."""
     a = [norm_word(w["w"]) for w in main]
     b = [norm_word(w["w"]) for w in ctc]
@@ -350,6 +398,7 @@ def vote3(main, ctc, whisper):
             stats["disputed"] += len(span)
             out.extend(span)
         i = k
+    _fit_times(out)
     main[:] = out
     return stats
 
@@ -409,8 +458,10 @@ def _vote3_outside_spans(main, ctc, whisper, spans):
 def combine_hypotheses(hypotheses, diagnostics):
     """Сведение гипотез проходов моделей -> слова с пометками и решения.
 
-    hypotheses: {"primary": слова RNN-T со временами, "second": слова CTC или None,
-    "whisper": слова-строки Whisper или None}; None — проход не выполнялся или не удался.
+    hypotheses: {"primary": слова основной модели со временами, "second": слова второй модели со
+    временами или None, "whisper": слова-строки третьей модели (любой; ключ прежний) или None};
+    None — проход не выполнялся или не удался. Вторая модель обязана давать времена слов: по ним
+    исключаются отрезки и ставятся слова, выбранные голосованием (worker.second_pass это проверяет).
     diagnostics: сведения о кусках каждого прохода, {"primary"|"second"|"whisper": {"chunks": [...]}}.
 
     Если все три гипотезы полны — голосование «два из трёх» (vote3) по всей записи. Сбойный кусок

@@ -17,8 +17,9 @@ DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnn
             # слой признаков разговора для «горячих мест» (hotspots.py): считается при обработке,
             # показывается только по запросу
             "interaction": True,
-            # вторая модель GigaAM и третья модель Whisper: голосование «два из трёх».
-            # У каждой группы своё устройство: RNN-T, CTC и Whisper могут считаться на разном железе.
+            # вторая и третья модели голосования «два из трёх» (по умолчанию GigaAM CTC и Whisper; любая
+            # модель со временами слов второй, любая третьей — transcript.asr_model_caps).
+            # У каждой группы своё устройство: модели могут считаться на разном железе.
             "asr_second_model": "v3_e2e_ctc", "asr_second_backend": "auto",
             "asr_second_device": "", "asr_second_batch": 0,   # пусто/0 — как у основного прохода
             "asr_third_model": "onnx-community/whisper-large-v3-turbo", "asr_third_device": "CPU",

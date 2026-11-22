@@ -519,9 +519,32 @@ def primary_pass(audio, chunks, cfg, st, quality, make_asr, prog, timing):
 
 
 def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
-    """Второй проход (CTC) по тем же кускам -> слова или None (не задан, та же модель или сбой)."""
+    """Второй проход (по умолчанию GigaAM CTC) по тем же кускам -> слова со временами или None
+    (не задан, совпадает с основной, не даёт времён слов или сбой).
+
+    Вторая модель может быть любой, если она отдаёт времена слов (transcript.asr_model_caps): по ним
+    голосование ставит её слова на место и исключает сбойные отрезки. Модель без времён (Whisper)
+    вторым номером не считается — одна ясная строка в журнале и quality["asr2_skipped"], без подмены
+    модели; модель, совпадающая с основной, новой гипотезы не дала бы — тоже asr2_skipped.
+
+    Совпадение второй с основной — по имени, как раньше (в отличие от третьей, _third_same_model):
+    точность вторая наследует у основной (asr_quant, asr_quant_cpu), отличаться может лишь движок
+    или устройство, а решение владельца 22.11.2026 касалось только третьей модели."""
     second = cfg.get("asr_second_model", "v3_e2e_ctc")
-    if not second or second == cfg.get("asr_model"):
+    if not second:
+        return None
+    label = transcript.model_label(second)
+    if second == cfg.get("asr_model"):
+        quality["asr2_skipped"] = {"reason": "same_as_primary", "model": second}
+        print(f"[words] вторая модель {second} совпадает с основной: второй проход пропущен — он не дал бы "
+              "новой гипотезы; сверки и голосования моделей не будет", file=sys.stderr, flush=True)
+        return None
+    if transcript.asr_model_caps(second)["word_times"] is False:
+        quality["asr2_skipped"] = {"reason": "no_word_times", "model": second}
+        print(f"[words] вторая модель {second} ({label}) не даёт времён слов, а второй модели они нужны "
+              "(голосование ставит её слова по времени): второй проход пропущен, сверки и голосования "
+              "моделей не будет. Такую модель ставьте третьей (asr_third_model), второй — модель со "
+              "временами слов (например v3_e2e_ctc)", file=sys.stderr, flush=True)
         return None
     try:
         t2 = time.time()
@@ -529,6 +552,12 @@ def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
         main_dev = normalize_device(cfg.get("asr_device", "CPU"))
         sec_dev = normalize_device(cfg.get("asr_second_device") or main_dev)
         sec_backend = str(cfg.get("asr_second_backend") or "auto")
+        if sec_backend in WHISPER_ONLY_ENGINES:
+            # движки только для Whisper второй модели не подходят: make_asr считал бы её общим
+            # onnx-путём под чужим именем движка
+            print(f"[words] вторая модель {second}: движок {sec_backend} умеет только Whisper — "
+                  "выбираю движок по устройству", file=sys.stderr, flush=True)
+            sec_backend = "auto"
         if sec_backend == "auto":
             # своё устройство — свой бэкенд; если устройство то же, доверяем основному
             sec_backend = (cfg.get("asr_backend", "auto") if sec_dev == main_dev
@@ -538,29 +567,87 @@ def second_pass(audio, chunks, cfg, quality, make_asr, prog, timing):
                       "asr_batch": int(cfg.get("asr_second_batch") or cfg.get("asr_batch", 1))}
         asr2, _ = make_asr(second_cfg)
         alt = timestamped_pass("second", asr2, audio, chunks, quality, getattr(asr2, "model_name", second),
-                               prog(62, 68, "второй проход распознавания (CTC)"))
+                               prog(62, 68, f"второй проход распознавания ({label})"))
         del asr2
         timing.update(asr2_sec=round(time.time() - t2), asr2_model=second)
         return alt
     except Exception as ex:
         quality["asr2_error"] = f"{type(ex).__name__}: {ex}"[:300]
-        print(f"[words] второй проход не выполнен: {ex}", file=sys.stderr, flush=True)
+        print(f"[words] второй проход ({label}) не выполнен: {ex}", file=sys.stderr, flush=True)
         _register_pass(quality, "second", second, None,
                        _failed_records(chunks, [{"result": "error", "error_type": type(ex).__name__}]))
         return None
 
 
-def whisper_plan(audio, regions, chunks, cfg, a, words, alt):
-    """Что считает третья модель: модель (None — выключена), режим, предел повторов и куски."""
+def _engine_key(name):
+    """Имя движка загруженной модели -> (движок, устройство, точность) без размера пакета.
+    «cpu:b4:int8» -> ("cpu", "int8"), «openvino:GPU:b8» -> ("openvino", "GPU"), «cpu» (fp32) -> ("cpu",).
+    Формат имени — backends.OnnxASR.name; размер пакета на загруженную модель не влияет."""
+    return tuple(p for p in str(name or "").split(":") if p and not re.fullmatch(r"b\d+", p))
+
+
+def _third_engine_key(third, cfg):
+    """Движок, на котором будет загружена третья модель не из семейства Whisper: только onnx-cpu
+    с точностью asr_third_quant_cpu (whisper_pass) -> ключ как у _engine_key; для Whisper — None."""
+    if transcript.asr_model_caps(third)["whisper"]:
+        return None
+    quant = cfg.get("asr_third_quant_cpu", "int8")
+    return ("cpu", quant) if quant else ("cpu",)
+
+
+def _third_same_model(third, cfg, quality):
+    """Третья модель совпадает с основной или второй -> причина пропуска (голос без новой информации).
+
+    «Совпадает» — то же имя модели и та же фактическая загрузка: движок, устройство и точность
+    (квантование), с которыми основная или вторая модель действительно загружена (её движок
+    в quality["asr_diagnostics"], с учётом откатов), против движка третьей (onnx-cpu,
+    asr_third_quant_cpu). Размер пакета не в счёт. Такая третья повторила бы гипотезу: совпадая
+    с основной, всегда поддерживала бы её и снимала бы метки расхождения со второй; совпадая со
+    второй, удваивала бы её голос. Тогда третий проход не считается, сводятся две модели (как при
+    asr_third_mode=off). Если отличается хоть что-то — модель, движок, устройство или точность —
+    третья считается (решение владельца 22.11.2026)."""
+    if quality is None:
+        return None
+    mine = _third_engine_key(third, cfg)
+    if mine is None:
+        return None
+    diag = quality.get("asr_diagnostics") or {}
+    reason = None
+    for role, key, why in (("primary", "asr_model", "same_as_primary"),
+                           ("second", "asr_second_model", "same_as_second")):
+        if cfg.get(key) and third == cfg.get(key) and \
+                _engine_key((diag.get(role) or {}).get("backend")) == mine:
+            reason = why
+            break
+    if reason is None:
+        return None
+    quality["asr3_skipped"] = {"reason": reason, "model": third, "engine": ":".join(mine)}
+    print(f"[words] третья модель {third} совпадает с " + ("основной" if reason == "same_as_primary" else "второй")
+          + f" и загружалась бы так же ({':'.join(mine)}): третий проход пропущен — он не дал бы нового "
+          "голоса; сверяются основная и вторая модели", file=sys.stderr, flush=True)
+    return reason
+
+
+def whisper_plan(audio, regions, chunks, cfg, a, words, alt, quality=None):
+    """Что считает третья модель: модель (None — выключена или совпадает с основной либо второй),
+    режим, предел повторов и куски. Правило нарезки — по возможностям модели (transcript.asr_model_caps)."""
     third = cfg.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
     wmode = (getattr(a, "whisper", "") or cfg.get("asr_third_mode", "all")).lower()
     wrep = a.whisper_max_repeat if getattr(a, "whisper_max_repeat", -1) >= 0 else int(cfg.get("asr_third_max_repeat", 3))
     if wmode == "off":
         third = None
-    # куски для Whisper — свои, до 28 с (он всегда считает окно 30 с); в режиме doubt — только те,
-    # где GigaAM RNN-T и CTC расходятся: в остальных голосование «два из трёх» решено без него
+    if third and alt is not None and _third_same_model(third, cfg, quality):
+        third = None
+    # куски для Whisper — свои, до 28 с (он всегда считает окно 30 с); другой модели (GigaAM CTC,
+    # Multilingual) — куски основного прохода: длинные куски Whisper ей не нужны. В режиме doubt —
+    # только куски, где основная и вторая модели расходятся: в остальных голосование решено без третьей
+    long_chunks = bool(cfg.get("asr_third_long_chunks", True))
+    if third and long_chunks and not transcript.asr_model_caps(third)["whisper"]:
+        print(f"[words] третья модель {third}: длинные куски Whisper (asr_third_long_chunks) к ней не "
+              "применяются — куски как у основного прохода", file=sys.stderr, flush=True)
+        long_chunks = False
     wchunks = W.make_chunks(audio, regions, max_len=W.WHISPER_MAX, min_len=W.WHISPER_MIN) \
-        if cfg.get("asr_third_long_chunks", True) else chunks
+        if long_chunks else chunks
     selected = list(range(len(wchunks)))
     if third and alt is not None and wmode == "doubt":
         dt = W.disagreement_times(words, alt)
@@ -620,13 +707,15 @@ def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cf
 
 
 def _whisper_words(plan, texts, whisper_diag, words):
-    """Текст Whisper по кускам -> слова гипотезы (без «субтитров» и зацикливания) и число убранных."""
+    """Текст третьей модели по кускам -> слова гипотезы и число убранных. Чистка «субтитров» и
+    зацикливания (words.clean_whisper) — только для Whisper; текст другой модели берётся как есть."""
     by_k = dict(zip(plan["selected"], texts))
     diag_by_k = dict(zip(plan["selected"], whisper_diag))
+    whisper = transcript.asr_model_caps(plan["model"])["whisper"]
     wh_words, removed = [], 0
     for k, c in enumerate(plan["chunks"]):
         if k in by_k:
-            tx, n = W.clean_whisper(by_k[k], plan["max_repeat"])
+            tx, n = W.third_text(by_k[k], plan["max_repeat"], whisper)
             rec = diag_by_k[k]
             rec.update(chunk_index=k, audio_span=[c["a"], c["b"]], own_span=list(c["own"]),
                        raw_words=len(by_k[k].split()), cleaned_words=len(tx.split()),
@@ -637,7 +726,7 @@ def _whisper_words(plan, texts, whisper_diag, words):
             # токен из одних знаков («—») — не слово: в голосовании он не совпал бы
             # ни с одним словом GigaAM (те знаков отдельно не дают, words.result_words)
             wh_words += [t for t in tx.split() if W.norm_word(t)]
-        else:            # RNN-T и CTC здесь согласны: Whisper голосования не изменил бы
+        else:            # основная и вторая здесь согласны: третья голосования не изменила бы
             s0, e0 = c["own"]
             wh_words += [w["w"] for w in words if s0 <= w["s"] < e0]
     return wh_words, removed
@@ -647,14 +736,17 @@ WHISPER_ONLY_ENGINES = ("whisper-ct2", "whisper-ov")     # движки, уме�
 
 
 def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
-    """Третий проход (Whisper, только текст) -> слова-строки или None, если не удался ни один движок.
+    """Третий проход (любая модель, только текст; по умолчанию Whisper) -> слова-строки или None,
+    если не удался ни один движок. Имя функции и ключ «whisper» в данных — прежние.
 
     Движки по очереди: faster-whisper (если выбран тестом скорости, asr_third_backend=whisper-ct2),
     видеокарта Arc (OpenVINO, fp16), процессор (int8). Ошибочные фрагменты повторяются на onnx-cpu:
     для Arc (GPU) это повтор на CPU, для faster-whisper (whisper-ct2) — возврат к прежнему движку.
     Для самого onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается.
     Если третья модель — не Whisper (например multilingual_large_ctc), движки faster-whisper и OpenVINO
-    Whisper пропускаются (они умеют только Whisper), считает общий onnx-cpu."""
+    Whisper пропускаются (они умеют только Whisper), считает общий onnx-cpu. faster-whisper грузит только
+    large-v3-turbo: для другого Whisper он тоже пропускается (transcript.asr_model_caps, ключ ct2),
+    а OpenVINO Whisper и onnx-cpu грузят выбранную модель по имени."""
     from backends import normalize_device
     third, pieces = plan["model"], plan["pieces"]
     dev = normalize_device(cfg.get("asr_third_device", "CPU"))
@@ -665,7 +757,8 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
     tries = ([("whisper-ct2", "CPU", "int8")] if cfg.get("asr_third_backend", "") == "whisper-ct2" else []) \
         + ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
         + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
-    if not transcript.is_whisper_model(third):
+    caps = transcript.asr_model_caps(third)
+    if not caps["whisper"]:
         # whisper-ct2 и whisper-ov грузят только Whisper и имя модели игнорируют: для другой модели
         # (например multilingual_large_ctc) они молча подменили бы её Whisper
         skipped = [t[0] for t in tries if t[0] in WHISPER_ONLY_ENGINES]
@@ -675,6 +768,13 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
                 f"движок {skipped[0]} пропущен — он умеет только Whisper" if len(skipped) == 1 else
                 f"движки {', '.join(skipped)} пропущены — они умеют только Whisper")
                 + "; считаю общим движком onnx-cpu", file=sys.stderr, flush=True)
+    elif not caps["ct2"] and tries[0][0] == "whisper-ct2":
+        # faster-whisper здесь грузит только large-v3-turbo: другой Whisper он подменил бы
+        # (решение владельца 22.11.2026 — движок пропускается). OpenVINO Whisper (whisper-ov)
+        # грузит модель по имени, поэтому для любого Whisper остаётся в очереди
+        tries = tries[1:]
+        print(f"[words] третья модель {third}: движок whisper-ct2 пропущен — он умеет только "
+              "Whisper large-v3-turbo; считаю движком с выбранной моделью", file=sys.stderr, flush=True)
     outer_attempts = []
     for backend, device, quant in tries:
         try:
@@ -846,8 +946,10 @@ def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, 
             start, end = item.get("t1", item["t"]), item.get("t2", item["t"])
             item["gap"] = [start, max(end + 0.04, start + 0.04)]
             item["asr_problem"] = {"model": "whisper", "state": "disagreement", "words_from": ["primary", "second"]}
+    third = transcript.model_label(cfg.get("asr_third_model", "onnx-community/whisper-large-v3-turbo"))
     items += _asr_problem_items([(s, e, "whisper", reason, sources) for s, e, reason, sources in evidence["whisper"]],
-                                segments, "Результат Whisper неполон или неизвестен; прослушайте фрагмент.")
+                                segments, f"Результат {third or 'третьей модели'} неполон или неизвестен; "
+                                          "прослушайте фрагмент.")
     items += _asr_problem_items(evidence["other"], segments,
                                 "Результат прохода неполон или неизвестен; прослушайте фрагмент.")
     items.sort(key=lambda item: item["t"])
@@ -927,7 +1029,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     prog = _progress(st)
     words = primary_pass(audio, chunks, cfg, st, quality, make_asr, prog, timing)
     alt = second_pass(audio, chunks, cfg, quality, make_asr, prog, timing)
-    plan = whisper_plan(audio, regions, chunks, cfg, a, words, alt)
+    plan = whisper_plan(audio, regions, chunks, cfg, a, words, alt, quality)
     wh_words = whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing) \
         if plan["model"] and alt is not None else None
 
@@ -1159,10 +1261,11 @@ def main():
     ap.add_argument("--voice-vocab-path", default="")
     ap.add_argument("--voice-vocab-hash", default="")
     ap.add_argument("--whisper", default="", choices=["", "all", "doubt", "off"],
-                    help="третья модель Whisper: all — вся запись, doubt — только куски, где GigaAM RNN-T и CTC "
-                         "расходятся, off — без неё")
+                    help="третья модель голосования (asr_third_model, по умолчанию Whisper): all — вся запись, "
+                         "doubt — только куски, где основная и вторая модели расходятся, off — без неё")
     ap.add_argument("--whisper-max-repeat", type=int, default=-1,
-                    help="сколько раз подряд Whisper может повторить одну фразу (зацикливание); 0 — без ограничения")
+                    help="только для третьей модели Whisper: сколько раз подряд она может повторить одну фразу "
+                         "(зацикливание); 0 — без ограничения")
     a = ap.parse_args()
     if a.storage_backend == "sqlite":
         import recordings

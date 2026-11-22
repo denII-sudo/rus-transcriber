@@ -631,7 +631,9 @@ def make_asr(cfg):
         order += [("onnx-cpu", None), ("torch", None)]
     else:
         order = [(backend, device), ("onnx-cpu", None), ("torch", None)]
-    if "whisper" in str(model):          # у пакета gigaam (PyTorch) Whisper нет
+    import transcript                    # возможности моделей (transcript.asr_model_caps)
+    if not transcript.asr_model_caps(model)["torch"]:
+        # у пакета gigaam (PyTorch) Whisper нет
         order = [o for o in order if o[0] != "torch"]
     errors = []
     for b, d in order:

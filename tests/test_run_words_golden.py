@@ -230,8 +230,9 @@ SCENARIOS = {
     # ошибка основного прохода на втором куске
     "primary_chunk_error": dict(primary_errors=(1,)),
     # faster-whisper с ошибкой на куске, повтор на onnx-cpu удался; второй проход на своём устройстве
+    # (третья модель названа large-v3-turbo: faster-whisper умеет только её, другой Whisper он пропускает)
     "ct2_retry": dict(cfg_extra={"asr_third_backend": "whisper-ct2", "asr_third_long_chunks": False,
-                                 "asr_second_device": "GPU"},
+                                 "asr_second_device": "GPU", "asr_third_model": "whisper-large-v3-turbo"},
                       whisper={"whisper-ct2": {"errors": (1,)}}),
     # Whisper на видеокарте: ошибка загрузки GPU, затем onnx-cpu с пустым куском; голосование
     # пропущено только на отрезке пустого куска (отпечаток снят заново 22.11.2026, vote3_partial)
@@ -241,16 +242,22 @@ SCENARIOS = {
     "args_override": dict(args=SimpleNamespace(whisper="doubt", whisper_max_repeat=0, no_emotions=True)),
 }
 
+# 22.11.2026 (любая модель вторым и третьим номером): подпись этапа второго прохода называет
+# модель — «второй проход распознавания (second)» у синтетической модели «second» вместо прежнего
+# «(CTC)»; у GigaAM CTC подпись прежняя. Другого отличия нет: обратная замена подписи в каноническом
+# виде даёт прежние отпечатки всех сценариев (second_fails подписи не содержит и не изменился).
+# 22.11.2026 (faster-whisper только для large-v3-turbo): в ct2_retry третья модель названа
+# «whisper-large-v3-turbo» вместо «whisper»; обратная замена имени даёт прежний отпечаток.
 EXPECTED = {
-    "three_models": "15c4ca2808faa51ab159784b7a9b7e29dcf3e513c97ef78f4069d071692e1aec",
+    "three_models": "64cfb7584947c48cf95bdad005071cf5afa5a5cae23a718e93b0a9d18738f91a",
     "second_fails": "e2638ce9942cac3ec1c3a64bee7520d84b18ee61d8c6b8f7af9ad2e4650ad259",
-    "whisper_fails": "49b8845fcbd2f899a6b5b5b362c75691ec535f1655fbc99aad31bc4cd4042f39",
-    "whisper_doubt": "fa19746260accfa914ac45de0833c31ca3975e6841c51dbea6c62e2dd2527717",
-    "whisper_off": "6da72866aa7e965d4e27d478d1d7209d525aff76f16d9443940df227d1e0b6d6",
-    "primary_chunk_error": "68a6adf67d3f089127f29d5401f4daf7121be1a4e662f78571fa402867ef3315",
-    "ct2_retry": "7cda80af0b5a47d051729fa76b6492a36b3233989d09acd2f2730c7b1d1c2de1",
-    "gpu_then_cpu": "6977fae86a717ea39d383b3eb11d3ef7764cc282a2ffb5148142596b41ebd178",
-    "args_override": "ed4dd3dafd09eeab4b1e6e29775549f036e79036fb4bd23b0eb2a2b2f7bf5347",
+    "whisper_fails": "7c1470d356a39efd2d89954a300e8c400e11d5048d7d43650b07407017a57eb0",
+    "whisper_doubt": "92038eaee5f3008d319cc89afe0b0ed17b07f83700181aeb176e9a384d03f459",
+    "whisper_off": "764331baf52406f6b793edab08e5671c12914de2157b279fa485f9880c45fb2c",
+    "primary_chunk_error": "e4641671fac09839fb4fde37e7400145be00506a318323ba52c29c02eae2483d",
+    "ct2_retry": "0463b5c880afe2eb213ab94ec41e64fcaf874b0ad74c6fa78fb726f992897f06",
+    "gpu_then_cpu": "3f2c02aec99d7491e74b98cf2ac707ae8ef73541c4d3d9eb63d8c0665f58027d",
+    "args_override": "52289a92987d8ebde448dc33484744dd2b5fe58170c73b51897c3462f81f3adf",
 }
 
 
