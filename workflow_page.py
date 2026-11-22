@@ -16,6 +16,7 @@ import json
 import mimetypes
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -202,10 +203,14 @@ def make_server(port):
                         "documents": core.list_document_conflicts(recording_id),
                         "conspects": core.list_conspect_conflicts(recording_id)})
                 return self._send(404, {"error": "не найдено"})
-            except (core.CoreError, storage.StorageError) as ex:
+            except core.CoreError as ex:
                 return self._send(400, {"error": str(ex)})
-            except (ValueError, KeyError, OSError) as ex:
+            except (storage.StorageError, sqlite3.Error, OSError) as ex:
+                return self._send(400, {"error": core.explain_error(ex)})
+            except (ValueError, KeyError) as ex:
                 return self._send(400, {"error": f"не удалось выполнить запрос: {ex}"})
+            except Exception as ex:    # неизвестный сбой: человек видит русское пояснение и причину, а не оборванную связь
+                return self._send(500, {"error": core.explain_error(ex)})
 
         def do_POST(self):
             u = self._path(post=True)
@@ -272,10 +277,14 @@ def make_server(port):
                 if u == "api/conflict/retry":
                     return self._send(200, core.retry_conflict_file(*conflict))
                 return self._send(404, {"error": "не найдено"})
-            except (core.CoreError, storage.StorageError) as ex:
+            except core.CoreError as ex:
                 return self._send(400, {"error": str(ex)})
-            except (ValueError, KeyError, OSError) as ex:
+            except (storage.StorageError, sqlite3.Error, OSError) as ex:
+                return self._send(400, {"error": core.explain_error(ex)})
+            except (ValueError, KeyError) as ex:
                 return self._send(400, {"error": f"не удалось обработать запрос: {ex}"})
+            except Exception as ex:    # неизвестный сбой: человек видит русское пояснение и причину, а не оборванную связь
+                return self._send(500, {"error": core.explain_error(ex)})
 
     srv, port = None, port
     for port in range(port, port + 20):
