@@ -400,8 +400,8 @@ audio{width:100%;height:36px}
 
     const free = document.createElement("form"); free.className = "free";
     const inp = document.createElement("input"); inp.id = `free-${it.id}`; inp.placeholder = it.answer_mode === "speaker"
-      ? "Кто говорит: имя (например, «это Вера») или «Вера: точные слова»; пояснения — не сюда"
-      : "Свой ответ текстом (например, «это не Анна, а Вера»)";
+      ? "Кто говорит: имя (как в записи) или «Имя: точные слова»; пояснения — не сюда"
+      : "Свой ответ: имя, «не Анна, а Вера» или «Имя: точные слова»";
     const ok = document.createElement("button"); ok.className = "btn"; ok.type = "submit"; ok.textContent = "Записать";
     if (a && kindOf(a) === "free" && editing.has(it.id)) inp.value = a.text || "";   // «Изменить ответ» — с прежним текстом
     free.append(inp, ok);
