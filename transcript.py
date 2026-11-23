@@ -1296,6 +1296,10 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             # человеку) решённое место снова уходит человеку, как раньше.
             status = it.get("status", "open")
             if status == "human":
+                # Комментарий человека из нового ответа дописывается; повтор того же ничего не пишет.
+                comment = d.get("comment")
+                if comment and d.get("note") and comment not in (it.get("note") or ""):
+                    it["note"] = (it["note"] + "; " if it.get("note") else "") + d["note"]
                 continue
             if status != "open" and d.get("if_open"):
                 report.setdefault("already_decided", []).append(it["id"])

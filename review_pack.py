@@ -704,6 +704,8 @@ def decisions(json_path):
             # строятся по уже решённым местам.
             d = {"status": "human", "note": f"{src}: оставлено человеку"
                  + (f" («{a['text']}»)" if a.get("text") else "")}
+            if a.get("text"):
+                d["comment"] = a["text"]            # комментарий человека — и к месту, уже оставленному ему
             if it.get("answer_mode") != "speaker":
                 d["if_open"] = True
             rep["human"].append(aid)
