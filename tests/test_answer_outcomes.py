@@ -695,6 +695,49 @@ class RevertAnswerText(unittest.TestCase):
         ''')
 
 
+class KeepRequests(AnswerOutcomeCase):
+    """«Не отменять» проходит ту же проверку времени, что и другие ответы; отклонённый запрос записан коротко."""
+
+    KEEP_FIELDS = {"id", "kind", "ts", "source", "why"}
+
+    def applied(self, jp, md, version):
+        self.save(jp, version, option=0)
+        self.apply(jp, md)
+
+    def keep(self, jp, version, ts, source="cloud"):
+        return review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "keep", "ts": ts}], source)
+
+    def rejected_keeps(self, jp):
+        return [r for r in review_pack.answers_state(jp).get("rejected") or []
+                if r.get("id") == "r1" and r.get("kind") == "keep"]
+
+    def test_old_keep_does_not_override_newer_revert(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.applied(jp, md, version)
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "revert",
+                                              "ts": "2026-11-23T10:10:00"}], "local", trusted_actor="human")
+                rep = self.keep(jp, version, "2026-11-23T10:05:00")
+                self.assertEqual([r["id"] for r in rep["rejected"]], ["r1"])
+                self.assertIn("более поздний", rep["rejected"][0]["why"])
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"]["kind"], "revert")
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "revert_pending")
+                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "reverted")
+
+    def test_rejected_keep_is_one_short_record_per_place(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.applied(jp, md, version)
+                self.save(jp, version, kind="revert")
+                self.apply(jp, md)                      # отмена прошла: применённого ответа нет
+                self.keep(jp, version, "2026-11-23T22:00:00")
+                self.keep(jp, version, "2026-11-23T23:00:00")
+                rows = self.rejected_keeps(jp)
+                self.assertEqual(len(rows), 1, rows)
+                self.assertEqual(set(rows[0]), self.KEEP_FIELDS)
+                self.assertEqual((rows[0]["ts"], rows[0]["source"]), ("2026-11-23T23:00:00", "cloud"))
+
+
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
 class CloudKeep(unittest.TestCase):
     """«Не отменять» на облачной странице до переноса на ноутбук: применённый ответ на месте."""
