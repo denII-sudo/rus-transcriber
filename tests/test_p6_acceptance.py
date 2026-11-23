@@ -33,7 +33,7 @@ INSTALLER = PROJECT / "install.ps1"
 REQUIRED_RUNTIME = {
     "storage.py", "documents.py", "recordings.py", "workflow.py",
     "product_policy.py", "model_tasks.py", "llm_provider.py",
-    "workflow_page.py", "workflow.html", "rt.py",
+    "workflow_page.py", "workflow.html", "rt.py", "answer_phrases.tsv",
 }
 # файл-метка изолированной папки приёмки, без него install.ps1 -AcceptanceCopyOnly отказывает
 SANDBOX_MARKER = "rus-transcriber-acceptance.sandbox"
@@ -107,6 +107,10 @@ class P6InstallUpdateTests(unittest.TestCase):
                          + installed.stderr.decode("utf-8", "replace"))
 
         self.assertTrue(REQUIRED_RUNTIME <= {p.name for p in self.target.iterdir()})
+        self.assertEqual(
+            (self.target / "answer_phrases.tsv").read_bytes(),
+            (PROJECT / "answer_phrases.tsv").read_bytes(),
+        )
         self.assertFalse((self.target / ".venv").exists())
         self.assertFalse((self.target / "cache").exists())
         self.assertEqual(hashlib.sha256(db_path.read_bytes()).hexdigest(), before)

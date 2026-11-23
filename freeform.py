@@ -24,21 +24,92 @@
      места других карточек, покрытые ответом, закрываются «решено человеком (через rN)».
 Результат — правки слов для transcript.apply_word_edits.
 """
+import csv
+import io
 import itertools
+from pathlib import Path
 import re
 
 PAD_BEFORE, PAD_AFTER, SLACK = 3.5, 1.5, 1.0
 GROW, MAX_GROW = 4.0, 2          # расширение окна, если ответ шире него (с), и сколько раз
 DUP_SEC = 2.0                    # повтор: то же слово модели не дальше этого от вставки
 MIN_ANCHORS = 0.3
-AGREE = {"да", "верно", "так", "правильно", "все верно", "всё верно", "да верно", "ага", "угу", "так и есть",
-         "как есть", "да так"}
+
+ANSWER_PHRASES_PATH = Path(__file__).with_name("answer_phrases.tsv")
+_ANSWER_PHRASE_KINDS = (
+    "agree", "negative_prefix", "negative_intensifier", "negative_core",
+)
+
+
+def _read_answer_phrases(path=ANSWER_PHRASES_PATH):
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"{path.name}, строка 1: не удалось прочитать файл таблицы слов"
+        ) from exc
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError(f"{path.name}, строка 1: файл не должен содержать BOM")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        line = raw[:exc.start].count(b"\n") + 1
+        raise ValueError(
+            f"{path.name}, строка {line}: файл должен быть в кодировке UTF-8"
+        ) from exc
+
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter="\t", strict=True)
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise ValueError(f"{path.name}, строка 1: отсутствует заголовок таблицы") from exc
+    except csv.Error as exc:
+        raise ValueError(f"{path.name}, строка 1: не удалось разобрать заголовок таблицы") from exc
+    if header != ["id", "kind", "text", "note"]:
+        raise ValueError(
+            f"{path.name}, строка 1: ожидается заголовок id, kind, text, note"
+        )
+
+    phrases = {kind: [] for kind in _ANSWER_PHRASE_KINDS}
+    seen_ids = set()
+    seen_texts = set()
+    try:
+        for row in reader:
+            line = reader.line_num
+            if len(row) != 4:
+                raise ValueError(
+                    f"{path.name}, строка {line}: ожидалось 4 поля, разделённые табуляцией"
+                )
+            phrase_id, kind, phrase, _note = row
+            if not phrase_id:
+                raise ValueError(f"{path.name}, строка {line}: пустой id")
+            if phrase_id in seen_ids:
+                raise ValueError(f"{path.name}, строка {line}: повторный id {phrase_id}")
+            if kind not in phrases:
+                raise ValueError(f"{path.name}, строка {line}: неизвестный kind {kind}")
+            if not phrase.strip():
+                raise ValueError(f"{path.name}, строка {line}: пустой text")
+            if phrase in seen_texts:
+                raise ValueError(f"{path.name}, строка {line}: повторная фраза")
+            seen_ids.add(phrase_id)
+            seen_texts.add(phrase)
+            phrases[kind].append(phrase)
+    except csv.Error as exc:
+        line = reader.line_num or 1
+        raise ValueError(
+            f"{path.name}, строка {line}: не удалось разобрать строку таблицы"
+        ) from exc
+    return phrases
+
+
+_ANSWER_PHRASES = _read_answer_phrases()
+AGREE = set(_ANSWER_PHRASES["agree"])
 # Закрытый список отрицаний: ответ (или его часть до двоеточия) после norm — ровно [приставка] [усилитель] отрицание.
 # Такой ответ ничего не меняет и не подтверждает. Других отрицаний нет: остальное разбирается как раньше.
-NEGATIVE_PREFIXES = ("нет", "это", "я", "нет-нет")
-NEGATIVE_INTENSIFIERS = ("совершенно", "совсем", "абсолютно")
-NEGATIVE_CORES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна", "не согласны",
-                  "не согласен с этим", "не согласна с этим", "не согласны с этим")
+NEGATIVE_PREFIXES = tuple(_ANSWER_PHRASES["negative_prefix"])
+NEGATIVE_INTENSIFIERS = tuple(_ANSWER_PHRASES["negative_intensifier"])
+NEGATIVE_CORES = tuple(_ANSWER_PHRASES["negative_core"])
 NEGATIVES = frozenset(" ".join(x for x in (p, i, c) if x) for p in ("",) + NEGATIVE_PREFIXES
                       for i in ("",) + NEGATIVE_INTENSIFIERS for c in NEGATIVE_CORES)
 WORD =re.compile(r"[\wЁё][\wЁё'-]*", re.U)

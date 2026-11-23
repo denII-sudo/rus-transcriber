@@ -742,7 +742,7 @@ Step "4/10" "Копирование файлов программы"
 if ($Source -ne $Target) {
     foreach ($f in @("server.py", "worker.py", "bench.py", "runinfo.py", "buildinfo.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hotspots.py", "quotes.py", "conspect.py",
-                     "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1")) {
+                     "review_pack.py", "freeform.py", "answer_phrases.tsv", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
     }
     $docsTarget = Join-Path $Target "docs"
