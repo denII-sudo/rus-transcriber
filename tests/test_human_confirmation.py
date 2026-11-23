@@ -236,6 +236,24 @@ class LeaveToHuman(base.AnswerOutcomeCase):
                 self.assertFalse(has_human_mark(w), f"«Оставить человеку» подтвердило слово: {w}")
                 self.assertFalse(voices._word_human(w))
 
+    def test_comment_reaches_note_of_place_already_left_to_human(self):
+        def held(jp, md):
+            transcript.apply_review(jp, md, [{"id": "r1", "status": "human", "note": "раньше"}], by="human")
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, held) as (jp, md, version):
+                self.save(jp, version, kind="human", text="тут шум")
+                rep = self.apply(jp, md)               # повтор: ни событий, ни ревизий, заметка та же
+                self.assertEqual(self.outcomes(rep)["r1"], "left_for_human")
+                it = item(jp, "r1")
+                self.assertEqual(it["status"], "human")
+                self.assertTrue(it["note"].startswith("раньше; "), it["note"])
+                self.assertEqual(it["note"].count("тут шум"), 1, it["note"])
+                self.assertFalse(has_human_mark(word(jp, "w1")))
+            with self.subTest(backend=backend, without_text=True), files(backend, held) as (jp, md, version):
+                self.save(jp, version, kind="human")
+                self.apply(jp, md)
+                self.assertEqual(item(jp, "r1")["note"], "раньше")
+
     def test_leave_to_human_on_listening_place(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
