@@ -353,9 +353,11 @@ def check_role(role):
     """Имя дополнительной роли: непустая строка без «+», из которой поле alt_<роль> не совпадает с занятым
     полем слова (alt_span — длина спорного отрезка, alt_ins, alt_place) и которая не совпадает со штатной
     ролью (primary, second, whisper) или подписью voted (ctc): иначе подпись голосования, например
-    «ctc+ctc», нельзя отличить от штатной. -> role или ValueError."""
-    if (not isinstance(role, str) or not role or "+" in role or "alt_" + role in _RESERVED_ALT_FIELDS
-            or role in ("primary", "second", "whisper") or role in _VOTED_LABEL.values()):
+    «ctc+ctc», нельзя отличить от штатной. Занятые имена сравниваются без учёта регистра («CTC», «Span»);
+    имя с пробельными символами по краям или пустое после strip() отклоняется. -> role или ValueError."""
+    key = role.strip().lower() if isinstance(role, str) else ""
+    if (not key or role != role.strip() or "+" in role or "alt_" + key in _RESERVED_ALT_FIELDS
+            or key in ("primary", "second", "whisper") or key in _VOTED_LABEL.values()):
         raise ValueError(f"имя роли модели {role!r} не подходит: пусто, с «+», совпадает со штатной ролью "
                          f"или подписью либо даёт занятое поле alt_<роль>")
     return role

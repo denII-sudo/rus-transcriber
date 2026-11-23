@@ -114,5 +114,23 @@ class DisabledVoteTraceTests(unittest.TestCase):
         self.assertEqual(outs[0], outs[1])
 
 
+class RoleNameTests(unittest.TestCase):
+    """Занятые имена сравниваются без учёта регистра; пробелы по краям и пустое имя отклоняются."""
+
+    def test_bad_names(self):
+        for role in ("CTC", " CTC ", "ctc ", "span ", "Span", "SPAN", " ", "", "\t", "fourth\n", " fourth",
+                     "Primary", "WHISPER", "Second", "ins", "Place", "a+b"):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    words.check_role(role)
+                with self.assertRaises(ValueError):
+                    words.vote_n(ten(), [("second", ten()), (role, ten())], words.TWO_OF_THREE)
+
+    def test_good_names(self):
+        for role in ("fourth", "parakeet_v2", "Четвёртая", "x y"):
+            with self.subTest(role=role):
+                self.assertEqual(words.check_role(role), role)
+
+
 if __name__ == "__main__":
     unittest.main()
