@@ -61,14 +61,21 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
         return Client
 
     def change_review(self, request):
+        """Изменить содержание, которое видит модель: новое открытое сомнение на первом слове.
+
+        Только номер ревизии (показ карточки) свёртку не устаревает — см. test_conspect_content_staleness."""
         recording = workflow.get(self.store, request)["recording_id"]
         current = self.store.get_current(recording)
+        review = json.loads(json.dumps(current["review"]["payload"]))
+        word = current["transcript"]["payload"]["segments"][0]["words"][0]["word_id"]
+        review["review"] = review.get("review", []) + [
+            {"id": str(uuid.uuid4()), "status": "open", "word_ids": [word], "t1": 0, "t2": 1}]
         binding = recordings.document_binding(self.store, recording)
         self.store.commit_change_with_document(
             recording, {"source_revision": current["transcript"]["revision"],
                         "review_revision": current["review"]["revision"]},
             str(uuid.uuid4()), recordings.operation_context(self.store, "human"),
-            review=current["review"]["payload"], root_id=binding["root_id"],
+            review=review, root_id=binding["root_id"],
             generated_at="2026-01-01T00:00:01Z")
 
     def execute(self, request, before_answer=None, **kwargs):
@@ -82,7 +89,7 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
             "JOIN conspects c USING(conspect_id) WHERE c.recording_id=? AND f.kind='md'", (recording,)).fetchone()
         return Path(row["path"]) / row["relative_path"]
 
-    # 1. Ревизия изменилась во время вызова: продолжить нельзя, но можно начать заново.
+    # 1. Содержание (сомнения) изменилось во время вызова: продолжить нельзя, но можно начать заново.
     def test_review_changed_during_call_can_be_restarted(self):
         request = self.prepare_request()
         with self.assertRaises(llm_provider.ProviderError) as error:

@@ -286,11 +286,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["readiness"]["human_verification"], "confirmed")
         current = self.store.get_current(recording)
         binding = recordings.document_binding(self.store, recording)
+        # Новая ревизия без изменения содержания (показ карточки) отметку не снимает (РАР-7, этап 7.2).
+        head = recordings.recording_head(self.store, recording)
+        self.store.commit_player_event(
+            recording, {"source_revision": head["source_revision"], "review_revision": head["review_revision"]},
+            str(uuid.uuid4()), recordings.operation_context(self.store, "human"), "card_visible")
+        with mock.patch("recordings.open_store", side_effect=lambda: storage.open_store(dbpath)):
+            shown = core.workflow_status(request)
+        self.assertEqual(shown["readiness"]["human_verification"], "confirmed")
+        current = self.store.get_current(recording)
+        transcript = json.loads(json.dumps(current["transcript"]["payload"]))
+        transcript["segments"][0]["words"][0]["w"] = "другое"
         self.store.commit_change_with_document(
             recording, {"source_revision": current["transcript"]["revision"],
                         "review_revision": current["review"]["revision"]},
             str(uuid.uuid4()), recordings.operation_context(self.store, "human"),
-            review=current["review"]["payload"], root_id=binding["root_id"],
+            transcript=transcript, review=current["review"]["payload"], root_id=binding["root_id"],
             generated_at="2026-01-01T00:00:01Z")
         with mock.patch("recordings.open_store", side_effect=lambda: storage.open_store(dbpath)):
             changed = core.workflow_status(request)
