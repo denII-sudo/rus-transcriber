@@ -194,6 +194,40 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
         self.assertEqual(self.calls, 2)                 # начать заново — блоки прежнего запуска не берутся
         self.assertEqual(self.model_runs(request), [("superseded", "superseded"), ("completed", "completed")])
 
+    # Начать заново, пока идёт облачный вызов прежнего запуска: его поздний ответ или ошибка
+    # не попадают в новый запуск.
+    def restart_during_call(self, request):
+        workflow.prepare_model_task(self.store, request, restart=True)
+
+    def assert_new_run_untouched(self, request):
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        self.assertEqual(self.model_runs(request), [("superseded", "superseded"), ("waiting_model", "waiting_model")])
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM workflow_model_parts WHERE request_id=?",
+                                               (request,)).fetchone()[0], 0)
+
+    def test_late_answer_of_replaced_run_is_not_saved_into_new_run(self):
+        request = self.prepare_request()
+        with self.assertRaises(llm_provider.ProviderError) as error:
+            self.execute(request, before_answer=lambda: self.restart_during_call(request))
+        self.assertIn("заново", str(error.exception))
+        self.assert_new_run_untouched(request)
+
+    def test_late_error_of_replaced_run_does_not_fail_new_run(self):
+        request = self.prepare_request()
+        test = self
+
+        class Client:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+            def generate(self, task, **_kwargs):
+                test.restart_during_call(request)
+                raise llm_provider.ProviderError("timeout", "synthetic: нет ответа")
+        with mock.patch("llm_provider.OpenCodeTextClient", Client):
+            with self.assertRaises(llm_provider.ProviderError):
+                workflow.execute_model(self.store, request)
+        self.assert_new_run_untouched(request)
+
     # Все блоки сохранены: итог собирается без создания клиента облака.
     def test_saved_blocks_are_assembled_without_creating_client(self):
         request = self.prepare_request(count=501)
