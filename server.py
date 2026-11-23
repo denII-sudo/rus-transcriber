@@ -82,7 +82,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.23.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.23.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -166,12 +166,14 @@ def workflow_status(request_id: str) -> str:
 
 
 @mcp.tool()
-def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000) -> str:
+def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000, restart: bool = False) -> str:
     """Получить страницу задания. Прочитайте все страницы до next_offset=null. В задании версии 2 у слова
     есть номер реплики turn, а в turns — условные метки говорящих («Участник N») для реплик этой страницы:
-    называйте говорящих только этими метками, имён в задании нет."""
+    называйте говорящих только этими метками, имён в задании нет. У готовой свёртки возвращается
+    сохранённое задание, ничего не меняется. restart=true (только с offset=0) — начать модельный шаг
+    заново: после ошибки или для новой свёртки; прежние блоки не используются."""
     try:
-        return json.dumps(core.workflow_model_task(request_id, offset, limit), ensure_ascii=False)
+        return json.dumps(core.workflow_model_task(request_id, offset, limit, restart=restart), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
 
@@ -230,11 +232,14 @@ def workflow_change_policy(request_id: str, policy: dict, expected_revision: int
 
 
 @mcp.tool()
-def workflow_execute_model(request_id: str, retry_failed: bool = False) -> str:
-    """Продолжить автономное модельное задание без повторного распознавания."""
+def workflow_execute_model(request_id: str, retry_failed: bool = False, restart: bool = False) -> str:
+    """Продолжить автономное модельное задание без повторного распознавания. retry_failed=true — продолжить
+    шаг после ошибки (только недостающие блоки); restart=true — начать шаг заново: текст стенограммы снова
+    уйдёт в облако. Вместе их не передавать. У готовой свёртки повтор облако не вызывает: дописывает файлы
+    или называет причину. Предел размера и ручная правка файла свёртки проверяются до вызова облака."""
     import llm_provider
     try:
-        return json.dumps(core.workflow_execute_model(request_id, retry_failed=retry_failed),
+        return json.dumps(core.workflow_execute_model(request_id, retry_failed=retry_failed, restart=restart),
                           ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)

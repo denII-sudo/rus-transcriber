@@ -188,12 +188,15 @@ def build():
     ws = sub.add_parser("workflow-status"); ws.add_argument("request")
     wt = sub.add_parser("workflow-task"); wt.add_argument("request")
     wt.add_argument("--offset", type=int, default=0); wt.add_argument("--limit", type=int, default=1000)
+    wt.add_argument("--restart", action="store_true", help="начать модельный шаг заново (только с первой страницы)")
     wr = sub.add_parser("workflow-result"); wr.add_argument("request"); wr.add_argument("result_file")
     wmp = sub.add_parser("workflow-part"); wmp.add_argument("request"); wmp.add_argument("index", type=int)
     wmr = sub.add_parser("workflow-part-result"); wmr.add_argument("request"); wmr.add_argument("index", type=int)
     wmr.add_argument("result_file")
     we = sub.add_parser("workflow-execute"); we.add_argument("request")
-    we.add_argument("--retry-failed", action="store_true")
+    we.add_argument("--retry-failed", action="store_true", help="продолжить шаг после ошибки")
+    we.add_argument("--restart", action="store_true",
+                    help="начать шаг заново: текст стенограммы снова уйдёт в облако")
     wp = sub.add_parser("workflow-policy"); wp.add_argument("request"); wp.add_argument("policy_file")
     wp.add_argument("expected_revision", type=int)
     wv = sub.add_parser("workflow-confirm"); wv.add_argument("request")
@@ -261,7 +264,7 @@ def run(a):
     elif c == "workflow-status":
         out(core.workflow_status(a.request))
     elif c == "workflow-task":
-        out(core.workflow_model_task(a.request, a.offset, a.limit))
+        out(core.workflow_model_task(a.request, a.offset, a.limit, restart=a.restart))
     elif c == "workflow-result":
         out(core.workflow_model_result(a.request, json.loads(Path(a.result_file).read_text(encoding="utf-8"))))
     elif c == "workflow-part":
@@ -269,7 +272,7 @@ def run(a):
     elif c == "workflow-part-result":
         out(core.workflow_model_part_result(a.request, a.index, json.loads(Path(a.result_file).read_text(encoding="utf-8"))))
     elif c == "workflow-execute":
-        out(core.workflow_execute_model(a.request, retry_failed=a.retry_failed))
+        out(core.workflow_execute_model(a.request, retry_failed=a.retry_failed, restart=a.restart))
     elif c == "workflow-policy":
         out(core.workflow_change_policy(a.request, json.loads(Path(a.policy_file).read_text(encoding="utf-8")),
                                         a.expected_revision))
