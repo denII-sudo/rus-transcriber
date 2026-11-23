@@ -453,6 +453,18 @@ def add_answers(json_path, answers, source, *, trusted_actor="unknown"):
             return _add_answers(json_path, answers, source, trusted_actor)
 
 
+def _newer(old, ans):
+    """Более поздний ответ побеждает: сохранённый ответ old новее пришедшего ans — ans не сохраняется."""
+    return bool(old) and old.get("ts", "") > ans["ts"]
+
+
+def _reject_keep(store, ans, why):
+    """Отклонённое «Не отменять» — одна короткая запись на место (последняя), без текста ответа."""
+    rows = store.setdefault("rejected", [])
+    rows[:] = [r for r in rows if not (r.get("id") == ans["id"] and r.get("kind") == "keep")]
+    rows.append({"id": ans["id"], "kind": "keep", "ts": ans["ts"], "source": ans["source"], "why": why})
+
+
 def _add_answers(json_path, answers, source, trusted_actor="unknown"):
     """Сводит ответы в answers.json. answers: [{id, version, kind|option|text|audio, ts?}].
     Голосовые ответы без текста распознаются GigaAM (отдельный процесс) и сопоставляются с вариантами."""
@@ -500,8 +512,11 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             # «Не отменять»: вместо подготовленной отмены (или ждущего ответа) снова сохраняется применённый
             # ответ — целиком, из копии, которую хранит заменивший его ответ (время, источник, услышанное).
             previous = applied.get(aid)
-            if previous is None:
-                rep["rejected"].append({"id": aid, "why": "нет применённого ответа, к которому можно вернуться"})
+            why = ("нет применённого ответа, к которому можно вернуться" if previous is None else
+                   "есть более поздний ответ" if _newer(store["answers"].get(aid), ans) else None)
+            if why:
+                rep["rejected"].append({"id": aid, "why": why})
+                _reject_keep(store, ans, why)
                 continue
             kept = (store["answers"].get(aid) or {}).get("applied_answer")
             if kept and _sig(kept) == previous:
@@ -546,7 +561,7 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             c = {"id": aid, "was": old, "now": ans}
             store.setdefault("conflicts", []).append(c)
             rep["conflicts"].append({"id": aid, "was": _desc(old, it), "now": _desc(ans, it)})
-        if old and old.get("ts", "") > ans["ts"]:          # более поздний ответ побеждает
+        if _newer(old, ans):
             continue
         if old and over_applied(ans, applied.get(aid)) not in (None, "applied"):
             # Ответ поверх применённого хранит копию применённого ответа целиком: по «Не отменять» он
