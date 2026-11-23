@@ -84,7 +84,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.23.5"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.23.6"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -635,7 +635,7 @@ async def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str 
             return "Передайте conspect_text или conspect_path"
         res = quotes.check(text, transcript.load(s["json"]))
         for r in res["problems"]:
-            r["t"] = transcript.hms(r["t"])
+            r["t"] = transcript.hms(r["t"]) if r["t"] is not None else None   # у слов места нет времени
         return json.dumps(res, ensure_ascii=False, indent=1)
 
     if path and not path.is_relative_to(paths.DATA_DIR.resolve()):

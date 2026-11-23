@@ -34,7 +34,8 @@ def _tokens(data):
             m = marks.get(si) or {}
             for k, w in enumerate(ws):
                 for x in WORD.findall(w["w"]):
-                    out.append((_n(x), seg["speaker"], w["s"], m.get(k)))
+                    start = w.get("s")                     # у слова без времени — None
+                    out.append((_n(x), seg["speaker"], start if type(start) in (int, float) else None, m.get(k)))
         else:
             for w in WORD.findall(seg["text"]):
                 out.append((_n(w), seg["speaker"], seg["start"], None))
@@ -124,7 +125,7 @@ def check(conspect_text, data, names=None):
         found_spk = spks.most_common(1)[0][0] if spks else None
         rows.append({"quote": q, "speaker": spk, "score": round(score, 2),
                      "verdict": "дословно" if score == 1.0 and len(parts) == 1 and "[" not in q and "…" not in q and "..." not in q and not ambiguous else ("близко" if score >= 0.6 else "не найдено"),
-                     "t": toks[i][2] if toks else 0, "transcript": " ".join(seq[max(0, i - 2):i + L + 2]),
+                     "t": next((t[2] for t in toks[i:i + max(L, 1)] if t[2] is not None), None) if toks else 0, "transcript": " ".join(seq[max(0, i - 2):i + L + 2]),
                      "transcript_speaker": found_spk,
                      "speaker_ok": None if not spk else spk == found_spk,
                      **({"doubt": sorted(doubt)} if doubt else {}), **({"ambiguous": True} if ambiguous else {}),
