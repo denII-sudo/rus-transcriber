@@ -589,5 +589,67 @@ class PreparedRevert(AnswerOutcomeCase):
         ''')
 
 
+class KeepRestoresWholeAnswer(AnswerOutcomeCase):
+    """«Не отменять» возвращает прежний применённый ответ целиком: время, источник, услышанный текст."""
+
+    def applied_with_heard(self, jp, md, version):
+        review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 0, "text": "другое слово",
+                                      "heard": True, "ts": "2026-11-23T09:00:00"}], "local", trusted_actor="human")
+        self.apply(jp, md)
+        return copy.deepcopy(review_pack.answers_state(jp)["answers"]["r1"])
+
+    def test_keep_after_revert_restores_whole_answer(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                original = self.applied_with_heard(jp, md, version)
+                self.save(jp, version, kind="revert")
+                self.save(jp, version, kind="keep")
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
+
+    def test_keep_after_pending_and_revert_restores_whole_answer(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                original = self.applied_with_heard(jp, md, version)
+                self.save(jp, version, option=1)
+                self.save(jp, version, kind="revert")
+                self.save(jp, version, kind="keep")
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+
+    def test_old_pack_without_copy_restores_by_signature_and_says_so(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.applied_with_heard(jp, md, version)
+                self.save(jp, version, kind="revert")
+                state = review_pack.answers_state(jp)
+                state["answers"]["r1"].pop("applied_answer", None)
+                review_pack._write_answers(jp, state)
+                self.save(jp, version, kind="keep")
+                answer = review_pack.answers_state(jp)["answers"]["r1"]
+                self.assertTrue(answer.get("restored"))
+                self.assertEqual((answer["kind"], answer["option"]), ("option", 0))
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
+
+
+@unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+class RevertAnswerText(unittest.TestCase):
+    """Строка ответа «отменить» не противоречит заголовку карточки."""
+
+    def test_revert_text_follows_state(self):
+        run_page(self, r'''
+          const a={kind:"revert",ts:"t2",source:"local"}, one={id:"r1", options: []};
+          const cases = {revert_pending: "отмена подготовлена", undo_conflict: "отмена не выполнена", reverted: "ответ отменён"};
+          for (const [state, start] of Object.entries(cases)) {
+            man = {answer_states:{r1:{state, ts:"t2", source:"local"}}};
+            const text = answerText(a, one);
+            if (!text.startsWith(start)) throw Error(state + ": " + text);
+            if (state !== "reverted" && text.includes("ответ отменён")) throw Error(state + " противоречит: " + text);
+          }
+          const restored = {kind:"option", option:0, restored:true, ts:"t3", source:"local"};
+          if (!answerMeta(restored).includes("возвращён применённый ответ") || answerMeta(restored).includes("·"))
+            throw Error("время возврата выдано за время ответа: " + answerMeta(restored));
+        ''')
+
+
 if __name__ == "__main__":
     unittest.main()

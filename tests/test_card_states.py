@@ -31,6 +31,42 @@ class CardStates(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_apply_renders_with_fresh_states(self):
+        # После «Применить» страница сначала забирает ответы и состояния у программы, потом рисует карточки.
+        html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
+        script = html.split("<script>", 1)[1]
+        prefix = script.split("  // ответы этой версии вопросов")[0]
+        layer = "  // ответы этой версии вопросов" + script.split("  // ответы этой версии вопросов", 1)[1].split(
+            "  async function cloudApi()", 1)[0]
+        handler = html.split('  $("apply").onclick = ', 1)[1].split("\n\n  async function start()", 1)[0]
+        lines = "  function reportLines" + html.split("  function reportLines", 1)[1].split("\n  }\n", 1)[0] + "\n  }\n"
+        stubs = r'''
+          global.location = {hostname: "127.0.0.1"};
+          const box = {hidden: true, textContent: "", style: {}}, button = {disabled: false};
+          global.document = {getElementById: id => id === "apply-report" ? box : button};
+          global.confirm = () => true;
+          const fresh = {answers: {r1: {id: "r1", version: "v", kind: "option", option: 0, ts: "t1", source: "local"}},
+                         answer_states: {r1: {state: "applied", ts: "t1", source: "local"}}};
+          global.fetch = async url => ({ok: true, json: async () => url === "api/answers" ? fresh : {outcomes: []}});
+        '''
+        body = r'''
+          man = {version: "v", items: [{id: "r1", options: []}], answers: {}};
+          answers = {r1: {id: "r1", version: "v", kind: "revert", ts: "t0", source: "local"}};
+          man.answer_states = {r1: {state: "revert_pending", ts: "t0", source: "local"}};
+          api = localApi();
+          const seen = [];
+          render = () => seen.push(stateOf({id: "r1"}, answers.r1));
+          const handler = ''' + handler + r'''
+          handler().then(() => {
+            if (seen.join() !== "applied") throw Error("карточка нарисована со старым состоянием: " + seen.join());
+          }).catch(e => { console.error(e); process.exitCode = 1; });
+        })();
+        '''
+        source = stubs + prefix + lines + layer + "  let render;\n" + body
+        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
     def test_card_state_comes_from_program(self):
         # Состояние ответа приходит из программы (answer_states) и относится только к тому же ответу.
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
