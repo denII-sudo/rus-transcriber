@@ -45,6 +45,8 @@ MAX_INTERACTION_EVENTS = 2000
 # Один словарь для отчёта применения, журнала и страницы карточек.
 OUTCOME_REASONS = {
     "saved": "ответ сохранён, ещё не применён",
+    "revert_pending": ("отмена подготовлена: нажмите «Применить сохранённые ответы»; до этого прежний ответ "
+                       "на месте. Передумали — «Не отменять»"),
     "applied": "ответ применён к стенограмме",
     "reverted": "ответ отменён, место снова открыто",
     "pending_new": ("новый ответ сохранён, но не применён: применённый ответ этим не заменяется. "
@@ -494,7 +496,20 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         for k in ("text", "audio", "heard", "by"):
             if a.get(k) is not None:
                 ans[k] = a[k]
-        if a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
+        if a.get("kind") == "keep":
+            # «Не отменять»: вместо подготовленной отмены снова сохраняется применённый ответ — по его подписи.
+            previous = applied.get(aid)
+            if previous is None:
+                rep["rejected"].append({"id": aid, "why": "нет применённого ответа, к которому можно вернуться"})
+                continue
+            kind, option, text = (list(previous) + [None, None, None])[:3]
+            ans.pop("text", None)
+            ans["kind"] = kind
+            if option is not None:
+                ans["option"] = option
+            if text is not None:
+                ans["text"] = text
+        elif a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
             ans["kind"] = a["kind"]
             if a["kind"] == "recommended":
                 ans["option"] = it.get("recommended")
@@ -944,7 +959,8 @@ def _answer_state(answer, applied_sig, event):
     kind = answer.get("kind")
     relation = over_applied(answer, applied_sig)
     if relation == "revert":
-        return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "saved"
+        # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
+        return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
     if relation is not None:
         return relation
     if event is not None and event.get("outcome") in OUTCOME_REASONS and event.get("outcome") != "applied":
