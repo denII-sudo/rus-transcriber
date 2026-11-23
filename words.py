@@ -424,8 +424,10 @@ def vote_n(main, others, rule, trace=None):
     байт в байт). В него дописывается: schema, rule, roles (основная и другие по порядку), unanimous (слова,
     за которые все модели), places — места, где решение не единогласно, по порядку записи: слово основной
     модели оставлено не всеми (kept, support — роли), заменено (replaced), вставлено (inserted) или спорно
-    (disputed); у них t — время начала, main — слова основной, variants — текст каждой роли, winner_roles —
-    роли победившей группы. Протокол ничего не меняет в словах."""
+    (disputed); у них t — время начала (у kept, replaced, disputed — слов основной; у inserted — итогового
+    слова после _fit_times, t_model — у модели), t_result у replaced — начало итоговых слов, main — слова
+    основной, variants — текст каждой роли, winner_roles — роли победившей группы. Протокол ничего не
+    меняет в словах."""
     check_rule(rule, len(others) + 1)
     roles = [role for role, _ in others]
     if len(set(roles)) != len(roles):
@@ -462,18 +464,23 @@ def vote_n(main, others, rule, trace=None):
     for w in main:
         w["agree"] = True
     out = []
+    final_time = []                           # (место протокола, поле, итоговое слово)
     i = 0
     while i <= len(main):
         ins = [(h, h["ins"][i], "".join(h["toks"][h["ins"][i][0]:h["ins"][i][1]])) for h in hyps if i in h["ins"]]
         win = _winner(ins, need, need_text=False)
         if win:
             h, js, label, win_roles = win
+            picked = chosen(h, js, label)
             if trace is not None:
-                first = chosen(h, js, label)[:1]
-                trace["places"].append({"decision": "inserted", "t": first[0]["s"] if first else None,
-                                        "main": "", "variants": {x[0]["role"]: text_of(x[0], x[1]) for x in ins},
-                                        "winner_roles": win_roles})
-            out += chosen(h, js, label)
+                place = {"decision": "inserted", "t": picked[0]["s"] if picked else None,
+                         "t_model": picked[0]["s"] if picked else None,
+                         "main": "", "variants": {x[0]["role"]: text_of(x[0], x[1]) for x in ins},
+                         "winner_roles": win_roles}
+                trace["places"].append(place)
+                if picked:
+                    final_time.append((place, "t", picked[0]))
+            out += picked
             stats["inserted"] += js[1] - js[0]
         if i == len(main):
             break
@@ -502,7 +509,10 @@ def vote_n(main, others, rule, trace=None):
                                     "winner_roles": win[3] if win else []})
         if win:
             h, js, label, _ = win
-            out += chosen(h, js, label, " ".join(w["w"] for w in span))
+            picked = chosen(h, js, label, " ".join(w["w"] for w in span))
+            if trace is not None and picked:
+                final_time.append((trace["places"][-1], "t_result", picked[0]))
+            out += picked
             stats["replaced"] += len(span)
         else:
             for w in span:
@@ -516,6 +526,8 @@ def vote_n(main, others, rule, trace=None):
             out.extend(span)
         i = k
     _fit_times(out)
+    for place, key, word in final_time:      # время итогового слова — после _fit_times
+        place[key] = word["s"]
     main[:] = out
     return stats
 

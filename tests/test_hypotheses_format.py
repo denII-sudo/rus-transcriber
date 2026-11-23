@@ -62,7 +62,7 @@ class TraceContentTests(unittest.TestCase):
         self.assertEqual(tr["unanimous"], 9)
         self.assertEqual(tr["places"], [{"decision": "replaced", "t": 1.0, "main": "два",
                                          "variants": {"second": "дважды", "whisper": "дважды"},
-                                         "winner_roles": ["second", "whisper"]}])
+                                         "winner_roles": ["second", "whisper"], "t_result": 1.0}])
         self.assertEqual(main[1]["voted"], "ctc+whisper")
 
     def test_kept_with_partial_support_and_disputed_place(self):
