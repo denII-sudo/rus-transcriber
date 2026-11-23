@@ -1,6 +1,7 @@
 """Ограниченный генератор конспекта через OpenCode Generate API и OpenAI."""
 
 import base64
+import http.client
 import json
 import os
 import re
@@ -36,49 +37,88 @@ class ProviderError(RuntimeError):
         self.detail = detail or {}          # причина отказа из тела ответа OpenCode (см. _opencode_error_detail)
 
 
-# Ошибки OpenCode, тело которых по схеме OpenCode 2.4 говорит только о провайдере, модели, месте
-# и доступе — их текст показываем. Для прочих (400, 502 и т. п.) текст может пересказывать запрос
-# или ответ OpenAI, поэтому показываем только вид ошибки.
-_DESCRIBED_ERRORS = {"ProviderNotFoundError", "ModelNotFoundError", "LocationNotFoundError",
-                     "UnsupportedModelError", "UnauthorizedError", "ServiceUnavailableError"}
-_DETAIL_FIELDS = ("providerID", "modelID", "capability", "message")
+# Причина отказа OpenCode в сообщении — одно правило с параметрами (аудит №130):
+# - вид ошибки (`_tag`) показывается всегда, если это строгий идентификатор;
+# - поля схемы — только для пар «вид + HTTP-код» из _DESCRIBED_ERRORS: по схеме OpenCode 2.4 их тело говорит
+#   лишь о провайдере, модели, месте и доступе. При другой паре (502, 503, 400, чужой код) — только вид:
+#   текст может пересказывать запрос или ответ OpenAI;
+# - providerID, modelID, capability — только строгий набор знаков (_ID_RE) и не похожие на ключ, иначе поле
+#   отбрасывается целиком; к ним применяются и шаблоны _SCRUB (путь вида C:/… тоже состоит из этих знаков);
+# - message — без путей, токенов, паролей и похожего на ключи (заменяются на «‹скрыто›»), не длиннее
+#   _MAX_DETAIL_CHARS. Исключение: message с не-ASCII знаками отбрасывается целиком — тексты OpenCode английские,
+#   стенограмма русская, так пересказ стенограммы не выходит наружу; в сообщении остаётся пометка, что текст был.
+_DESCRIBED_ERRORS = {("ProviderNotFoundError", 404), ("ModelNotFoundError", 404), ("LocationNotFoundError", 404),
+                     ("UnsupportedModelError", 422), ("UnauthorizedError", 401)}
+_ID_FIELDS = ("providerID", "modelID", "capability")
+_TAG_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 _MAX_ERROR_BODY = 64_000
-_MAX_DETAIL_CHARS = 300
+_MAX_DETAIL_CHARS = 160
+_HIDDEN = "‹скрыто›"
+_MESSAGE_HIDDEN = "сообщение OpenCode скрыто (не прошло проверку)"
+_KEY_LIKE = re.compile(r"(?i)\b(?:sk|hf|ghp|gho|ghs|github_pat|xox[abpr])[-_][A-Za-z0-9_-]{6,}"
+                       r"|[A-Za-z0-9+_=]{24,}")
+_SCRUB = (
+    re.compile(r"(?i)\b(?:bearer|basic)\s+\S+"),
+    re.compile(r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key|authorization)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\bfile:/+\S*"),
+    re.compile(r"(?<![\w])[A-Za-z]:[\\/]\S*"),        # C:\… и C:/…
+    re.compile(r"\\\\\S+"),                              # \\сервер\…
+    re.compile(r"(?<![\w.:/-])~?/(?:[^\s/]+/)+[^\s/]*"),  # /home/…/…, ~/…/…
+    _KEY_LIKE,
+)
 
 
-def _opencode_error_detail(body):
-    """Причина отказа из тела ошибки OpenCode: вид (`_tag`) и, для описанных видов, поля схемы.
+def _clean(value):
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
 
-    Без тела запроса и без чужих полей; строки укорочены и очищены от управляющих символов.
-    Нераспознанное тело даёт пустой словарь — сообщение тогда остаётся прежним.
+
+def _scrub_message(text):
+    for pattern in _SCRUB:
+        text = pattern.sub(_HIDDEN, text)
+    return text[:_MAX_DETAIL_CHARS]
+
+
+def _opencode_error_detail(body, status=None):
+    """Причина отказа из тела ошибки OpenCode по правилу выше; любой сбой разбора — пустой словарь.
+
+    Без тела запроса и без чужих полей. Нераспознанное тело даёт пустой словарь — сообщение тогда прежнее.
     """
     try:
         data = json.loads(body.decode("utf-8"))
-    except (UnicodeError, ValueError, AttributeError):
+        if isinstance(data, dict) and isinstance(data.get("error"), dict):
+            data = data["error"]
+        if not isinstance(data, dict):
+            return {}
+        tag = data.get("_tag")
+        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            return {}
+        detail = {"tag": tag}
+        if (tag, status) not in _DESCRIBED_ERRORS:
+            return detail
+        for field in _ID_FIELDS:
+            value = data.get(field)
+            if isinstance(value, str) and _ID_RE.fullmatch(value) and not any(p.search(value) for p in _SCRUB):
+                detail[field] = value
+        message = data.get("message")
+        if isinstance(message, str) and _clean(message):
+            if _clean(message).isascii():
+                detail["message"] = _scrub_message(_clean(message))
+            else:
+                detail["message_hidden"] = True
+        return detail
+    except Exception:        # RecursionError, MemoryError и любые другие: причина неизвестна, отказ прежний
         return {}
-    if isinstance(data, dict) and isinstance(data.get("error"), dict):
-        data = data["error"]
-    if not isinstance(data, dict):
-        return {}
-    clean = lambda value: re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()[:_MAX_DETAIL_CHARS]
-    tag = data.get("_tag")
-    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", tag):
-        return {}
-    detail = {"tag": tag}
-    if tag in _DESCRIBED_ERRORS:
-        for field in _DETAIL_FIELDS:
-            if isinstance(data.get(field), str) and clean(data[field]):
-                detail[field] = clean(data[field])
-    return detail
 
 
 def _describe_detail(detail):
     if not detail:
         return ""
-    parts = [detail["tag"]] + [f"{field}={detail[field]}" for field in ("providerID", "modelID", "capability")
-                               if field in detail]
+    parts = [detail["tag"]] + [f"{field}={detail[field]}" for field in _ID_FIELDS if field in detail]
     text = "; ответ OpenCode: " + ", ".join(parts)
-    return text + (f" — {detail['message']}" if "message" in detail else "")
+    if "message" in detail:
+        return text + f" — {detail['message']}"
+    return text + (f" — {_MESSAGE_HIDDEN}" if detail.get("message_hidden") else "")
 
 
 def _opencode_executable():
@@ -258,6 +298,11 @@ class OpenCodeTextClient:
                 return self._start(executable)
             except _PortTaken as ex:
                 last = ex          # порт занял чужой процесс — пароль ему не отправлен, берём новый порт
+            except BaseException:
+                # Любое исключение запуска, не только ProviderError (например, сбой разбора ответа
+                # или прерывание): запущенный OpenCode не остаётся висеть. close() повторно безопасен.
+                self.close()
+                raise
         raise ProviderError("unavailable", "OpenCode API не удалось запустить на свободном локальном порту") from last
 
     def _start(self, executable):
@@ -389,14 +434,16 @@ class OpenCodeTextClient:
             }[code]
             try:
                 body = ex.read(_MAX_ERROR_BODY + 1)
-            except (OSError, ValueError, AttributeError):
+            except Exception:       # IncompleteRead, обрыв, отсутствие тела — причина неизвестна, отказ прежний
                 body = b""
-            detail = _opencode_error_detail(body) if body and len(body) <= _MAX_ERROR_BODY else {}
+            if not isinstance(body, bytes) or len(body) > _MAX_ERROR_BODY:
+                body = b""
+            detail = _opencode_error_detail(body, ex.code) if body else {}
             raise ProviderError(code, message + _describe_detail(detail), http_status=ex.code,
                                 detail=detail) from None
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException):
             raise ProviderError("offline", "не удалось связаться с OpenCode/OpenAI") from None
-        except (UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError, RecursionError):      # RecursionError — слишком глубокий JSON
             raise ProviderError("invalid_response", "OpenCode вернул некорректный JSON") from None
 
     def generate(self, task, *, repair_error=None, invalid_output=None):

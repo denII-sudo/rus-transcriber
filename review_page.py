@@ -34,6 +34,36 @@ mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_ANSWER_BYTES = 64 * 1024
 MAX_VOICE_BYTES = 16 * 1024 * 1024
 
+# Причины, которые страница может показать человеку дословно: в них нет путей, текста ответов и
+# чужих данных. Сообщение с таким началом и подробностями после «:» показывается без подробностей.
+SAFE_ERRORS = (
+    "версия пакета изменилась",
+    "карточка не найдена",
+    "неизвестное событие карточки",
+    "неверный идентификатор сессии страницы",
+    "пакет разбора не собран: сначала build_review_pack",
+    "Ответ неизвестного происхождения нельзя применять как человеческий; необходимо явное подтверждение",
+    "Ответы сохранены в БД; обновление документа не завершено",
+    "Ответы сохранены, но конспекты не обновлены",
+)
+
+
+def safe_error(ex):
+    """Причина ошибки запроса по-русски для страницы: известная причина или общая фраза с кодом.
+    Текст исключения, пути и ответы на страницу не попадают."""
+    code = type(ex).__name__
+    if code == "Conflict" and type(ex).__module__ == "storage":
+        return ("запись изменилась, пока применялись ответы; ничего не применено — обновите страницу "
+                f"и повторите (код: {code})")
+    if isinstance(ex, json.JSONDecodeError):
+        return f"запрос повреждён: неверный JSON (код: {code})"
+    if (isinstance(ex, (ValueError, RuntimeError)) or code == "CoreError") and ex.args and isinstance(ex.args[0], str):
+        message = ex.args[0]
+        for known in SAFE_ERRORS:
+            if message == known or message.startswith(known + ":"):
+                return known
+    return f"не удалось обработать запрос (код: {code})"
+
 
 class ExclusiveHTTPServer(ThreadingHTTPServer):
     """Сервер, который не делит порт с другим процессом.
@@ -115,6 +145,8 @@ def main():
             if u == "api/answers":
                 store = P.answers_state(a.json_path, {"answers": {}})
                 store["applied_answers"] = store.get("applied_answers") or {}
+                # Состояние каждого ответа считает Python; страница его только показывает.
+                store["answer_states"] = P.answer_states_of(store, P.manifest(a.json_path) or {})
                 return self._send(200, store)
             if u == "manifest.json":
                 manifest = P.manifest(a.json_path)
@@ -210,7 +242,7 @@ def main():
                     return self._send(200, {"heard": text, "match": P.match(text, item)})
             except Exception as ex:
                 print(f"[page] ошибка запроса: {type(ex).__name__}", file=sys.stderr, flush=True)
-                return self._send(400, {"error": "не удалось обработать запрос"})
+                return self._send(400, {"error": safe_error(ex)})
             self._send(404, {"error": "не найдено"})
 
     srv, port = bind_free_port(a.port, H)

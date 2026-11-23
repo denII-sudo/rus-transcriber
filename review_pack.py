@@ -41,6 +41,34 @@ SR = 16000
 HERE = Path(__file__).resolve().parent
 MAX_INTERACTION_EVENTS = 2000
 
+# Исход каждого сохранённого ответа после «Применить» — он же состояние, которое видит человек на странице.
+# Один словарь для отчёта применения, журнала и страницы карточек.
+OUTCOME_REASONS = {
+    "saved": "ответ сохранён, ещё не применён",
+    "revert_pending": ("отмена подготовлена: нажмите «Применить сохранённые ответы»; до этого прежний ответ "
+                       "на месте. Передумали — «Не отменять»"),
+    "applied": "ответ применён к стенограмме",
+    "reverted": "ответ отменён, место снова открыто",
+    "pending_new": ("новый ответ сохранён, но не применён: применённый ответ этим не заменяется. "
+                    "Чтобы заменить: «Подготовить отмену» → «Применить сохранённые ответы» → выберите ответ "
+                    "заново → «Применить сохранённые ответы»"),
+    "kept_previous": "применённый ответ оставлен: пропуск и отрицание его не меняют",
+    "skipped": "пропущено, стенограмма не менялась",
+    "negative": "отрицание: правка не применена, место осталось открытым",
+    "left_for_human": "требует проверки человеком",
+    "apply_conflict": "не применён: слова карточки изменились после её создания или конфликтуют с прежней правкой",
+    "blocked_preflight": "не применён: ответ затрагивает те же слова, что и ответ другой карточки",
+    "undo_conflict": "отмена не выполнена: место изменилось после применения или нет снимка для отмены",
+    "source_conflict": "не применён: стенограмма изменилась после создания карточек или пакет от другой записи",
+    "not_found": "не применён: место карточки не найдено в стенограмме",
+    "not_applied": "не применён: автоматическое изменение не получилось",
+}
+# Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
+UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
+# Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
+# «пропущено» и «сохранено» ничего не пробовали менять.
+_QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
+
 
 def pack_dir(json_path):
     jp = Path(json_path)
@@ -425,6 +453,24 @@ def add_answers(json_path, answers, source, *, trusted_actor="unknown"):
             return _add_answers(json_path, answers, source, trusted_actor)
 
 
+def _answer_time(answer):
+    """Время ответа для правила «более поздний побеждает». Исключение: у ответа, возвращённого по «Не отменять»,
+    время прежнее, а решение принято в момент запроса — берётся более позднее из двух."""
+    return max(answer.get("ts", ""), (answer.get("keep_request") or {}).get("ts", ""))
+
+
+def _newer(old, ans):
+    """Более поздний ответ побеждает: сохранённый ответ old новее пришедшего ans — ans не сохраняется."""
+    return bool(old) and _answer_time(old) > ans["ts"]
+
+
+def _reject_keep(store, ans, why):
+    """Отклонённое «Не отменять» — одна короткая запись на место (последняя), без текста ответа."""
+    rows = store.setdefault("rejected", [])
+    rows[:] = [r for r in rows if not (r.get("id") == ans["id"] and r.get("kind") == "keep")]
+    rows.append({"id": ans["id"], "kind": "keep", "ts": ans["ts"], "source": ans["source"], "why": why})
+
+
 def _add_answers(json_path, answers, source, trusted_actor="unknown"):
     """Сводит ответы в answers.json. answers: [{id, version, kind|option|text|audio, ts?}].
     Голосовые ответы без текста распознаются GigaAM (отдельный процесс) и сопоставляются с вариантами."""
@@ -443,6 +489,7 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             a["text"] = heard.get(str(a["audio"]), "")
             a["heard"] = True
     rep = {"accepted": [], "rejected": [], "conflicts": [], "free": []}
+    applied = _applied_map(store)
     for a in answers:
         aid = a.get("id")
         it = by_id.get(aid)
@@ -467,7 +514,33 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         for k in ("text", "audio", "heard", "by"):
             if a.get(k) is not None:
                 ans[k] = a[k]
-        if a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
+        if a.get("kind") == "keep":
+            # «Не отменять»: вместо подготовленной отмены (или ждущего ответа) снова сохраняется применённый
+            # ответ — целиком, из копии, которую хранит заменивший его ответ (время, источник, услышанное).
+            previous = applied.get(aid)
+            why = ("нет применённого ответа, к которому можно вернуться" if previous is None else
+                   "есть более поздний ответ" if _newer(store["answers"].get(aid), ans) else None)
+            if why:
+                rep["rejected"].append({"id": aid, "why": why})
+                _reject_keep(store, ans, why)
+                continue
+            kept = (store["answers"].get(aid) or {}).get("applied_answer")
+            if kept and _sig(kept) == previous:
+                # keep_request — по какому запросу ответ возвращён: страница сверяет с ним свой запрос.
+                store["answers"][aid] = dict(copy.deepcopy(kept), keep_request={"ts": ans["ts"], "source": source})
+                rep["accepted"].append({"id": aid, "kind": kept.get("kind"), "answer": _desc(kept, it),
+                                        "restored": True})
+                continue
+            # Исключение для пакетов, записанных до появления копии: ответ собирается по подписи,
+            # с отметкой restored и временем возврата (прежнее время неизвестно).
+            kind, option, text = (list(previous) + [None, None, None])[:3]
+            ans.pop("text", None)
+            ans.update(kind=kind, restored=True, keep_request={"ts": ans["ts"], "source": source})
+            if option is not None:
+                ans["option"] = option
+            if text is not None:
+                ans["text"] = text
+        elif a.get("kind") in ("human", "skip", "recommended", "free", "repeat", "revert"):
             ans["kind"] = a["kind"]
             if a["kind"] == "recommended":
                 ans["option"] = it.get("recommended")
@@ -485,13 +558,25 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         if ans["kind"] in ("repeat", "skip") and not ans.get("text"):
             rep["accepted"].append({"id": aid, "kind": ans["kind"], "stored": False})
             continue
+        if ans["kind"] in ("repeat", "skip") and over_applied(ans, applied.get(aid)) == "kept_previous":
+            # Пропуск не заменяет применённый ответ: иначе «Применить» сняло бы прежнюю правку.
+            rep["accepted"].append({"id": aid, "kind": ans["kind"], "stored": False,
+                                    "note": "пропуск не меняет применённый ответ — он остаётся"})
+            continue
         old = store["answers"].get(aid)
         if old and old.get("source") != source and not _same(old, ans):
             c = {"id": aid, "was": old, "now": ans}
             store.setdefault("conflicts", []).append(c)
             rep["conflicts"].append({"id": aid, "was": _desc(old, it), "now": _desc(ans, it)})
-        if old and old.get("ts", "") > ans["ts"]:          # более поздний ответ побеждает
+        if _newer(old, ans):
             continue
+        if old and over_applied(ans, applied.get(aid)) not in (None, "applied"):
+            # Ответ поверх применённого хранит копию применённого ответа целиком: по «Не отменять» он
+            # возвращается как был. Копия переносится и через цепочку ждущих ответов.
+            kept = old if _sig(old) == applied.get(aid) else old.get("applied_answer")
+            if kept and _sig(kept) == applied.get(aid):
+                ans["applied_answer"] = {k: copy.deepcopy(v) for k, v in kept.items()
+                                         if k not in ("applied_answer", "keep_request")}
         store["answers"][aid] = ans
         rep["accepted"].append({"id": aid, "kind": ans["kind"], "answer": _desc(ans, it)})
         if ans["kind"] == "free":
@@ -514,6 +599,25 @@ def _sig(a):
     return [a.get("kind"), a.get("option"), (a.get("text") or "").strip() if a.get("kind") == "free" else None]
 
 
+def over_applied(answer, applied_sig):
+    """Правило замены применённого ответа (одно на сохранение, применение и страницу). -> None, если
+    применённого ответа на месте нет; «applied» — это он и есть; «revert» — отменить его; «kept_previous» —
+    пропуск или отрицание его не меняют; «pending_new» — новый ответ ждёт, пока прежний не отменят.
+    Исключение до полной замены ответа: другой ответ (кнопка, свой текст, «Оставить человеку») применённый
+    не заменяет — только явная отмена."""
+    import freeform
+    if applied_sig is None:
+        return None
+    kind = answer.get("kind")
+    if applied_sig == _sig(answer):
+        return "applied"
+    if kind == "revert":
+        return "revert"
+    if kind in ("skip", "repeat") or (kind == "free" and freeform.negative_answer(answer.get("text"))):
+        return "kept_previous"
+    return "pending_new"
+
+
 def _applied_map(store):
     """{id: подпись применённого ответа}. Для пакетов до появления этой записи — ответы не позже applied_at."""
     m = dict(store.get("applied_answers") or {})
@@ -526,10 +630,10 @@ def _applied_map(store):
 
 def decisions(json_path):
     """Ответы пакета -> решения для apply_review. -> (decisions, отчёт).
-    Уже применённый и не изменившийся ответ повторно не применяется. Если ответ на место изменили после
-    применения (на карточке «Изменить ответ») — при наличии структурного снимка прежняя правка сначала
-    отменяется, затем применяется новый ответ; без снимка изменение блокируется конфликтом. Ответ
-    «отменить» только откатывает и снова открывает место."""
+    Уже применённый и не изменившийся ответ повторно не применяется. Применённый ответ другим ответом не
+    заменяется: новый ответ сохраняется и ждёт (pending_new), пока человек не отменит прежний; пропуск и
+    отрицание оставляют прежний (kept_previous). Только ответ «отменить» откатывает правку по структурному
+    снимку и снова открывает место; без снимка отмена блокируется конфликтом."""
     import freeform
     import transcript as T
     pd = pack_dir(json_path)
@@ -540,16 +644,19 @@ def decisions(json_path):
     by_id = {it["id"]: it for it in man["items"]}
     conflicted = {c["id"] for c in store.get("conflicts") or []}
     out, rep = [], {"applied_from_answers": 0, "human": [], "free": [], "skipped": [], "unanswered": [],
-                    "unchanged": [], "changed": [], "reverted": []}
+                    "unchanged": [], "changed": [], "reverted": [], "kept_previous": [], "pending_new": [],
+                    "source_conflict_ids": []}
     if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
         rep["source_conflict"] = "пакет относится к другой стенограмме"
+        rep["source_conflict_ids"] = [aid for aid in by_id if store["answers"].get(aid)]
         return out, rep
     for aid, it in by_id.items():
         a = store["answers"].get(aid)
         if not a:
             rep["unanswered"].append(aid)
             continue
-        if aid in applied and applied[aid] == _sig(a):
+        relation = over_applied(a, applied.get(aid))
+        if relation == "applied":
             rep["unchanged"].append(aid)
             continue
         src = f"разбор ({a['source']}, {a['ts']})"
@@ -557,8 +664,14 @@ def decisions(json_path):
         if k == "free" and freeform.negative_answer(a.get("text")):
             # отрицание не отменяет и ранее применённый ответ; подсказку даёт разбор свободного ответа
             rep["free"].append({"id": aid, "text": a.get("text")})
+            if relation == "kept_previous":
+                rep["kept_previous"].append(aid)
             continue
-        if aid in applied:
+        if relation in ("kept_previous", "pending_new"):
+            # Старый пакет мог сохранить пропуск поверх применённого ответа; другой ответ ждёт отмены.
+            rep[relation].append(aid)
+            continue
+        if relation == "revert":
             snapshot = (store.get("undo_snapshots") or {}).get(aid)
             if not snapshot:
                 rep.setdefault("undo_conflicts", []).append({"id": aid, "why":
@@ -566,20 +679,12 @@ def decisions(json_path):
                 continue
             # Прежний ответ снимается структурно, а не по тексту отображения.
             out.append({"id": aid, "_undo_snapshot": snapshot})
-            if k == "revert":
-                continue
-            if k == "free":
-                # Новую формулировку свободного ответа после отмены проверяет человек.
-                rep["human"].append(aid)
-                rep["changed"].append(aid)
-                out.append({"id": aid, "status": "human",
-                            "note": f"{src}: свой ответ изменён после применения — проверить: «{a.get('text')}»"})
-                continue
-            rep["changed"].append(aid)
+            continue
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})
             if d.get("listened") and man.get("source_revision") != data.get("source_revision"):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
+                rep["source_conflict_ids"].append(aid)
                 continue
             if "word_ids" in it:
                 d["word_ids"] = it["word_ids"]
@@ -787,8 +892,12 @@ def cloud_bundle(json_path, artifact_url=None):
         meta["artifact_url"] = artifact_url
     clips = {it["clip"]: pd / it["clip"] for it in man["items"]}
     have = {k: v for k, v in clips.items() if v.exists()}
-    out = dict(man, answers={k: v for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
-               applied_answers=store.get("applied_answers") or {}, conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
+    # Копия применённого ответа (applied_answer) и отметка запроса (keep_request) нужны только ноутбуку:
+    # странице хватает answer_states (keep: ts, source, accepted).
+    out = dict(man, answers={k: {f: x for f, x in v.items() if f not in ("applied_answer", "keep_request")}
+                             for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
+               applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
+               conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
                clips_removed=not have, artifact_url=meta.get("artifact_url"))
     out.pop("job_json", None)                        # пути ноутбука в облако не нужны
@@ -811,57 +920,133 @@ def cloud_bundle(json_path, artifact_url=None):
 
 
 def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
-    """Запоминает успешное применение и итоги неуспешных попыток без копии текста ответа."""
-    pd = pack_dir(json_path)
+    """Запоминает исходы применения без копии текста ответа.
+
+    outcomes {id: исход}: «applied» отмечает ответ применённым (подпись ставится только после успеха),
+    «reverted» снимает отметку и снимок только у ответа «отменить», остальные исходы пишут в журнал попытку
+    применения — один раз на ответ: повторный запуск с тем же исходом событий не дописывает.
+    Без outcomes (прежний вызов) ответы из ids отмечаются по своему виду."""
     store = _read_answers(json_path, {"answers": {}})
     man = manifest(json_path) or {}
     manifest_items = {it.get("id"): it for it in man.get("items") or []}
     m = _applied_map(store)
-    applied_ids = []
-    for aid, a in store.get("answers", {}).items():
-        if ids is None or aid in ids:
-            if a.get("kind") == "revert":
-                m.pop(aid, None)
+    answers = store.get("answers") or {}
+    if outcomes is None:
+        outcomes = {aid: "reverted" if a.get("kind") == "revert" else "applied"
+                    for aid, a in answers.items() if (ids is None or aid in ids) and a.get("kind") != "skip"}
+    changes = []
+    for aid, outcome in outcomes.items():
+        a = answers.get(aid)
+        if not a or (ids is not None and outcome in ("applied", "reverted") and aid not in ids):
+            continue
+        if outcome == "reverted" and a.get("kind") == "revert":
+            m.pop(aid, None)
+            store.setdefault("undo_snapshots", {}).pop(aid, None)
+            changes.append((aid, "reverted"))
+        elif outcome == "applied" and a.get("kind") not in ("skip", "repeat", "revert"):
+            m[aid] = _sig(a)
+            if snapshots and aid in snapshots:
+                store.setdefault("undo_snapshots", {})[aid] = snapshots[aid]
+            else:
                 store.setdefault("undo_snapshots", {}).pop(aid, None)
-            elif a.get("kind") != "skip":
-                m[aid] = _sig(a)
-                if snapshots and aid in snapshots:
-                    store.setdefault("undo_snapshots", {})[aid] = snapshots[aid]
-            if a.get("kind") != "skip":
-                applied_ids.append(aid)
+            changes.append((aid, "applied"))
     store["applied_answers"] = m
-    if applied_ids:
+    if changes:
         store["applied_at"] = _now()
     events = store.setdefault("application_events", [])
     first_new_event = len(events)
-    for aid, outcome in (outcomes or {}).items():
-        if outcome in ("applied", "reverted"):
+
+    def event(aid, action, outcome):
+        answer = answers.get(aid) or {}
+        item = manifest_items.get(aid) or {}
+        return {"id": aid, "version": answer.get("version") or man.get("version"),
+                "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
+                "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
+                "answer_sig_sha256": _sig_hash(answer), "action": action, "outcome": outcome, "at": _now()}
+
+    for aid, outcome in outcomes.items():
+        if outcome in _QUIET_OUTCOMES or aid not in answers:
             continue
-        answer = (store.get("answers") or {}).get(aid) or {}
-        item = manifest_items.get(aid) or {}
-        events.append({"id": aid, "version": answer.get("version") or man.get("version"),
-                       "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
-                       "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
-                       "action": "apply_attempt", "outcome": outcome, "at": _now()})
-    for aid in applied_ids:
-        answer = (store.get("answers") or {}).get(aid) or {}
-        item = manifest_items.get(aid) or {}
-        events.append({"id": aid, "version": answer.get("version") or man.get("version"),
-                       "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
-                       "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
-                       "action": "reverted" if answer.get("kind") == "revert" else "applied",
-                       "outcome": "reverted" if answer.get("kind") == "revert" else "applied",
-                       "at": _now()})
+        last = _answer_event(events, aid, answers[aid])
+        if last is not None and last.get("outcome") == outcome:
+            continue                      # тот же исход того же ответа уже в журнале
+        events.append(event(aid, "apply_attempt", outcome))
+    for aid, outcome in changes:
+        events.append(event(aid, outcome, outcome))
     import recordings
     draft = recordings.answer_draft_for(json_path)
     if draft is not None:
-        for event in events[first_new_event:]:
-            event["context"] = copy.deepcopy(draft["context"])
+        for row in events[first_new_event:]:
+            row["context"] = copy.deepcopy(draft["context"])
     if len(events) > MAX_INTERACTION_EVENTS:
         removed = len(events) - MAX_INTERACTION_EVENTS
         del events[:removed]
         store["application_events_dropped"] = store.get("application_events_dropped", 0) + removed
     _write_answers(json_path, store)
+
+
+def _sig_hash(answer):
+    """Хэш подписи ответа для журнала применения: сам ответ (текст своего ответа) в журнал не пишется."""
+    raw = json.dumps(_sig(answer), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _answer_event(events, aid, answer):
+    """Последнее событие применения именно этого ответа: то же место, источник, время и сам ответ (хэш подписи).
+    Исключение: у событий, записанных без хэша подписи, сверяются только место, источник и время."""
+    for row in reversed(events or []):
+        if (row.get("id") == aid and row.get("answer_ts") == answer.get("ts") and
+                row.get("answer_source") == answer.get("source") and
+                ("answer_sig_sha256" not in row or row["answer_sig_sha256"] == _sig_hash(answer))):
+            return row
+    return None
+
+
+def _answer_state(answer, applied_sig, event):
+    kind = answer.get("kind")
+    relation = over_applied(answer, applied_sig)
+    if relation == "revert":
+        # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
+        return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
+    if relation is not None:
+        return relation
+    if event is not None and event.get("outcome") in OUTCOME_REASONS and event.get("outcome") != "applied":
+        return event["outcome"]
+    if kind in ("skip", "repeat", "revert"):
+        return "skipped"
+    return "saved"
+
+
+def answer_states_of(store, man):
+    """{id: {state, why, card, ts, source}} по сохранённому состоянию пакета — то, что показывает страница."""
+    applied = _applied_map(store)
+    events = store.get("application_events") or []
+    snapshots = store.get("undo_snapshots") or {}
+    cards = {it.get("id"): n for n, it in enumerate((man or {}).get("items") or [], 1)}
+    rejected_keeps = {r.get("id"): r for r in store.get("rejected") or [] if r.get("kind") == "keep"}
+    out = {}
+    for aid, answer in (store.get("answers") or {}).items():
+        state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer))
+        out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
+                    "ts": answer.get("ts"), "source": answer.get("source")}
+        details = []
+        if aid in applied and aid not in snapshots and state in ("applied", "pending_new", "kept_previous"):
+            details.append(UNDO_UNAVAILABLE)
+        # Последний обработанный запрос «Не отменять»: по нему страница узнаёт, что её запрос принят или отклонён.
+        accepted, rejected = answer.get("keep_request"), rejected_keeps.get(aid)
+        if rejected and (not accepted or rejected["ts"] > accepted.get("ts", "")):
+            out[aid]["keep"] = {"ts": rejected["ts"], "source": rejected["source"], "accepted": False}
+            if rejected["ts"] > _answer_time(answer):       # причина — только под ответом, который старше запроса
+                details.append("«Не отменять» не принят: " + rejected["why"])
+        elif accepted:
+            out[aid]["keep"] = {"ts": accepted.get("ts"), "source": accepted.get("source"), "accepted": True}
+        if details:
+            out[aid]["detail"] = " — ".join(details)
+    return out
+
+
+def answer_states(json_path):
+    return answer_states_of(_read_answers(json_path, {"answers": {}}), manifest(json_path) or {})
 
 
 def drop_audio(json_path):

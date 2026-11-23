@@ -311,7 +311,7 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(merged["counts"], {"relabel": 1, "replace": 3, "insert": 3})
         self.assertEqual([c["id"] for c in merged["cards"]], ["r1", "r2"])
 
-    def test_changed_answer_restores_model_and_applies_new_one(self):
+    def test_changed_answer_waits_until_previous_is_reverted(self):
         from unittest.mock import patch
         import core
         import review_pack as P
@@ -335,15 +335,31 @@ class AnswerIntegrity(unittest.TestCase):
         store = P._read(pd / "answers.json", {})
         store["answers"]["r1"].update(option=1, ts="2026-01-02")
         P._write(pd / "answers.json", store)
+        # Применённый ответ другим не заменяется: новый ждёт, прежняя правка остаётся.
         result = apply()
-        self.assertEqual(result["changed"], ["r1"])
+        self.assertEqual(result["pending_new"], ["r1"])
+        self.assertEqual(result["changed"], [])
         self.assertEqual(result["reverted"], [])
+        self.assertNotIn("voice_profile_warning", result)
+        self.assertEqual([s["speaker"] for s in T.load(c.json)["segments"]], ["Борис"])
+        # Замена — через отмену и новый выбор.
+        store = P._read(pd / "answers.json", {})
+        store["answers"]["r1"] = dict(store["answers"]["r1"], kind="revert", ts="2026-01-03")
+        store["answers"]["r1"].pop("option", None)
+        P._write(pd / "answers.json", store)
+        result = apply()
+        self.assertEqual(result["reverted"], ["r1"])
         self.assertEqual(result["voice_profile_warning"]["answer_ids"], ["r1"])
+        self.assertEqual([s["speaker"] for s in T.load(c.json)["segments"]], ["Анна"])
+        store = P._read(pd / "answers.json", {})
+        store["answers"]["r1"].update(kind="option", option=1, ts="2026-01-04")
+        P._write(pd / "answers.json", store)
+        apply()
         after = T.load(c.json)
         self.assertEqual([s["speaker"] for s in after["segments"]], ["Анна"])
         self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["другое"])
 
-    def test_changed_free_answer_is_undone_and_left_to_human(self):
+    def test_changed_free_answer_is_saved_and_waits(self):
         from unittest.mock import patch
         import core
         import review_pack as P
@@ -365,12 +381,13 @@ class AnswerIntegrity(unittest.TestCase):
         store["answers"]["r1"].update(text="второе", ts="2026-01-02")
         P._write(pd / "answers.json", store)
         result = apply()
-        self.assertEqual(result["changed"], ["r1"])
-        self.assertIn("r1", result["human"])
+        self.assertEqual(result["pending_new"], ["r1"])
+        self.assertNotIn("r1", result["human"])
         self.assertEqual(result["reverted"], [])
         after = T.load(c.json)
-        self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["одно"])
-        self.assertEqual(after["review"][0]["status"], "human")
+        self.assertEqual([w["w"] for s in after["segments"] for w in s["words"]], ["первое"])
+        self.assertNotEqual(after["review"][0]["status"], "human")
+        self.assertEqual(P._read(pd / "answers.json", {})["answers"]["r1"]["text"], "второе")
 
     def test_undo_removes_vocabulary_suggestion_of_answer(self):
         c = Case([seg("Борис", W("это Kwartzline", 0.0))], [item("r1", 0.3, 0.3, "Борис", "Kwartzline")])
@@ -562,7 +579,7 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertNotIn("voice_profile_warning", result)
         self.assertEqual(T.load(c.json), later)
 
-    def test_changed_answer_does_not_apply_after_failed_undo(self):
+    def test_changed_answer_after_later_edit_waits_without_undo(self):
         c, P, apply = self._answer_case()
         apply()
         T.edit_span(c.json, c.md, 0.3, 0.3, "новое", by="human")
@@ -574,7 +591,10 @@ class AnswerIntegrity(unittest.TestCase):
         store = P._read(pd / "answers.json", {})
         store["answers"]["r1"].update(option=1, ts="2026-01-02")
         P._write(pd / "answers.json", store)
-        self.assertTrue(apply()["undo_conflicts"])
+        # Новый ответ над применённым ждёт отмены прежнего; отмену сам по себе он не запускает.
+        result = apply()
+        self.assertEqual(result["pending_new"], ["r1"])
+        self.assertFalse(result.get("undo_conflicts"))
         self.assertEqual(T.load(c.json), later)
 
     def test_free_preview_does_not_write(self):
@@ -713,7 +733,7 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(c.json.read_bytes(), before_json)
         self.assertEqual(c.md.read_bytes(), before_md)
 
-    def test_conflict_blocks_undo_of_previously_applied_answer(self):
+    def test_changed_answer_and_overlapping_free_keep_previous(self):
         from unittest.mock import patch
         import core
         import review_pack as P
@@ -739,8 +759,10 @@ class AnswerIntegrity(unittest.TestCase):
                                       "source": "local", "actor_kind": "human", "ts": "2026-01-02"}
             P._write(pd / "answers.json", store)
             result = core.apply_answers("demo")
-        self.assertTrue(result["preflight_conflicts"])
-        self.assertEqual(T.load(c.json), previous)
+        outcomes = {row["id"]: row["outcome"] for row in result["outcomes"]}
+        self.assertEqual(outcomes["r1"], "pending_new")
+        self.assertNotEqual(outcomes["r2"], "applied")
+        self.assertEqual(T.load(c.json)["segments"], previous["segments"])
         self.assertEqual(P._read(pd / "answers.json", {})["applied_answers"]["r1"], ["option", 0, None])
 
     def test_free_duplicate_id_is_rejected_without_retargeting(self):

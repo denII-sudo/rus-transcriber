@@ -10,8 +10,11 @@ class CardStates(unittest.TestCase):
     def test_apply_displays_voice_warning(self):
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
         handler = html.split('  $("apply").onclick = ', 1)[1].split("\n\n  async function start()", 1)[0]
-        script = r'''
-          const box = {hidden: true, textContent: ""};
+        # строки отчёта собирает отдельная функция страницы
+        lines = "  function reportLines" + html.split("  function reportLines", 1)[1].split("\n  }\n", 1)[0] + "\n  }\n"
+        script = lines + r'''
+          const man = {items: []};
+          const box = {hidden: true, textContent: "", style: {}};
           const button = {disabled: false};
           const $ = id => id === "apply-report" ? box : button;
           const confirm = () => true;
@@ -28,16 +31,58 @@ class CardStates(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
-    def test_applied_is_per_card_and_signature(self):
+    def test_apply_renders_with_fresh_states(self):
+        # После «Применить» страница сначала забирает ответы и состояния у программы, потом рисует карточки.
+        html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
+        script = html.split("<script>", 1)[1]
+        prefix = script.split("  // ответы этой версии вопросов")[0]
+        layer = "  // ответы этой версии вопросов" + script.split("  // ответы этой версии вопросов", 1)[1].split(
+            "  async function cloudApi()", 1)[0]
+        handler = html.split('  $("apply").onclick = ', 1)[1].split("\n\n  async function start()", 1)[0]
+        lines = "  function reportLines" + html.split("  function reportLines", 1)[1].split("\n  }\n", 1)[0] + "\n  }\n"
+        stubs = r'''
+          global.location = {hostname: "127.0.0.1"};
+          const box = {hidden: true, textContent: "", style: {}}, button = {disabled: false};
+          global.document = {getElementById: id => id === "apply-report" ? box : button};
+          global.confirm = () => true;
+          const fresh = {answers: {r1: {id: "r1", version: "v", kind: "option", option: 0, ts: "t1", source: "local"}},
+                         answer_states: {r1: {state: "applied", ts: "t1", source: "local"}}};
+          global.fetch = async url => ({ok: true, json: async () => url === "api/answers" ? fresh : {outcomes: []}});
+        '''
+        body = r'''
+          man = {version: "v", items: [{id: "r1", options: []}], answers: {}};
+          answers = {r1: {id: "r1", version: "v", kind: "revert", ts: "t0", source: "local"}};
+          man.answer_states = {r1: {state: "revert_pending", ts: "t0", source: "local"}};
+          api = localApi();
+          const seen = [];
+          render = () => seen.push(stateOf({id: "r1"}, answers.r1));
+          const handler = ''' + handler + r'''
+          handler().then(() => {
+            if (seen.join() !== "applied") throw Error("карточка нарисована со старым состоянием: " + seen.join());
+          }).catch(e => { console.error(e); process.exitCode = 1; });
+        })();
+        '''
+        source = stubs + prefix + lines + layer + "  let render;\n" + body
+        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_card_state_comes_from_program(self):
+        # Состояние ответа приходит из программы (answer_states) и относится только к тому же ответу.
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
         prefix = html.split('  // ответы этой версии вопросов')[0].split('<script>', 1)[1]
         script = 'global.location={hostname:"127.0.0.1"};\n' + prefix + r'''
-          man = {applied_answers:{r1:["option",0,null]}};
+          const a={kind:"option",option:0,ts:"t1",source:"local"}, changed={kind:"option",option:1,ts:"t2",source:"local"};
+          man = {answer_states:{r1:{state:"applied",ts:"t1",source:"local",why:"применён"}}};
           const one={id:"r1"}, two={id:"r2"};
-          const a={kind:"option",option:0}, changed={kind:"option",option:1};
-          if (!isApplied(one,a) || isApplied(two,a) || isApplied(one,changed) || !pending(one,changed)) throw Error("card state");
+          if (stateOf(one,a) !== "applied" || stateOf(two,a) !== "saved" || stateOf(one,changed) !== "saved") throw Error("card state");
           if (cardStatus(one,a) !== "применён ответ" || cardStatus(two,a) !== "ответ сохранён") throw Error("status");
           if (cardStatus(two,{kind:"human"}) !== "требует проверки") throw Error("human");
+          man.answer_states.r1 = {state:"pending_new",ts:"t2",source:"local",why:"ждёт"};
+          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — не применён" || !appliedCard(one,changed)) throw Error("pending");
+          man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};
+          if (cardStatus(one,changed) !== "применён прежний ответ" || !appliedCard(one,changed)) throw Error("kept");
+          man.answer_states.r1 = {state:"applied",ts:"t1",source:"local"};
           man.conflicts=[{id:"r1"}]; if (!cardStatus(one,a).startsWith("конфликт")) throw Error("conflict");
           if (!appliedCard(one,a)) throw Error("applied card");
           editing.add("r1"); if (appliedCard(one,a)) throw Error("editing card");
