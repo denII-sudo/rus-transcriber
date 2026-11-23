@@ -1017,6 +1017,9 @@ if ($SkipSelfCheck) {
         $selfCheckOk = [bool]$sc.ok
         $t = $sc.tests
         $line = "  {0}: тестов {1}, падений {2}, ошибок {3}, пропусков {4}" -f $sc.summary, $t.ran, $t.failures, $t.errors, $t.skipped
+        # Ожидаемые падения (@unittest.expectedFailure) — известные ограничения, не падения; показываются отдельно
+        if ([int]$t.expected_failures -gt 0) { $line += ", ожидаемых падений {0}" -f $t.expected_failures }
+        if ([int]$t.unexpected_successes -gt 0) { $line += ", неожиданных успехов {0} (имена — запуск тестов с -v)" -f $t.unexpected_successes }
         if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
         foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
         if ($sc.check_repo -and $sc.check_repo.partial) { Write-Host "  проверка файлов частичная: $($sc.check_repo.note)" -ForegroundColor DarkGray }

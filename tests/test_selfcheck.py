@@ -52,6 +52,24 @@ class SelfCheck(unittest.TestCase):
         self.assertEqual(r["failed"][0]["why"], "AssertionError: 1 != 2")
         self.assertIn("No module named", r["failed"][1]["why"])
 
+    @staticmethod
+    def _counts(summary):
+        r = selfcheck.parse_unittest("Ran 5 tests in 1.000s\n\n" + summary + "\n")
+        return (r["ok"], r["failures"], r["errors"], r["skipped"], r["expected_failures"], r["unexpected_successes"])
+
+    def test_expected_failures_are_not_failures(self):
+        # «expected failures=2» — помеченные @unittest.expectedFailure известные ограничения, не падения
+        self.assertEqual(self._counts("OK (skipped=1, expected failures=2)"), (True, 0, 0, 1, 2, 0))
+
+    def test_real_failures_keep_their_count_next_to_expected_ones(self):
+        self.assertEqual(self._counts("FAILED (failures=1, skipped=1, expected failures=2)"), (False, 1, 0, 1, 2, 0))
+
+    def test_unexpected_success_is_counted_separately(self):
+        self.assertEqual(self._counts("FAILED (expected failures=1, unexpected successes=1)"), (False, 0, 0, 0, 1, 1))
+
+    def test_plain_ok_has_zero_expected_and_unexpected(self):
+        self.assertEqual(self._counts("OK"), (True, 0, 0, 0, 0, 0))
+
     def test_mask_hides_words_and_user_paths(self):
         m = selfcheck.mask([("a.py:3", "запрещённое слово «Секрет»"), ("b.md:1", r"путь с именем пользователя: C:\Users\user\x"),
                             ("groups/x.json", "файл личных данных или результатов не должен быть в репозитории")])
