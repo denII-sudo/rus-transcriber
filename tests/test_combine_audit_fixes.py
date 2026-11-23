@@ -83,5 +83,33 @@ class ExtraRoleNamesTests(unittest.TestCase):
         self.assertEqual(TEN[1], main[1]["w"])
 
 
+class RoleLabelAndDuplicateTests(unittest.TestCase):
+    """Имя дополнительной роли не должно совпадать со штатной ролью или подписью voted; роль не повторяется."""
+
+    def test_names_equal_to_standard_roles_and_labels_are_refused(self):
+        for role in ("ctc", "whisper", "second", "primary", "a+b"):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    words.check_role(role)
+                with self.assertRaises(ValueError):
+                    words.vote_n(ten(), [("second", ten()), ("whisper", text(ten())), (role, ten())], RULE)
+
+    def test_combine_refuses_extra_role_named_like_a_label(self):
+        with self.assertRaises(ValueError):
+            words.combine_hypotheses({"primary": ten(), "second": ten(), "whisper": text(ten()), "ctc": ten()},
+                                     ok_diag("primary", "second", "whisper", "ctc"), rule=RULE)
+
+    def test_repeated_role_is_refused_by_vote_n(self):
+        main = ten()
+        others = [("second", ten({1: "дважды"})), ("fourth", ten({1: "двойка"})), ("fourth", ten({1: "двойка"}))]
+        with self.assertRaises(ValueError):
+            words.vote_n(main, others, {"keep": 3, "replace": 2})
+        self.assertEqual(text(main), TEN)                      # слова основной модели не тронуты
+
+    def test_repeated_standard_role_is_refused_too(self):
+        with self.assertRaises(ValueError):
+            words.vote_n(ten(), [("second", ten()), ("second", ten())], {"keep": 2, "replace": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

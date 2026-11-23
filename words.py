@@ -350,10 +350,14 @@ _RESERVED_ALT_FIELDS = {"alt_span", "alt_ins", "alt_place"}
 
 
 def check_role(role):
-    """Имя дополнительной роли: непустая строка, из которой поле alt_<роль> не совпадает с занятым полем слова
-    (alt_span — длина спорного отрезка, alt_ins, alt_place). -> role или ValueError."""
-    if not isinstance(role, str) or not role or "alt_" + role in _RESERVED_ALT_FIELDS:
-        raise ValueError(f"имя роли модели {role!r} не подходит: поле alt_<роль> занято или имя пусто")
+    """Имя дополнительной роли: непустая строка без «+», из которой поле alt_<роль> не совпадает с занятым
+    полем слова (alt_span — длина спорного отрезка, alt_ins, alt_place) и которая не совпадает со штатной
+    ролью (primary, second, whisper) или подписью voted (ctc): иначе подпись голосования, например
+    «ctc+ctc», нельзя отличить от штатной. -> role или ValueError."""
+    if (not isinstance(role, str) or not role or "+" in role or "alt_" + role in _RESERVED_ALT_FIELDS
+            or role in ("primary", "second", "whisper") or role in _VOTED_LABEL.values()):
+        raise ValueError(f"имя роли модели {role!r} не подходит: пусто, с «+», совпадает со штатной ролью "
+                         f"или подписью либо даёт занятое поле alt_<роль>")
     return role
 
 
@@ -415,7 +419,10 @@ def vote_n(main, others, rule):
     Изменяет main на месте. -> статистика: agree<N> — слова, поддержанные N моделями (от всех до keep),
     replaced, inserted, disputed."""
     check_rule(rule, len(others) + 1)
-    for role, _ in others:
+    roles = [role for role, _ in others]
+    if len(set(roles)) != len(roles):
+        raise ValueError(f"роли гипотез должны быть разными: {roles!r}")
+    for role in roles:
         if role not in _ALT_FIELD:
             check_role(role)
     keep_min, need = rule["keep"], rule["replace"]
