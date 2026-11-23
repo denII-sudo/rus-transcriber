@@ -24,6 +24,7 @@ import review_pack
 import settings
 import storage
 import transcript
+import workflow
 
 
 class AnswerRevisionGuardTests(unittest.TestCase):
@@ -107,6 +108,38 @@ class AnswerRevisionGuardTests(unittest.TestCase):
                 self.assertEqual(transcript.load(jp)["segments"], before)
                 self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
                 self.assertTrue(result.get("revision_conflicts"))
+
+    def test_pruned_refs_target_and_model_doubts(self):
+        for partial in (True, False):
+            helper, data = self.fixture()
+            data["review"] = [data["review"][0]]
+            data["review"][0].update(t2=1.0, word_ids=["w1", "w2"] if partial else ["w1"])
+            with self.subTest(partial=partial), helper.answer_files("sqlite", data) as (jp, md):
+                review_pack.build(jp, [{"id": "r1", "question": "Проверьте", "options": [
+                    {"label": "Оставить", "decision": {}}]}])
+                manifest = copy.deepcopy(review_pack.manifest(jp))
+                transcript.edit_span(jp, md, 0.2, 0.4, "", by="human")
+                current = transcript.load(jp)
+                place = current["review"][0]
+                question = current["questions"][0]
+                if partial:
+                    self.assertEqual(place["word_ids"], ["w2"])
+                    self.assertEqual(question["word_ids"], ["w2"])
+                else:
+                    self.assertNotIn("word_ids", place)
+                    self.assertNotIn("word_ids", question)
+                loc = transcript._find_span(current, place)
+                self.assertIsNotNone(loc)
+                si, start, end = loc
+                expected = ["w2"] if partial else ["w2", "w3"]
+                self.assertEqual([w["word_id"] for w in current["segments"][si]["words"][start:end]], expected)
+                self.assertEqual(review_pack.manifest(jp), manifest)
+                task = workflow._build_task(
+                    {"recording_id": "synthetic-recording", "policy": {"goal": ""}},
+                    {"transcript": {"revision": 1, "payload": current},
+                     "review": {"revision": 1, "payload": {"review": [place]}}})
+                self.assertEqual([w["word_id"] for w in task["words"] if w["uncertain"]], expected)
+                self.assertEqual(task["unlocated_doubts"], 0)
 
     def test_missing_source_revision_is_a_conflict(self):
         helper, data = self.fixture()
