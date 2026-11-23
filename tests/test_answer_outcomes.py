@@ -117,9 +117,11 @@ class AnswerOutcomeCase(unittest.TestCase):
     def pack_state(jp):
         return review_pack.answers_state(jp)
 
-    def apply(self, jp, md, repeat=True):
+    def apply(self, jp, md, repeat=True, rewrite=False):
         """Применить ответы и проверить общие правила исходов; повторный запуск ничего не меняет.
-        repeat=False — только для «Оставить человеку»: его повторы — задача следующей части."""
+        repeat=False — только для «Оставить человеку»: его повторы — задача следующей части.
+        rewrite=True — различие режимов: в legacy_files ответ с конфликтом пробуется снова, и файл
+        стенограммы перезаписывается с тем же содержимым и новым номером source_revision."""
         rep = core.apply_answers_files(jp, md)
         self.check_outcomes(jp, rep)
         if not repeat:
@@ -128,7 +130,10 @@ class AnswerOutcomeCase(unittest.TestCase):
         state_before = self.pack_state(jp)
         again = core.apply_answers_files(jp, md)
         self.check_outcomes(jp, again)
-        self.assertEqual(transcript.load(jp), transcript_before, "повторный запуск изменил стенограмму")
+        transcript_after = transcript.load(jp)
+        if rewrite:
+            self.assertEqual(transcript_after.pop("source_revision"), transcript_before.pop("source_revision") + 1)
+        self.assertEqual(transcript_after, transcript_before, "повторный запуск изменил стенограмму")
         self.assertEqual(self.pack_state(jp), state_before,
                          "повторный запуск дописал события, ревизии или отметки")
         self.assertEqual(self.outcomes(again), self.outcomes(rep))
@@ -186,7 +191,7 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
                     self.assertFalse(rep.get("changed"))
                     events = [e for e in self.pack_state(jp).get("application_events") or [] if e["id"] == "r1"]
                     self.assertEqual([e["outcome"] for e in events].count("applied"), 1, "ложное «применён»")
-                    self.assertIn("Отмен", rep["outcomes"][0]["why"])
+                    self.assertIn("Подготовить отмену", rep["outcomes"][0]["why"])
 
     def test_without_snapshot_new_answer_also_waits(self):
         for backend in BACKENDS:
@@ -313,7 +318,7 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                 transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human")
                 self.save(jp, version, option=0)
                 self.save(jp, version, aid="r2", option=0)
-                rep = self.apply(jp, md)
+                rep = self.apply(jp, md, rewrite=backend == "legacy_files")
                 self.assertEqual(self.outcomes(rep), {"r1": "apply_conflict", "r2": "applied"})
                 self.assertEqual(self.words(jp), ["ручной", "новое"])
 

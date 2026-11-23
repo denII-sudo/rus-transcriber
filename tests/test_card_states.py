@@ -28,16 +28,22 @@ class CardStates(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
-    def test_applied_is_per_card_and_signature(self):
+    def test_card_state_comes_from_program(self):
+        # Состояние ответа приходит из программы (answer_states) и относится только к тому же ответу.
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
         prefix = html.split('  // ответы этой версии вопросов')[0].split('<script>', 1)[1]
         script = 'global.location={hostname:"127.0.0.1"};\n' + prefix + r'''
-          man = {applied_answers:{r1:["option",0,null]}};
+          const a={kind:"option",option:0,ts:"t1",source:"local"}, changed={kind:"option",option:1,ts:"t2",source:"local"};
+          man = {answer_states:{r1:{state:"applied",ts:"t1",source:"local",why:"применён"}}};
           const one={id:"r1"}, two={id:"r2"};
-          const a={kind:"option",option:0}, changed={kind:"option",option:1};
-          if (!isApplied(one,a) || isApplied(two,a) || isApplied(one,changed) || !pending(one,changed)) throw Error("card state");
+          if (stateOf(one,a) !== "applied" || stateOf(two,a) !== "saved" || stateOf(one,changed) !== "saved") throw Error("card state");
           if (cardStatus(one,a) !== "применён ответ" || cardStatus(two,a) !== "ответ сохранён") throw Error("status");
           if (cardStatus(two,{kind:"human"}) !== "требует проверки") throw Error("human");
+          man.answer_states.r1 = {state:"pending_new",ts:"t2",source:"local",why:"ждёт"};
+          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — не применён" || !appliedCard(one,changed)) throw Error("pending");
+          man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};
+          if (cardStatus(one,changed) !== "применён прежний ответ" || !appliedCard(one,changed)) throw Error("kept");
+          man.answer_states.r1 = {state:"applied",ts:"t1",source:"local"};
           man.conflicts=[{id:"r1"}]; if (!cardStatus(one,a).startsWith("конфликт")) throw Error("conflict");
           if (!appliedCard(one,a)) throw Error("applied card");
           editing.add("r1"); if (appliedCard(one,a)) throw Error("editing card");

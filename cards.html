@@ -128,15 +128,25 @@ audio{width:100%;height:36px}
   const editing = new Set();          // карточки с применённым ответом, которые сейчас меняют
   // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
   const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
-  const signature = (a) => [kindOf(a), a.option == null ? null : a.option,
-                            kindOf(a) === "free" ? (a.text || "").trim() : null];
-  const isApplied = (it, a) => !!(a && man.applied_answers && man.applied_answers[it.id] &&
-    JSON.stringify(man.applied_answers[it.id]) === JSON.stringify(signature(a)));
-  const pending = (it, a) => !!(a && man.applied_answers && man.applied_answers[it.id] && !isApplied(it, a));
-  const appliedCard = (it, a) => isApplied(it, a) && !editing.has(it.id);
+  // Состояние ответа считает программа на ноутбуке (answer_states): страница его только показывает.
+  // Ответ, которого ноутбук ещё не видел (облако), — «сохранён в облаке».
+  const stateOf = (it, a) => {
+    if (!a) return "";
+    const st = (man.answer_states || {})[it.id];
+    if (st && st.ts === a.ts && st.source === a.source) return st.state;
+    return LOCAL ? "saved" : "cloud_saved";
+  };
+  const whyOf = (it) => ((man.answer_states || {})[it.id] || {}).why || "";
+  // применённая правка на месте: прежний ответ (новый ждёт отмены или не меняет его)
+  const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous"].includes(stateOf(it, a));
+  const pending = (it, a) => stateOf(it, a) === "pending_new";
+  const appliedCard = (it, a) => holdsApplied(it, a) && !editing.has(it.id);
+  const STATUS = {applied: "применён ответ", pending_new: "новый ответ — не применён", kept_previous: "применён прежний ответ",
+                  reverted: "ответ отменён", skipped: "пропущено", negative: "не применён — место открыто",
+                  left_for_human: "требует проверки", cloud_saved: "сохранён в облаке — не применён"};
   const cardStatus = (it, a) => (man.conflicts || []).some(c => c.id === it.id) ? "конфликт — требуется проверка" :
-    kindOf(a) === "human" ? "требует проверки" : isApplied(it, a) ? "применён ответ" :
-    pending(it, a) ? "новый ответ — не применён" : "ответ сохранён";
+    STATUS[stateOf(it, a)] || (stateOf(it, a) === "saved" ? (kindOf(a) === "human" ? "требует проверки" : "ответ сохранён")
+                                                         : "не применён");
   // ответы этой версии вопросов из базы страницы: {id: ответ}, при повторах — более поздний
   function pick(list) {
     const o = {};
@@ -156,7 +166,7 @@ audio{width:100%;height:36px}
   function localApi() {
     return {
       voiceMode: "record",
-      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json(); man.applied_answers = s.applied_answers || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
+      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json(); man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
@@ -272,6 +282,10 @@ audio{width:100%;height:36px}
     const m = document.createElement("span"); m.className = "m";
     m.textContent = `${a.source === "local" ? "ноутбук" : "облако"} · ${when(a.ts)}` + (a.heard && a.text && kind !== "free" ? ` · услышано «${a.text}»` : "");
     box.append(k, v, m);
+    const state = stateOf(it, a);
+    if (!["applied", "saved", "cloud_saved"].includes(state) && whyOf(it)) {
+      const w = document.createElement("span"); w.className = "m"; w.textContent = whyOf(it); box.append(w);
+    }
     return box;
   }
   function speak(it) {
@@ -292,7 +306,8 @@ audio{width:100%;height:36px}
       const rejected = r.rejected && r.rejected.length;
       render();
       if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
-      else flash(it.id, acc && acc.answer ? "Принято: " + acc.answer : "Ответ записан");
+      else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
+      else flash(it.id, acc && acc.answer ? "Сохранено (ещё не применено): " + acc.answer : "Ответ записан");
     } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
   }
   function flash(id, text) { const el = document.querySelector(`[data-id="${id}"] .state`); if (el) el.textContent = text; }
@@ -333,7 +348,7 @@ audio{width:100%;height:36px}
     }
     if (a) c.append(lastAnswer(a, it));
     const state = document.createElement("div"); state.className = "state";
-    if (isApplied(it, a)) {
+    if (holdsApplied(it, a)) {
       const er = document.createElement("div"); er.className = "edit-row";
       const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
       eb.onclick = () => { editing.add(it.id); render(); };
@@ -448,18 +463,11 @@ audio{width:100%;height:36px}
     if (!confirm("Применить сохранённые ответы к стенограмме? Отмена возможна только при наличии снимка и отсутствии более поздних конфликтующих правок.")) return;
     const box = $("apply-report"); box.hidden = false; box.textContent = "Применяю…"; $("apply").disabled = true;
     try { const rep = await api.apply(); const lines = [];
-      const add = (label, values) => { if (values && values.length) lines.push(label + ": " + values.map(x => typeof x === "string" ? x : (x.id || "?") + (x.why ? " — " + x.why : "")).join(", ")); };
-      add("Применено", rep.review && rep.review.successful_ids); add("Отменено", rep.reverted);
-      add("Без изменений", rep.unchanged); add("Требует проверки", rep.human);
-      add("Конфликт отмены", rep.undo_conflicts); add("Отмена недоступна", rep.undo_unavailable);
-      add("Конфликт карточек до применения", (rep.preflight_conflicts || []).map(c => ({id: (c.cards || []).join(", "), why: c.why})));
-      add("Не найдено", rep.review && rep.review.not_found); add("Свободный ответ применён", rep.free_text && rep.free_text.successful_ids);
-      add("Свободный ответ требует проверки", rep.free_text && rep.free_text.left_to_human); add("Не найдено", rep.free_text && rep.free_text.not_found);
-      add("Конфликт применения", rep.review && rep.review.conflicts); add("Конфликт свободных ответов", rep.free_text && rep.free_text.conflicts);
-      if (rep.free_text) {
-        Object.entries(rep.free_text.failed || {}).forEach(([id, why]) => lines.push(`Не применено ${id}: ${why}`));
-        (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${c.id}: ${c.was_now}`); });
-      }
+      // Исход каждого сохранённого ответа — из отчёта программы, по номеру карточки.
+      const cardName = (id, n) => { const it = man.items.find(x => x.id === id); n = n || (man.items.indexOf(it) + 1);
+        return `Карточка ${n || id}` + (it && it.t ? ` (${it.t})` : ""); };
+      (rep.outcomes || []).forEach(o => lines.push(`${cardName(o.id, o.card)}: ${o.why}`));
+      if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${cardName(c.id)}: ${c.was_now}`); });
       if (rep.source_conflict) lines.push("Конфликт источника: " + rep.source_conflict);
       if (rep.voice_profile_warning && rep.voice_profile_warning.message) lines.push(rep.voice_profile_warning.message);
       box.textContent = lines.length ? lines.join(" · ") : "Новых изменений нет. Проверьте сохранённые ответы."; showAll = true; render(); }

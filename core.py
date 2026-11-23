@@ -2668,6 +2668,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     if revision_conflicts is None and draft is not None:
         revision_conflicts = draft.get("revision_conflicts")
     revision_conflicts = dict(revision_conflicts or {})
+    import freeform
+    applied_before = P._applied_map(P.answers_state(jp, {"answers": {}}))
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
     if draft is not None:
@@ -2694,6 +2696,7 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         rep["preflight_conflicts"] = preflight
         rep["human"] = list(dict.fromkeys((rep.get("human") or []) + sorted(blocked)))
         rep["changed"] = [aid for aid in rep.get("changed") or [] if aid not in blocked]
+    # Отменяется только ответ «отменить»: замены применённого ответа другим до полной замены нет.
     undo = [d for d in decisions if "_undo_snapshot" in d]
     decisions = [d for d in decisions if "_undo_snapshot" not in d]
     undone, undo_failed = [], set()
@@ -2706,10 +2709,6 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         else:
             rep.setdefault("undo_conflicts", []).append(result)
             undo_failed.add(d["id"])
-    decisions = [d for d in decisions if d.get("id") not in undo_failed]
-    free = {aid: answer for aid, answer in free.items() if aid not in undo_failed}
-    # Изменённый ответ тоже сначала отменяется, но в отчёте это изменение, а не отмена.
-    rep["reverted"] = [x for x in rep.get("reverted") or [] if x not in rep.get("changed", [])]
     snapshots, report = {}, {}
     snapshot_bytes = 0
 
@@ -2742,9 +2741,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             aid = decision.get("id")
             if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
                 remember_snapshot(aid, before, after)
-                if aid in snapshots:
-                    P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]},
-                                   outcomes={aid: "applied"})
+                # Без снимка ответ всё равно применён: отметка ставится, отмена сообщит, что снимка нет.
+                P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
+                               outcomes={aid: "applied"})
     free_items = []
     if blocked_free:
         free_items.append({"conflicts": preflight,
@@ -2762,9 +2761,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             free_items.append(part)
             if aid in part.get("successful_ids", []):
                 remember_snapshot(aid, before, transcript.load(jp))
-                if aid in snapshots:
-                    P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]},
-                                   outcomes={aid: "applied"})
+                P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
+                               outcomes={aid: "applied"})
     if free_items:
         rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
@@ -2795,10 +2793,38 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "not_found"
         else:
             outcomes[aid] = "not_applied"
+        if aid in free and freeform.negative_answer(free[aid].get("text")) and \
+                outcomes[aid] in ("not_applied", "left_for_human", "not_found"):
+            outcomes[aid] = ("kept_previous" if P.over_applied(free[aid], applied_before.get(aid)) == "kept_previous"
+                             else "negative")
+    # Исход есть у каждого сохранённого ответа пакета, а не только у тех, что применялись в этот раз.
+    stored = P.answers_state(jp, {"answers": {}}).get("answers") or {}
+    undo_conflict_ids = {row.get("id") for row in rep.get("undo_conflicts") or []}
+    for aid in stored:
+        if aid in rep.get("source_conflict_ids", []):
+            outcomes[aid] = "source_conflict"
+        elif aid in outcomes:
+            continue
+        elif aid in rep.get("unchanged", []):
+            outcomes[aid] = "applied"
+        elif aid in rep.get("kept_previous", []):
+            outcomes[aid] = "kept_previous"
+        elif aid in rep.get("pending_new", []):
+            outcomes[aid] = "pending_new"
+        elif aid in undo_conflict_ids:
+            outcomes[aid] = "undo_conflict"
     failed_outcomes = {aid: outcome for aid, outcome in outcomes.items()
                        if outcome not in ("applied", "reverted")}
     if failed_outcomes:
         P.mark_applied(jp, set(), outcomes=failed_outcomes)
+    # Оставшиеся (пропуск, отмена без применённого ответа, давняя отмена) — по сохранённому состоянию.
+    states = P.answer_states(jp)
+    for aid in stored:
+        if aid not in outcomes:
+            outcomes[aid] = states[aid]["state"]
+    rep["outcomes"] = [{"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
+                        "why": P.OUTCOME_REASONS[outcomes[aid]]}
+                       for aid in sorted(stored, key=lambda x: (states[x]["card"] or 0, x))]
     if undone:
         rep["voice_profile_warning"] = {
             "answer_ids": undone,
