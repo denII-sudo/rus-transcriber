@@ -1,5 +1,6 @@
 import http.server
 import json
+import io
 import os
 import socket
 import shutil
@@ -283,6 +284,60 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
             with self.assertRaises(llm_provider.ProviderError) as caught:
                 client._request("/api/model", None, timeout=1)
         self.assertEqual((caught.exception.code, caught.exception.http_status), ("model_unavailable", 404))
+
+    def _refusal(self, status, body):
+        client = llm_provider.OpenCodeTextClient()
+        client.base_url, client.auth = "http://127.0.0.1:9", "Basic x"
+        raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        error = llm_provider.urllib.error.HTTPError("http://127.0.0.1:9/api/experimental/generate/text",
+                                                    status, "err", {}, io.BytesIO(raw))
+        with mock.patch.object(llm_provider.urllib.request.OpenerDirector, "open", side_effect=error):
+            with self.assertRaises(llm_provider.ProviderError) as caught:
+                client._request("/api/experimental/generate/text", {"prompt": "x"}, timeout=1)
+        return caught.exception
+
+    def test_refusal_names_opencode_cause_for_every_documented_kind(self):
+        # Виды ошибок маршрута generate/text по схеме OpenCode 2.4.0 (/openapi.json).
+        cases = [
+            (404, {"_tag": "ProviderNotFoundError", "providerID": "openai", "message": "provider gone"}),
+            (404, {"_tag": "ModelNotFoundError", "providerID": "openai", "modelID": "gpt-6-luna",
+                   "message": "no such model"}),
+            (404, {"_tag": "LocationNotFoundError", "location": {"directory": "C:/x"}, "message": "no location"}),
+            (422, {"_tag": "UnsupportedModelError", "providerID": "openai", "modelID": "gpt-6-luna",
+                   "capability": "generate", "message": "not supported"}),
+            (401, {"_tag": "UnauthorizedError", "message": "sign in"}),
+        ]
+        for status, body in cases:
+            with self.subTest(tag=body["_tag"]):
+                ex = self._refusal(status, body)
+                self.assertEqual(ex.detail["tag"], body["_tag"])
+                self.assertIn(body["_tag"], str(ex))
+                self.assertIn(body["message"], str(ex))
+                for field in ("providerID", "modelID", "capability"):
+                    if field in body:
+                        self.assertIn(f"{field}={body[field]}", str(ex))
+                self.assertNotIn("C:/x", str(ex))       # чужие поля (место) не показываются
+        self.assertIn("capability=generate", str(self._refusal(*cases[3])))
+
+    def test_refusal_text_of_unlisted_kinds_is_not_shown(self):
+        # 502 и 400 могут пересказывать запрос или ответ OpenAI: только вид ошибки.
+        ex = self._refusal(502, {"_tag": "ProviderRequestError", "message": "SECRET-PROMPT-ECHO"})
+        self.assertEqual((ex.code, ex.detail), ("provider_error", {"tag": "ProviderRequestError"}))
+        self.assertNotIn("SECRET-PROMPT-ECHO", str(ex))
+        ex = self._refusal(400, {"_tag": "InvalidRequestError", "message": "SECRET-PROMPT-ECHO"})
+        self.assertNotIn("SECRET-PROMPT-ECHO", str(ex))
+
+    def test_unreadable_refusal_body_keeps_the_old_message(self):
+        for body in (b"", b"not json", b"\xff\xfe", b"[1, 2]", {"_tag": "bad tag!", "message": "m"},
+                     b"{" + b" " * 70_000 + b"}"):
+            with self.subTest(body=str(body)[:30]):
+                ex = self._refusal(404, body)
+                self.assertEqual((str(ex), ex.detail), ("модель OpenAI недоступна в OpenCode", {}))
+
+    def test_refusal_detail_is_cleaned_and_shortened(self):
+        ex = self._refusal(404, {"_tag": "ModelNotFoundError", "message": "line1\nline2\x07" + "я" * 500})
+        self.assertNotIn("\n", str(ex))
+        self.assertEqual(len(ex.detail["message"]), 300)
 
     def test_listener_pids_sees_own_socket(self):
         with socket.socket() as sock:

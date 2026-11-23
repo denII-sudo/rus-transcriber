@@ -29,10 +29,56 @@ STARTUP_TIMEOUT_SEC = 20
 class ProviderError(RuntimeError):
     """Безопасная для показа ошибка без текста запроса, ответа или credentials."""
 
-    def __init__(self, code, message, *, http_status=None):
+    def __init__(self, code, message, *, http_status=None, detail=None):
         super().__init__(message)
         self.code = code
         self.http_status = http_status      # HTTP-код ответа OpenCode, если ошибка пришла ответом сервера
+        self.detail = detail or {}          # причина отказа из тела ответа OpenCode (см. _opencode_error_detail)
+
+
+# Ошибки OpenCode, тело которых по схеме OpenCode 2.4 говорит только о провайдере, модели, месте
+# и доступе — их текст показываем. Для прочих (400, 502 и т. п.) текст может пересказывать запрос
+# или ответ OpenAI, поэтому показываем только вид ошибки.
+_DESCRIBED_ERRORS = {"ProviderNotFoundError", "ModelNotFoundError", "LocationNotFoundError",
+                     "UnsupportedModelError", "UnauthorizedError", "ServiceUnavailableError"}
+_DETAIL_FIELDS = ("providerID", "modelID", "capability", "message")
+_MAX_ERROR_BODY = 64_000
+_MAX_DETAIL_CHARS = 300
+
+
+def _opencode_error_detail(body):
+    """Причина отказа из тела ошибки OpenCode: вид (`_tag`) и, для описанных видов, поля схемы.
+
+    Без тела запроса и без чужих полей; строки укорочены и очищены от управляющих символов.
+    Нераспознанное тело даёт пустой словарь — сообщение тогда остаётся прежним.
+    """
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError, AttributeError):
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        data = data["error"]
+    if not isinstance(data, dict):
+        return {}
+    clean = lambda value: re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()[:_MAX_DETAIL_CHARS]
+    tag = data.get("_tag")
+    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", tag):
+        return {}
+    detail = {"tag": tag}
+    if tag in _DESCRIBED_ERRORS:
+        for field in _DETAIL_FIELDS:
+            if isinstance(data.get(field), str) and clean(data[field]):
+                detail[field] = clean(data[field])
+    return detail
+
+
+def _describe_detail(detail):
+    if not detail:
+        return ""
+    parts = [detail["tag"]] + [f"{field}={detail[field]}" for field in ("providerID", "modelID", "capability")
+                               if field in detail]
+    text = "; ответ OpenCode: " + ", ".join(parts)
+    return text + (f" — {detail['message']}" if "message" in detail else "")
 
 
 def _opencode_executable():
@@ -341,7 +387,13 @@ class OpenCodeTextClient:
                 "offline": "OpenCode или OpenAI временно недоступен",
                 "provider_error": f"ошибка OpenCode/OpenAI (HTTP {ex.code})",
             }[code]
-            raise ProviderError(code, message, http_status=ex.code) from None
+            try:
+                body = ex.read(_MAX_ERROR_BODY + 1)
+            except (OSError, ValueError, AttributeError):
+                body = b""
+            detail = _opencode_error_detail(body) if body and len(body) <= _MAX_ERROR_BODY else {}
+            raise ProviderError(code, message + _describe_detail(detail), http_status=ex.code,
+                                detail=detail) from None
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
             raise ProviderError("offline", "не удалось связаться с OpenCode/OpenAI") from None
         except (UnicodeError, json.JSONDecodeError):
