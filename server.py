@@ -77,14 +77,14 @@ rus-transcriber: расшифровка речи на этом компьюте�
    с местами стенограммы, conspect_render собирает документ.
 7. После обновления программы — self_check (тесты, проверка файлов на личные данные, морфология).
 8. Данные: get_settings (папка данных, группы, настройки). export_group, import_group (apply=true), delete_group,
-   cleanup_jobs (apply=true), migrate_data (dry_run=false) меняют или выгружают личные данные — только по прямой
+   cleanup_jobs (apply=true), cleanup_hypotheses (apply=true), migrate_data (dry_run=false) меняют или выгружают личные данные — только по прямой
    просьбе человека, после отчёта в режиме «без применения». Каждое такое действие дополнительно подтверждает сам
    человек в окне на экране (или командой `python rt.py approve` в терминале): подтвердить за него нельзя, ответ
    «Человек не подтвердил» значит отказ — не повторяйте вызов без новой просьбы. Архив export_group содержит
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.23.8"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.24.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -1041,6 +1041,20 @@ async def cleanup_jobs(days: int = 30, apply: bool = False) -> str:
         return await _gated(None, None, None, lambda: core.do_cleanup(days, False))
     return await _gated("Очистка журналов задач", {"days": days}, lambda: core.describe_cleanup(days),
                         lambda: core.do_cleanup(days, True))
+
+
+@mcp.tool()
+async def cleanup_hypotheses(unit_id: str = "", older_than_days: float = -1, apply: bool = False) -> str:
+    """Удаляет сохранённые гипотезы моделей (настройка save_hypotheses; в них полный текст записей):
+    всех, одной записи (unit_id) или старше older_than_days дней (-1 — без ограничения по возрасту).
+    apply=false — только подсчёт; apply=true — после подтверждения человеком в окне на экране.
+    Выключение save_hypotheses уже сохранённые файлы не удаляет."""
+    days = None if older_than_days < 0 else older_than_days
+    if not apply:
+        return await _gated(None, None, None, lambda: core.do_cleanup_hypotheses(unit_id, days, False))
+    return await _gated("Удаление гипотез моделей", {"unit_id": unit_id, "older_than_days": days},
+                        lambda: core.describe_cleanup_hypotheses(unit_id, days),
+                        lambda: core.do_cleanup_hypotheses(unit_id, days, True))
 
 
 def _local_voice_tool():

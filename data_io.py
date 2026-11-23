@@ -370,6 +370,13 @@ def delete_group(group, confirm="", permanent=False):
     return {"group": g, "deleted": "перенесена (можно вернуть)", "folder": str(dst)}
 
 
+def cleanup_hypotheses(unit_id=None, older_than_days=None, apply=False):
+    """Удаление сохранённых гипотез моделей (hypstore): всех, одной записи (unit_id — 12 знаков) или
+    старше older_than_days дней. apply=False — только подсчёт. Только файлы прогонов в папке hypotheses."""
+    import hypstore
+    return hypstore.cleanup(unit_id=unit_id or None, older_than_days=older_than_days, apply=apply)
+
+
 def cleanup_jobs(days=30, apply=False):
     cutoff = time.time() - max(0, float(days)) * 86400
     n = size = 0

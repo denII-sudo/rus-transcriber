@@ -6,7 +6,7 @@ r"""Проверка перед коммитом: в отслеживаемых 
     python tools/check_repo.py --hide-words # не показывать найденные слова и имена в путях (для публичного журнала CI)
 
 Что проверяется:
-  1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, config.json, bench*, аудио,
+  1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, hypotheses/, config.json, bench*, аудио,
      *.transcript.*, cache/, hf-cache/, .venv/; в репозитории Git ещё и файлы в корневых папках приватного
      служебного репозитория (research/, people/, machines/, sessions/, notes/, reports/): им место там;
   2. абсолютные пути с настоящим именем пользователя: C:\Users\<имя>\ (допустимы <вы>, Иван, %USERNAME%, user …);
@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BAD_NAMES = ["*.voices.json", "voices.json", "config.json", "bench_*", "bench.json", "*.transcript.*",
              "*.mp3", "*.m4a", "*.wav", "*.ogg", "*.opus", "*.flac", "*.aac", "*.mp4", "*.mkv", "*.webm",
              "rus-transcriber.vocab.json"]
-BAD_DIRS = {"groups", "jobs", "cache", "hf-cache", ".venv", "profiles", "exports", "_deleted"}
+BAD_DIRS = {"groups", "jobs", "cache", "hf-cache", ".venv", "profiles", "exports", "_deleted", "hypotheses"}
 # Имена групп, которые не несут личных данных: «default» есть в любой установке и встречается
 # в исходниках как обычное слово, поэтому запрещённым словом оно быть не должно.
 GENERIC_GROUP_NAMES = {"default"}

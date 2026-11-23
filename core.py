@@ -3564,6 +3564,13 @@ def do_cleanup(days=30, apply=False):
     return data_io.cleanup_jobs(days, apply)
 
 
+def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False):
+    try:
+        return data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply)
+    except ValueError as ex:
+        raise CoreError(str(ex)) from ex
+
+
 # ---------- описание действия для человека (без выполнения) ----------
 def describe_export(group="", dest_dir="", with_jobs=False):
     groups = [paths.safe_group(group)] if group else paths.list_groups()
@@ -3596,6 +3603,15 @@ def describe_delete(group, permanent=False):
 def describe_cleanup(days=30):
     r = do_cleanup(days, False)
     return [f"Удаление статусов и логов задач старше {days} дн.: файлов {r['files']}, {r['bytes'] // 1024} КБ."]
+
+
+def describe_cleanup_hypotheses(unit_id="", older_than_days=None):
+    r = do_cleanup_hypotheses(unit_id, older_than_days, False)
+    scope = f"записи {unit_id}" if unit_id else "всех записей"
+    age = f", старше {older_than_days} дн." if older_than_days is not None else ""
+    return [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
+            f"файлов {r['files']}, записей {r['units']}, {r['bytes'] // 1024} КБ.",
+            "Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить."]
 
 
 def describe_migrate():

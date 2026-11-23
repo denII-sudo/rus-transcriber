@@ -41,6 +41,7 @@ EXTRA_CONFIG_TYPES = {
     "asr_quant": str, "asr_quant_cpu": str, "asr_language": str, "asr_third_backend": str,
     "word_win_near_change": float,
     "review_missed": bool, "voices": bool, "voices_debug": bool, "review_local": bool,
+    "save_hypotheses": bool,
 }
 CONFIG_TYPES = {**{key: type(value) for key, value in DEFAULTS.items()}, **EXTRA_CONFIG_TYPES}
 

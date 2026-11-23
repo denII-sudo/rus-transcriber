@@ -706,7 +706,7 @@ def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cf
                  "error_type": type(ex).__name__, "fallback": True})
 
 
-def _whisper_words(plan, texts, whisper_diag, words):
+def _whisper_words(plan, texts, whisper_diag, words, capture=None):
     """Текст третьей модели по кускам -> слова гипотезы и число убранных. Чистка «субтитров» и
     зацикливания (words.clean_whisper) — только для Whisper; текст другой модели берётся как есть."""
     by_k = dict(zip(plan["selected"], texts))
@@ -726,16 +726,30 @@ def _whisper_words(plan, texts, whisper_diag, words):
             # токен из одних знаков («—») — не слово: в голосовании он не совпал бы
             # ни с одним словом GigaAM (те знаков отдельно не дают, words.result_words)
             wh_words += [t for t in tx.split() if W.norm_word(t)]
+            if capture is not None:
+                capture.append({"chunk_index": k, "audio_span": [c["a"], c["b"]], "own_span": list(c["own"]),
+                                "heard": True, "state": rec.get("state"), "raw_text": by_k[k], "text": tx,
+                                "removed_words": n})
         else:            # основная и вторая здесь согласны: третья голосования не изменила бы
             s0, e0 = c["own"]
             wh_words += [w["w"] for w in words if s0 <= w["s"] < e0]
+            if capture is not None:     # подставлено из основной модели — не голос третьей
+                capture.append({"chunk_index": k, "audio_span": [c["a"], c["b"]], "own_span": list(c["own"]),
+                                "heard": False, "state": None, "raw_text": None, "text": None,
+                                "removed_words": None})
     return wh_words, removed
 
 
 WHISPER_ONLY_ENGINES = ("whisper-ct2", "whisper-ov")     # движки, умеющие только Whisper
+# Третьи модели, у которых при сохранении гипотез (save_hypotheses) слова со временами берутся тем же
+# вызовом (backends.texts_timed): только те, у кого текст совпал с transcribe_texts побайтно при сравнении
+# на настоящей модели. У остальных — прежний путь, в гипотезах word_times: not_measured.
+# Сравнение 24.11.2026 (синтетическая речь 86 с, 6 кусков, onnx-cpu int8, модели из кэша): тексты и
+# диагностика кусков совпали у всех трёх моделей. Другая точность или движок — прежний путь.
+TIMED_THIRD_VERIFIED = frozenset({"multilingual_large_ctc", "multilingual_ctc", "v3_e2e_ctc"})
 
 
-def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
+def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing, capture=None):
     """Третий проход (любая модель, только текст; по умолчанию Whisper) -> слова-строки или None,
     если не удался ни один движок. Имя функции и ключ «whisper» в данных — прежние.
 
@@ -746,7 +760,11 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
     Если третья модель — не Whisper (например multilingual_large_ctc), движки faster-whisper и OpenVINO
     Whisper пропускаются (они умеют только Whisper), считает общий onnx-cpu. faster-whisper грузит только
     large-v3-turbo: для другого Whisper он тоже пропускается (transcript.asr_model_caps, ключ ct2),
-    а OpenVINO Whisper и onnx-cpu грузят выбранную модель по имени."""
+    а OpenVINO Whisper и onnx-cpu грузят выбранную модель по имени.
+
+    capture — словарь для сохранения гипотез (hypstore) или None (прежнее поведение): в него пишутся
+    куски третьей модели (слушала / подставлено из основной, сырой текст и после чистки) и, для моделей
+    из TIMED_THIRD_VERIFIED, слова со временами того же вызова."""
     from backends import normalize_device
     third, pieces = plan["model"], plan["pieces"]
     dev = normalize_device(cfg.get("asr_third_device", "CPU"))
@@ -786,8 +804,15 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
             compile_sec, name3 = getattr(asr3, "compile_sec", None), getattr(asr3, "name", None)
             whisper_diag = []
             _register_pass(quality, "whisper", third, asr3.name, whisper_diag)
-            texts = asr3.transcribe_texts(pieces, progress=prog(68, 74, f"третья модель ({label}, {device})"),
-                                          diagnostics=whisper_diag)
+            timed = None
+            if capture is not None and third in TIMED_THIRD_VERIFIED and backend == "onnx-cpu" and quant == "int8" \
+                    and not caps["whisper"] and hasattr(getattr(asr3, "model", None), "with_timestamps"):
+                from backends import texts_timed
+                texts, timed = texts_timed(asr3, pieces, progress=prog(68, 74, f"третья модель ({label}, {device})"),
+                                           diagnostics=whisper_diag)
+            else:
+                texts = asr3.transcribe_texts(pieces, progress=prog(68, 74, f"третья модель ({label}, {device})"),
+                                              diagnostics=whisper_diag)
             del asr3
             for rec in whisper_diag:
                 rec["attempts"][:0] = [dict(attempt) for attempt in outer_attempts]
@@ -796,7 +821,20 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing):
             failed_indices = [i for i, rec in enumerate(whisper_diag) if rec["state"] == "error"]
             if failed_indices and backend != "onnx-cpu":
                 _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cfg, st, make_asr, prog)
-            wh_words, removed = _whisper_words(plan, texts, whisper_diag, words)
+            chunk_capture = [] if capture is not None else None
+            wh_words, removed = _whisper_words(plan, texts, whisper_diag, words, chunk_capture)
+            if capture is not None:
+                capture.update(chunks=chunk_capture, engine={"backend": backend, "device": device, "quant": quant,
+                                                             "name": name3, "fallbacks": errs3 or None})
+                if timed is not None:
+                    tw = []
+                    for k, r in zip(plan["selected"], timed):
+                        if r is None:
+                            continue
+                        c = plan["chunks"][k]
+                        tw += [w for w in W.result_words(r, c["a"]) if c["own"][0] <= w["s"] < c["own"][1]]
+                    # повтор на CPU заменяет текст ошибочных кусков без времён: тогда времена не полные
+                    capture["timed_words"] = tw if not failed_indices else None
             timing.update(asr3_mode=plan["mode"], asr3_pieces=f"{len(plan['selected'])}/{len(plan['chunks'])}",
                           asr3_removed_words=removed or None)
             timing.update(asr3_sec=round(time.time() - t3), asr3_load_sec=round(t_load, 1),
@@ -1005,6 +1043,138 @@ def _emotions(audio, segments, cfg, a, quality, timing):
         timing["emotions_sec"] = round(time.time() - t_emo, 1)
 
 
+class _HypCapture:
+    """Сбор гипотез для сохранения (hypstore, настройка save_hypotheses). Результат расшифровки не меняет:
+    добавляется только файл в папке данных и поле quality.hypotheses_saved."""
+
+    def __init__(self, audio, cfg, a):
+        import runinfo
+        self.cfg, self.a, self.audio = cfg, a, audio
+        self.third, self.trace, self.before = {}, {}, None
+        self.conditions_start = _safe(lambda: runinfo.conditions(paths.JOBS, cfg.get("max_heavy_jobs", 2), 1,
+                                                                 load_interval=1.0))
+        self.conditions_end = None
+
+    def before_vote(self, words, alt, wh_words, plan, quality):
+        import copy
+        import runinfo
+        self.before = {"primary": copy.deepcopy(words), "second": copy.deepcopy(alt),
+                       "whisper": list(wh_words) if wh_words is not None else None,
+                       "plan": {"model": plan.get("model"), "mode": plan.get("mode"),
+                                "max_repeat": plan.get("max_repeat"),
+                                "selected": len(plan.get("selected") or []), "chunks": len(plan.get("chunks") or [])},
+                       "diagnostics": copy.deepcopy(quality.get("asr_diagnostics") or {})}
+        self.conditions_end = _safe(lambda: runinfo.conditions(paths.JOBS, self.cfg.get("max_heavy_jobs", 2), 1,
+                                                               load_interval=0))
+
+    def save(self, quality, timing, vocab):
+        """Сбой записи гипотез расшифровку не роняет: причина без пути — в quality."""
+        try:
+            path = _save_hypotheses(self, quality, timing, vocab)
+            quality["hypotheses_saved"] = True
+            print(f"[words] гипотезы моделей сохранены ({path.parent.name}/{path.name})", file=sys.stderr, flush=True)
+        except Exception as ex:
+            quality["hypotheses_saved"] = False
+            quality["hypotheses_error"] = type(ex).__name__
+            print(f"[words] гипотезы моделей не сохранены: {type(ex).__name__}", file=sys.stderr, flush=True)
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception as ex:
+        return {"status": "not_measured", "reason": type(ex).__name__}
+
+
+def _save_hypotheses(cap, quality, timing, vocab):
+    """Запись файла гипотез hyp-2 (hypstore) после сведения. -> путь файла."""
+    import platform
+    import hypotheses as H
+    import hypstore
+    import runinfo
+    b = cap.before
+    if b is None:
+        raise RuntimeError("гипотезы до голосования не собраны")
+    base = hypstore.root()
+    base.mkdir(parents=True, exist_ok=True)
+    pcm = hypstore.pcm_bytes(cap.audio)
+    src = Path(cap.a.audio).expanduser() if getattr(cap.a, "audio", "") else None
+    ident = runinfo.audio_identity(src if src else Path("-"), pcm, SR)
+    ex = ident.pop("excerpt")
+    unit_id = ident.pop("unit_id")
+    audio_block = {**ident, "pcm_sha256": ex["pcm_sha256"], "pcm_format": ex["pcm_format"],
+                   "duration_sec": ex["duration_sec"]}
+    run_id = runinfo.new_run_id()
+    diag = b["diagnostics"]
+    arts = hypstore._read_json(base / hypstore.ARTIFACTS_FILE, {})
+
+    def artifact(model):
+        return {"name": model, "artifact": _safe(lambda: hypstore.model_artifact(model, paths.CACHE, arts))}
+
+    def chunks_of(name):
+        return [{k: rec.get(k) for k in ("index", "audio_span", "own_span", "state")}
+                for rec in (diag.get(name) or {}).get("chunks", [])]
+
+    def absent(why):
+        return {k: H.not_available(why) for k in ("model", "engine", "timing", "words", "word_times")}
+
+    roles = [{"role": "primary", "model": artifact(timing.get("asr_model")),
+              "engine": {"name": timing.get("asr_backend"), "fallbacks": quality.get("asr_fallbacks")},
+              "timing": {"pass_sec": timing.get("asr_sec"), "chunks": timing.get("asr_chunks")},
+              "chunks": chunks_of("primary"), "words": b["primary"], "word_times": H.available()}]
+    if b["second"] is not None:
+        roles.append({"role": "second", "model": artifact(timing.get("asr2_model")),
+                      "engine": {"name": (diag.get("second") or {}).get("backend")},
+                      "timing": {"pass_sec": timing.get("asr2_sec")},
+                      "chunks": chunks_of("second"), "words": b["second"], "word_times": H.available()})
+    else:
+        roles.append({"role": "second", "chunks": chunks_of("second"), **absent("вторая модель не считалась")})
+    third_model, t3 = b["plan"]["model"], cap.third
+    if third_model and b["whisper"] is not None:
+        if transcript.asr_model_caps(third_model)["whisper"]:
+            wt = H.not_available("Whisper: времена слов меняют декодирование, сохраняется только текст")
+            tw = wt
+        elif t3.get("timed_words") is not None:
+            wt, tw = H.available(), t3["timed_words"]
+        elif third_model in TIMED_THIRD_VERIFIED:
+            wt = tw = H.not_measured("повтор кусков на CPU: времена не полные")
+        else:
+            wt = tw = H.not_measured("text_mismatch: совпадение текста со временами для этой модели не проверено")
+        roles.append({"role": "third", "model": artifact(third_model),
+                      "engine": {**(t3.get("engine") or {}), "mode": b["plan"]["mode"],
+                                 "pieces": timing.get("asr3_pieces"), "fallbacks": timing.get("asr3_fallbacks")},
+                      "timing": {"pass_sec": timing.get("asr3_sec"), "load_sec": timing.get("asr3_load_sec"),
+                                 "compile_sec": timing.get("asr3_compile_sec")},
+                      "chunks": t3.get("chunks") or chunks_of("whisper"), "words": tw, "word_times": wt})
+    else:
+        roles.append({"role": "third", "chunks": chunks_of("whisper"),
+                      **absent("третья модель не считалась или не дала результата")})
+    tid, hw = hypstore.testbed(HERE, base)
+    meta = {"audio": audio_block,
+            "program": {"version": runinfo.program_version(HERE), "code": _safe(lambda: runinfo.code_revision(HERE))},
+            "environment": {"os": _safe(runinfo.os_info), "python": {"version": platform.python_version()},
+                            "packages": _safe(runinfo.packages), "asr_run": quality.get("asr_run")},
+            "hardware": {"testbed_id": tid, "machine": hw},
+            "conditions": {"start": cap.conditions_start, "after_passes": cap.conditions_end,
+                           "peak_memory_mb": _safe(runinfo.peak_memory_mb)},
+            "config": hypstore.config_snapshot(cap.cfg, vocab),
+            "ids": {"run_id": run_id, "unit_id": unit_id,
+                    "job_id": Path(cap.a.status).stem if getattr(cap.a, "status", "") else None,
+                    "recording_id": H.not_measured("запись в базу идёт после сохранения гипотез"),
+                    "written_utc": runinfo.utc_now()}}
+    combine = {"function": "vote_n", "rule": cap.trace.get("rule") or dict(W.TWO_OF_THREE),
+               "partial": quality.get("vote3_partial"), "skipped": quality.get("vote3_skipped"),
+               "third_words": b["whisper"], "third_plan": b["plan"]}
+    rec = H.build_record(roles, legacy={"combine_rule": "vote3_partial"}, combine=combine,
+                         trace=cap.trace or None, meta=meta)
+    path = hypstore.write(rec, unit_id, run_id, base)
+    try:
+        hypstore._write_json_atomic(base / hypstore.ARTIFACTS_FILE, arts)
+    except OSError:
+        pass
+    return path
+
+
 def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of, voice_ctx,
               allowed, genders_by_name, vocab, quality, make_asr, a):
     """Пословная обработка (words.py). -> данные расшифровки (без file/duration/timing).
@@ -1015,6 +1185,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     для разбора; слой признаков разговора; эмоции."""
 
     timing = {}
+    import hypstore
+    hyp = _HypCapture(audio, cfg, a) if hypstore.enabled(cfg) else None
     refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed)
     mapping = voice_ctx.get("mapping") or {}
 
@@ -1030,13 +1202,18 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     words = primary_pass(audio, chunks, cfg, st, quality, make_asr, prog, timing)
     alt = second_pass(audio, chunks, cfg, quality, make_asr, prog, timing)
     plan = whisper_plan(audio, regions, chunks, cfg, a, words, alt, quality)
-    wh_words = whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing) \
+    wh_words = whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing,
+                            **({"capture": hyp.third} if hyp else {})) \
         if plan["model"] and alt is not None else None
+    if hyp:
+        hyp.before_vote(words, alt, wh_words, plan, quality)
 
     # сведение гипотез -> слова с пометками расхождений, решения голосования, сведения о сбоях
     fused = W.combine_hypotheses({"primary": words, "second": alt, "whisper": wh_words},
-                                 quality["asr_diagnostics"])
+                                 quality["asr_diagnostics"], **({"trace": hyp.trace} if hyp else {}))
     quality.update(fused["quality"])
+    if hyp:
+        hyp.save(quality, timing, vocab)
 
     _apply_vocab(words, vocab, quality)
 

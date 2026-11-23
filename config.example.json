@@ -27,6 +27,7 @@
   "torch_threads": 0,
   "pipeline": "words",
   "max_heavy_jobs": 2,
+  "save_hypotheses": false,
   "default_group": "",
   "confirm_mode": "auto",
   "confirm_timeout_sec": 180,

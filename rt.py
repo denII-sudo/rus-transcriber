@@ -29,6 +29,7 @@
     python rt.py import архив.zip [--replace] [--apply]       # без --apply только отчёт
     python rt.py delete-group имя [--permanent]
     python rt.py cleanup [--days 30] [--apply]
+    python rt.py cleanup-hypotheses [--unit ID] [--days N] [--apply]   # сохранённые гипотезы моделей
     python rt.py migrate [--apply]
     python rt.py approve                                       # разрешить запрос, оставленный MCP-сервером
 
@@ -248,6 +249,8 @@ def build():
     i = sub.add_parser("import"); i.add_argument("zip"); i.add_argument("--replace", action="store_true"); i.add_argument("--apply", action="store_true")
     d = sub.add_parser("delete-group"); d.add_argument("name"); d.add_argument("--permanent", action="store_true")
     k = sub.add_parser("cleanup"); k.add_argument("--days", type=float, default=30); k.add_argument("--apply", action="store_true")
+    k = sub.add_parser("cleanup-hypotheses"); k.add_argument("--unit", default=""); k.add_argument("--days", type=float, default=None)
+    k.add_argument("--apply", action="store_true")
     m = sub.add_parser("migrate"); m.add_argument("--apply", action="store_true")
     return ap
 
@@ -408,6 +411,12 @@ def run(a):
             out(core.do_cleanup(a.days, False))
         else:
             return gated("Очистка журналов задач", core.describe_cleanup(a.days), lambda: core.do_cleanup(a.days, True))
+    elif c == "cleanup-hypotheses":
+        if not a.apply:
+            out(core.do_cleanup_hypotheses(a.unit, a.days, False))
+        else:
+            return gated("Удаление гипотез моделей", core.describe_cleanup_hypotheses(a.unit, a.days),
+                         lambda: core.do_cleanup_hypotheses(a.unit, a.days, True))
     elif c == "migrate":
         if not a.apply:
             out(core.do_migrate(True))

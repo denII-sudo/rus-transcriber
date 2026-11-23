@@ -419,6 +419,30 @@ class OnnxASR:
         return out
 
 
+def texts_timed(asr, pieces, progress=None, diagnostics=None):
+    """Текст и слова со временами одним вызовом модели, теми же пакетами и параметрами, что
+    OnnxASR.transcribe_texts (без дополнения тишиной; язык — asr.language). Нужен только для сохранения
+    гипотез (hypstore): текст для голосования берётся из .text того же результата. Совпадение текста
+    с transcribe_texts проверено сравнением на настоящей модели только для моделей из
+    worker.TIMED_THIRD_VERIFIED; для остальных worker этот путь не вызывает.
+    -> (тексты, результаты со временами или None по кускам)."""
+    kw = {"language": asr.language} if asr.language else {}
+    model = asr.model.with_timestamps()
+    bs = max(1, min(asr.batch, 4))
+    batches = [list(range(g, min(g + bs, len(pieces)))) for g in range(0, len(pieces), bs)]
+    results, records = _observed_recognize(model, pieces, batches, kwargs=kw, progress=progress, timestamped=True)
+    texts = [_as_text(r).strip() if r is not None else "" for r in results]
+    for rec, text in zip(records, texts):       # «пусто» — по тексту, как у transcribe_texts
+        for attempt in rec["attempts"]:
+            if attempt.get("result") in ("ok", "empty"):
+                attempt["result"] = "ok" if text else "empty"
+        if rec.get("state") in ("ok", "empty_unknown"):
+            rec["state"] = "ok" if text else "empty_unknown"
+    if diagnostics is not None:
+        diagnostics.extend(records)
+    return texts, results
+
+
 class WhisperOV:
     """Whisper: тяжёлый кодировщик — напрямую в OpenVINO (видеокарта Arc или CPU), лёгкий декодер —
     onnxruntime на процессоре. У fp16-модели оптимизатор onnxruntime падает на слиянии LayerNorm,
