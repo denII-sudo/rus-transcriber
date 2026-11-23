@@ -188,6 +188,29 @@ class RunWordsWithSavingTests(Sandbox):
         self.assertEqual(G.digest(data, calls), G.EXPECTED["three_models"])
         self.assertEqual(self.files(), [])
 
+    def test_no_none_inside_model_engine_timing(self):
+        """Неизвестное внутри блоков model, engine, timing — not_measured, а не None (в words и chunks None —
+        значение, например raw_text неслушанного куска)."""
+        def nones(obj, where):
+            if obj is None:
+                return [where]
+            if isinstance(obj, dict):
+                return [p for k, v in obj.items() for p in nones(v, f"{where}.{k}")]
+            if isinstance(obj, list):
+                return [p for i, v in enumerate(obj) for p in nones(v, f"{where}[{i}]")]
+            return []
+        for name in ("three_models", "whisper_doubt", "whisper_fails", "second_fails", "whisper_off",
+                     "primary_chunk_error", "gpu_then_cpu"):
+            self.scenario(name)
+        files = self.files()
+        self.assertEqual(len(files), 7)
+        for path in files:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            for block in rec["roles"]:
+                for key in ("model", "engine", "timing"):
+                    with self.subTest(role=block["role"], key=key):
+                        self.assertEqual(nones(block[key], key), [])
+
     def test_two_runs_of_same_audio_lie_side_by_side(self):
         self.scenario("three_models")
         time.sleep(0.01)

@@ -1096,6 +1096,18 @@ def _safe(fn):
         return {"status": "not_measured", "reason": type(ex).__name__}
 
 
+def _no_none(obj):
+    """None внутри блока (и сам блок None) -> not_measured: в файле гипотез неизвестное записано явно."""
+    import hypotheses as H
+    if obj is None:
+        return H.not_measured("не записано")
+    if isinstance(obj, dict):
+        return {k: _no_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_no_none(v) for v in obj]
+    return obj
+
+
 def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
     """Запись файла гипотез hyp-2 (hypstore) после сохранения результата задачи. -> путь файла."""
     import platform
@@ -1159,6 +1171,9 @@ def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
     else:
         roles.append({"role": "third", "chunks": chunks_of("whisper"),
                       **absent("третья модель не считалась или не дала результата")})
+    for block in roles:      # неизвестное в model/engine/timing — not_measured, а не None (words, chunks — как есть)
+        for key in ("model", "engine", "timing"):
+            block[key] = _no_none(block.get(key))
     tid, hw = hypstore.testbed(HERE, base)
     meta = {"audio": audio_block,
             "program": {"version": runinfo.program_version(HERE), "code": _safe(lambda: runinfo.code_revision(HERE))},

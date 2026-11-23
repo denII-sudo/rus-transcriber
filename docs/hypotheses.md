@@ -27,7 +27,16 @@
 - `roles` — по блоку на модель (`primary`, `second`, `third`), одинаковой формы: `model` (имя и файлы весов с размером и SHA-256), `engine` (движок, устройство, точность, откаты), `timing`, `chunks` (у третьей модели — `heard`: слушала ли модель кусок; в режиме `doubt` неслушанные куски подставлены из основной и голосом третьей модели не считаются), `words` (до голосования), `word_times`.
 - `vote_trace` — протокол голосования `words.vote_n(trace=...)`: поддержавшие роли, решение (`kept`, `replaced`, `inserted`, `disputed`), варианты ролей, победившая группа, исключённые отрезки с ролью и причиной. Алгоритм голосования не меняется.
 - `combine`, `audio`, `program`, `environment` (ОС, Python, пакеты), `hardware`, `conditions` (на старте и после проходов, пиковая память), `config` (параметры распознавания; словарь группы — только сумма и число записей), `ids`.
-- Чего нет, записано явно: `{"status": "not_available" | "not_measured", "reason": ...}`.
+- Чего нет, записано явно: `{"status": "not_available" | "not_measured", "reason": ...}`. Внутри блоков `model`, `engine`, `timing` значения `None` нет: неизвестное поле записывается как `not_measured` («не записано»). В `words` и `chunks` `None` — значение, а не пропуск: например, `raw_text: null` у куска, который третья модель не слушала (`heard: false`). `hypotheses.check` вложенные `None` не проверяет — это обязанность сборщика (`worker._save_hypotheses`).
+
+Соответствие имён: в файле роли называются `primary`, `second`, `third`, а в голосовании и в результате расшифровки у третьей модели историческое имя `whisper` (оно же для любой третьей модели, не только Whisper).
+
+| Блок роли в `roles` | Роль в `vote_trace` (`roles`, `support`, `variants`, `winner_roles`, `skip_spans`) | Поля слова и `quality` | Подпись в `voted` |
+|---|---|---|---|
+| `primary` | `primary` | — | — |
+| `second` | `second` | `alt`; `vote3_partial`, `vote3_skipped` | `ctc` |
+| `third` | `whisper` | `alt_whisper`; `vote3_*`; `asr_diagnostics.whisper` | `whisper` |
+| дополнительная роль `<имя>` | `<имя>` | `alt_<имя>` | `<имя>` |
 
 Времена слов третьей модели: у Whisper — `not_available` (только текст). У других моделей слова со временами берутся тем же вызовом модели (`backends.texts_timed`) только для моделей из `worker.TIMED_THIRD_VERIFIED`, у которых текст совпал с `transcribe_texts` побайтно при сравнении на настоящей модели; у остальных — прежний путь и `word_times: not_measured` («text_mismatch»). Сравнение 24.11.2026: синтетическая речь (синтезатор Windows, 86 с, 6 кусков), движок onnx-cpu, точность int8, модели из кэша без сети; у `multilingual_large_ctc`, `multilingual_ctc` и `v3_e2e_ctc` совпали тексты всех кусков и диагностика кусков. Путь со временами включается только при этих условиях (onnx-cpu, int8); при повторе ошибочных кусков на CPU времена не записываются (`not_measured`).
 
