@@ -1089,6 +1089,7 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
         "SELECT part_index FROM workflow_model_parts WHERE request_id=? AND task_hash=?",
         (request_id, task_hash))}
     invalid_count = 0
+    cleanup = []                                     # предупреждения клиента: неубранные сессии OpenCode
 
     def progress():
         saved = saved_part_count(store, request_id=request_id, task_hash=task_hash)
@@ -1097,6 +1098,7 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
     try:
         if len(completed) < total:                  # все блоки сохранены — клиент облака не нужен
             with llm_provider.OpenCodeTextClient() as client:
+                cleanup = getattr(client, "cleanup_warnings", cleanup)
                 for part_index in range(total):
                     if part_index in completed:
                         continue
@@ -1142,6 +1144,8 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
             code, message = "internal_error", f"модельный шаг остановлен; {progress()}"
         _fail_model_run(store, request_id, code, message, invalid_count=invalid_count, expected_run_id=run_id)
         raise llm_provider.ProviderError(code, message) from ex
+    finally:
+        _record_cleanup_warnings(store, run_id, cleanup)
     after = get(store, request_id)
     if after["state"] == "completed":
         return _completed_result(store, after)
@@ -1151,6 +1155,28 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
     _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count,
                     expected_run_id=run_id)
     raise llm_provider.ProviderError("internal_error", message)
+
+
+def _record_cleanup_warnings(store, run_id, warnings):
+    """Предупреждения исполнителя (например, OpenCode не удалил временную сессию) — в шаги этого запуска.
+
+    Текст предупреждения задаёт llm_provider: без пути и идентификатора сессии. Ошибка записи не меняет исход шага.
+    """
+    if not warnings:
+        return
+    try:
+        with store._transaction():
+            for row in store.db.execute("SELECT step_id, result_json FROM workflow_steps WHERE run_id=?",
+                                        (run_id,)).fetchall():
+                result = json.loads(row["result_json"]) if row["result_json"] else {}
+                if not isinstance(result, dict):
+                    result = {"result": result}
+                result["warnings"] = list(dict.fromkeys([*result.get("warnings", []), *warnings]))
+                store.db.execute("UPDATE workflow_steps SET result_json=? WHERE step_id=?",
+                                 (storage._json(result), row["step_id"]))
+    except Exception as ex:        # запись предупреждения не должна менять исход шага
+        import sys
+        print(f"workflow: предупреждение исполнителя не записано: {type(ex).__name__}", file=sys.stderr)
 
 
 def _accept_model_result(store, request_id, result):

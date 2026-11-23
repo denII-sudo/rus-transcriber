@@ -21,22 +21,150 @@ import storage
 import workflow
 
 
+class SessionRoutes:
+    """Поддельный _request для сессии OpenCode 2.4: создание, ответ, удаление. Запоминает вызовы."""
+
+    def __init__(self, text, *, created=None, generate_error=None, delete_error=None):
+        self.text, self.created = text, created or {}
+        self.generate_error, self.delete_error = generate_error, delete_error
+        self.calls, self.count = [], 0
+
+    def __call__(self, route, payload, *, timeout, method=None):
+        verb = method or ("POST" if payload is not None else "GET")
+        self.calls.append((verb, route, payload, timeout))
+        if verb == "POST" and route == "/api/session":
+            self.count += 1
+            info = {"id": f"ses_fake{self.count}", "model": {**payload["model"], "variant": "default"},
+                    "permissions": payload["permissions"], "location": payload.get("location")}
+            return {"data": {**info, **self.created}}
+        if route.endswith("/generate"):
+            if self.generate_error is not None:
+                raise self.generate_error
+            return {"data": {"text": self.text, "tokens": {}, "cost": 0}}
+        if verb == "DELETE" and self.delete_error is not None:
+            raise self.delete_error
+        return {}
+
+
 class OpenCodeProviderTests(unittest.TestCase):
     def test_generate_uses_fixed_model_and_only_minimal_task_fields(self):
         client = llm_provider.OpenCodeTextClient()
         task = {"kind": "conspect", "recording_id": "synthetic", "source_revision": 1,
                 "review_revision": 1, "goal": "кратко",
                 "words": [{"word_id": "w1", "text": "Синтетика", "uncertain": False}]}
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "{\"source_revision\":1}"}}) as call:
+        fake = SessionRoutes('{"source_revision":1}')
+        with mock.patch.object(client, "_request", side_effect=fake):
             result, raw = client.generate(task)
         self.assertEqual((result, raw), ({"source_revision": 1}, "{\"source_revision\":1}"))
-        payload = call.call_args.args[1]
-        self.assertEqual(payload["model"], {"providerID": "openai", "id": "gpt-6-luna"})
-        self.assertNotIn("recording_id", payload["prompt"])
-        self.assertIn("Синтетика", payload["prompt"])
-        self.assertEqual(call.call_args.args[0], "/api/experimental/generate/text")
-        self.assertEqual(call.call_args.kwargs["timeout"], llm_provider.REQUEST_TIMEOUT_SEC)
+        create, generate, delete = fake.calls
+        self.assertEqual(create[2]["model"], {"providerID": "openai", "id": "gpt-6-luna"})
+        self.assertNotIn("recording_id", generate[2]["prompt"])
+        self.assertIn("Синтетика", generate[2]["prompt"])
+        self.assertEqual(generate[1], "/api/session/ses_fake1/generate")
+        self.assertEqual(generate[3], llm_provider.REQUEST_TIMEOUT_SEC)
         self.assertEqual(llm_provider.REQUEST_TIMEOUT_SEC, 300)
+
+    def test_text_goes_only_through_a_locked_session_that_is_deleted_afterwards(self):
+        # OpenCode 2.4.0: /api/experimental/generate/text не видит openai/gpt-6-luna («базовая конфигурация»,
+        # проба 7.4б 24.11.2026), а сессия видит. Сессия: модель, место-песочница, запрет всего; после — удаление.
+        client = llm_provider.OpenCodeTextClient()
+        client.directory = "C:/sandbox/tmp"
+        fake = SessionRoutes("{}")
+        with mock.patch.object(client, "_request", side_effect=fake):
+            client._generate_text("секретный синтетический текст")
+        self.assertEqual([(c[0], c[1]) for c in fake.calls], [
+            ("POST", "/api/session"), ("POST", "/api/session/ses_fake1/generate"), ("DELETE", "/api/session/ses_fake1")])
+        create = fake.calls[0][2]
+        self.assertEqual(create["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}])
+        self.assertEqual(create["location"], {"directory": "C:/sandbox/tmp"})
+        self.assertNotIn("секретный", json.dumps(create, ensure_ascii=False))
+        self.assertEqual(set(fake.calls[1][2]), {"prompt"})
+
+    def test_session_is_deleted_even_when_generation_fails(self):
+        for failure in (llm_provider.ProviderError("offline", "нет связи"), KeyboardInterrupt(), RuntimeError("x")):
+            with self.subTest(failure=type(failure).__name__):
+                client = llm_provider.OpenCodeTextClient()
+                fake = SessionRoutes("{}", generate_error=failure)
+                with mock.patch.object(client, "_request", side_effect=fake):
+                    with self.assertRaises(type(failure)):
+                        client._generate_text("x")
+                self.assertEqual(fake.calls[-1][:2], ("DELETE", "/api/session/ses_fake1"))
+
+    def test_failed_delete_archives_the_session_and_keeps_the_answer(self):
+        client = llm_provider.OpenCodeTextClient()
+        fake = SessionRoutes('{"ok": 1}', delete_error=llm_provider.ProviderError("offline", "нет связи"))
+        with mock.patch.object(client, "_request", side_effect=fake):
+            response = client._generate_text("x")
+        self.assertEqual(response["data"]["text"], '{"ok": 1}')
+        self.assertEqual(fake.calls[-1][:3], ("PATCH", "/api/session/ses_fake1", {"archived": True}))
+
+    def test_text_is_not_sent_when_the_session_has_another_model_or_rights(self):
+        cases = {"model": {"providerID": "opencode", "id": "tidepool-alpha-free", "variant": "default"},
+                 "permissions": [], "id": "../../api/x"}
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                client = llm_provider.OpenCodeTextClient()
+                fake = SessionRoutes("{}", created={field: value})
+                with mock.patch.object(client, "_request", side_effect=fake):
+                    with self.assertRaises(llm_provider.ProviderError) as caught:
+                        client._generate_text("секретный текст")
+                self.assertEqual(caught.exception.code, "model_unavailable")
+                self.assertIn("текст в облако не отправлялся", str(caught.exception))
+                self.assertFalse(any(c[1].endswith("/generate") for c in fake.calls))
+                if field != "id":
+                    self.assertEqual(fake.calls[-1][0], "DELETE")
+
+    def test_refused_session_creation_sends_the_text_nowhere(self):
+        # Поправка архитектора: при отказе в создании сессии текст не уходит ни в какой запрос.
+        refusals = [llm_provider.ProviderError("model_unavailable", "нет", http_status=404),
+                    llm_provider.ProviderError("offline", "нет связи"), RuntimeError("сбой")]
+        for refusal in refusals:
+            with self.subTest(refusal=type(refusal).__name__):
+                client = llm_provider.OpenCodeTextClient()
+                calls = []
+
+                def request(route, payload, *, timeout, method=None):
+                    calls.append((route, payload))
+                    if route == "/api/session" and method is None:
+                        raise refusal
+                    return {}
+                task = model_tasks.build("synthetic", 1, [{"word_id": "w1", "text": "секретноеслово"}], "кратко")
+                with mock.patch.object(client, "_request", side_effect=request):
+                    with self.assertRaises(type(refusal)):
+                        client.generate(task)
+                self.assertEqual([c[0] for c in calls], ["/api/session"])
+                self.assertFalse(any("секретноеслово" in json.dumps(c[1], ensure_ascii=False) for c in calls))
+
+    def test_session_left_behind_gives_a_warning_without_id_or_path(self):
+        client = llm_provider.OpenCodeTextClient()
+        client.directory = "C:/sandbox/tmp"
+        failure = llm_provider.ProviderError("offline", "нет связи")
+        fake = SessionRoutes("{}", delete_error=failure)
+        original = fake.__call__
+
+        def request(route, payload, *, timeout, method=None):
+            if method == "PATCH":
+                fake.calls.append((method, route, payload, timeout))
+                raise failure
+            return original(route, payload, timeout=timeout, method=method)
+        with mock.patch.object(client, "_request", side_effect=request):
+            client._generate_text("x")
+            client._generate_text("y")
+        self.assertEqual(client.cleanup_warnings, [llm_provider.SESSION_LEFT_WARNING])
+        self.assertNotIn("ses_fake", llm_provider.SESSION_LEFT_WARNING)
+        self.assertNotIn("sandbox", llm_provider.SESSION_LEFT_WARNING)
+
+    def test_every_attempt_gets_its_own_session(self):
+        client = llm_provider.OpenCodeTextClient()
+        task = model_tasks.build("synthetic", 1, [{"word_id": "w1", "text": "слово"}], "кратко")
+        fake = SessionRoutes("{}")
+        with mock.patch.object(client, "_request", side_effect=fake):
+            client.generate(task)
+            client.generate(task, repair_error="ошибка", invalid_output="{}")
+        self.assertEqual([c[1] for c in fake.calls if c[0] == "POST" and c[1] == "/api/session"],
+                         ["/api/session", "/api/session"])
+        self.assertEqual([c[1] for c in fake.calls if c[0] == "DELETE"],
+                         ["/api/session/ses_fake1", "/api/session/ses_fake2"])
 
     def test_version_2_request_sends_turns_with_labels_and_speaker_rules(self):
         client = llm_provider.OpenCodeTextClient()
@@ -46,9 +174,9 @@ class OpenCodeProviderTests(unittest.TestCase):
              {"word_id": "w3", "text": "Да", "turn": 2}],
             "протокол встречи", 2,
             turns=[{"turn": 1, "speaker": "Участник 1"}, {"turn": 2, "speaker": "Участник 2"}])
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "{}"}}) as call:
+        with mock.patch.object(client, "_generate_text", return_value={"data": {"text": "{}"}}) as call:
             client.generate(task)
-        prompt = call.call_args.args[1]["prompt"]
+        prompt = call.call_args.args[0]
         instructions, sent = prompt.split("Задание:\n", 1)
         self.assertEqual(json.loads(sent), {
             "kind": "conspect", "source_revision": 3, "review_revision": 2, "goal": "протокол встречи",
@@ -66,9 +194,9 @@ class OpenCodeProviderTests(unittest.TestCase):
     def test_version_1_request_text_is_unchanged(self):
         client = llm_provider.OpenCodeTextClient()
         task = model_tasks.build("synthetic", 1, [{"word_id": "w1", "text": "слово"}], "кратко")
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "{}"}}) as call:
+        with mock.patch.object(client, "_generate_text", return_value={"data": {"text": "{}"}}) as call:
             client.generate(task)
-        self.assertEqual(call.call_args.args[1]["prompt"], (
+        self.assertEqual(call.call_args.args[0], (
             "Подготовь краткий конспект русской стенограммы. Верни ровно один JSON-объект без Markdown, "
             "без полей сверх указанных: {\"source_revision\": число, \"sections\": "
             "[{\"text\": строка, \"evidence\": [\"word_id\", ...]}]}. "
@@ -112,7 +240,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         task = {"kind": "conspect", "recording_id": "synthetic", "source_revision": 1,
                 "review_revision": 1, "goal": "",
                 "words": [{"word_id": "w1", "text": "слово", "uncertain": False}]}
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "not json"}}):
+        with mock.patch.object(client, "_generate_text", return_value={"data": {"text": "not json"}}):
             result, raw = client.generate(task)
         self.assertIsNone(result)
         self.assertEqual(raw, "not json")
@@ -489,9 +617,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
         def __enter__(self): return self
         def __exit__(self, *args): return False
 
-        def _request(self, route, payload, *, timeout):
-            type(self).prompts.append(payload["prompt"])
-            sent = json.loads(payload["prompt"].split("Задание:\n", 1)[1])
+        def _generate_text(self, prompt):
+            type(self).prompts.append(prompt)
+            sent = json.loads(prompt.split("Задание:\n", 1)[1])
             answer = {"source_revision": sent["source_revision"], "sections": [{
                 "text": "Итог блока.", "evidence": [word["word_id"] for word in sent["words"]]}]}
             return {"data": {"text": json.dumps(answer, ensure_ascii=False)}}
@@ -644,6 +772,39 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 saved, answer, history, journal = self.run_refused(request, 404, body)
                 self.assertEqual((saved["state"], answer["error_code"]), ("failed", "model_unavailable"))
                 self.assertIn("model_unavailable", history)
+
+    def test_session_left_behind_is_written_into_the_step_on_success_and_failure(self):
+        warning = llm_provider.SESSION_LEFT_WARNING
+
+        class LeavingClient(self.CapturingClient):
+            def __enter__(self):
+                self.cleanup_warnings = [warning]
+                return self
+
+        class FailingLeavingClient:
+            def __enter__(self):
+                self.cleanup_warnings = [warning]
+                return self
+            def __exit__(self, *args): return False
+            def generate(self, *args, **kwargs):
+                raise llm_provider.ProviderError("offline", "нет связи")
+
+        for client_class, state in ((LeavingClient, "completed"), (FailingLeavingClient, "failed")):
+            with self.subTest(state=state):
+                self.fresh_source(state)
+                request = self.prepare_request()
+                with mock.patch("llm_provider.OpenCodeTextClient", client_class):
+                    try:
+                        workflow.execute_model(self.store, request)
+                    except llm_provider.ProviderError:
+                        pass
+                saved = workflow.get(self.store, request)
+                self.assertEqual(saved["state"], state)
+                rows = self.store.db.execute("SELECT result_json FROM workflow_steps WHERE run_id=?",
+                                             (saved["model_run_id"],)).fetchall()
+                self.assertTrue(rows)
+                for row in rows:
+                    self.assertEqual(json.loads(row["result_json"])["warnings"], [warning])
 
     def test_provider_failure_is_visible_and_keeps_transcript(self):
         request = self.prepare_request()

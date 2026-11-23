@@ -192,9 +192,9 @@ class Version3ContractTests(unittest.TestCase):
 class Version3RequestTextTests(unittest.TestCase):
     def prompt(self, task):
         client = llm_provider.OpenCodeTextClient()
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "{}"}}) as call:
+        with mock.patch.object(client, "_generate_text", return_value={"data": {"text": "{}"}}) as call:
             client.generate(task)
-        return call.call_args.args[1]["prompt"]
+        return call.call_args.args[0]
 
     def test_version_3_sends_only_the_count_in_addition_and_explains_the_marks(self):
         task = model_tasks.build("synthetic-recording-id", 3,

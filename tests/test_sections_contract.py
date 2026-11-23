@@ -197,9 +197,9 @@ class SectionValidationTests(unittest.TestCase):
 class RequestTextTests(unittest.TestCase):
     def prompt(self, task, **kwargs):
         client = llm_provider.OpenCodeTextClient()
-        with mock.patch.object(client, "_request", return_value={"data": {"text": "{}"}}) as call:
+        with mock.patch.object(client, "_generate_text", return_value={"data": {"text": "{}"}}) as call:
             client.generate(task, **kwargs)
-        return call.call_args.args[1]["prompt"]
+        return call.call_args.args[0]
 
     def test_request_sends_only_the_view_and_explains_the_contract(self):
         task = _task(_words(3, 1, doubtful=(1,)) + _words(2, 2, start=3), TURNS)
