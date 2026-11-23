@@ -1,5 +1,8 @@
+import contextlib
+import http.client
 import http.server
 import json
+import logging
 import io
 import os
 import socket
@@ -218,7 +221,7 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
              mock.patch.object(llm_provider.time, "sleep"),              mock.patch.object(client, "_request", side_effect=self.routes(models or [self.LISTED])) as request:
             try:
                 result = client.__enter__()
-            except llm_provider.ProviderError as ex:
+            except Exception as ex:      # любое исключение запуска — результат проверки, не падение теста
                 result = ex
         return result, request, procs
 
@@ -335,9 +338,97 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
                 self.assertEqual((str(ex), ex.detail), ("модель OpenAI недоступна в OpenCode", {}))
 
     def test_refusal_detail_is_cleaned_and_shortened(self):
-        ex = self._refusal(404, {"_tag": "ModelNotFoundError", "message": "line1\nline2\x07" + "я" * 500})
+        ex = self._refusal(404, {"_tag": "ModelNotFoundError", "message": "line1\nline2\x07 " + "word " * 100})
         self.assertNotIn("\n", str(ex))
-        self.assertEqual(len(ex.detail["message"]), 300)
+        self.assertEqual(len(ex.detail["message"]), llm_provider._MAX_DETAIL_CHARS)
+        self.assertEqual(llm_provider._MAX_DETAIL_CHARS, 160)
+
+    # Маркеры, которые не должны выйти из тела ошибки ни в одно поле (аудит №130, замечание 1).
+    LEAKS = {"transcript": "синтетическая тайна стенограммы", "windows_path": r"C:\Users\someone\secret\a.txt",
+             "windows_slash_path": "C:/Users/someone/secret/a.txt",
+             "posix_path": "/home/someone/secret/a.txt", "bearer": "Bearer abcSECRETTOKENxyz0987654321",
+             "key": "sk-SECRETKEY1234567890abcdefgh", "password": "password=Hunter2Secret"}
+    LEAK_CORES = ("тайна", "someone", "SECRETTOKEN", "SECRETKEY", "Hunter2")
+
+    def assert_no_leak(self, *texts):
+        for text in texts:
+            for core in self.LEAK_CORES:
+                self.assertNotIn(core, text)
+
+    def test_identifier_fields_accept_only_a_strict_character_set(self):
+        for name, leak in self.LEAKS.items():
+            for field in ("providerID", "modelID", "capability"):
+                with self.subTest(leak=name, field=field):
+                    ex = self._refusal(422, {"_tag": "UnsupportedModelError", "providerID": "openai",
+                                             "modelID": "gpt-6-luna", "capability": "text",
+                                             "message": "not supported", field: leak})
+                    self.assertNotIn(field, ex.detail)
+                    self.assert_no_leak(str(ex), json.dumps(ex.detail, ensure_ascii=False))
+                    self.assertEqual(ex.detail["tag"], "UnsupportedModelError")
+
+    def test_refusal_message_is_scrubbed_of_paths_tokens_and_passwords(self):
+        for name, leak in self.LEAKS.items():
+            with self.subTest(leak=name):
+                ex = self._refusal(404, {"_tag": "ModelNotFoundError", "providerID": "openai",
+                                         "modelID": "gpt-6-luna", "message": f"Model not found: {leak} end"})
+                self.assert_no_leak(str(ex), json.dumps(ex.detail, ensure_ascii=False))
+                self.assertIn("ModelNotFoundError", str(ex))
+        # Обычный текст OpenCode с именем модели проходит без изменений.
+        ex = self._refusal(404, {"_tag": "ModelNotFoundError", "providerID": "openai", "modelID": "gpt-6-luna",
+                                 "message": "Model not found: openai/gpt-6-luna"})
+        self.assertIn("— Model not found: openai/gpt-6-luna", str(ex))
+
+    def test_non_ascii_refusal_message_is_hidden_but_named(self):
+        ex = self._refusal(404, {"_tag": "ModelNotFoundError", "message": "Model " + self.LEAKS["transcript"]})
+        self.assertNotIn("message", ex.detail)
+        self.assertIn("сообщение OpenCode скрыто (не прошло проверку)", str(ex))
+        self.assert_no_leak(str(ex), json.dumps(ex.detail, ensure_ascii=False))
+
+    def test_fields_are_shown_only_for_listed_tag_and_status_pairs(self):
+        body = {"_tag": "ModelNotFoundError", "providerID": "openai", "modelID": "gpt-6-luna",
+                "message": "SECRET-PROMPT-ECHO"}
+        for status in (400, 422, 500, 502, 503):
+            with self.subTest(status=status):
+                ex = self._refusal(status, body)
+                self.assertEqual(ex.detail, {"tag": "ModelNotFoundError"})
+                self.assertNotIn("SECRET-PROMPT-ECHO", str(ex))
+                self.assertNotIn("gpt-6-luna", str(ex))
+        ex = self._refusal(503, {"_tag": "ServiceUnavailableError", "message": "SECRET-PROMPT-ECHO"})
+        self.assertEqual(ex.detail, {"tag": "ServiceUnavailableError"})
+
+    def test_deeply_nested_or_interrupted_refusal_body_is_an_ordinary_refusal(self):
+        # Аудит №130, замечание 2: RecursionError и IncompleteRead не должны выходить наружу.
+        nested = b"[" * 60_000
+        self.assertLess(len(nested), llm_provider._MAX_ERROR_BODY)
+        ex = self._refusal(404, nested)
+        self.assertEqual((ex.code, str(ex), ex.detail), ("model_unavailable", "модель OpenAI недоступна в OpenCode", {}))
+        nested_object = b'{"_tag": "ModelNotFoundError", "x": ' + b"[" * 60_000
+        self.assertEqual(self._refusal(404, nested_object).detail, {})
+
+        client = llm_provider.OpenCodeTextClient()
+        client.base_url, client.auth = "http://127.0.0.1:9", "Basic x"
+        error = llm_provider.urllib.error.HTTPError("http://127.0.0.1:9/x", 422, "err", {}, io.BytesIO(b"{}"))
+        error.read = mock.Mock(side_effect=http.client.IncompleteRead(b"{", 10))
+        with mock.patch.object(llm_provider.urllib.request.OpenerDirector, "open", side_effect=error):
+            with self.assertRaises(llm_provider.ProviderError) as caught:
+                client._request("/api/experimental/generate/text", {"prompt": "x"}, timeout=1)
+        self.assertEqual((caught.exception.code, caught.exception.http_status), ("model_unavailable", 422))
+
+    def test_deeply_nested_success_body_is_invalid_response(self):
+        client = llm_provider.OpenCodeTextClient()
+        client.base_url, client.auth = "http://127.0.0.1:9", "Basic x"
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"[" * 60_000
+        with mock.patch.object(llm_provider.urllib.request.OpenerDirector, "open", return_value=response):
+            with self.assertRaises(llm_provider.ProviderError) as caught:
+                client._request("/api/model", None, timeout=1)
+        self.assertEqual(caught.exception.code, "invalid_response")
+
+    def test_any_exception_during_start_stops_the_process(self):
+        result, request, procs = self.start({112}, models=[RuntimeError("неожиданный сбой")])
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(len(procs), 1)
+        self.assertTrue(procs[0].stopped)
 
     def test_listener_pids_sees_own_socket(self):
         with socket.socket() as sock:
@@ -481,6 +572,78 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertEqual(workflow.get(self.store, request)["model_attempts"], 1)
         self.assertEqual(len(self.store.list_conspects(workflow.get(self.store, request)["recording_id"])), 1)
+
+    class RefusingClient(llm_provider.OpenCodeTextClient):
+        """Настоящие generate и _request; без запуска OpenCode. Сеть подменяет тест через OpenerDirector.open."""
+        def __enter__(self):
+            self.base_url, self.auth = "http://127.0.0.1:9", "Basic x"
+            return self
+        def __exit__(self, *args): return False
+
+    def fresh_source(self, number):
+        """Отдельная синтетическая запись на каждый случай: одну запись дважды не заводят."""
+        self.source = self.root / f"synthetic-{number}.wav"
+        self.source.write_bytes(b"synthetic")
+
+    def run_refused(self, request, status, body):
+        """Отказ OpenCode через весь путь: workflow.execute_model → история шага → ответ MCP, с журналом."""
+        raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        def refuse(*args, **kwargs):
+            raise llm_provider.urllib.error.HTTPError("http://127.0.0.1:9/api/experimental/generate/text",
+                                                      status, "err", {}, io.BytesIO(raw))
+        import migrate
+        with mock.patch.object(migrate, "run"):
+            import server
+        stderr, records = io.StringIO(), []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        with mock.patch("llm_provider.OpenCodeTextClient", self.RefusingClient), \
+             mock.patch.object(llm_provider.urllib.request.OpenerDirector, "open", side_effect=refuse), \
+             mock.patch("core.workflow_execute_model",
+                        lambda rid, **kw: workflow.execute_model(self.store, rid, **kw)), \
+             contextlib.redirect_stderr(stderr):
+            answer = server.workflow_execute_model(request)
+        saved = workflow.get(self.store, request)
+        failure = self.store.db.execute("SELECT result_json FROM workflow_steps WHERE state='failed' AND run_id=?",
+                                        (saved["model_run_id"],)).fetchone()
+        journal = stderr.getvalue() + "\n".join(str(record.getMessage()) for record in records)
+        return saved, json.loads(answer), failure["result_json"] if failure else None, journal
+
+    def test_refusal_markers_do_not_reach_message_history_mcp_or_journal(self):
+        leaks = OpenCodePortOwnershipTests.LEAKS
+        cores = OpenCodePortOwnershipTests.LEAK_CORES
+        bodies = []
+        for leak in leaks.values():
+            for field in ("providerID", "modelID", "capability", "message"):
+                for status, tag in ((404, "ModelNotFoundError"), (422, "UnsupportedModelError"),
+                                    (502, "ModelNotFoundError"), (503, "ServiceUnavailableError")):
+                    body = {"_tag": tag, "providerID": "openai", "modelID": "gpt-6-luna", "capability": "text",
+                            "message": "Model not found"}
+                    body[field] = leak if field != "message" else f"Model not found: {leak}"
+                    bodies.append((status, body))
+        for number, (status, body) in enumerate(bodies):
+            with self.subTest(status=status, body=body):
+                self.fresh_source(number)
+                request = self.prepare_request(segments=[self.segment("Спикер 1", ["синтетическая", "тайна",
+                                                                                     "стенограммы"], 0)])
+                saved, answer, history, journal = self.run_refused(request, status, body)
+                self.assertEqual(saved["state"], "failed")
+                self.assertIn(body["_tag"], answer["error"])
+                for text in (answer["error"], history, journal):
+                    for core in cores:
+                        self.assertNotIn(core, text)
+
+    def test_unreadable_refusal_body_fails_the_step_instead_of_leaving_it_waiting(self):
+        for number, body in enumerate((b"[" * 60_000, b'{"_tag": "ModelNotFoundError", "x": ' + b"[" * 60_000)):
+            with self.subTest(body=body[:40]):
+                self.fresh_source(number)
+                request = self.prepare_request()
+                saved, answer, history, journal = self.run_refused(request, 404, body)
+                self.assertEqual((saved["state"], answer["error_code"]), ("failed", "model_unavailable"))
+                self.assertIn("model_unavailable", history)
 
     def test_provider_failure_is_visible_and_keeps_transcript(self):
         request = self.prepare_request()
