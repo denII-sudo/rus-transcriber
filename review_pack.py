@@ -61,6 +61,8 @@ OUTCOME_REASONS = {
     "not_found": "не применён: место карточки не найдено в стенограмме",
     "not_applied": "не применён: автоматическое изменение не получилось",
 }
+# Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
+UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -904,7 +906,7 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
         return {"id": aid, "version": answer.get("version") or man.get("version"),
                 "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
                 "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
-                "action": action, "outcome": outcome, "at": _now()}
+                "answer_sig": _sig(answer), "action": action, "outcome": outcome, "at": _now()}
 
     for aid, outcome in outcomes.items():
         if outcome in _QUIET_OUTCOMES or aid not in answers:
@@ -928,10 +930,12 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
 
 
 def _answer_event(events, aid, answer):
-    """Последнее событие применения именно этого ответа (то же место, источник и время ответа)."""
+    """Последнее событие применения именно этого ответа: то же место, источник, время и сам ответ (подпись).
+    Исключение: у событий, записанных до появления подписи, сверяются только место, источник и время."""
     for row in reversed(events or []):
         if (row.get("id") == aid and row.get("answer_ts") == answer.get("ts") and
-                row.get("answer_source") == answer.get("source")):
+                row.get("answer_source") == answer.get("source") and
+                ("answer_sig" not in row or row["answer_sig"] == _sig(answer))):
             return row
     return None
 
@@ -954,12 +958,15 @@ def answer_states_of(store, man):
     """{id: {state, why, card, ts, source}} по сохранённому состоянию пакета — то, что показывает страница."""
     applied = _applied_map(store)
     events = store.get("application_events") or []
+    snapshots = store.get("undo_snapshots") or {}
     cards = {it.get("id"): n for n, it in enumerate((man or {}).get("items") or [], 1)}
     out = {}
     for aid, answer in (store.get("answers") or {}).items():
         state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer))
         out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
                     "ts": answer.get("ts"), "source": answer.get("source")}
+        if aid in applied and aid not in snapshots and state in ("applied", "pending_new", "kept_previous"):
+            out[aid]["detail"] = UNDO_UNAVAILABLE
     return out
 
 

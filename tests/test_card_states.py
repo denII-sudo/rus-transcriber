@@ -10,8 +10,11 @@ class CardStates(unittest.TestCase):
     def test_apply_displays_voice_warning(self):
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
         handler = html.split('  $("apply").onclick = ', 1)[1].split("\n\n  async function start()", 1)[0]
-        script = r'''
-          const box = {hidden: true, textContent: ""};
+        # строки отчёта собирает отдельная функция страницы
+        lines = "  function reportLines" + html.split("  function reportLines", 1)[1].split("\n  }\n", 1)[0] + "\n  }\n"
+        script = lines + r'''
+          const man = {items: []};
+          const box = {hidden: true, textContent: "", style: {}};
           const button = {disabled: false};
           const $ = id => id === "apply-report" ? box : button;
           const confirm = () => true;

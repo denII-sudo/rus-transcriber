@@ -2822,9 +2822,42 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     for aid in stored:
         if aid not in outcomes:
             outcomes[aid] = states[aid]["state"]
-    rep["outcomes"] = [{"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
-                        "why": P.OUTCOME_REASONS[outcomes[aid]]}
-                       for aid in sorted(stored, key=lambda x: (states[x]["card"] or 0, x))]
+    # Уточнения к исходу — то, что прежний отчёт показывал отдельными списками.
+    details = {aid: [states[aid]["detail"]] if states[aid].get("detail") else [] for aid in stored}
+
+    def add_detail(aid, text):
+        if aid in details and text and text not in details[aid]:
+            details[aid].append(text)
+
+    for row in rep.get("undo_conflicts") or []:
+        add_detail(row.get("id"), row.get("why") or row.get("conflict"))
+    for conflict in preflight or []:
+        for aid in conflict.get("cards") or []:
+            others = [states[x]["card"] or x for x in conflict["cards"] if x != aid and x in states]
+            add_detail(aid, "с карточкой " + ", ".join(str(x) for x in others) if others else conflict.get("why"))
+    for aid, why in revision_conflicts.items():
+        add_detail(aid, why)
+    for row in free_report.get("left_to_human") or []:
+        add_detail(row.get("id"), row.get("why"))
+    for aid, why in (free_report.get("failed") or {}).items():
+        add_detail(aid, why)
+    for row in report.get("conflicts") or []:
+        add_detail(row.get("id"), row.get("why") or ("слово уже исправлено прежней правкой"
+                                                      if row.get("kept_edits") else None))
+    for aid in rep.get("source_conflict_ids") or []:
+        add_detail(aid, rep.get("source_conflict"))
+
+    def row(aid):
+        out = {"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
+               "why": P.OUTCOME_REASONS[outcomes[aid]]}
+        if outcomes[aid] == "applied" and aid in (rep.get("undo_unavailable") or []):
+            add_detail(aid, P.UNDO_UNAVAILABLE)
+        extra = [text for text in details[aid] if text != out["why"]]
+        if extra:
+            out["detail"] = "; ".join(extra)
+        return out
+
+    rep["outcomes"] = [row(aid) for aid in sorted(stored, key=lambda x: (states[x]["card"] or 0, x))]
     if undone:
         rep["voice_profile_warning"] = {
             "answer_ids": undone,
