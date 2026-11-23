@@ -6,6 +6,7 @@
 содержания (слово, говорящий, признак сомнения, цель) по-прежнему делает свёртку устаревшей.
 """
 import copy
+import json
 import shutil
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ import core
 import llm_provider
 import model_tasks
 import recordings
+import quotes
 import storage
 import workflow
 
@@ -336,17 +338,7 @@ class ConspectContentStalenessTests(unittest.TestCase):
     def test_completed_conspect_built_by_old_rule_goes_stale(self):
         request = self.prepare_request()
         self.untimed_word_with_place(request)
-        tokens = conspect._tokens
-
-        def timed_tokens(data):
-            # Связывание цитат само требует время у каждого слова; для проверки устаревания
-            # слову без времени на время сборки свёртки подставляется время соседа.
-            data = copy.deepcopy(data)
-            for segment in data["segments"]:
-                for word in segment["words"]:
-                    word.setdefault("s", 1.0)
-            return tokens(data)
-        with self.old_rule(request), mock.patch("conspect._tokens", timed_tokens):
+        with self.old_rule(request):
             self.assertEqual(self.execute(request)["state"], "completed")
             self.assert_conspect_current(request)
         self.assert_conspect_stale(request)
@@ -361,6 +353,41 @@ class ConspectContentStalenessTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "revision_changed")
         self.assertIn("restart", str(error.exception))
         self.assertEqual(self.calls, 0)
+
+    def test_quote_over_untimed_word_is_linked_and_conspect_saved(self):
+        # Слово без времени (перенесённые данные) не роняет проверку ответа: цитата связывается
+        # по тексту и ID, время отрезка — по словам, у которых оно есть.
+        request = self.prepare_request()
+
+        def untimed(transcript, _review):
+            word = transcript["segments"][0]["words"][1]
+            word.pop("s"), word.pop("e")
+        self.commit(request, untimed)
+        test = self
+
+        class Client:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+            def generate(self, task, **_kwargs):
+                test.calls += 1
+                return {"source_revision": task["source_revision"], "sections": [{
+                    "text": "Сказано «w0 w1».", "evidence": [word["word_id"] for word in task["words"]]}]}, "{}"
+        with mock.patch("llm_provider.OpenCodeTextClient", Client):
+            self.assertEqual(workflow.execute_model(self.store, request)["state"], "completed")
+        saved = self.store.list_conspects(self.recording(request))
+        self.assertEqual(len(saved), 1)
+        current = self.store.get_current(self.recording(request))["transcript"]["payload"]
+        ids = [word["word_id"] for word in current["segments"][0]["words"]]
+        quote = json.loads(bytes(self.store.get_conspect(saved[0]["conspect_id"])["json"]))["quotes"]["1"]
+        self.assertEqual(quote["parts"], [{"t1": 0, "t2": 0, "word_ids": ids}])
+
+    def test_quote_check_tolerates_untimed_words(self):
+        data = {"segments": [{"speaker": "Спикер 1", "start": 0, "end": 2, "words": [
+            {"word_id": "a", "w": "первое"}, {"word_id": "b", "w": "второе", "s": 1.0, "e": 2.0}]}]}
+        rows = quotes.check("«первое второе»", data)["problems"] + quotes.check("«первое»", data)["problems"]
+        self.assertTrue(all(row["t"] in (None, 1.0) for row in rows))
+        self.assertEqual(conspect._span_text(data, 0.5, 1.5), ("второе", "Спикер 1"))
 
     def test_fingerprint_ignores_revisions_only(self):
         request = self.prepare_request(doubt=True)

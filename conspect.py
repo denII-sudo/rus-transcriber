@@ -161,7 +161,9 @@ def _write_files_raw(json_path, files, create=False):
 
 
 def _tokens(data):
-    """[(слово, говорящий, время начала слова)] — по словам, а для старых расшифровок — равномерно по реплике."""
+    """[(слово, говорящий, время начала слова)] — по словам, а для старых расшифровок — равномерно по реплике.
+
+    У слова без времени (перенесённые старые данные) время — None: цитата по нему связывается по тексту и ID."""
     out = []
     for seg in data["segments"]:
         ws = seg.get("words")
@@ -169,13 +171,25 @@ def _tokens(data):
             for w in ws:
                 toks = Q.WORD.findall(w["w"])
                 for x in toks:
-                    out.append((Q._n(x), seg["speaker"], w["s"], w.get("word_id")))
+                    out.append((Q._n(x), seg["speaker"], _start(w), w.get("word_id")))
         else:
             toks = Q.WORD.findall(seg["text"])
             n = max(1, len(toks))
             for k, x in enumerate(toks):
                 out.append((Q._n(x), seg["speaker"], round(seg["start"] + (seg["end"] - seg["start"]) * k / n, 3), None))
     return out
+
+
+def _start(word):
+    """Время начала слова или None, если его нет."""
+    start = word.get("s")
+    return start if type(start) in (int, float) else None
+
+
+def _part_times(toks):
+    """(t1, t2) отрезка — по словам, у которых есть время; (None, None), если времени нет ни у одного."""
+    times = [tok[2] for tok in toks if tok[2] is not None]
+    return (times[0], times[-1]) if times else (None, None)
 
 
 def _span_text(data, t1, t2):
@@ -185,7 +199,7 @@ def _span_text(data, t1, t2):
         ws = seg.get("words")
         if ws:
             for w in ws:
-                if t1 - 0.005 <= w["s"] <= t2 + 0.005:
+                if _start(w) is not None and t1 - 0.005 <= w["s"] <= t2 + 0.005:
                     words.append(w["w"])
                     spk[seg["speaker"]] = spk.get(seg["speaker"], 0) + 1
         elif seg["start"] <= t2 and seg["end"] >= t1:
@@ -238,7 +252,7 @@ def _legacy_span(data, t1, t2):
             legacy_segments += 1
             speakers.add(seg["speaker"])
         for word in seg.get("words") or []:
-            if t1 - 0.005 <= word["s"] <= t2 + 0.005:
+            if _start(word) is not None and t1 - 0.005 <= word["s"] <= t2 + 0.005:
                 key = round(word["s"], 3)
                 if key in seen:
                     return None, None
@@ -285,8 +299,8 @@ def link(conspect_md, data, min_score=0.75, selections=None):
             for _, ci, cl in matches[:21]:
                 selected_ids = list(dict.fromkeys(t[3] for t in toks[ci:ci + cl]))
                 if None not in selected_ids and all(id_counts[wid] == 1 for wid in selected_ids):
-                    options.append({"word_ids": selected_ids, "speaker": toks[ci][1],
-                                    "t1": toks[ci][2], "t2": toks[ci + cl - 1][2]})
+                    t1, t2 = _part_times(toks[ci:ci + cl])
+                    options.append({"word_ids": selected_ids, "speaker": toks[ci][1], "t1": t1, "t2": t2})
             if len(matches) > 1:
                 candidates_report.append({"quote_index": quote_index, "quote": q, "candidates": options[:20],
                                           "truncated": len(matches) > 20})
@@ -308,7 +322,8 @@ def link(conspect_md, data, min_score=0.75, selections=None):
             if None in ids or any(id_counts[wid] != 1 for wid in ids):
                 ok = False
                 break
-            parts.append({"t1": toks[i][2], "t2": toks[i + L - 1][2], "word_ids": ids})
+            t1, t2 = _part_times(toks[i:i + L])
+            parts.append({"t1": t1, "t2": t2, "word_ids": ids})
         if not ok or not parts:
             unlinked.append(q)
             continue

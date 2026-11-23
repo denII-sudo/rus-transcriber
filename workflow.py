@@ -574,6 +574,9 @@ def _prepare_model_task(store, request, restart):
         if request["model_run_id"] is not None:
             return saved
         task = saved
+    elif request["state"] == "waiting_model" and not restart and isinstance(saved, dict):
+        # Содержание сменилось, пока задание ждало: переписать его можно только явным «начать заново».
+        raise storage.Conflict("содержание стенограммы или сомнений изменилось после выдачи задания. " + RESTART_HINT)
     else:
         task = _build_task(request, snapshots)
     with store._transaction():
