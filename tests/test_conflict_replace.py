@@ -1946,5 +1946,60 @@ class ConflictPageTests(unittest.TestCase):
         self.assertTrue("api/conflicts/all" in self.html, "страница не читает общий список конфликтов")
 
 
+
+# ---------- общий список: повторные чтения в одном построении не повторяются ----------
+class ConflictListReuseTests(ScreenCase):
+    def two_objects(self):
+        """Две свёртки, у каждой по два открытых конфликта (json и md)."""
+        for _ in range(2):
+            self.both_conspect_files()
+        items = core.list_all_conflicts()["items"]
+        self.assertEqual(len(items), 4)
+        return items
+
+    def test_program_version_is_read_once_per_object(self):
+        before = self.two_objects()
+        with mock.patch("core._program_version", wraps=core._program_version) as read:
+            items = core.list_all_conflicts()["items"]
+        self.assertEqual(read.call_count, 2)        # раньше — по разу на каждый конфликт
+        self.assertEqual(items, before)
+        self.assertTrue(all(item["status"] == "open" and item["can_replace"] for item in items))
+
+    def test_damaged_program_version_marks_every_row_of_its_object(self):
+        items = self.two_objects()
+        broken = items[0]["recording_id"]
+        original = core._program_version
+
+        def program_version(store, row):
+            if row["recording_id"] == broken:
+                raise core.CoreError("синтетически повреждена")
+            return original(store, row)
+        with mock.patch("core._program_version", side_effect=program_version) as read:
+            items = core.list_all_conflicts()["items"]
+        self.assertEqual(read.call_count, 2)
+        for item in items:
+            if item["recording_id"] == broken:
+                self.assertEqual((item["status"], item["can_replace"], item["problem"]),
+                                 ("damaged", False, "синтетически повреждена"))
+            else:
+                self.assertEqual(item["status"], "open")
+                self.assertTrue(item["can_replace"])
+
+
+class RealCaseTests(unittest.TestCase):
+    def test_case_lookup_matches_previous_rules(self):
+        listing = {Path("C:\\"): ["Data", "DATA", "Другое"], Path("C:\\Data"): ["Запись.md"]}
+        with mock.patch("os.listdir", side_effect=lambda path: listing[Path(path)]):
+            cache = {}
+            self.assertEqual(core._real_case("c:\\data\\запись.md", cache), Path("C:\\Data\\Запись.md"))
+            # точное совпадение важнее; Windows-пути равны без учёта регистра, поэтому папка та же
+            self.assertEqual(core._real_case("c:\\DATA\\запись.md", cache), Path("C:\\DATA\\Запись.md"))
+            self.assertEqual(core._real_case("c:\\нет\\файл.md", cache), Path("C:\\нет\\файл.md"))
+        self.assertEqual(core._real_case("relative\\path", {}), Path("relative\\path"))
+
+    def test_unreadable_folder_keeps_the_rest_as_is(self):
+        with mock.patch("os.listdir", side_effect=OSError("synthetic")):
+            self.assertEqual(core._real_case("c:\\data\\x.md", {}), Path("C:\\data\\x.md"))
+
 if __name__ == "__main__":
     unittest.main()
