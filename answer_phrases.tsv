@@ -1,30 +1,30 @@
 id	kind	text	note
 A001	agree	да	ID постоянный: не переиспользовать и не перенумеровывать.
-A002	agree	верно	
-A003	agree	так	
-A004	agree	правильно	
-A005	agree	все верно	
-A006	agree	всё верно	
-A007	agree	да верно	
-A008	agree	ага	
-A009	agree	угу	
-A010	agree	так и есть	
-A011	agree	как есть	
-A012	agree	да так	
-N001	negative_prefix	нет	
-N002	negative_prefix	это	
-N003	negative_prefix	я	
-N004	negative_prefix	нет-нет	
-N005	negative_intensifier	совершенно	
-N006	negative_intensifier	совсем	
-N007	negative_intensifier	абсолютно	
-N008	negative_core	неверно	
-N009	negative_core	не верно	
-N010	negative_core	неправильно	
-N011	negative_core	не правильно	
-N012	negative_core	не согласен	
-N013	negative_core	не согласна	
-N014	negative_core	не согласны	
-N015	negative_core	не согласен с этим	
-N016	negative_core	не согласна с этим	
-N017	negative_core	не согласны с этим	
+A002	agree	верно	""
+A003	agree	так	""
+A004	agree	правильно	""
+A005	agree	все верно	""
+A006	agree	всё верно	""
+A007	agree	да верно	""
+A008	agree	ага	""
+A009	agree	угу	""
+A010	agree	так и есть	""
+A011	agree	как есть	""
+A012	agree	да так	""
+N001	negative_prefix	нет	""
+N002	negative_prefix	это	""
+N003	negative_prefix	я	""
+N004	negative_prefix	нет-нет	""
+N005	negative_intensifier	совершенно	""
+N006	negative_intensifier	совсем	""
+N007	negative_intensifier	абсолютно	""
+N008	negative_core	неверно	""
+N009	negative_core	не верно	""
+N010	negative_core	неправильно	""
+N011	negative_core	не правильно	""
+N012	negative_core	не согласен	""
+N013	negative_core	не согласна	""
+N014	negative_core	не согласны	""
+N015	negative_core	не согласен с этим	""
+N016	negative_core	не согласна с этим	""
+N017	negative_core	не согласны с этим	""
