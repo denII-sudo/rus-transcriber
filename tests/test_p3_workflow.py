@@ -73,7 +73,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertEqual(workflow.get(self.store, request)["state"], "completed")
         self.assertEqual(len(self.store.list_conspects(recording)), 1)
-        workflow.prepare_model_task(self.store, request)
+        self.assertEqual(workflow.prepare_model_task(self.store, request), task)   # чтение ничего не меняет
+        self.assertEqual(workflow.get(self.store, request)["state"], "completed")
+        workflow.prepare_model_task(self.store, request, restart=True)             # новое поколение — явно
         workflow.accept_model_result(self.store, request, answer)
         self.assertEqual(self.store.list_conspects(recording)[0]["revision"], 2)
         runs = workflow.get(self.store, request)["runs"]
@@ -500,8 +502,9 @@ class WorkflowTests(unittest.TestCase):
                              "Итог блока.\n\nИтог блока.\n")
         self.assertNotIn("speaker_labels", payload)
         self.assertEqual(len(self.store.list_conspects(recording)), 1)
-        # новое поколение задания для того же запроса — уже версии 2
-        self.assertEqual(workflow.prepare_model_task(self.store, request)["version"], 2)
+        # новое поколение задания для того же запроса (явное «начать заново») — уже версии 2
+        self.assertEqual(workflow.prepare_model_task(self.store, request), legacy)
+        self.assertEqual(workflow.prepare_model_task(self.store, request, restart=True)["version"], 2)
 
     def test_conspect_file_explains_labels_and_gives_section_time(self):
         request, recording = self.ready_request(

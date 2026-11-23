@@ -324,9 +324,27 @@ def _task_turns(transcript):
                 (segment for segment in transcript.get("segments", []) if segment.get("words")), 1)]
 
 
-def prepare_model_task(store, request_id):
+RESTART_HINT = ("Начните модельный шаг заново: workflow_execute_model(restart=true) или "
+                "workflow_model_task(restart=true), в командной строке — rt.py workflow-execute --restart "
+                "или rt.py workflow-task --restart. Расшифровка не повторяется; через workflow_execute_model "
+                "текст стенограммы снова уйдёт в облако.")
+
+
+def prepare_model_task(store, request_id, *, restart=False):
+    """Задание модели. У готовой свёртки возвращает сохранённое задание и ничего не меняет.
+
+    restart=True — явная команда «начать заново»: новый модельный шаг того же запроса из ошибки,
+    готовой свёртки или ожидания; прежние блоки не используются, расшифровка не повторяется.
+    """
     request = get(store, request_id)
-    if request["state"] not in ("processed", "waiting_model", "completed"):
+    if request["state"] == "completed" and request["model_task"] is not None and not restart:
+        return request["model_task"]
+    allowed = ("processed", "waiting_model", "completed")
+    if restart and request["model_task"] is not None:
+        allowed += ("failed",)
+    if request["state"] not in allowed:
+        if request["state"] == "failed" and request["model_task"] is not None:
+            raise storage.Conflict("модельный шаг завершился с ошибкой. " + RESTART_HINT)
         raise storage.Conflict("стенограмма ещё не готова")
     snapshots = store.get_current(request["recording_id"])
     current = snapshots["transcript"]
@@ -343,7 +361,8 @@ def prepare_model_task(store, request_id):
                           "uncertain": unknown_spans or word["word_id"] in uncertain, "turn": turn})
     task = None
     saved = request["model_task"]
-    if request["state"] == "waiting_model" and isinstance(saved, dict) and "version" not in saved:
+    if (request["state"] == "waiting_model" and not restart and isinstance(saved, dict)
+            and "version" not in saved):
         # Сохранённое задание версии 1 доигрывается без изменений; иначе принятые блоки
         # (ключ — хэш задания) потеряли бы связь с ним. Новое задание — всегда версии 2.
         legacy = model_tasks.build(
@@ -361,7 +380,7 @@ def prepare_model_task(store, request_id):
         if (head is None or head["source_revision"] != current["revision"]
                 or head["review_revision"] != snapshots["review"]["revision"]):
             raise storage.Conflict("ревизия стенограммы изменилась")
-        new_generation = request["state"] in ("processed", "completed")
+        new_generation = restart or request["state"] in ("processed", "completed")
         cursor = store.db.execute("UPDATE workflow_requests SET state='waiting_model', model_task_json=?, "
                                   "model_result_json=NULL, model_attempts=CASE WHEN ? THEN 0 ELSE model_attempts END, "
                                   "updated_at=? WHERE request_id=? AND state=?",
@@ -509,9 +528,51 @@ def _speaker_anchors(transcript):
     return [{"label": label, "word_ids": ids} for label, ids in anchors.items()]
 
 
+def _workflow_conspect_id(request):
+    return str(uuid.uuid5(uuid.UUID(request["recording_id"]), "conspect:workflow-" + request["request_id"]))
+
+
+def _conspect_files(store, ident):
+    """Записанные файлы свёртки и их подтверждённые суммы; общая основа двух сверок ниже."""
+    return store.db.execute("SELECT f.relative_path, f.confirmed_hash, f.confirmed_revision, r.path "
+                            "FROM conspect_file_locations f "
+                            "JOIN allowed_roots r USING(root_id) WHERE f.conspect_id=?", (ident,)).fetchall()
+
+
+def conspect_file_problem(store, request):
+    """Почему файлы свёртки запроса нельзя перезаписать, или None. Только чтение.
+
+    Та же сверка, что после записи: файл на месте отличается от подтверждённой суммы или по нему
+    открыт конфликт. Пропавший файл программа создаст заново — это не помеха. Проверка до вызова
+    облака не исключает правку в редакторе между ней и записью (известное ограничение).
+    """
+    import documents
+    if not request["recording_id"]:
+        return None
+    ident = _workflow_conspect_id(request)
+    opened = store.db.execute("SELECT relative_path FROM conspect_conflicts WHERE conspect_id=? "
+                              "AND resolution_operation_id IS NULL ORDER BY rowid", (ident,)).fetchone()
+    if opened is not None:
+        return (f"по файлу свёртки {opened['relative_path']} открыт конфликт с правкой вне программы. "
+                "Решите его на экране программы (rt.py screen), затем повторите.")
+    for item in _conspect_files(store, ident):
+        if item["confirmed_hash"] is None:
+            continue
+        try:
+            path, exists = documents._read_only_target(Path(item["path"]), item["relative_path"])
+            if exists and documents._file_digest(path)[0] != item["confirmed_hash"]:
+                return (f"файл свёртки {item['relative_path']} изменён вне программы; новая свёртка "
+                        "перезаписала бы правку. Верните прежний текст или сохраните свою версию под другим "
+                        "именем, затем повторите.")
+        except (OSError, ValueError):
+            return (f"файл свёртки {item['relative_path']} сейчас нельзя прочитать: он занят другой "
+                    "программой или недоступен. Освободите его и повторите.")
+    return None
+
+
 def _ensure_conspect_materialized(store, request):
     import documents
-    ident = str(uuid.uuid5(uuid.UUID(request["recording_id"]), "conspect:workflow-" + request["request_id"]))
+    ident = _workflow_conspect_id(request)
     row = store.db.execute("SELECT current_revision FROM conspects WHERE conspect_id=?", (ident,)).fetchone()
     if row is None:
         raise storage.StorageError("сохранённый конспект отсутствует")
@@ -520,9 +581,7 @@ def _ensure_conspect_materialized(store, request):
         return
     state = store.db.execute("SELECT state FROM conspect_outbox WHERE conspect_id=? AND revision=?",
                              (ident, row["current_revision"])).fetchone()
-    files = store.db.execute("SELECT f.relative_path, f.confirmed_hash, f.confirmed_revision, r.path "
-                             "FROM conspect_file_locations f "
-                             "JOIN allowed_roots r USING(root_id) WHERE f.conspect_id=?", (ident,)).fetchall()
+    files = _conspect_files(store, ident)
     if state and state["state"] == "synced" and len(files) == 2:
         try:
             for item in files:
@@ -543,6 +602,8 @@ def model_part(store, request_id, part_index):
         raise ValueError("неверный номер блока")
     request = get(store, request_id)
     if request["state"] not in ("processed", "waiting_model"):
+        if request["state"] == "failed" and request["model_task"] is not None:
+            raise storage.Conflict("модельный шаг завершился с ошибкой. " + RESTART_HINT)
         raise storage.Conflict("нет ожидающего модельного задания")
     task = prepare_model_task(store, request_id)
     bounds = _part_bounds(task)
@@ -593,11 +654,24 @@ def accept_model_part(store, request_id, part_index, result):
                                 (request_id, task_hash)).fetchall()
     if len(rows) != total:
         return {"part_index": part_index, "received": len(rows), "part_count": total, "state": "waiting_model"}
-    sections = [section for row in rows for section in storage._loads(row["result_json"])["sections"]]
-    accepted = accept_model_result(store, request_id, {"source_revision": task["source_revision"],
-                                                        "sections": sections})
+    accepted = _assemble_parts(store, request_id, task, task_hash)
     return {"part_index": part_index, "received": total, "part_count": total,
             "state": "completed", "result": accepted}
+
+
+def saved_part_count(store, *, request_id, task_hash):
+    """Сколько блоков этого задания и шага сохранено."""
+    return store.db.execute("SELECT COUNT(*) FROM workflow_model_parts WHERE request_id=? AND task_hash=?",
+                            (request_id, task_hash)).fetchone()[0]
+
+
+def _assemble_parts(store, request_id, task, task_hash):
+    """Итог из всех сохранённых блоков; облако не вызывается."""
+    rows = store.db.execute("SELECT result_json FROM workflow_model_parts WHERE request_id=? AND task_hash=? "
+                            "ORDER BY part_index", (request_id, task_hash)).fetchall()
+    sections = [section for row in rows for section in storage._loads(row["result_json"])["sections"]]
+    return accept_model_result(store, request_id, {"source_revision": task["source_revision"],
+                                                    "sections": sections})
 
 
 def _validate_model_part(store, request_id, part_index, result, before=None):
@@ -657,11 +731,12 @@ def _resume_model_run(store, request):
     if request["state"] != "failed" or not request["model_task"]:
         raise storage.Conflict("нет завершившегося с ошибкой модельного задания для продолжения")
     if request["model_task"]["goal"] != request["policy"]["goal"]:
-        raise storage.Conflict("цель изменилась; продолжение старого модельного задания запрещено")
+        raise storage.Conflict("цель изменилась; продолжение старого модельного задания запрещено. " + RESTART_HINT)
     current = store.get_current(request["recording_id"])
     if (current["transcript"]["revision"] != request["model_task"]["source_revision"]
             or current["review"]["revision"] != request["model_task"]["review_revision"]):
-        raise storage.Conflict("ревизии изменились; подготовьте новое модельное задание")
+        raise storage.Conflict("стенограмма или разбор изменились; продолжить прежний модельный шаг нельзя. "
+                               + RESTART_HINT)
     with store._transaction():
         store.current_identity()
         now = storage._now()
@@ -674,30 +749,84 @@ def _resume_model_run(store, request):
                          "WHERE run_id=? AND state='failed'", (now, request["model_run_id"]))
 
 
-def execute_model(store, request_id, *, retry_failed=False):
-    """Автономно выполнить все ещё не сохранённые блоки одним ограниченным OpenCode provider."""
+def _completed_result(store, request):
+    """Ответ «готово» — только когда итог сохранён в базе и файлы свёртки записаны."""
     import llm_provider
+    try:
+        _ensure_conspect_materialized(store, request)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        raise llm_provider.ProviderError(
+            "files_not_written",
+            "свёртка сохранена в базе, но её файлы не записаны: файл изменён вне программы, занят или "
+            "недоступен. Решите конфликт на экране программы (rt.py screen) или освободите файл и повторите "
+            "workflow_execute_model — в облако повторно ничего не уйдёт.") from ex
+    total = len(_part_bounds(request["model_task"]))
+    return {"request_id": request["request_id"], "state": "completed",
+            "model": f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}",
+            "part_count": total, "completed_parts": total}
+
+
+def _limit_problem(request, words):
+    import llm_provider
+    if words == 0:
+        return "в стенограмме нет слов: свёртку делать не из чего. В облако ничего не отправлено."
+    if words <= llm_provider.MAX_WORDS:
+        return None
+    exits = ("свёртку блоками по 500 слов может сделать ИИ-агент без облака (workflow_model_part и "
+             "workflow_model_part_result); или снимите заказ конспекта (workflow_change_policy с "
+             "require_conspect=false), стенограмма останется.")
+    if request["state"] == "failed":
+        exits = "сначала начните шаг заново для ИИ-агента: workflow_model_task(restart=true); затем " + exits
+    return (f"задание длиннее предела облачного исполнителя ({llm_provider.MAX_WORDS} слов): {words} слов. "
+            "В облако ничего не отправлено, состояние запроса не изменилось. Выходы: " + exits)
+
+
+def execute_model(store, request_id, *, retry_failed=False, restart=False):
+    """Автономно выполнить все ещё не сохранённые блоки одним ограниченным OpenCode provider.
+
+    Повтор у готовой свёртки облако не вызывает: дописывает файлы или честно говорит, почему не может.
+    Все блоки сохранены — повтор собирает итог без облака. restart — явное «начать заново».
+    Предел размера и файл свёртки проверяются до любого изменения состояния и до вызова облака.
+    """
+    import llm_provider
+    if retry_failed and restart:
+        raise ValueError("retry_failed и restart вместе не допускаются: продолжить или начать заново — что-то одно")
     request = get(store, request_id)
     if not request["policy"]["require_conspect"]:
         raise storage.Conflict("для запроса не заказан конспект")
     if not request["policy"]["allow_cloud_model"]:
         raise storage.Conflict("облачный модельный исполнитель запрещён политикой запроса")
-    if request["state"] == "processed":
-        task = prepare_model_task(store, request_id)
+    state = request["state"]
+    if state == "completed" and request["model_task"] is not None and not restart:
+        return _completed_result(store, request)
+    if restart or state == "processed":
+        if not request["recording_id"] or (state == "failed" and request["model_task"] is None):
+            raise storage.Conflict("модельное задание ещё не готово к исполнению")
+        words = sum(len(segment.get("words", [])) for segment in
+                    store.get_current(request["recording_id"])["transcript"]["payload"].get("segments", []))
+    elif state == "waiting_model" or (state == "failed" and retry_failed):
+        words = len(request["model_task"]["words"])
+    elif state == "failed" and request["model_task"] is not None:
+        raise storage.Conflict("модельный шаг завершился с ошибкой: продолжите его (retry_failed=true) или "
+                               "начните заново. " + RESTART_HINT)
+    else:
+        raise storage.Conflict("модельное задание ещё не готово к исполнению")
+    problem = _limit_problem(request, words)
+    if problem:
+        raise llm_provider.ProviderError("limit", problem)
+    problem = conspect_file_problem(store, request)
+    if problem:
+        raise llm_provider.ProviderError("conspect_file_changed", problem + " В облако ничего не отправлено.")
+    if restart or state == "processed":
+        task = prepare_model_task(store, request_id, restart=restart)
         request = get(store, request_id)
-    elif request["state"] == "failed" and retry_failed:
+    elif state == "failed":
         _resume_model_run(store, request)
         request = get(store, request_id)
         task = request["model_task"]
-    elif request["state"] == "waiting_model":
-        task = request["model_task"]
     else:
-        raise storage.Conflict("модельное задание ещё не готово к исполнению")
+        task = request["model_task"]
     total = len(_part_bounds(task))
-    if not task["words"] or len(task["words"]) > llm_provider.MAX_WORDS:
-        message = f"задание превышает лимит исполнителя ({llm_provider.MAX_WORDS} слов)"
-        _fail_model_run(store, request_id, "limit", message)
-        raise llm_provider.ProviderError("limit", message)
     task_hash = storage._hash({"task": task, "run_id": request["model_run_id"]})
     completed = {row["part_index"] for row in store.db.execute(
         "SELECT part_index FROM workflow_model_parts WHERE request_id=? AND task_hash=?",
@@ -724,20 +853,31 @@ def execute_model(store, request_id, *, retry_failed=False):
                         continue
                     accept_model_part(store, request_id, part_index, result)
                     break
+        if (get(store, request_id)["state"] == "waiting_model"
+                and saved_part_count(store, request_id=request_id, task_hash=task_hash) == total):
+            _assemble_parts(store, request_id, task, task_hash)     # блоки сохранены раньше, итога не было
     except llm_provider.ProviderError as ex:
         _fail_model_run(store, request_id, ex.code, str(ex), invalid_count=invalid_count)
         raise
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
-        if get(store, request_id)["state"] == "completed":
-            return {"request_id": request_id, "state": "completed",
-                    "model": f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}",
-                    "part_count": total, "completed_parts": total}
-        message = "модельный шаг остановлен; сохранённые блоки оставлены без изменений"
-        _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count)
-        raise llm_provider.ProviderError("internal_error", message) from ex
-    return {"request_id": request_id, "state": get(store, request_id)["state"],
-            "model": f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}",
-            "part_count": total, "completed_parts": total}
+        after = get(store, request_id)
+        if after["state"] == "completed":
+            return _completed_result(store, after)
+        if isinstance(ex, storage.Conflict):
+            code = "revision_changed"
+            message = ("стенограмма или разбор изменились, пока модель отвечала (например, показ карточки или "
+                       "сохранённый ответ); сохранённые блоки устарели. " + RESTART_HINT)
+        else:
+            code, message = "internal_error", "модельный шаг остановлен; сохранённые блоки оставлены без изменений"
+        _fail_model_run(store, request_id, code, message, invalid_count=invalid_count)
+        raise llm_provider.ProviderError(code, message) from ex
+    after = get(store, request_id)
+    if after["state"] == "completed":
+        return _completed_result(store, after)
+    saved = saved_part_count(store, request_id=request_id, task_hash=task_hash)
+    message = f"модельный шаг не завершён: сохранено блоков {saved} из {total}"
+    _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count)
+    raise llm_provider.ProviderError("internal_error", message)
 
 
 def _accept_model_result(store, request_id, result):

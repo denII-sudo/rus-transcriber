@@ -474,14 +474,17 @@ def workflow_status(request_id):
         store.close()
 
 
-def workflow_model_task(request_id, offset=0, limit=1000):
+def workflow_model_task(request_id, offset=0, limit=1000, *, restart=False):
+    """Страница задания модели. restart — явное «начать заново», только с первой страницы."""
     import recordings
     import workflow
     if (type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000):
         raise ValueError("неверные границы страницы")
+    if restart and offset != 0:
+        raise ValueError("начать заново можно только с первой страницы (offset=0)")
     store = recordings.open_store()
     try:
-        task = workflow.prepare_model_task(store, request_id)
+        task = workflow.prepare_model_task(store, request_id, restart=restart)
         total = len(task["words"])
         page = {**task, "words": task["words"][offset:offset + limit], "offset": offset,
                 "total_words": total, "next_offset": offset + limit if offset + limit < total else None}
@@ -523,12 +526,12 @@ def workflow_model_part_result(request_id, part_index, result):
         store.close()
 
 
-def workflow_execute_model(request_id, *, retry_failed=False):
+def workflow_execute_model(request_id, *, retry_failed=False, restart=False):
     import recordings
     import workflow
     store = recordings.open_store()
     try:
-        return workflow.execute_model(store, request_id, retry_failed=retry_failed)
+        return workflow.execute_model(store, request_id, retry_failed=retry_failed, restart=restart)
     finally:
         store.close()
 
