@@ -843,11 +843,15 @@ def _real_case(path, cache):
     for number, part in enumerate(parts[1:]):
         if current not in cache:
             try:
-                cache[current] = os.listdir(current)
+                names = os.listdir(current)
             except OSError:
-                cache[current] = []
-        names = cache[current]
-        found = part if part in names else next((n for n in names if n.casefold() == part.casefold()), None)
+                names = []
+            folded = {}
+            for name in names:              # при нескольких совпадениях — первое, как раньше при переборе
+                folded.setdefault(name.casefold(), name)
+            cache[current] = (set(names), folded)
+        exact, folded = cache[current]
+        found = part if part in exact else folded.get(part.casefold())
         if found is None:
             shown.extend(parts[1 + number:])
             break
@@ -969,8 +973,33 @@ def _missing_text(row, then):
             f"«{_copy_name(row)}»), переименуйте её в «{name}» и положите в папку {folder}, {then}")
 
 
+def _same_object(row, rows, cache):
+    """Конфликты того же объекта; rows группируются один раз на построение списка."""
+    key = ("same_object", row["object"])
+    if key not in cache:
+        for other in rows:
+            cache.setdefault(("same_object", other["object"]), []).append(other)
+    return cache[key]
+
+
+def _listed_program_version(store, row, cache):
+    """Версия программы для списка: читается один раз на объект; ошибка запоминается так же, как успех.
+    Замена файла и запись по-прежнему читают версию заново (_program_version)."""
+    key = ("program", row["object"])
+    if key not in cache:
+        try:
+            cache[key] = (_program_version(store, row), None)
+        except CoreError as ex:
+            cache[key] = (None, ex)
+    found, error = cache[key]
+    if error is not None:
+        raise error
+    return found
+
+
 def _conflict_item(store, row, rows, cache):
-    """Строка общего списка; rows — все конфликты той же области. Повреждённая строка не роняет список."""
+    """Строка общего списка; rows — все конфликты той же области. Повреждённая строка не роняет список.
+    cache живёт одно построение списка: в нём регистр путей, группы объектов и версии программы."""
     import documents
     import storage
     item = {"conflict_id": row["conflict_id"], "scope": row["scope"], "recording_id": row["recording_id"],
@@ -980,14 +1009,14 @@ def _conflict_item(store, row, rows, cache):
             "can_replace": False, "can_retry": False, "problem": None,
             "copy_problem": None, "next_effect": None, "next_step": None}
     try:
-        same_object = [other for other in rows if other["object"] == row["object"]]
+        same_object = _same_object(row, rows, cache)
         status = "resolved" if row["resolved"] else "open"
         last_of_file = row["seq"] == max(other["seq"] for other in same_object
                                          if other["relative_path"] == row["relative_path"])
         if not row["resolved"] and not row["kind"].startswith("archive_"):
-            _program_version(store, row)    # версия программы повреждена — строка «повреждена», замена выключена
+            _listed_program_version(store, row, cache)    # повреждена — строка «повреждена», замена выключена
         if row["resolved"] and last_of_file and _queue_unfinished(store, row):
-            program = _program_version(store, row)[1].get(row["kind"])
+            program = _listed_program_version(store, row, cache)[1].get(row["kind"])
             if program is not None and _file_at(store, row, row["relative_path"])[1] != documents._digest(program):
                 status = "not_written"
         item.update(status=status,
