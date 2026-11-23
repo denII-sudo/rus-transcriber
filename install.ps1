@@ -741,7 +741,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 Step "4/10" "Копирование файлов программы"
 if ($Source -ne $Target) {
     foreach ($f in @("server.py", "worker.py", "bench.py", "runinfo.py", "buildinfo.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
-                     "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hotspots.py", "quotes.py", "conspect.py",
+                     "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hypotheses.py", "hotspots.py", "quotes.py", "conspect.py",
                      "review_pack.py", "freeform.py", "answer_phrases.tsv", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
     }
@@ -1017,6 +1017,9 @@ if ($SkipSelfCheck) {
         $selfCheckOk = [bool]$sc.ok
         $t = $sc.tests
         $line = "  {0}: тестов {1}, падений {2}, ошибок {3}, пропусков {4}" -f $sc.summary, $t.ran, $t.failures, $t.errors, $t.skipped
+        # Ожидаемые падения (@unittest.expectedFailure) — известные ограничения, не падения; показываются отдельно
+        if ([int]$t.expected_failures -gt 0) { $line += ", ожидаемых падений {0}" -f $t.expected_failures }
+        if ([int]$t.unexpected_successes -gt 0) { $line += ", неожиданных успехов {0} (имена — запуск тестов с -v)" -f $t.unexpected_successes }
         if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
         foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
         if ($sc.check_repo -and $sc.check_repo.partial) { Write-Host "  проверка файлов частичная: $($sc.check_repo.note)" -ForegroundColor DarkGray }

@@ -62,6 +62,13 @@ def _words_module():
     return words
 
 
+def _hyps(text):
+    """Гипотезы пары: запись hyp-2 или прежняя lab-hyp-1 (верхние ключи у них одни); чужая — пустая."""
+    _words_module()                       # путь к программе в sys.path
+    import hypotheses
+    return hypotheses.read(_loads(text, {})) if text else {}
+
+
 def _loads(text, default=None):
     try:
         return json.loads(text) if text else default
@@ -126,7 +133,7 @@ def load_pairs(db):
             "pair_id": r["pair_id"], "unit_id": r["unit_id"], "config_id": cid,
             "config_sha256": r["config_sha256"], "diarization_sha256": r["diarization_sha256"],
             "metrics": metrics, "result": _loads(r["result_json"], {}) or {},
-            "hyps": _loads(r["hypotheses_json"], {}) or {}, "effective": conf.get("effective") or {},
+            "hyps": _hyps(r["hypotheses_json"]), "effective": conf.get("effective") or {},
             "roles": conf.get("roles") or {},
             "hours": (_num(metrics.get("duration_sec")) or 0) / 3600.0}
     errors = {k: v for k, v in errors.items() if k not in pairs}

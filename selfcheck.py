@@ -24,13 +24,21 @@ MORPH_EXPECT = ["Quartzline", "Москва"]
 
 
 def parse_unittest(text):
-    """Итог unittest из его вывода: число тестов, падения, ошибки, пропуски, имена упавших."""
+    """Итог unittest из его вывода: число тестов, падения, ошибки, пропуски, имена упавших.
+
+    expected_failures — тесты с @unittest.expectedFailure (записанные известные ограничения),
+    они не падения; unexpected_successes — такой тест вдруг прошёл (unittest считает это неуспехом,
+    имён в обычном выводе не печатает: их показывает запуск тестов с -v).
+    """
     ran = re.search(r"Ran (\d+) tests? in ([\d.]+)s", text)
     res = {"ran": int(ran.group(1)) if ran else 0, "seconds": float(ran.group(2)) if ran else None,
-           "ok": bool(re.search(r"^OK\b", text, re.M)), "failures": 0, "errors": 0, "skipped": 0}
+           "ok": bool(re.search(r"^OK\b", text, re.M)), "failures": 0, "errors": 0, "skipped": 0,
+           "expected_failures": 0, "unexpected_successes": 0}
     m = re.search(r"^(?:OK|FAILED) \(([^)]*)\)", text, re.M)
     if m:
-        for k, v in re.findall(r"(\w+)=(\d+)", m.group(1)):
+        # Название поля — целиком, с пробелами: «expected failures=2» не должно попасть в failures
+        for k, v in re.findall(r"([a-z][a-z ]*)=(\d+)", m.group(1)):
+            k = k.strip().replace(" ", "_")
             if k in res:
                 res[k] = int(v)
     failed = []

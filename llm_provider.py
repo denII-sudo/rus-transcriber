@@ -1,6 +1,7 @@
 """Ограниченный генератор конспекта через OpenCode Generate API и OpenAI."""
 
 import base64
+import http.client
 import json
 import os
 import re
@@ -29,9 +30,95 @@ STARTUP_TIMEOUT_SEC = 20
 class ProviderError(RuntimeError):
     """Безопасная для показа ошибка без текста запроса, ответа или credentials."""
 
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, http_status=None, detail=None):
         super().__init__(message)
         self.code = code
+        self.http_status = http_status      # HTTP-код ответа OpenCode, если ошибка пришла ответом сервера
+        self.detail = detail or {}          # причина отказа из тела ответа OpenCode (см. _opencode_error_detail)
+
+
+# Причина отказа OpenCode в сообщении — одно правило с параметрами (аудит №130):
+# - вид ошибки (`_tag`) показывается всегда, если это строгий идентификатор;
+# - поля схемы — только для пар «вид + HTTP-код» из _DESCRIBED_ERRORS: по схеме OpenCode 2.4 их тело говорит
+#   лишь о провайдере, модели, месте и доступе. При другой паре (502, 503, 400, чужой код) — только вид:
+#   текст может пересказывать запрос или ответ OpenAI;
+# - providerID, modelID, capability — только строгий набор знаков (_ID_RE) и не похожие на ключ, иначе поле
+#   отбрасывается целиком; к ним применяются и шаблоны _SCRUB (путь вида C:/… тоже состоит из этих знаков);
+# - message — без путей, токенов, паролей и похожего на ключи (заменяются на «‹скрыто›»), не длиннее
+#   _MAX_DETAIL_CHARS. Исключение: message с не-ASCII знаками отбрасывается целиком — тексты OpenCode английские,
+#   стенограмма русская, так пересказ стенограммы не выходит наружу; в сообщении остаётся пометка, что текст был.
+_DESCRIBED_ERRORS = {("ProviderNotFoundError", 404), ("ModelNotFoundError", 404), ("LocationNotFoundError", 404),
+                     ("UnsupportedModelError", 422), ("UnauthorizedError", 401)}
+_ID_FIELDS = ("providerID", "modelID", "capability")
+_TAG_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
+_MAX_ERROR_BODY = 64_000
+_MAX_DETAIL_CHARS = 160
+_HIDDEN = "‹скрыто›"
+_MESSAGE_HIDDEN = "сообщение OpenCode скрыто (не прошло проверку)"
+_KEY_LIKE = re.compile(r"(?i)\b(?:sk|hf|ghp|gho|ghs|github_pat|xox[abpr])[-_][A-Za-z0-9_-]{6,}"
+                       r"|[A-Za-z0-9+_=]{24,}")
+_SCRUB = (
+    re.compile(r"(?i)\b(?:bearer|basic)\s+\S+"),
+    re.compile(r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key|authorization)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\bfile:/+\S*"),
+    re.compile(r"(?<![\w])[A-Za-z]:[\\/]\S*"),        # C:\… и C:/…
+    re.compile(r"\\\\\S+"),                              # \\сервер\…
+    re.compile(r"(?<![\w.:/-])~?/(?:[^\s/]+/)+[^\s/]*"),  # /home/…/…, ~/…/…
+    _KEY_LIKE,
+)
+
+
+def _clean(value):
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
+
+
+def _scrub_message(text):
+    for pattern in _SCRUB:
+        text = pattern.sub(_HIDDEN, text)
+    return text[:_MAX_DETAIL_CHARS]
+
+
+def _opencode_error_detail(body, status=None):
+    """Причина отказа из тела ошибки OpenCode по правилу выше; любой сбой разбора — пустой словарь.
+
+    Без тела запроса и без чужих полей. Нераспознанное тело даёт пустой словарь — сообщение тогда прежнее.
+    """
+    try:
+        data = json.loads(body.decode("utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("error"), dict):
+            data = data["error"]
+        if not isinstance(data, dict):
+            return {}
+        tag = data.get("_tag")
+        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            return {}
+        detail = {"tag": tag}
+        if (tag, status) not in _DESCRIBED_ERRORS:
+            return detail
+        for field in _ID_FIELDS:
+            value = data.get(field)
+            if isinstance(value, str) and _ID_RE.fullmatch(value) and not any(p.search(value) for p in _SCRUB):
+                detail[field] = value
+        message = data.get("message")
+        if isinstance(message, str) and _clean(message):
+            if _clean(message).isascii():
+                detail["message"] = _scrub_message(_clean(message))
+            else:
+                detail["message_hidden"] = True
+        return detail
+    except Exception:        # RecursionError, MemoryError и любые другие: причина неизвестна, отказ прежний
+        return {}
+
+
+def _describe_detail(detail):
+    if not detail:
+        return ""
+    parts = [detail["tag"]] + [f"{field}={detail[field]}" for field in _ID_FIELDS if field in detail]
+    text = "; ответ OpenCode: " + ", ".join(parts)
+    if "message" in detail:
+        return text + f" — {detail['message']}"
+    return text + (f" — {_MESSAGE_HIDDEN}" if detail.get("message_hidden") else "")
 
 
 def _opencode_executable():
@@ -211,6 +298,11 @@ class OpenCodeTextClient:
                 return self._start(executable)
             except _PortTaken as ex:
                 last = ex          # порт занял чужой процесс — пароль ему не отправлен, берём новый порт
+            except BaseException:
+                # Любое исключение запуска, не только ProviderError (например, сбой разбора ответа
+                # или прерывание): запущенный OpenCode не остаётся висеть. close() повторно безопасен.
+                self.close()
+                raise
         raise ProviderError("unavailable", "OpenCode API не удалось запустить на свободном локальном порту") from last
 
     def _start(self, executable):
@@ -236,7 +328,7 @@ class OpenCodeTextClient:
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         self.auth = "Basic " + token
         deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
-        verified = False
+        verified = version_checked = False
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.close()
@@ -257,18 +349,44 @@ class OpenCodeTextClient:
                         raise _PortTaken()
                 verified = True
             try:
-                info = self._request("/api/info", None, timeout=1)
-                if not isinstance(info, dict) or not str(info.get("version", "")).startswith("2."):
-                    self.close()
-                    raise ProviderError("unsupported_version", "исполнителю требуется OpenCode V2")
-                return self
+                if not version_checked:
+                    info = self._request("/api/info", None, timeout=1)
+                    if not isinstance(info, dict) or not str(info.get("version", "")).startswith("2."):
+                        self.close()
+                        raise ProviderError("unsupported_version", "исполнителю требуется OpenCode V2")
+                    version_checked = True
+                # OpenCode 2.4 отвечает на /api/info раньше, чем загрузит список моделей; запрос
+                # в этот промежуток получает «модель не найдена». Текст уходит только после появления модели.
+                if self._model_listed():
+                    return self
             except ProviderError as ex:
                 if ex.code not in ("offline", "timeout"):
                     self.close()
                     raise
-                time.sleep(0.1)
+            time.sleep(0.1)
         self.close()
+        if version_checked:
+            raise ProviderError("model_unavailable",
+                                f"OpenCode не показал модель {PROVIDER_ID}/{MODEL_ID} за {STARTUP_TIMEOUT_SEC} с: "
+                                "проверьте вход в OpenAI в OpenCode. В этой попытке текст в облако не отправлялся")
         raise ProviderError("unavailable", "OpenCode API не запустился за отведённое время")
+
+    def _model_listed(self):
+        """Есть ли нужная модель в списке OpenCode.
+
+        Исключение: HTTP 404 на сам список означает, что у этой версии OpenCode 2.x маршрута нет, —
+        тогда не ждать, как раньше. Другие ошибки (в том числе 422) — отказ до отправки текста.
+        """
+        try:
+            listed = self._request("/api/model", None, timeout=1)
+        except ProviderError as ex:
+            if ex.http_status == 404:
+                return True
+            raise
+        models = listed.get("data") if isinstance(listed, dict) else None
+        return isinstance(models, list) and any(
+            isinstance(model, dict) and model.get("providerID") == PROVIDER_ID and model.get("id") == MODEL_ID
+            for model in models)
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -314,10 +432,18 @@ class OpenCodeTextClient:
                 "offline": "OpenCode или OpenAI временно недоступен",
                 "provider_error": f"ошибка OpenCode/OpenAI (HTTP {ex.code})",
             }[code]
-            raise ProviderError(code, message) from None
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
+            try:
+                body = ex.read(_MAX_ERROR_BODY + 1)
+            except Exception:       # IncompleteRead, обрыв, отсутствие тела — причина неизвестна, отказ прежний
+                body = b""
+            if not isinstance(body, bytes) or len(body) > _MAX_ERROR_BODY:
+                body = b""
+            detail = _opencode_error_detail(body, ex.code) if body else {}
+            raise ProviderError(code, message + _describe_detail(detail), http_status=ex.code,
+                                detail=detail) from None
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException):
             raise ProviderError("offline", "не удалось связаться с OpenCode/OpenAI") from None
-        except (UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError, RecursionError):      # RecursionError — слишком глубокий JSON
             raise ProviderError("invalid_response", "OpenCode вернул некорректный JSON") from None
 
     def generate(self, task, *, repair_error=None, invalid_output=None):

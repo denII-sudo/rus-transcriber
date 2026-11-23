@@ -671,6 +671,13 @@ class CaptureWithRealPipeline(unittest.TestCase):
         self.assertEqual([c["raw_text"] for c in hyps["third"]["chunks"]], ["три три", "три три"])
         self.assertEqual(hyps["vote"]["function"], "vote3")
         self.assertEqual(hyps["vote"]["third_words"], ["три", "три", "три", "три"])
+        import hypotheses            # общий сборщик программы: запись hyp-2, верхние ключи lab-hyp-1 те же
+        self.assertEqual(hyps["schema"], lab_run.HYP_SCHEMA)
+        self.assertEqual(hypotheses.check(hyps), [])
+        self.assertEqual([b["role"] for b in hyps["roles"]], ["primary", "second", "third"])
+        self.assertEqual(hyps["roles"][1]["words"], hyps["second"]["words"])
+        self.assertTrue(hypotheses.is_missing(hyps["roles"][2]["word_times"]))
+        self.assertEqual(hypotheses.read(json.loads(json.dumps(hyps)))["roles"][0]["role"], "primary")
         self.assertEqual([c["actual"] for c in calls], ["fake-primary", "fake-second"])
         self.assertIn("asr_sec", timing)
         self.assertIn("asr3_sec", timing)

@@ -338,62 +338,179 @@ def _fit_times(out):
         prev = w["s"]
 
 
-def vote3(main, ctc, whisper):
-    """Голосование «два из трёх»: основная модель (main, со временами; по умолчанию GigaAM RNN-T),
-    вторая (ctc, со временами; по умолчанию GigaAM CTC) и третья (whisper, только текст; по умолчанию
-    Whisper). Имена параметров прежние: на них опираются лаборатория и тесты.
+# Правило сведения «два из трёх»: keep — сколько моделей, считая основную, должны поддержать её слово,
+# чтобы оно осталось; replace — сколько других моделей должны совпасть, чтобы заменить или вставить слова.
+TWO_OF_THREE = {"keep": 2, "replace": 2}
+# Пометки слов по ролям гипотез: для второй и третьей модели — прежние (их читают стенограммы, карточки
+# и лаборатория); у дополнительных ролей (четвёртая и следующие модели) — по имени роли.
+_VOTED_LABEL = {"second": "ctc", "whisper": "whisper"}
+_ALT_FIELD = {"second": "alt", "whisper": "alt_whisper"}
+# Занятые поля слова с приставкой alt_: имя дополнительной роли не должно давать такое поле.
+_RESERVED_ALT_FIELDS = {"alt_span", "alt_ins", "alt_place"}
 
-    Слово основной модели принимается, если с ним согласна хотя бы одна из двух других. Если обе другие
-    согласны между собой и против основной — берётся их вариант (слова и времена второй модели),
-    помечается voted. Слова, которые слышат обе другие модели, а основная нет, вставляются (времена
-    второй модели). Время такого слова держится между соседними словами основной (_fit_times).
-    Где разошлись все три — метка asr и оба варианта (alt — вторая модель, alt_whisper — третья).
-    Изменяет main на месте. -> статистика."""
+
+def check_role(role):
+    """Имя дополнительной роли: непустая строка без «+», из которой поле alt_<роль> не совпадает с занятым
+    полем слова (alt_span — длина спорного отрезка, alt_ins, alt_place) и которая не совпадает со штатной
+    ролью (primary, second, whisper) или подписью voted (ctc): иначе подпись голосования, например
+    «ctc+ctc», нельзя отличить от штатной. -> role или ValueError."""
+    if (not isinstance(role, str) or not role or "+" in role or "alt_" + role in _RESERVED_ALT_FIELDS
+            or role in ("primary", "second", "whisper") or role in _VOTED_LABEL.values()):
+        raise ValueError(f"имя роли модели {role!r} не подходит: пусто, с «+», совпадает со штатной ролью "
+                         f"или подписью либо даёт занятое поле alt_<роль>")
+    return role
+
+
+def check_rule(rule, models):
+    """Проверка правила сведения для models моделей (вместе с основной). -> rule или ValueError."""
+    if not isinstance(rule, dict) or set(rule) != {"keep", "replace"}:
+        raise ValueError(f"правило сведения — словарь с ключами keep и replace, получено {rule!r}")
+    for key, hi in (("keep", models), ("replace", models - 1)):
+        v = rule[key]
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= hi:
+            raise ValueError(f"правило сведения: {key} — целое от 1 до {hi} при {models} моделях, получено {v!r}")
+    return rule
+
+
+def _is_timed(ws):
+    """Гипотеза со временами слов (словари) или только текст (строки)."""
+    if all(isinstance(x, dict) for x in ws):
+        return True
+    if all(isinstance(x, str) for x in ws):
+        return False
+    raise ValueError("гипотеза — либо слова со временами (словари), либо только текст (строки)")
+
+
+def _winner(cands, need, need_text):
+    """Вариант, который поддержали не меньше need других моделей и у которого есть времена слов.
+
+    cands — [(гипотеза, (j1, j2), текст)] в порядке ролей. Варианты группируются по тексту;
+    берётся самая большая группа, при равенстве — первая по порядку ролей; слова и времена — у первой
+    гипотезы группы со временами. need_text — пустой текст вариантом не считается.
+    -> (гипотеза, (j1, j2), подпись voted, роли группы) или None."""
+    groups = {}
+    for h, js, txt in cands:
+        if txt or not need_text:
+            groups.setdefault(txt, []).append((h, js))
+    best = None
+    for members in groups.values():
+        timed = [m for m in members if m[0]["timed"]]
+        if len(members) >= need and timed and (best is None or len(members) > len(best[0])):
+            best = (members, timed[0])
+    if best is None:
+        return None
+    members, (h, js) = best
+    return (h, js, "+".join(_VOTED_LABEL.get(m[0]["role"], m[0]["role"]) for m in members),
+            [m[0]["role"] for m in members])
+
+
+def vote_n(main, others, rule, trace=None):
+    """Голосование любого числа моделей: основная (main, слова со временами) против других.
+
+    others — [(роль, гипотеза)] по порядку: гипотеза — слова со временами (словари) или только текст
+    (строки). rule — {"keep", "replace"} (check_rule); TWO_OF_THREE при второй и третьей модели — это
+    прежнее vote3, результат совпадает байт в байт.
+
+    Слово основной модели остаётся, если его поддержали не меньше keep моделей, считая её саму.
+    Остальные подряд идущие слова — спорный отрезок: если не меньше replace других моделей дали
+    одинаковый вариант и среди них есть модель со временами, берутся её слова (voted — роли группы,
+    model — текст основной); иначе метка asr и варианты всех других моделей (alt — вторая, alt_whisper —
+    третья, alt_<роль> — дополнительные). Слова, которые не меньше replace других слышат, а основная
+    нет, вставляются так же. Время выбранных слов держится между соседями (_fit_times).
+    Изменяет main на месте. -> статистика: agree<N> — слова, поддержанные N моделями (от всех до keep),
+    replaced, inserted, disputed.
+
+    trace — необязательный словарь для протокола голосования (None — прежнее поведение, результат тот же
+    байт в байт). В него дописывается: schema, rule, roles (основная и другие по порядку), unanimous (слова,
+    за которые все модели), places — места, где решение не единогласно, по порядку записи: слово основной
+    модели оставлено не всеми (kept, support — роли), заменено (replaced), вставлено (inserted) или спорно
+    (disputed); у них t — время начала, main — слова основной, variants — текст каждой роли, winner_roles —
+    роли победившей группы. Протокол ничего не меняет в словах."""
+    check_rule(rule, len(others) + 1)
+    roles = [role for role, _ in others]
+    if len(set(roles)) != len(roles):
+        raise ValueError(f"роли гипотез должны быть разными: {roles!r}")
+    for role in roles:
+        if role not in _ALT_FIELD:
+            check_role(role)
+    keep_min, need = rule["keep"], rule["replace"]
     a = [norm_word(w["w"]) for w in main]
-    b = [norm_word(w["w"]) for w in ctc]
-    c = [norm_word(w) for w in whisper]
-    agB, badB = _ops(a, b)
-    agC, badC = _ops(a, c)
-    stats = {"agree3": 0, "agree2": 0, "replaced": 0, "inserted": 0, "disputed": 0}
+    hyps = []
+    for role, ws in others:
+        timed = _is_timed(ws)
+        toks = [norm_word(x["w"] if timed else x) for x in ws]
+        agree, bad = _ops(a, toks)
+        hyps.append({"role": role, "words": ws, "timed": timed, "toks": toks, "agree": agree, "bad": bad,
+                     "ins": {i1: (j1, j2) for op, i1, i2, j1, j2 in bad if op == "insert"}})
+    stats = {f"agree{k}": 0 for k in range(len(others) + 1, keep_min - 1, -1)}
+    stats.update(replaced=0, inserted=0, disputed=0)
+    if trace is not None:
+        trace.update(schema="vote-trace-1", rule=dict(rule), roles=["primary"] + [h["role"] for h in hyps],
+                     unanimous=0, places=[])
+
+    def text_of(h, js):
+        return " ".join(x["w"] if h["timed"] else x for x in h["words"][js[0]:js[1]]) if js else ""
+
+    def support(i):
+        return 1 + sum(1 for h in hyps if h["agree"][i])
+
+    def chosen(h, js, label, model_text=None):
+        extra = {} if model_text is None else {"model": model_text}
+        return [{**{k: x[k] for k in ("w", "s", "e")}, "c": 1.0, "voted": label, **extra}
+                for x in h["words"][js[0]:js[1]]]
+
     for w in main:
         w["agree"] = True
     out = []
-    # вставки «обе другие слышат, RNN-T — нет»
-    insB = {i1: (j1, j2) for op, i1, i2, j1, j2 in badB if op == "insert"}
-    insC = {i1: (j1, j2) for op, i1, i2, j1, j2 in badC if op == "insert"}
     i = 0
     while i <= len(main):
-        if i in insB and i in insC:
-            jb, jc = insB[i], insC[i]
-            if "".join(b[jb[0]:jb[1]]) == "".join(c[jc[0]:jc[1]]) and b[jb[0]:jb[1]]:
-                for x in ctc[jb[0]:jb[1]]:
-                    out.append({**{k: x[k] for k in ("w", "s", "e")}, "c": 1.0, "voted": "ctc+whisper"})
-                stats["inserted"] += jb[1] - jb[0]
+        ins = [(h, h["ins"][i], "".join(h["toks"][h["ins"][i][0]:h["ins"][i][1]])) for h in hyps if i in h["ins"]]
+        win = _winner(ins, need, need_text=False)
+        if win:
+            h, js, label, win_roles = win
+            if trace is not None:
+                first = chosen(h, js, label)[:1]
+                trace["places"].append({"decision": "inserted", "t": first[0]["s"] if first else None,
+                                        "main": "", "variants": {x[0]["role"]: text_of(x[0], x[1]) for x in ins},
+                                        "winner_roles": win_roles})
+            out += chosen(h, js, label)
+            stats["inserted"] += js[1] - js[0]
         if i == len(main):
             break
-        if agB[i] or agC[i]:
-            stats["agree3" if agB[i] and agC[i] else "agree2"] += 1
+        n = support(i)
+        if n >= keep_min:
+            stats[f"agree{n}"] += 1
+            if trace is not None:
+                if n == len(hyps) + 1:
+                    trace["unanimous"] += 1
+                else:
+                    trace["places"].append({"decision": "kept", "t": main[i]["s"], "main": main[i]["w"],
+                                            "support": ["primary"] + [h["role"] for h in hyps if h["agree"][i]]})
             out.append(main[i])
             i += 1
             continue
         k = i
-        while k < len(main) and not (agB[k] or agC[k]):
+        while k < len(main) and support(k) < keep_min:
             k += 1
-        sb, sc = _span_j(badB, i, k), _span_j(badC, i, k)
-        tb = "".join(b[sb[0]:sb[1]]) if sb else ""
-        tc = "".join(c[sc[0]:sc[1]]) if sc else ""
+        spans = [(h, _span_j(h["bad"], i, k)) for h in hyps]
         span = main[i:k]
-        if sb and sc and tb and tb == tc:          # CTC и Whisper согласны против RNN-T
-            model_text = " ".join(w["w"] for w in span)
-            for x in ctc[sb[0]:sb[1]]:
-                out.append({**{kk: x[kk] for kk in ("w", "s", "e")}, "c": 1.0, "voted": "ctc+whisper",
-                            "model": model_text})
+        win = _winner([(h, sj, "".join(h["toks"][sj[0]:sj[1]])) for h, sj in spans if sj], need, need_text=True)
+        if trace is not None:
+            trace["places"].append({"decision": "replaced" if win else "disputed", "t": span[0]["s"],
+                                    "main": " ".join(w["w"] for w in span),
+                                    "variants": {h["role"]: text_of(h, sj) for h, sj in spans},
+                                    "winner_roles": win[3] if win else []})
+        if win:
+            h, js, label, _ = win
+            out += chosen(h, js, label, " ".join(w["w"] for w in span))
             stats["replaced"] += len(span)
         else:
             for w in span:
                 w["agree"] = False
-            span[0]["alt"] = " ".join(x["w"] for x in ctc[sb[0]:sb[1]]) if sb else ""
-            span[0]["alt_whisper"] = " ".join(whisper[sc[0]:sc[1]]) if sc else ""
+            for h, sj in spans:
+                part = h["words"][sj[0]:sj[1]] if sj else []
+                field = _ALT_FIELD.get(h["role"], "alt_" + h["role"])
+                span[0][field] = " ".join(x["w"] if h["timed"] else x for x in part)
             span[0]["alt_span"] = len(span)
             stats["disputed"] += len(span)
             out.extend(span)
@@ -401,6 +518,21 @@ def vote3(main, ctc, whisper):
     _fit_times(out)
     main[:] = out
     return stats
+
+
+def vote3(main, ctc, whisper):
+    """Голосование «два из трёх»: основная модель (main, со временами; по умолчанию GigaAM RNN-T),
+    вторая (ctc, со временами; по умолчанию GigaAM CTC) и третья (whisper, только текст; по умолчанию
+    Whisper). Имена параметров прежние: на них опираются лаборатория и тесты; лаборатория подменяет
+    эту функцию, чтобы записать, какое сведение выполнено.
+
+    Слово основной модели принимается, если с ним согласна хотя бы одна из двух других. Если обе другие
+    согласны между собой и против основной — берётся их вариант (слова и времена второй модели),
+    помечается voted. Слова, которые слышат обе другие модели, а основная нет, вставляются (времена
+    второй модели). Время такого слова держится между соседними словами основной (_fit_times).
+    Где разошлись все три — метка asr и оба варианта (alt — вторая модель, alt_whisper — третья).
+    Это vote_n с правилом TWO_OF_THREE. Изменяет main на месте. -> статистика."""
+    return vote_n(main, [("second", ctc), ("whisper", whisper)], TWO_OF_THREE)
 
 
 def _merge_spans(spans):
@@ -420,13 +552,15 @@ def _span_index(t, spans):
     return k if k >= 0 and t < spans[k][1] else None
 
 
-def _vote3_outside_spans(main, ctc, whisper, spans):
-    """vote3 вне отрезков spans, сверка mark_alt внутри них; main собирается обратно по времени.
+def _vote_outside_spans(main, others, spans, vote):
+    """Голосование vote вне отрезков spans, сверка mark_alt со второй моделью внутри них; main
+    собирается обратно по времени.
 
-    Слова основной и второй гипотез делятся по start <= s < end. Текст Whisper времён не имеет,
-    но состоит только из удачных кусков, поэтому голосует целиком против слов вне отрезков.
-    Слова, которые на отрезке слышит только вторая гипотеза (основная там пуста), становятся
-    alt_ins соседнего слова, как в mark_alt. Изменяет main на месте. -> статистика vote3."""
+    others — [(роль, гипотеза)], первая — вторая модель (со временами). Слова основной и гипотез со
+    временами делятся по start <= s < end. Текст третьей модели (и других моделей без времён) времён
+    не имеет, но состоит только из удачных кусков, поэтому голосует целиком против слов вне отрезков.
+    Слова, которые на отрезке слышит только вторая гипотеза (основная там пуста), становятся alt_ins
+    соседнего слова, как в mark_alt. Изменяет main на месте. -> статистика голосования."""
     def split(ws):
         keep, parts = [], [[] for _ in spans]
         for w in ws:
@@ -435,8 +569,16 @@ def _vote3_outside_spans(main, ctc, whisper, spans):
         return keep, parts
 
     keep, main_parts = split(main)
-    ctc_keep, ctc_parts = split(ctc)
-    stats = vote3(keep, ctc_keep, whisper)     # keep заменён результатом голосования
+    others_keep, ctc_parts = [], None
+    for role, ws in others:
+        if role == "second" or _is_timed(ws):
+            ws_keep, parts = split(ws)
+            if ctc_parts is None:
+                ctc_parts = parts
+            others_keep.append((role, ws_keep))
+        else:
+            others_keep.append((role, ws))
+    stats = vote(keep, others_keep)            # keep заменён результатом голосования
     out, i, lonely = [], 0, []
     for (start, _), mp, cp in zip(spans, main_parts, ctc_parts):
         mark_alt(mp, cp)
@@ -455,27 +597,55 @@ def _vote3_outside_spans(main, ctc, whisper, spans):
     return stats
 
 
-def combine_hypotheses(hypotheses, diagnostics):
+def _vote3_outside_spans(main, ctc, whisper, spans):
+    """vote3 вне отрезков spans, сверка mark_alt внутри них (_vote_outside_spans для трёх моделей).
+    Имя прежнее: по нему лаборатория (lab_run.combine_rule) узнаёт правило частичного исключения."""
+    return _vote_outside_spans(main, [("second", ctc), ("whisper", whisper)], spans,
+                               lambda m, o: vote3(m, o[0][1], o[1][1]))
+
+
+def combine_hypotheses(hypotheses, diagnostics, rule=None, trace=None):
     """Сведение гипотез проходов моделей -> слова с пометками и решения.
 
     hypotheses: {"primary": слова основной модели со временами, "second": слова второй модели со
-    временами или None, "whisper": слова-строки третьей модели (любой; ключ прежний) или None};
+    временами или None, "whisper": слова-строки третьей модели или None}. Ключ "whisper" исторический
+    и не переименовывается: он обозначает роль третьей модели, а не движок — это может быть любая модель
+    (PR №84, transcript.asr_model_caps), в том числе не из семейства Whisper;
     None — проход не выполнялся или не удался. Вторая модель обязана давать времена слов: по ним
     исключаются отрезки и ставятся слова, выбранные голосованием (worker.second_pass это проверяет).
-    diagnostics: сведения о кусках каждого прохода, {"primary"|"second"|"whisper": {"chunks": [...]}}.
+    Другие ключи — дополнительные модели (четвёртая и следующие) под именем роли, по порядку
+    словаря: слова со временами или строки текста, None — не участвует.
+    diagnostics: сведения о кусках каждого прохода, {роль: {"chunks": [...]}}. До показа человеку
+    различаются три состояния куска: error — ошибка, empty_unknown — пустота по неизвестной причине,
+    filtered — текст целиком удалён очисткой (filtered_all; у третьей и дополнительных моделей).
+    Все три дают свидетельство в evidence и исключают свой отрезок из голосования.
+    rule: правило голосования {"keep", "replace"} (vote_n, check_rule). По умолчанию при трёх
+    моделях — «два из трёх» (TWO_OF_THREE, прежнее vote3); при четырёх и более моделях правило
+    обязательно (ValueError): программа его не выбирает, его задаёт опыт.
 
-    Если все три гипотезы полны — голосование «два из трёх» (vote3) по всей записи. Сбойный кусок
-    третьей или второй модели исключает из голосования только свой отрезок own_span: там основная
-    гипотеза сверяется со второй (mark_alt), на остальной записи идёт vote3 (vote3_partial).
-    Сбойный кусок основной модели, отсутствие Whisper или пустой остаток вне исключённых отрезков —
+    Если все гипотезы полны — голосование по всей записи. Сбойный кусок любой модели, кроме
+    основной, исключает из голосования только свой отрезок own_span: там основная гипотеза
+    сверяется со второй (mark_alt), на остальной записи идёт голосование (vote3_partial).
+    Сбойный кусок основной модели, меньше трёх гипотез или пустой остаток вне исключённых отрезков —
     только сверка mark_alt по всей записи (при неполной гипотезе — vote3_skipped).
     Слова основной гипотезы меняются на месте.
+    trace — необязательный словарь для протокола голосования (vote_n; None — прежнее поведение, результат
+    тот же байт в байт). При заданном trace голосование идёт через vote_n (для трёх моделей результат
+    совпадает с vote3), а в протокол дописывается skip_spans — отрезки, исключённые из голосования, с ролью
+    модели и причиной (error / empty_unknown / filtered), и merged_skip_spans — они же после слияния.
 
     -> {"quality": {vote, asr_votes, vote3_partial, vote3_skipped, asr_incomplete_chunks — что есть},
         "evidence": {"whisper": [(начало, конец, причина, проходы со словами)],
                      "other": [(начало, конец, проход, причина, проходы со словами)]}}
     """
     words, alt, wh_words = hypotheses["primary"], hypotheses.get("second"), hypotheses.get("whisper")
+    extra_roles = [check_role(role) for role in hypotheses if role not in ("primary", "second", "whisper")]
+    extras = [(role, hypotheses[role]) for role in extra_roles if hypotheses[role] is not None]
+    present = 1 + (alt is not None) + (wh_words is not None) + len(extras)
+    if rule is None and present > 3:
+        raise ValueError(f"сведение {present} моделей: правило голосования (rule) задаётся явно")
+    if rule is not None and present >= 3:
+        check_rule(rule, present)
     # Свидетельства других проходов фиксируем до изменения слов голосованием.
     whisper_evidence = []
     for rec in (diagnostics.get("whisper") or {}).get("chunks", []):
@@ -487,31 +657,57 @@ def combine_hypotheses(hypotheses, diagnostics):
                    if any(start <= w["s"] < end for w in ws)]
         whisper_evidence.append((start, end, reason, sources))
     other_evidence = []
-    for name in ("primary", "second"):
+    for name in ("primary", "second", *extra_roles):
         for rec in (diagnostics.get(name) or {}).get("chunks", []):
-            if rec.get("state") not in ("error", "empty_unknown") or not rec.get("own_span"):
+            state = rec.get("state")
+            if name in extra_roles and rec.get("filtered_all"):
+                state = "filtered"            # текст куска целиком удалён очисткой, как у третьей модели
+            if state not in ("error", "empty_unknown", "filtered") or not rec.get("own_span"):
                 continue
             start, end = rec["own_span"]
-            other = "second" if name == "primary" else "primary"
-            other_words = (alt or []) if name == "primary" else words
-            sources = [other] if any(start <= w["s"] < end for w in other_words) else []
-            other_evidence.append((start, end, name, rec["state"], sources))
+            if name in ("primary", "second"):
+                other = "second" if name == "primary" else "primary"
+                other_words = (alt or []) if name == "primary" else words
+                sources = [other] if any(start <= w["s"] < end for w in other_words) else []
+            else:
+                sources = [p for p, ws in (("primary", words), ("second", alt or []))
+                           if any(start <= w["s"] < end for w in ws)]
+            other_evidence.append((start, end, name, state, sources))
     quality = {}
     reason = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
-    # Сбой основной модели отключает голосование целиком; сбой третьей или второй — только свой отрезок.
+    # Модель без гипотезы голосование не ограничивает: её сбойные куски остаются в evidence, но не в skip_spans.
+    voting_whisper = whisper_evidence if wh_words is not None else []
+    partial_reason = "whisper_incomplete" if voting_whisper else "asr_incomplete"
+    # Сбой основной модели отключает голосование целиком; сбой другой модели — только свой отрезок.
+    # Модель без гипотезы (None) в голосовании не участвует, и её сбойные куски его не ограничивают.
+    voting_extras = {role for role, _ in extras}
     primary_failed = any(name == "primary" for _, _, name, _, _ in other_evidence)
-    skip_spans = _merge_spans([(s, e) for s, e, _, _ in whisper_evidence]
-                              + [(s, e) for s, e, name, _, _ in other_evidence if name == "second"])
-    can_vote = alt is not None and wh_words is not None and not primary_failed
+    skip_spans = _merge_spans([(s, e) for s, e, _, _ in voting_whisper]
+                              + [(s, e) for s, e, name, _, _ in other_evidence
+                                 if name == "second" or name in voting_extras])
+    others = ([("second", alt)] if alt is not None else []) \
+        + ([("whisper", wh_words)] if wh_words is not None else []) + extras
+    can_vote = alt is not None and len(others) >= 2 and not primary_failed
     if can_vote and skip_spans and all(_span_index(w["s"], skip_spans) is not None for w in words):
         can_vote = False                      # вне исключённых отрезков голосовать не о чем
     if can_vote:
+        if trace is None and [role for role, _ in others] == ["second", "whisper"] and rule in (None, TWO_OF_THREE):
+            def vote(main, hyps):             # прежний путь: лаборатория подменяет vote3
+                return vote3(main, hyps[0][1], hyps[1][1])
+        else:
+            def vote(main, hyps):
+                return vote_n(main, hyps, rule or TWO_OF_THREE, trace)
+        if trace is not None:
+            trace["skip_spans"] = [{"start": s, "end": e, "role": "whisper", "reason": why}
+                                   for s, e, why, _ in voting_whisper]                 + [{"start": s, "end": e, "role": name, "reason": why}
+                   for s, e, name, why, _ in other_evidence if name == "second" or name in voting_extras]
+            trace["merged_skip_spans"] = [[s, e] for s, e in skip_spans]
         if skip_spans:
-            quality["vote"] = _vote3_outside_spans(words, alt, wh_words, skip_spans)
-            quality["vote3_partial"] = {"reason": reason, "spans": len(skip_spans),
+            quality["vote"] = _vote_outside_spans(words, others, skip_spans, vote)
+            quality["vote3_partial"] = {"reason": partial_reason, "spans": len(skip_spans),
                                         "seconds": round(sum(e - s for s, e in skip_spans), 1)}
         else:
-            quality["vote"] = vote3(words, alt, wh_words)
+            quality["vote"] = vote(words, others)
         prev = None
         for wd in words:                      # что заменило голосование — в список исправлений
             if wd.get("voted") and wd.get("model", "") != "":
@@ -527,8 +723,8 @@ def combine_hypotheses(hypotheses, diagnostics):
             else:
                 prev = None
     elif alt is not None:
-        if whisper_evidence or (other_evidence and wh_words is not None):
-            # Не превращаем неизвестный результат Whisper в голос за пустоту.
+        if whisper_evidence or (other_evidence and (wh_words is not None or extras)):
+            # Не превращаем неизвестный результат третьей модели в голос за пустоту.
             quality["vote3_skipped"] = reason
         mark_alt(words, alt)
     failed = sum(1 for stage in diagnostics.values() for item in stage["chunks"] if item["state"] == "error")
