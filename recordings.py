@@ -260,6 +260,37 @@ def read_review_pack_state(document_path):
         store.close()
 
 
+def _drop_missing_review_word_ids(transcript, review):
+    """Удалить из ссылок разбора и вопросов только отсутствующие в стенограмме слова."""
+    if not isinstance(transcript, dict) or not isinstance(review, dict):
+        return
+    segments = transcript.get("segments")
+    if not isinstance(segments, list):
+        return
+    word_ids = set()
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("words"), list):
+            continue
+        word_ids.update(word["word_id"] for word in segment["words"]
+                        if isinstance(word, dict) and isinstance(word.get("word_id"), str))
+    for collection_name in ("review", "questions"):
+        collection = review.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            refs = item.get("word_ids")
+            if not isinstance(refs, list):
+                continue
+            kept = [word_id for word_id in refs
+                    if not isinstance(word_id, str) or word_id in word_ids]
+            if kept:
+                item["word_ids"] = kept
+            else:
+                item.pop("word_ids", None)
+
+
 def write_review_pack_state(document_path, state):
     """Сохранить ответный пакет в review-снимок и обновить пользовательский документ."""
     draft = answer_draft_for(document_path)
@@ -299,6 +330,7 @@ def write_review_pack_state(document_path, state):
         if "manifest" in state:
             manifest = copy.deepcopy(state["manifest"])
             review["questions"] = copy.deepcopy(manifest.get("items") or []) if manifest else []
+        _drop_missing_review_word_ids(current["transcript"]["payload"], review)
         for field in ("answers", "conflicts", "rejected"):
             if field in state:
                 review[field] = copy.deepcopy(state[field])
@@ -666,6 +698,7 @@ def commit_recording_data(store, recording_id, data, expected_versions, operatio
     for key in ("recording_id", "source_revision", "review_revision", "document_revision",
                 "document_sync", "json", "markdown", "manifest"):
         candidate.pop(key, None)
+    _drop_missing_review_word_ids(candidate, candidate)
     _, transcript, review = snapshots_from_worker(candidate, recording_id)
     current = store.get_current(recording_id)
     transcript_changed = transcript != current["transcript"]["payload"]

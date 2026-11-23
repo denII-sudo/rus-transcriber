@@ -737,7 +737,7 @@ def _mark_provenance(word, dimension, by, edit):
     word["provenance"] = provenance
 
 
-def _diff_words(old, new_text, item_id):
+def _diff_words(old, new_text, item_id, allow_span_overwrite=False):
     """Правка текста места по словам: меняются только отличающиеся слова, у остальных сохраняются время,
     уверенность и прежние правки (на время слов опираются ссылки конспекта). Слово, уже исправленное
     другой правкой, не перезаписывается — оно возвращается в списке конфликтов.
@@ -762,7 +762,9 @@ def _diff_words(old, new_text, item_id):
             for w, x in zip(src, new[j1:j2]):          # пунктуация и регистр — из правки
                 out.append(w if w["w"] == x else {**w, "w": x, "edited": w.get("edited", item_id)})
             continue
-        prior = [w["edited"] for w in src if w.get("edited") and w["edited"] != item_id]
+        prior = [w["edited"] for w in src if w.get("edited") and w["edited"] != item_id
+                 and not (allow_span_overwrite and isinstance(w["edited"], str)
+                          and w["edited"].startswith("span@"))]
         if prior:
             conflicts += prior
             out.extend(src)
@@ -1224,6 +1226,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             report["successful_ids"].append(it["id"])
             continue
         target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
+        if d.get("_fallback_to_time"):
+            target.pop("word_ids", None)
         loc = _find_span(data, target)
         if loc is None:
             report.setdefault("not_found", []).append(it["id"])     # место исчезло (перекрыто другой правкой)
@@ -1262,7 +1266,9 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         new_text = d.get("text")
         if new_text and new_text != before["text"]:
             model = [w.get("raw", w["w"]) for w in ws[w1:w2]]
-            new_ws, conflicts = _diff_words(ws[w1:w2], new_text, it["id"])
+            new_ws, conflicts = _diff_words(
+                ws[w1:w2], new_text, it["id"],
+                allow_span_overwrite=bool(d.get("_fallback_to_time")))
             if conflicts:
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts})
                 continue

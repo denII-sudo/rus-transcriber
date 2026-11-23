@@ -583,6 +583,13 @@ def decisions(json_path):
                 continue
             if "word_ids" in it:
                 d["word_ids"] = it["word_ids"]
+                current_word_ids = {
+                    word.get("word_id")
+                    for segment in data.get("segments") or []
+                    for word in segment.get("words") or []
+                }
+                if any(word_id not in current_word_ids for word_id in it["word_ids"]):
+                    d["_fallback_to_time"] = True
             note = f"{src}: {it['options'][a['option']]['label']}"
             if aid in conflicted:
                 was = next((c["was"] for c in reversed(store["conflicts"]) if c["id"] == aid), {})
