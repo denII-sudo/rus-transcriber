@@ -2001,5 +2001,22 @@ class RealCaseTests(unittest.TestCase):
         with mock.patch("os.listdir", side_effect=OSError("synthetic")):
             self.assertEqual(core._real_case("c:\\data\\x.md", {}), Path("C:\\data\\x.md"))
 
+
+class ListedProgramVersionCacheTests(unittest.TestCase):
+    """Кеш одного построения списка конфликтов не держит содержимое файлов программы."""
+
+    def test_cache_keeps_digests_not_file_contents(self):
+        import core
+        import documents
+        md, js = b"m" * 4096, b"j" * 4096
+        store = SimpleNamespace(get_conspect=lambda _cid: {"revision": 3, "md": md, "json": js})
+        row = {"scope": "conspect", "object": ("conspect", "c1"), "conspect_id": "c1", "kind": "md"}
+        cache = {}
+        revision, digests = core._listed_program_version(store, row, cache)
+        self.assertEqual(revision, 3)
+        self.assertEqual(digests, {"md": documents._digest(md), "json": documents._digest(js)})
+        self.assertFalse(any(isinstance(value, (bytes, bytearray)) for value in digests.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

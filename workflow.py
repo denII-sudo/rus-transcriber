@@ -363,7 +363,8 @@ def _precise_doubts(transcript, review):
     Место со ссылками на слова помечает эти слова. Место без ссылок с годным временем —
     слова по правилу _word_in_place; если таких слов нет (пауза), — последнее слово до t1
     и первое после t2 (что есть). Место без ссылок и без годного времени, а также место
-    со временем в записи, где у слов нет времени, привязать нельзя: тогда, как в версии 2,
+    со временем в записи, где у слов нет времени, а также место без ссылок, чьё время задевает
+    промежуток со словом без времени, привязать нельзя: тогда, как в версии 2,
     сомнительны все слова записи, а число таких мест идёт в задание.
     """
     timed = []                                        # (начало, конец, порядок, ID) слов со временем
@@ -373,6 +374,21 @@ def _precise_doubts(transcript, review):
             if _seconds(start):
                 timed.append((start, end if _seconds(end) and end >= start else start, len(timed),
                               word["word_id"]))
+    # Промежутки вокруг слов без времени: от конца предыдущего слова со временем до начала следующего.
+    # Где внутри такое слово, неизвестно, поэтому место без ссылок, задевающее промежуток, не привязывается.
+    untimed, last_end, pending = [], -math.inf, False
+    for segment in transcript.get("segments", []):
+        for word in segment.get("words", []):
+            start, end = word.get("s"), word.get("e")
+            if _seconds(start):
+                if pending:
+                    untimed.append((last_end, start))
+                    pending = False
+                last_end = end if _seconds(end) and end >= start else start
+            else:
+                pending = True
+    if pending:
+        untimed.append((last_end, math.inf))
     marked, unlocated = set(), 0
     for item in _open_places(review):
         if item.get("word_ids"):
@@ -383,6 +399,9 @@ def _precise_doubts(transcript, review):
             unlocated += 1
             continue
         t1, t2 = span
+        if any(t1 - PLACE_TIME_TOLERANCE <= hi and t2 + PLACE_TIME_TOLERANCE >= lo for lo, hi in untimed):
+            unlocated += 1
+            continue
         inside = {ident for start, end, _order, ident in timed if _word_in_place(start, end, t1, t2)}
         if not inside:                                # пауза: никакое слово не попало во время места
             before = [word for word in timed if word[0] < t1]
@@ -577,6 +596,13 @@ def _prepare_model_task(store, request, restart):
                                (request_id,)).fetchone()
         if run is None or new_generation:
             run_id, now = str(uuid.uuid4()), storage._now()
+            # Начать заново из ожидания: прежний ожидающий запуск и его шаг закрываются здесь же,
+            # иначе ожидающих стало бы два и ни блок, ни итог нового запуска не были бы приняты.
+            store.db.execute("UPDATE workflow_steps SET state='superseded', updated_at=? WHERE run_id IN "
+                             "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
+                             "AND state='waiting_model') AND state='waiting_model'", (now, request_id))
+            store.db.execute("UPDATE workflow_runs SET state='superseded', updated_at=? "
+                             "WHERE request_id=? AND kind='model' AND state='waiting_model'", (now, request_id))
             store.db.execute("INSERT INTO workflow_runs VALUES (?, ?, 'model', 'waiting_model', "
                              "'opencode/openai/gpt-6-luna', ?, ?)",
                              (run_id, request_id, now, now))
@@ -814,13 +840,22 @@ def model_part(store, request_id, part_index):
             "part_index": part_index, "part_count": len(bounds)}
 
 
-def accept_model_part(store, request_id, part_index, result):
-    """Сохранить блок; итог формируется только после покрытия всех блоков."""
+RUN_REPLACED = "модельный шаг начат заново другим вызовом; ответ прежнего запуска не сохранён"
+
+
+def accept_model_part(store, request_id, part_index, result, *, expected_run_id=None):
+    """Сохранить блок; итог формируется только после покрытия всех блоков.
+
+    expected_run_id — запуск, которому выдано задание (execute_model): если его уже заменили
+    (начать заново), блок не сохраняется. Без него — текущий запуск (ИИ-агент номера запуска не знает)."""
     before = get(store, request_id)
-    return _retry_head_moved(lambda: _accept_model_part(store, request_id, part_index, result, before))
+    return _retry_head_moved(lambda: _accept_model_part(store, request_id, part_index, result, before,
+                                                        expected_run_id))
 
 
-def _accept_model_part(store, request_id, part_index, result, before):
+def _accept_model_part(store, request_id, part_index, result, before, expected_run_id=None):
+    if expected_run_id is not None and before["model_run_id"] != expected_run_id:
+        raise storage.Conflict(RUN_REPLACED)
     try:
         task, total, accepted, snapshots = _validate_model_part(store, request_id, part_index, result, before)
     except ValueError:
@@ -845,6 +880,8 @@ def _accept_model_part(store, request_id, part_index, result, before):
         head = recordings.recording_head(store, before["recording_id"])
         run = store.db.execute("SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
                                "AND state='waiting_model'", (request_id,)).fetchall()
+        if expected_run_id is not None and row["model_run_id"] != expected_run_id:
+            raise storage.Conflict(RUN_REPLACED)
         if (row["state"] != "waiting_model" or storage._loads(row["model_task_json"]) != task
                 or len(run) != 1 or row["model_run_id"] != run[0]["run_id"]):
             raise storage.Conflict("задание или ревизия изменились")
@@ -864,7 +901,7 @@ def _accept_model_part(store, request_id, part_index, result, before):
                                 (request_id, task_hash)).fetchall()
     if len(rows) != total:
         return {"part_index": part_index, "received": len(rows), "part_count": total, "state": "waiting_model"}
-    accepted = _assemble_parts(store, request_id, task, task_hash)
+    accepted = _assemble_parts(store, request_id, task, task_hash, expected_run_id=expected_run_id)
     return {"part_index": part_index, "received": total, "part_count": total,
             "state": "completed", "result": accepted}
 
@@ -875,8 +912,10 @@ def saved_part_count(store, *, request_id, task_hash):
                             (request_id, task_hash)).fetchone()[0]
 
 
-def _assemble_parts(store, request_id, task, task_hash):
-    """Итог из всех сохранённых блоков; облако не вызывается."""
+def _assemble_parts(store, request_id, task, task_hash, *, expected_run_id=None):
+    """Итог из всех сохранённых блоков; облако не вызывается. expected_run_id — только для своего запуска."""
+    if expected_run_id is not None and get(store, request_id)["model_run_id"] != expected_run_id:
+        raise storage.Conflict(RUN_REPLACED)
     rows = store.db.execute("SELECT result_json FROM workflow_model_parts WHERE request_id=? AND task_hash=? "
                             "ORDER BY part_index", (request_id, task_hash)).fetchall()
     sections = [section for row in rows for section in storage._loads(row["result_json"])["sections"]]
@@ -922,22 +961,24 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
     return task, total, accepted, current
 
 
-def _fail_model_run(store, request_id, code, message, *, invalid_count=0):
+def _fail_model_run(store, request_id, code, message, *, invalid_count=0, expected_run_id=None):
+    """Ошибка модельного шага. expected_run_id — запуск вызова: если его уже заменили, ничего не меняется."""
     with store._transaction():
         store.current_identity()
-        row = store.db.execute("SELECT state FROM workflow_requests WHERE request_id=?",
+        row = store.db.execute("SELECT state, model_run_id FROM workflow_requests WHERE request_id=?",
                                (request_id,)).fetchone()
         if row is None or row["state"] != "waiting_model":
+            return
+        if expected_run_id is not None and row["model_run_id"] != expected_run_id:
             return
         now = storage._now()
         store.db.execute("UPDATE workflow_requests SET state='failed', model_attempts=model_attempts+?, "
                          "updated_at=? WHERE request_id=?", (invalid_count, now, request_id))
         store.db.execute("UPDATE workflow_runs SET state='failed', updated_at=? "
-                         "WHERE request_id=? AND kind='model' AND state='waiting_model'", (now, request_id))
-        store.db.execute("UPDATE workflow_steps SET state='failed', result_json=?, updated_at=? WHERE run_id IN "
-                         "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' AND state='failed') "
-                         "AND state='waiting_model'",
-                         (storage._json({"error_code": code, "message": message}), now, request_id))
+                         "WHERE run_id=? AND kind='model' AND state='waiting_model'", (now, row["model_run_id"]))
+        store.db.execute("UPDATE workflow_steps SET state='failed', result_json=?, updated_at=? "
+                         "WHERE run_id=? AND state='waiting_model'",
+                         (storage._json({"error_code": code, "message": message}), now, row["model_run_id"]))
 
 
 def _resume_model_run(store, request):
@@ -1039,7 +1080,8 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
     else:
         task = request["model_task"]
     total = len(_part_bounds(task))
-    task_hash = storage._hash({"task": task, "run_id": request["model_run_id"]})
+    run_id = request["model_run_id"]                 # свой запуск: ответы и ошибки — только в него
+    task_hash = storage._hash({"task": task, "run_id": run_id})
     completed = {row["part_index"] for row in store.db.execute(
         "SELECT part_index FROM workflow_model_parts WHERE request_id=? AND task_hash=?",
         (request_id, task_hash))}
@@ -1050,37 +1092,43 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
         return (f"сохранено блоков {saved} из {total}; продолжить с места остановки — "
                 "workflow_execute_model(retry_failed=true) или rt.py workflow-execute --retry-failed")
     try:
-        with llm_provider.OpenCodeTextClient() as client:
-            for part_index in range(total):
-                if part_index in completed:
-                    continue
-                part = model_part(store, request_id, part_index)
-                if get(store, request_id)["model_task"] != task:
-                    raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
-                repair_error = invalid_output = None
-                for attempt in range(2):
-                    result, raw = client.generate(part["task"], repair_error=repair_error,
-                                                  invalid_output=invalid_output)
-                    try:
-                        _validate_model_part(store, request_id, part_index, result)
-                    except ValueError as ex:
-                        invalid_count += 1
-                        if attempt == 1:
-                            raise llm_provider.ProviderError(
-                                "invalid_response", "ответ модели не прошёл проверку после одной попытки исправления")
-                        repair_error, invalid_output = str(ex), raw
+        if len(completed) < total:                  # все блоки сохранены — клиент облака не нужен
+            with llm_provider.OpenCodeTextClient() as client:
+                for part_index in range(total):
+                    if part_index in completed:
                         continue
-                    accept_model_part(store, request_id, part_index, result)
-                    break
+                    part = model_part(store, request_id, part_index)
+                    if get(store, request_id)["model_task"] != task:
+                        raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
+                    repair_error = invalid_output = None
+                    for attempt in range(2):
+                        result, raw = client.generate(part["task"], repair_error=repair_error,
+                                                      invalid_output=invalid_output)
+                        try:
+                            _validate_model_part(store, request_id, part_index, result)
+                        except ValueError as ex:
+                            invalid_count += 1
+                            if attempt == 1:
+                                raise llm_provider.ProviderError(
+                                    "invalid_response", "ответ модели не прошёл проверку после одной попытки исправления")
+                            repair_error, invalid_output = str(ex), raw
+                            continue
+                        accept_model_part(store, request_id, part_index, result, expected_run_id=run_id)
+                        break
         if (get(store, request_id)["state"] == "waiting_model"
                 and saved_part_count(store, request_id=request_id, task_hash=task_hash) == total):
-            _assemble_parts(store, request_id, task, task_hash)     # блоки сохранены раньше, итога не было
+            _assemble_parts(store, request_id, task, task_hash,      # блоки сохранены раньше, итога не было
+                            expected_run_id=run_id)
     except llm_provider.ProviderError as ex:
+        if get(store, request_id)["model_run_id"] != run_id:
+            raise llm_provider.ProviderError(ex.code, f"{ex}; {RUN_REPLACED}") from ex
         message = f"{ex}; {progress()}"
-        _fail_model_run(store, request_id, ex.code, message, invalid_count=invalid_count)
+        _fail_model_run(store, request_id, ex.code, message, invalid_count=invalid_count, expected_run_id=run_id)
         raise llm_provider.ProviderError(ex.code, message) from ex
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
         after = get(store, request_id)
+        if after["model_run_id"] != run_id:
+            raise llm_provider.ProviderError("revision_changed", RUN_REPLACED) from ex
         if after["state"] == "completed":
             return _completed_result(store, after)
         if isinstance(ex, storage.Conflict):
@@ -1089,13 +1137,16 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
                        "применённый ответ на сомнение); сохранённые блоки устарели. " + RESTART_HINT)
         else:
             code, message = "internal_error", f"модельный шаг остановлен; {progress()}"
-        _fail_model_run(store, request_id, code, message, invalid_count=invalid_count)
+        _fail_model_run(store, request_id, code, message, invalid_count=invalid_count, expected_run_id=run_id)
         raise llm_provider.ProviderError(code, message) from ex
     after = get(store, request_id)
     if after["state"] == "completed":
         return _completed_result(store, after)
     message = f"модельный шаг не завершён: {progress()}"
-    _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count)
+    if after["model_run_id"] != run_id:
+        raise llm_provider.ProviderError("revision_changed", RUN_REPLACED)
+    _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count,
+                    expected_run_id=run_id)
     raise llm_provider.ProviderError("internal_error", message)
 
 

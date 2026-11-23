@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+import conspect
 import core
 import llm_provider
 import model_tasks
@@ -315,6 +316,51 @@ class ConspectContentStalenessTests(unittest.TestCase):
                 self.assertEqual(self.status(request)["readiness"]["human_verification"], "none")
 
     # ---------- 5. Отпечаток содержания ----------
+
+    # ---------- Задание, собранное до осторожного правила для слов без времени ----------
+
+    def untimed_word_with_place(self, request):
+        """Слово w1 без времени и открытое место без ссылок рядом с ним (перенесённые старые данные)."""
+        def change(transcript, review):
+            word = transcript["segments"][0]["words"][1]
+            word.pop("s"), word.pop("e")
+            review["review"] = [{"id": "doubt-1", "status": "open", "t1": 1.2, "t2": 1.8}]
+        self.commit(request, change)
+
+    def old_rule(self, request):
+        """Пометки по прежнему правилу: место привязано к соседним словам со временем, слово без времени не задето."""
+        current = self.store.get_current(self.recording(request))["transcript"]["payload"]
+        words = [word["word_id"] for segment in current["segments"] for word in segment["words"]]
+        return mock.patch("workflow._precise_doubts", return_value=({words[0], words[2]}, 0))
+
+    def test_completed_conspect_built_by_old_rule_goes_stale(self):
+        request = self.prepare_request()
+        self.untimed_word_with_place(request)
+        tokens = conspect._tokens
+
+        def timed_tokens(data):
+            # Связывание цитат само требует время у каждого слова; для проверки устаревания
+            # слову без времени на время сборки свёртки подставляется время соседа.
+            data = copy.deepcopy(data)
+            for segment in data["segments"]:
+                for word in segment["words"]:
+                    word.setdefault("s", 1.0)
+            return tokens(data)
+        with self.old_rule(request), mock.patch("conspect._tokens", timed_tokens):
+            self.assertEqual(self.execute(request)["state"], "completed")
+            self.assert_conspect_current(request)
+        self.assert_conspect_stale(request)
+
+    def test_waiting_task_built_by_old_rule_needs_restart_without_cloud(self):
+        request = self.prepare_request()
+        self.untimed_word_with_place(request)
+        with self.old_rule(request):
+            workflow.prepare_model_task(self.store, request)
+        with self.assertRaises(llm_provider.ProviderError) as error:
+            self.execute(request)
+        self.assertEqual(error.exception.code, "revision_changed")
+        self.assertIn("restart", str(error.exception))
+        self.assertEqual(self.calls, 0)
 
     def test_fingerprint_ignores_revisions_only(self):
         request = self.prepare_request(doubt=True)

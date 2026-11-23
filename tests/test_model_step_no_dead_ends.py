@@ -158,6 +158,90 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
         self.assertEqual(self.calls, 0)
         self.assertEqual(len(self.store.list_conspects(workflow.get(self.store, request)["recording_id"])), 1)
 
+    def answer_parts(self, request, task, count=2):
+        result = None
+        for index in range(count):
+            part = workflow.model_part(self.store, request, index)
+            result = workflow.accept_model_part(self.store, request, index, {
+                "source_revision": task["source_revision"], "sections": [{
+                    "text": "Блок.", "evidence": [word["word_id"] for word in part["task"]["words"]]}]})
+        return result
+
+    def model_runs(self, request):
+        return [tuple(row) for row in self.store.db.execute(
+            "SELECT r.state, s.state FROM workflow_runs r JOIN workflow_steps s USING(run_id) "
+            "WHERE r.request_id=? AND r.kind='model' ORDER BY r.created_at, r.rowid", (request,))]
+
+    # Перезапуск из ожидания: прежний ожидающий запуск закрывается, новый принимает блоки и итог.
+    def test_restart_while_waiting_accepts_parts_and_result(self):
+        request = self.prepare_request(count=501)
+        workflow.prepare_model_task(self.store, request)
+        task = workflow.prepare_model_task(self.store, request, restart=True)
+        result = self.answer_parts(request, task)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(workflow.get(self.store, request)["state"], "completed")
+        self.assertEqual(self.model_runs(request), [("superseded", "superseded"), ("completed", "completed")])
+
+    def test_restart_while_waiting_through_execute_model(self):
+        request = self.prepare_request(count=501)
+        task = workflow.prepare_model_task(self.store, request)
+        part = workflow.model_part(self.store, request, 0)
+        workflow.accept_model_part(self.store, request, 0, {
+            "source_revision": task["source_revision"], "sections": [{
+                "text": "Блок.", "evidence": [word["word_id"] for word in part["task"]["words"]]}]})
+        result = self.execute(request, restart=True)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(self.calls, 2)                 # начать заново — блоки прежнего запуска не берутся
+        self.assertEqual(self.model_runs(request), [("superseded", "superseded"), ("completed", "completed")])
+
+    # Начать заново, пока идёт облачный вызов прежнего запуска: его поздний ответ или ошибка
+    # не попадают в новый запуск.
+    def restart_during_call(self, request):
+        workflow.prepare_model_task(self.store, request, restart=True)
+
+    def assert_new_run_untouched(self, request):
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        self.assertEqual(self.model_runs(request), [("superseded", "superseded"), ("waiting_model", "waiting_model")])
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM workflow_model_parts WHERE request_id=?",
+                                               (request,)).fetchone()[0], 0)
+
+    def test_late_answer_of_replaced_run_is_not_saved_into_new_run(self):
+        request = self.prepare_request()
+        with self.assertRaises(llm_provider.ProviderError) as error:
+            self.execute(request, before_answer=lambda: self.restart_during_call(request))
+        self.assertIn("заново", str(error.exception))
+        self.assert_new_run_untouched(request)
+
+    def test_late_error_of_replaced_run_does_not_fail_new_run(self):
+        request = self.prepare_request()
+        test = self
+
+        class Client:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+            def generate(self, task, **_kwargs):
+                test.restart_during_call(request)
+                raise llm_provider.ProviderError("timeout", "synthetic: нет ответа")
+        with mock.patch("llm_provider.OpenCodeTextClient", Client):
+            with self.assertRaises(llm_provider.ProviderError):
+                workflow.execute_model(self.store, request)
+        self.assert_new_run_untouched(request)
+
+    # Все блоки сохранены: итог собирается без создания клиента облака.
+    def test_saved_blocks_are_assembled_without_creating_client(self):
+        request = self.prepare_request(count=501)
+        task = workflow.prepare_model_task(self.store, request)
+        with mock.patch("workflow.accept_model_result", side_effect=OSError("synthetic")):
+            with self.assertRaises(OSError):
+                self.answer_parts(request, task)
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        broken = mock.Mock(side_effect=llm_provider.ProviderError("unavailable", "synthetic: клиента нет"))
+        with mock.patch("llm_provider.OpenCodeTextClient", broken):
+            result = workflow.execute_model(self.store, request)
+        self.assertEqual(result["state"], "completed")
+        broken.assert_not_called()
+
     def test_completed_parts_counts_saved_blocks_on_failure(self):
         request = self.prepare_request(count=501)
         task = workflow.prepare_model_task(self.store, request)

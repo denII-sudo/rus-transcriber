@@ -996,12 +996,15 @@ def _same_object(row, rows, cache):
 
 
 def _listed_program_version(store, row, cache):
-    """Версия программы для списка: читается один раз на объект; ошибка запоминается так же, как успех.
-    Замена файла и запись по-прежнему читают версию заново (_program_version)."""
+    """Версия программы для списка: (ревизия, {вид файла: хэш}); читается один раз на объект, ошибка
+    запоминается так же, как успех. Кеш держит только хэши, не содержимое: построение списка не копит
+    файлы всех объектов в памяти. Замена файла и запись по-прежнему читают версию заново (_program_version)."""
+    import documents
     key = ("program", row["object"])
     if key not in cache:
         try:
-            cache[key] = (_program_version(store, row), None)
+            revision, files = _program_version(store, row)
+            cache[key] = ((revision, {kind: documents._digest(data) for kind, data in files.items()}), None)
         except CoreError as ex:
             cache[key] = (None, ex)
     found, error = cache[key]
@@ -1013,7 +1016,6 @@ def _listed_program_version(store, row, cache):
 def _conflict_item(store, row, rows, cache):
     """Строка общего списка; rows — все конфликты той же области. Повреждённая строка не роняет список.
     cache живёт одно построение списка: в нём регистр путей, группы объектов и версии программы."""
-    import documents
     import storage
     item = {"conflict_id": row["conflict_id"], "scope": row["scope"], "recording_id": row["recording_id"],
             "title": _real_case(row["location"], cache).name, "name": row["name"], "kind": row["kind"],
@@ -1030,7 +1032,7 @@ def _conflict_item(store, row, rows, cache):
             _listed_program_version(store, row, cache)    # повреждена — строка «повреждена», замена выключена
         if row["resolved"] and last_of_file and _queue_unfinished(store, row):
             program = _listed_program_version(store, row, cache)[1].get(row["kind"])
-            if program is not None and _file_at(store, row, row["relative_path"])[1] != documents._digest(program):
+            if program is not None and _file_at(store, row, row["relative_path"])[1] != program:
                 status = "not_written"
         item.update(status=status,
                     can_replace=status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
