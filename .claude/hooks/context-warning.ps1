@@ -1,7 +1,8 @@
 ﻿# Хук Claude Code (UserPromptSubmit и Stop): предупреждает, что контекст сессии пора сжать.
 # Заполнение считается по транскрипту: токены входа последнего ответа модели, как в строке
 # состояния. С порога RT_CONTEXT_WARN_PCT (30%) хук показывает предупреждение человеку, а при
-# отправке сообщения просит модель предложить /compact; повторяет на каждых следующих 5%.
+# отправке сообщения просит модель предложить /compact; повторяет один раз на 5% выше порога
+# (35%) и дальше молчит до сжатия.
 # Само сжатие хук не запускает: автосжатие задаёт CLAUDE_AUTOCOMPACT_PCT_OVERRIDE в
 # .claude/settings.json. Размер окна — RT_CONTEXT_WINDOW_TOKENS (по умолчанию 1 000 000).
 # Любая ошибка — тишина и код 0: хук не должен мешать работе.
@@ -84,7 +85,8 @@ try {
         if (Test-Path -LiteralPath $state) { Remove-Item -LiteralPath $state -Force }
         exit 0
     }
-    $level = $warn + [Math]::Floor(($percent - $warn) / $step) * $step
+    # Два предупреждения: на пороге и на 5% выше; выше 35% — тишина до сжатия.
+    $level = [Math]::Min($warn + [Math]::Floor(($percent - $warn) / $step) * $step, $warn + $step)
     $previous = 0
     if (Test-Path -LiteralPath $state) {
         $saved = (Get-Content -LiteralPath $state -Raw).Trim()
