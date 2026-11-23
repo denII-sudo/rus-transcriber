@@ -442,15 +442,16 @@ class PageStateFromPython(unittest.TestCase):
             self.assertEqual(man["answer_states"]["r1"]["state"], "applied")
 
 
-def page_script():
-    """Начало скрипта cards.html (до функций ответов) — для проверки логики страницы в Node.js."""
+def page_script(host="127.0.0.1"):
+    """Начало скрипта cards.html (до функций ответов) — для проверки логики страницы в Node.js.
+    host — адрес страницы: не 127.0.0.1/localhost означает облачную страницу."""
     html = (PROJECT / "cards.html").read_text(encoding="utf-8")
-    return 'global.location={hostname:"127.0.0.1"};\n' + \
+    return f'global.location={{hostname:"{host}"}};\n' + \
         html.split('  // ответы этой версии вопросов')[0].split('<script>', 1)[1]
 
 
-def run_page(test, body):
-    script = page_script() + body + "\n})();\n"
+def run_page(test, body, host="127.0.0.1"):
+    script = page_script(host) + body + "\n})();\n"
     result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
     test.assertEqual(result.returncode, 0, result.stderr)
     return result.stdout
@@ -458,9 +459,12 @@ def run_page(test, body):
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
 class PageLabels(unittest.TestCase):
+    # Состояния, которые знает только страница: ответ из облака, которого ноутбук ещё не видел.
+    PAGE_ONLY = {"cloud_saved", "cloud_keep"}
+
     def test_every_outcome_has_its_own_label(self):
         out = run_page(self, "console.log(JSON.stringify(Object.keys(STATUS)));")
-        self.assertLessEqual(set(review_pack.OUTCOME_REASONS), set(json.loads(out)))
+        self.assertEqual(set(json.loads(out)), set(review_pack.OUTCOME_REASONS) | self.PAGE_ONLY)
 
     def test_failed_undo_keeps_buttons_and_says_previous_is_in_place(self):
         run_page(self, r'''
@@ -645,6 +649,17 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
             text = (Path(bundle["base"]) / "cloud" / "manifest.json").read_text(encoding="utf-8")
             self.assertNotIn("\"applied_answer\"", text)
 
+    def test_keep_from_cloud_restores_whole_answer(self):
+        # «Не отменять» на облачной странице приходит на ноутбук через import_answers (источник cloud).
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                original = self.applied_with_heard(jp, md, version)
+                self.save(jp, version, kind="revert")
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "keep",
+                                              "ts": "2026-11-23T23:00:00"}], "cloud")
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
+
     def test_old_pack_without_copy_restores_by_signature_and_says_so(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
@@ -677,6 +692,42 @@ class RevertAnswerText(unittest.TestCase):
           const restored = {kind:"option", option:0, restored:true, ts:"t3", source:"local"};
           if (!answerMeta(restored).includes("возвращён применённый ответ") || answerMeta(restored).includes("·"))
             throw Error("время возврата выдано за время ответа: " + answerMeta(restored));
+        ''')
+
+
+@unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+class CloudKeep(unittest.TestCase):
+    """«Не отменять» на облачной странице до переноса на ноутбук: применённый ответ на месте."""
+
+    SETUP = r'''
+          const one={id:"r1", options:[{label:"Первое"},{label:"Второе"}]};
+          const revert={id:"r1", kind:"revert", ts:"t2", source:"local"};
+          const keep={id:"r1", kind:"keep", ts:"t3", source:"cloud"};
+          man = {answer_states:{r1:{state:"revert_pending", ts:"t2", source:"local"}}};
+        '''
+
+    def test_cloud_keep_holds_applied_answer(self):
+        run_page(self, self.SETUP + r'''
+          if (stateOf(one, keep) !== "cloud_keep") throw Error("состояние: " + stateOf(one, keep));
+          if (!holdsApplied(one, keep) || !appliedCard(one, keep)) throw Error("варианты открыты, кнопок нет");
+          const texts = [cardStatus(one, keep), answerText(keep, one)].join(" | ");
+          if (texts.includes("keep") || texts.includes("ответ отменён")) throw Error("служебное слово или неправда: " + texts);
+          if (!texts.includes("применённый ответ")) throw Error("не сказано, что применённый ответ на месте: " + texts);
+          const b = revertButton(one, keep);
+          if (b.kind !== "revert" || b.label !== "Подготовить отмену") throw Error("«Не отменять» повторно: " + JSON.stringify(b));
+          const p = revertButton(one, revert);
+          if (p.kind !== "keep" || p.label !== "Не отменять") throw Error("подготовленная отмена: " + JSON.stringify(p));
+        ''', host="cards.example")
+
+    def test_state_from_program_once_laptop_saw_answer(self):
+        run_page(self, self.SETUP + r'''
+          man.answer_states.r1 = {state:"applied", ts:"t3", source:"cloud"};
+          if (stateOf(one, keep) !== "applied") throw Error("состояние не из программы: " + stateOf(one, keep));
+        ''', host="cards.example")
+
+    def test_local_page_has_no_cloud_keep(self):
+        run_page(self, self.SETUP + r'''
+          if (stateOf(one, keep) === "cloud_keep") throw Error("на ноутбуке страничного состояния нет");
         ''')
 
 
