@@ -112,6 +112,19 @@ class PreciseMarksTests(unittest.TestCase):
         self.assertEqual(marked, ["u", "v"])
         self.assertEqual(task["unlocated_doubts"], 1)
 
+    def test_place_touching_untimed_words_counts_as_unlocated(self):
+        # Слово без времени между словами со временем: его место во времени неизвестно, поэтому
+        # место без ссылок, задевающее промежуток вокруг него, привязать нельзя — сомнительны все слова.
+        words = [_word("a", 0.0, 1.0), {"word_id": "u", "w": "u"}, _word("b", 2.0, 3.0), _word("c", 9.0, 10.0)]
+        for t1, t2 in ((1.2, 1.8), (0.5, 1.0), (2.0, 2.5)):
+            with self.subTest(t1=t1, t2=t2):
+                marked, task = _marked([{"id": "r1", "status": "open", "t1": t1, "t2": t2}], words)
+                self.assertEqual(marked, ["a", "u", "b", "c"])
+                self.assertEqual(task["unlocated_doubts"], 1)
+        marked, task = _marked([{"id": "r1", "status": "open", "t1": 9.2, "t2": 9.5}], words)
+        self.assertEqual(marked, ["c"])                # далеко от слова без времени — привязано как раньше
+        self.assertEqual(task["unlocated_doubts"], 0)
+
     def test_only_open_and_human_places_count(self):
         places = [{"id": "r1", "status": "resolved", "t1": 0.0, "t2": 8.0},
                   {"id": "r2", "status": "resolved"},
