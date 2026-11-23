@@ -363,7 +363,8 @@ def _precise_doubts(transcript, review):
     Место со ссылками на слова помечает эти слова. Место без ссылок с годным временем —
     слова по правилу _word_in_place; если таких слов нет (пауза), — последнее слово до t1
     и первое после t2 (что есть). Место без ссылок и без годного времени, а также место
-    со временем в записи, где у слов нет времени, привязать нельзя: тогда, как в версии 2,
+    со временем в записи, где у слов нет времени, а также место без ссылок, чьё время задевает
+    промежуток со словом без времени, привязать нельзя: тогда, как в версии 2,
     сомнительны все слова записи, а число таких мест идёт в задание.
     """
     timed = []                                        # (начало, конец, порядок, ID) слов со временем
@@ -373,6 +374,21 @@ def _precise_doubts(transcript, review):
             if _seconds(start):
                 timed.append((start, end if _seconds(end) and end >= start else start, len(timed),
                               word["word_id"]))
+    # Промежутки вокруг слов без времени: от конца предыдущего слова со временем до начала следующего.
+    # Где внутри такое слово, неизвестно, поэтому место без ссылок, задевающее промежуток, не привязывается.
+    untimed, last_end, pending = [], -math.inf, False
+    for segment in transcript.get("segments", []):
+        for word in segment.get("words", []):
+            start, end = word.get("s"), word.get("e")
+            if _seconds(start):
+                if pending:
+                    untimed.append((last_end, start))
+                    pending = False
+                last_end = end if _seconds(end) and end >= start else start
+            else:
+                pending = True
+    if pending:
+        untimed.append((last_end, math.inf))
     marked, unlocated = set(), 0
     for item in _open_places(review):
         if item.get("word_ids"):
@@ -383,6 +399,9 @@ def _precise_doubts(transcript, review):
             unlocated += 1
             continue
         t1, t2 = span
+        if any(t1 - PLACE_TIME_TOLERANCE <= hi and t2 + PLACE_TIME_TOLERANCE >= lo for lo, hi in untimed):
+            unlocated += 1
+            continue
         inside = {ident for start, end, _order, ident in timed if _word_in_place(start, end, t1, t2)}
         if not inside:                                # пауза: никакое слово не попало во время места
             before = [word for word in timed if word[0] < t1]
@@ -577,6 +596,13 @@ def _prepare_model_task(store, request, restart):
                                (request_id,)).fetchone()
         if run is None or new_generation:
             run_id, now = str(uuid.uuid4()), storage._now()
+            # Начать заново из ожидания: прежний ожидающий запуск и его шаг закрываются здесь же,
+            # иначе ожидающих стало бы два и ни блок, ни итог нового запуска не были бы приняты.
+            store.db.execute("UPDATE workflow_steps SET state='superseded', updated_at=? WHERE run_id IN "
+                             "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
+                             "AND state='waiting_model') AND state='waiting_model'", (now, request_id))
+            store.db.execute("UPDATE workflow_runs SET state='superseded', updated_at=? "
+                             "WHERE request_id=? AND kind='model' AND state='waiting_model'", (now, request_id))
             store.db.execute("INSERT INTO workflow_runs VALUES (?, ?, 'model', 'waiting_model', "
                              "'opencode/openai/gpt-6-luna', ?, ?)",
                              (run_id, request_id, now, now))
@@ -1050,28 +1076,29 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
         return (f"сохранено блоков {saved} из {total}; продолжить с места остановки — "
                 "workflow_execute_model(retry_failed=true) или rt.py workflow-execute --retry-failed")
     try:
-        with llm_provider.OpenCodeTextClient() as client:
-            for part_index in range(total):
-                if part_index in completed:
-                    continue
-                part = model_part(store, request_id, part_index)
-                if get(store, request_id)["model_task"] != task:
-                    raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
-                repair_error = invalid_output = None
-                for attempt in range(2):
-                    result, raw = client.generate(part["task"], repair_error=repair_error,
-                                                  invalid_output=invalid_output)
-                    try:
-                        _validate_model_part(store, request_id, part_index, result)
-                    except ValueError as ex:
-                        invalid_count += 1
-                        if attempt == 1:
-                            raise llm_provider.ProviderError(
-                                "invalid_response", "ответ модели не прошёл проверку после одной попытки исправления")
-                        repair_error, invalid_output = str(ex), raw
+        if len(completed) < total:                  # все блоки сохранены — клиент облака не нужен
+            with llm_provider.OpenCodeTextClient() as client:
+                for part_index in range(total):
+                    if part_index in completed:
                         continue
-                    accept_model_part(store, request_id, part_index, result)
-                    break
+                    part = model_part(store, request_id, part_index)
+                    if get(store, request_id)["model_task"] != task:
+                        raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
+                    repair_error = invalid_output = None
+                    for attempt in range(2):
+                        result, raw = client.generate(part["task"], repair_error=repair_error,
+                                                      invalid_output=invalid_output)
+                        try:
+                            _validate_model_part(store, request_id, part_index, result)
+                        except ValueError as ex:
+                            invalid_count += 1
+                            if attempt == 1:
+                                raise llm_provider.ProviderError(
+                                    "invalid_response", "ответ модели не прошёл проверку после одной попытки исправления")
+                            repair_error, invalid_output = str(ex), raw
+                            continue
+                        accept_model_part(store, request_id, part_index, result)
+                        break
         if (get(store, request_id)["state"] == "waiting_model"
                 and saved_part_count(store, request_id=request_id, task_hash=task_hash) == total):
             _assemble_parts(store, request_id, task, task_hash)     # блоки сохранены раньше, итога не было
