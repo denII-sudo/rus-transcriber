@@ -616,6 +616,35 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
                 self.save(jp, version, kind="keep")
                 self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
 
+    def test_copy_is_one_level_and_does_not_change_application(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                original = self.applied_with_heard(jp, md, version)
+                self.save(jp, version, option=1)
+                self.save(jp, version, text="пятое")
+                self.save(jp, version, kind="revert")
+                stored = review_pack.answers_state(jp)["answers"]["r1"]
+                self.assertEqual(stored["applied_answer"], original)
+                self.assertNotIn("applied_answer", stored["applied_answer"])
+                # С копией внутри ответ применяется так же, как без неё.
+                with_copy = review_pack.decisions(jp), review_pack.answer_states(jp)
+                state = review_pack.answers_state(jp)
+                state["answers"]["r1"].pop("applied_answer")
+                review_pack._write_answers(jp, state)
+                self.assertEqual((review_pack.decisions(jp), review_pack.answer_states(jp)), with_copy)
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r1"], "reverted")
+                self.assertNotIn("applied_answer", json.dumps(rep, ensure_ascii=False))
+
+    def test_cloud_bundle_does_not_carry_copy(self):
+        with answer_files("legacy_files") as (jp, md, version):
+            self.applied_with_heard(jp, md, version)
+            self.save(jp, version, kind="revert")
+            self.assertIn("applied_answer", review_pack.answers_state(jp)["answers"]["r1"])
+            bundle = review_pack.cloud_bundle(jp)
+            text = (Path(bundle["base"]) / "cloud" / "manifest.json").read_text(encoding="utf-8")
+            self.assertNotIn("\"applied_answer\"", text)
+
     def test_old_pack_without_copy_restores_by_signature_and_says_so(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
