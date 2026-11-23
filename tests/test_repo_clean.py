@@ -1,6 +1,8 @@
 """Репозиторий чист от личных данных (имена из локальных данных, пути пользователя, профили голосов).
 Запуск: python -m unittest discover -s tests. Слова берутся из папки данных; нет данных — проверка слов пропускается."""
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -100,6 +102,32 @@ class T(unittest.TestCase):
         self.assertNotIn("Сосновка", text)
         self.assertNotIn("Примеров", text)
         self.assertIn("Сосновка", " ".join(why for _, why in shown))
+
+    def test_private_repo_folders_are_rejected_only_as_file_places(self):
+        """Отчёт в research/ публичного репозитория — не на месте; ссылка на такой путь в тексте допустима."""
+        if shutil.which("git") is None:
+            self.skipTest("нет git")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            git = lambda *a: subprocess.run(["git", "-C", str(root), *a], check=True, capture_output=True, env=env)
+            git("init", "-q")
+            files = {"research/plan/report.md": "отчёт", "people/someone.md": "правила",
+                     "docs/research/bench.md": "замер", "docs/notes.md": "см. приватный research/plan/README.md",
+                     "tools/reports.py": "x = 1", "notes.md": "заметка"}
+            for rel, text in files.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text + "\n", encoding="utf-8")
+            git("add", "-A")
+            old = check_repo.ROOT
+            check_repo.ROOT = root
+            try:
+                problems, _, is_git = check_repo.check(hide_words=True)
+            finally:
+                check_repo.ROOT = old
+        self.assertTrue(is_git)
+        self.assertEqual(sorted(w for w, _ in problems), ["people/someone.md", "research/plan/report.md"])
+        self.assertIn("приватном", problems[0][1])
 
     def test_user_path_regex_allows_placeholders(self):
         rx = check_repo.USER_PATH

@@ -7,7 +7,8 @@ r"""Проверка перед коммитом: в отслеживаемых 
 
 Что проверяется:
   1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, config.json, bench*, аудио,
-     *.transcript.*, cache/, hf-cache/, .venv/;
+     *.transcript.*, cache/, hf-cache/, .venv/; в репозитории Git ещё и файлы в корневых папках приватного
+     служебного репозитория (research/, people/, machines/, sessions/, notes/, reports/): им место там;
   2. абсолютные пути с настоящим именем пользователя: C:\Users\<имя>\ (допустимы <вы>, Иван, %USERNAME%, user …);
   3. запрещённые слова — имена участников, названия и термины групп. Откуда берутся (список хранится ВНЕ
      репозитория): все groups\*\vocab.json и voices.json из папки данных (RUS_TRANSCRIBER_DATA или
@@ -33,6 +34,9 @@ BAD_DIRS = {"groups", "jobs", "cache", "hf-cache", ".venv", "profiles", "exports
 # Имена групп, которые не несут личных данных: «default» есть в любой установке и встречается
 # в исходниках как обычное слово, поэтому запрещённым словом оно быть не должно.
 GENERIC_GROUP_NAMES = {"default"}
+# Корневые папки приватного служебного репозитория. В публичном таких нет: файл в них — отчёт или заметка,
+# положенные не в тот репозиторий. Ссылки на такие пути в тексте разрешены, проверяется только место файла.
+PRIVATE_REPO_DIRS = {"research", "people", "machines", "sessions", "notes", "reports"}
 OK_USERS = {"иван", "user", "username", "you", "name", "вы", "<вы>", "ваше_имя", "someone", "public"}
 TEXT_MAX = 2_000_000
 USER_PATH = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+([^\\/\s\"'`<>%]+)", re.I)
@@ -129,6 +133,9 @@ def check(staged=False, require_words=True, hide_words=False):
         name = parts[-1]
         if any(fnmatch.fnmatch(name, pat) for pat in BAD_NAMES) or BAD_DIRS & set(parts[:-1]):
             problems.append((rel, "файл личных данных или результатов не должен быть в репозитории"))
+        elif is_git and len(parts) > 1 and parts[0] in PRIVATE_REPO_DIRS:
+            problems.append((rel, f"папка {parts[0]}/ есть только в приватном служебном репозитории: "
+                                  "файлу место там, не в этом"))
     words = forbidden_words()
     wrx = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(" + "|".join(re.escape(w) for w in words) + r")(?![А-Яа-яЁёA-Za-z])", re.I) if words else None
     for rel in files:
