@@ -31,7 +31,7 @@ import lab_spec
 import lab_summary
 
 RESULTS_SCHEMA = "lab-results-1"
-HYP_SCHEMA = "lab-hyp-1"
+HYP_SCHEMA = "hyp-2"       # формат гипотез программы (hypotheses.SCHEMA); lab-hyp-1 читается как прежде
 OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
                "HF_HUB_DISABLE_TELEMETRY": "1"}
 # Грубые оценки секунд счёта на час звука, если нет ни истории, ни посчитанных пар.
@@ -255,9 +255,26 @@ class Capture:
             third = {"model": timing.get("asr3_model"), "backend": timing.get("asr3_device"),
                      "name": timing.get("asr3_name"), "mode": timing.get("asr3_mode"),
                      "pieces": timing.get("asr3_pieces"), "chunks": chunks}
-        return {"schema": HYP_SCHEMA, "combine_rule": combine_rule(self.W),
-                "primary": roles.get("primary"), "second": roles.get("second"),
-                "third": third, "vote": self.vote}
+        legacy = {"combine_rule": combine_rule(self.W), "primary": roles.get("primary"),
+                  "second": roles.get("second"), "third": third, "vote": self.vote}
+        return self.record(roles, third, legacy, timing)
+
+    def record(self, roles, third, legacy, timing):
+        """Запись hyp-2 общим сборщиком программы (hypotheses.build_record); верхние ключи lab-hyp-1 те же."""
+        import hypotheses as H
+        blocks = []
+        for name, p in roles.items():
+            blocks.append({"role": name, "model": {"name": p.get("model")}, "engine": {"name": p.get("backend")},
+                           "chunks": p.get("chunks"), "words": p.get("words"), "word_times": H.available()})
+        if third is not None:
+            blocks.append({"role": "third", "model": {"name": third.get("model")},
+                           "engine": {"name": third.get("backend"), "engine_name": third.get("name"),
+                                      "mode": third.get("mode"), "pieces": third.get("pieces")},
+                           "timing": {k: timing.get(k) for k in ("asr3_sec", "asr3_load_sec", "asr3_compile_sec")},
+                           "chunks": third.get("chunks"),
+                           "words": H.not_measured("лаборатория хранит у третьей модели текст кусков (chunks)"),
+                           "word_times": H.not_available("лаборатория: у третьей модели только текст")})
+        return H.build_record(blocks, legacy=legacy)
 
 
 # ── рабочий движок ───────────────────────────────────────────────────────────────────────────────

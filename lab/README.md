@@ -282,10 +282,17 @@ Whisper). Multilingual второй сохраняет времена слов; 
 конфигурацией, без эмоций); `realtime_factor` = длительность / `total_sec`;
 `asr_fallbacks` — откаты основного прохода.
 
-`hypotheses_json` (схема `lab-hyp-1`):
+`hypotheses_json` (схема `hyp-2`; прежняя `lab-hyp-1` читается как есть). Запись собирает общий сборщик
+программы `hypotheses.build_record` (его же использует расшифровка при сохранении гипотез, РАР-4.2 шаг 3):
+верхние ключи ниже остались теми же, добавлены `roles` (одинаковые блоки всех ролей: `role`, `model`,
+`engine`, `timing`, `chunks`, `words`, `word_times`), `combine`, `vote_trace` (протокол голосования,
+`words.vote_n(..., trace=...)`) и блоки сведений `audio`, `program`, `environment`, `hardware`,
+`conditions`, `config`, `ids`. Чего нет, записано явно: `{"status": "not_available" | "not_measured",
+"reason": ...}`. Лаборатория пока заполняет только `roles` и верхние ключи, остальные блоки — `not_measured`.
+Ниже — верхние ключи (схема `lab-hyp-1`):
 
 ```
-{"schema": "lab-hyp-1",
+{"schema": "hyp-2" (или "lab-hyp-1"),
  "combine_rule": "vote3_partial" | "whole_record",
  "primary": {"model", "backend", "chunks": [{"a", "b", "own": [с, по]}], "words": [{"w", "s", "e", "c"}]},
  "second":  тот же вид или null,
