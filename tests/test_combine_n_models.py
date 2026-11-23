@@ -330,6 +330,32 @@ class FailedChunksWithFourModelsTests(unittest.TestCase):
         self.assertEqual(got["quality"]["vote3_partial"], {"reason": "whisper_incomplete", "spans": 1, "seconds": 1.0})
         self.assertEqual(got["evidence"]["whisper"], [(7.0, 8.0, "error", ["primary", "second"])])
 
+    def test_fourth_model_chunk_states_are_told_apart(self):
+        """error, empty_unknown и filtered у четвёртой модели различаются и исключают только свой отрезок."""
+        for state, extra in (("error", {}), ("empty_unknown", {}), ("filtered", {"filtered_all": True})):
+            with self.subTest(state=state):
+                self.main = ten()
+                rec_state = "ok" if state == "filtered" else state
+                diag = self.diag("fourth", (3.0, 6.0), state=rec_state)
+                if extra:
+                    for rec in diag["fourth"]["chunks"]:
+                        if rec["own_span"] == [3.0, 6.0]:
+                            rec.update(extra)
+                got = self.combine(diag)
+                self.assertEqual(got["evidence"]["other"], [(3.0, 6.0, "fourth", state, ["primary", "second"])])
+                self.assertEqual(got["quality"]["vote3_partial"],
+                                 {"reason": "asr_incomplete", "spans": 1, "seconds": 3.0})
+                self.assertEqual(got["quality"]["vote"]["agree4"], 5)    # вне отрезка голосуют четыре модели
+
+    def test_filtered_flag_of_primary_and_second_is_ignored_as_before(self):
+        main = ten()
+        diag = ok_diag("primary", "second", "whisper")
+        diag["second"]["chunks"][0]["filtered_all"] = True
+        got = words.combine_hypotheses({"primary": main, "second": ten({1: "дважды"}),
+                                        "whisper": text(ten({1: "дважды"}))}, diag)
+        self.assertEqual(got["evidence"], {"whisper": [], "other": []})
+        self.assertEqual(main[1]["voted"], "ctc+whisper")
+
     def test_primary_failure_disables_vote(self):
         expected = copy.deepcopy(self.main)
         words.mark_alt(expected, self.second)

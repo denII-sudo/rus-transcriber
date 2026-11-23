@@ -558,12 +558,17 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
     """Сведение гипотез проходов моделей -> слова с пометками и решения.
 
     hypotheses: {"primary": слова основной модели со временами, "second": слова второй модели со
-    временами или None, "whisper": слова-строки третьей модели (любой; ключ прежний) или None};
+    временами или None, "whisper": слова-строки третьей модели или None}. Ключ "whisper" исторический
+    и не переименовывается: он обозначает роль третьей модели, а не движок — это может быть любая модель
+    (PR №84, transcript.asr_model_caps), в том числе не из семейства Whisper;
     None — проход не выполнялся или не удался. Вторая модель обязана давать времена слов: по ним
     исключаются отрезки и ставятся слова, выбранные голосованием (worker.second_pass это проверяет).
     Другие ключи — дополнительные модели (четвёртая и следующие) под именем роли, по порядку
     словаря: слова со временами или строки текста, None — не участвует.
-    diagnostics: сведения о кусках каждого прохода, {роль: {"chunks": [...]}}.
+    diagnostics: сведения о кусках каждого прохода, {роль: {"chunks": [...]}}. До показа человеку
+    различаются три состояния куска: error — ошибка, empty_unknown — пустота по неизвестной причине,
+    filtered — текст целиком удалён очисткой (filtered_all; у третьей и дополнительных моделей).
+    Все три дают свидетельство в evidence и исключают свой отрезок из голосования.
     rule: правило голосования {"keep", "replace"} (vote_n, check_rule). По умолчанию при трёх
     моделях — «два из трёх» (TWO_OF_THREE, прежнее vote3); при четырёх и более моделях правило
     обязательно (ValueError): программа его не выбирает, его задаёт опыт.
@@ -600,7 +605,10 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
     other_evidence = []
     for name in ("primary", "second", *extra_roles):
         for rec in (diagnostics.get(name) or {}).get("chunks", []):
-            if rec.get("state") not in ("error", "empty_unknown") or not rec.get("own_span"):
+            state = rec.get("state")
+            if name in extra_roles and rec.get("filtered_all"):
+                state = "filtered"            # текст куска целиком удалён очисткой, как у третьей модели
+            if state not in ("error", "empty_unknown", "filtered") or not rec.get("own_span"):
                 continue
             start, end = rec["own_span"]
             if name in ("primary", "second"):
@@ -610,7 +618,7 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
             else:
                 sources = [p for p, ws in (("primary", words), ("second", alt or []))
                            if any(start <= w["s"] < end for w in ws)]
-            other_evidence.append((start, end, name, rec["state"], sources))
+            other_evidence.append((start, end, name, state, sources))
     quality = {}
     reason = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
     # Сбой основной модели отключает голосование целиком; сбой другой модели — только свой отрезок.
