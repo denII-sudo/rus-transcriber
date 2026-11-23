@@ -213,7 +213,7 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
                 self.save(jp, version, option=1)
                 self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "pending_new")
                 self.save(jp, version, kind="revert")
-                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "saved")
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "revert_pending")
                 rep = self.apply(jp, md)
                 self.assertEqual(self.outcomes(rep)["r1"], "reverted")
                 self.assertEqual(self.words(jp), ["тест", "слово"])
@@ -549,6 +549,44 @@ class ReportDetails(AnswerOutcomeCase):
                 self.assertIn("карточкой 1", self.detail(rep, "r2"))
                 lines = self.lines(jp, rep)
                 self.assertTrue(any(line.startswith("Карточка 1") and "карточкой 2" in line for line in lines))
+
+
+class PreparedRevert(AnswerOutcomeCase):
+    """Отмена сохранена, но «Применить» ещё не нажато: прежний ответ на месте; передумать — «Не отменять»."""
+
+    def test_prepared_revert_state_and_keep(self):
+        for backend in BACKENDS:
+            for first in ({"option": 0}, {"text": "пятое"}):
+                with self.subTest(backend=backend, first=first), answer_files(backend) as (jp, md, version):
+                    self.save(jp, version, **first)
+                    self.apply(jp, md)
+                    applied = transcript.load(jp)
+                    self.save(jp, version, kind="revert")
+                    state = review_pack.answer_states(jp)["r1"]
+                    self.assertEqual(state["state"], "revert_pending")
+                    self.assertIn("Применить", state["why"])
+                    rep = self.save(jp, version, kind="keep")
+                    self.assertFalse(rep["rejected"])
+                    self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
+                    rep = self.apply(jp, md)
+                    self.assertEqual(self.outcomes(rep)["r1"], "applied")
+                    self.assertFalse(rep["reverted"])
+                    self.assertEqual(transcript.load(jp)["segments"], applied["segments"])
+
+    def test_keep_without_applied_answer_is_rejected(self):
+        with answer_files("legacy_files") as (jp, md, version):
+            rep = self.save(jp, version, kind="keep")
+            self.assertEqual(rep["rejected"][0]["id"], "r1")
+            self.assertNotIn("r1", review_pack.answers_state(jp).get("answers") or {})
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_page_prepared_revert_holds_applied(self):
+        run_page(self, r'''
+          const a={kind:"revert",ts:"t2",source:"local"}, one={id:"r1"};
+          man = {answer_states:{r1:{state:"revert_pending",ts:"t2",source:"local",why:"отмена подготовлена"}}};
+          if (!holdsApplied(one,a) || !appliedCard(one,a)) throw Error("варианты как у открытого места");
+          if (!cardStatus(one,a).startsWith("отмена подготовлена")) throw Error(cardStatus(one,a));
+        ''')
 
 
 if __name__ == "__main__":
