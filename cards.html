@@ -144,6 +144,27 @@ audio{width:100%;height:36px}
   const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous", "undo_conflict", "revert_pending"]
     .includes(stateOf(it, a));
   const pending = (it, a) => stateOf(it, a) === "pending_new";
+  // Что сказано об ответе под заголовком. Ответ «отменить» описывается по состоянию: пока отмена не прошла,
+  // прежний ответ на месте, и строка не должна говорить «ответ отменён».
+  const REVERT_TEXT = {revert_pending: "отмена подготовлена — прежний ответ пока на месте",
+                       undo_conflict: "отмена не выполнена — прежний ответ на месте",
+                       reverted: "ответ отменён — место снова открыто"};
+  function answerText(a, it) {
+    const kind = kindOf(a);
+    if (kind === "revert") return REVERT_TEXT[stateOf(it, a)] || "отмена ответа";
+    let what = {human: "оставлено человеку", skip: "пропущено", voice: "голосовой ответ — распознается на ноутбуке",
+                free: `свой ответ: «${a.text || ""}»`}[kind] || kind || "ответ";
+    if (kind === "human" && a.text) what += ` («${a.text}»)`;
+    if (a.option != null && it.options && it.options[a.option] && (kind === "option" || kind === "recommended"))
+      what = `${a.option + 1} — ${it.options[a.option].label}`;
+    return what;
+  }
+  // Откуда и когда ответ. Ответ, собранный заново по «Не отменять» в старом пакете, времени прежнего ответа не знает.
+  function answerMeta(a) {
+    const where = a.source === "local" ? "ноутбук" : "облако";
+    if (a.restored) return `${where} — возвращён применённый ответ`;
+    return `${where} · ${when(a.ts)}` + (a.heard && a.text && kindOf(a) !== "free" ? ` · услышано «${a.text}»` : "");
+  }
   const appliedCard = (it, a) => holdsApplied(it, a) && !editing.has(it.id);
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
   // Неуспешные исходы — «не применён — …» с краткой причиной; полная причина — строкой под ответом.
@@ -289,19 +310,13 @@ audio{width:100%;height:36px}
   }
   function lastAnswer(a, it) {
     const box = document.createElement("div"); box.className = "last";
-    const kind = kindOf(a);
-    let what = {human: "оставлено человеку", skip: "пропущено", voice: "голосовой ответ — распознается на ноутбуке",
-                revert: "ответ отменён — место вернётся как распознала модель",
-                free: `свой ответ: «${a.text || ""}»`}[kind] || kind || "ответ";
-    if (kind === "human" && a.text) what += ` («${a.text}»)`;
-    if (a.option != null && it.options[a.option] && (kind === "option" || kind === "recommended"))
-      what = `${a.option + 1} — ${it.options[a.option].label}`;
+    const what = answerText(a, it);
     const k = document.createElement("span"); k.className = "k";
     k.textContent = cardStatus(it, a);
     if (pending(it, a)) box.dataset.pending = "1";
     const v = document.createElement("span"); v.className = "v"; v.textContent = what;
     const m = document.createElement("span"); m.className = "m";
-    m.textContent = `${a.source === "local" ? "ноутбук" : "облако"} · ${when(a.ts)}` + (a.heard && a.text && kind !== "free" ? ` · услышано «${a.text}»` : "");
+    m.textContent = answerMeta(a);
     box.append(k, v, m);
     const state = stateOf(it, a);
     const reason = ["applied", "saved", "cloud_saved"].includes(state) ? "" : whyOf(it);
@@ -329,6 +344,7 @@ audio{width:100%;height:36px}
       if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
       else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
       else if (a.kind === "keep") flash(it.id, "Отмена снята: применённый ответ остаётся");
+      else if (a.kind === "revert") flash(it.id, "Отмена подготовлена: нажмите «Применить сохранённые ответы»");
       else flash(it.id, acc && acc.answer ? "Сохранено (ещё не применено): " + acc.answer : "Ответ записан");
     } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
   }

@@ -497,14 +497,23 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             if a.get(k) is not None:
                 ans[k] = a[k]
         if a.get("kind") == "keep":
-            # «Не отменять»: вместо подготовленной отмены снова сохраняется применённый ответ — по его подписи.
+            # «Не отменять»: вместо подготовленной отмены (или ждущего ответа) снова сохраняется применённый
+            # ответ — целиком, из копии, которую хранит заменивший его ответ (время, источник, услышанное).
             previous = applied.get(aid)
             if previous is None:
                 rep["rejected"].append({"id": aid, "why": "нет применённого ответа, к которому можно вернуться"})
                 continue
+            kept = (store["answers"].get(aid) or {}).get("applied_answer")
+            if kept and _sig(kept) == previous:
+                store["answers"][aid] = copy.deepcopy(kept)
+                rep["accepted"].append({"id": aid, "kind": kept.get("kind"), "answer": _desc(kept, it),
+                                        "restored": True})
+                continue
+            # Исключение для пакетов, записанных до появления копии: ответ собирается по подписи,
+            # с отметкой restored и временем возврата (прежнее время неизвестно).
             kind, option, text = (list(previous) + [None, None, None])[:3]
             ans.pop("text", None)
-            ans["kind"] = kind
+            ans.update(kind=kind, restored=True)
             if option is not None:
                 ans["option"] = option
             if text is not None:
@@ -539,6 +548,12 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             rep["conflicts"].append({"id": aid, "was": _desc(old, it), "now": _desc(ans, it)})
         if old and old.get("ts", "") > ans["ts"]:          # более поздний ответ побеждает
             continue
+        if old and over_applied(ans, applied.get(aid)) not in (None, "applied"):
+            # Ответ поверх применённого хранит копию применённого ответа целиком: по «Не отменять» он
+            # возвращается как был. Копия переносится и через цепочку ждущих ответов.
+            kept = old if _sig(old) == applied.get(aid) else old.get("applied_answer")
+            if kept and _sig(kept) == applied.get(aid):
+                ans["applied_answer"] = {k: copy.deepcopy(v) for k, v in kept.items() if k != "applied_answer"}
         store["answers"][aid] = ans
         rep["accepted"].append({"id": aid, "kind": ans["kind"], "answer": _desc(ans, it)})
         if ans["kind"] == "free":
