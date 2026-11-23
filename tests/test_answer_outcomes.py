@@ -713,6 +713,8 @@ class CloudKeep(unittest.TestCase):
           const texts = [cardStatus(one, keep), answerText(keep, one)].join(" | ");
           if (texts.includes("keep") || texts.includes("ответ отменён")) throw Error("служебное слово или неправда: " + texts);
           if (!texts.includes("применённый ответ")) throw Error("не сказано, что применённый ответ на месте: " + texts);
+          man.answer_states.r1.why = "отмена подготовлена"; man.answer_states.r1.detail = "уточнение";
+          if (programNote(one, keep) !== "") throw Error("причина прежнего ответа: " + programNote(one, keep));
           const b = revertButton(one, keep);
           if (b.kind !== "revert" || b.label !== "Подготовить отмену") throw Error("«Не отменять» повторно: " + JSON.stringify(b));
           const p = revertButton(one, revert);

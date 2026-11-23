@@ -129,20 +129,28 @@ audio{width:100%;height:36px}
   // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
   const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
   // Состояние ответа считает программа на ноутбуке (answer_states): страница его только показывает.
-  // Ответ, которого ноутбук ещё не видел (облако), — «сохранён в облаке».
+  // Ответ, которого ноутбук ещё не видел (облако), — «сохранён в облаке»; страничное исключение —
+  // «Не отменять» из облака (cloud_keep): до переноса на ноутбук применённый ответ на месте.
   const stateOf = (it, a) => {
     if (!a) return "";
     const st = (man.answer_states || {})[it.id];
     if (st && st.ts === a.ts && st.source === a.source) return st.state;
-    return LOCAL ? "saved" : "cloud_saved";
+    if (LOCAL) return "saved";
+    return kindOf(a) === "keep" ? "cloud_keep" : "cloud_saved";
   };
   const whyOf = (it) => ((man.answer_states || {})[it.id] || {}).why || "";
   const detailOf = (it) => ((man.answer_states || {})[it.id] || {}).detail || "";
   // применённая правка на месте: прежний ответ (новый ждёт отмены или не меняет его)
   // undo_conflict: отмена не выполнилась — прежняя правка на месте, кнопки «Изменить» и «Отмена» нужны
   // revert_pending: отмена подготовлена, но не применена — правка тоже ещё на месте
-  const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous", "undo_conflict", "revert_pending"]
-    .includes(stateOf(it, a));
+  // cloud_keep: отмена снята в облаке — применённая правка на месте
+  const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous", "undo_conflict", "revert_pending",
+                                   "cloud_keep"].includes(stateOf(it, a));
+  // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
+  const revertButton = (it, a) => stateOf(it, a) === "revert_pending" ?
+    {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
+    {label: "Подготовить отмену", kind: "revert",
+     title: "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось."};
   const pending = (it, a) => stateOf(it, a) === "pending_new";
   // Что сказано об ответе под заголовком. Ответ «отменить» описывается по состоянию: пока отмена не прошла,
   // прежний ответ на месте, и строка не должна говорить «ответ отменён».
@@ -152,6 +160,7 @@ audio{width:100%;height:36px}
   function answerText(a, it) {
     const kind = kindOf(a);
     if (kind === "revert") return REVERT_TEXT[stateOf(it, a)] || "отмена ответа";
+    if (kind === "keep") return "отмена снята — применённый ответ остаётся";
     let what = {human: "оставлено человеку", skip: "пропущено", voice: "голосовой ответ — распознается на ноутбуке",
                 free: `свой ответ: «${a.text || ""}»`}[kind] || kind || "ответ";
     if (kind === "human" && a.text) what += ` («${a.text}»)`;
@@ -166,6 +175,13 @@ audio{width:100%;height:36px}
     return `${where} · ${when(a.ts)}` + (a.heard && a.text && kindOf(a) !== "free" ? ` · услышано «${a.text}»` : "");
   }
   const appliedCard = (it, a) => holdsApplied(it, a) && !editing.has(it.id);
+  // Причина и уточнение программы под ответом. У ответа из облака, которого ноутбук ещё не видел, их нет:
+  // то, что знает программа, относится к прежнему ответу.
+  function programNote(it, a) {
+    const state = stateOf(it, a), cloud = ["cloud_saved", "cloud_keep"].includes(state);
+    const reason = cloud || ["applied", "saved"].includes(state) ? "" : whyOf(it);
+    return [reason, cloud ? "" : detailOf(it)].filter(Boolean).join(" — ");
+  }
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
   // Неуспешные исходы — «не применён — …» с краткой причиной; полная причина — строкой под ответом.
   const STATUS = {saved: "ответ сохранён", applied: "применён ответ", pending_new: "новый ответ — не применён",
@@ -175,7 +191,8 @@ audio{width:100%;height:36px}
                   apply_conflict: "не применён — слова изменились", blocked_preflight: "не применён — пересекается с другой карточкой",
                   undo_conflict: "отмена не выполнена — прежний ответ на месте",
                   source_conflict: "не применён — стенограмма изменилась", not_found: "не применён — место не найдено",
-                  not_applied: "не применён", cloud_saved: "сохранён в облаке — не применён"};
+                  not_applied: "не применён", cloud_saved: "сохранён в облаке — не применён",
+                  cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте"};
   const cardStatus = (it, a) => (man.conflicts || []).some(c => c.id === it.id) ? "конфликт — требуется проверка" :
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "требует проверки" : STATUS[stateOf(it, a)] || "не применён";
   // Строки отчёта «Применить»: исход каждого ответа по номеру карточки, с уточнением программы.
@@ -318,9 +335,7 @@ audio{width:100%;height:36px}
     const m = document.createElement("span"); m.className = "m";
     m.textContent = answerMeta(a);
     box.append(k, v, m);
-    const state = stateOf(it, a);
-    const reason = ["applied", "saved", "cloud_saved"].includes(state) ? "" : whyOf(it);
-    const note = [reason, state === "cloud_saved" ? "" : detailOf(it)].filter(Boolean).join(" — ");
+    const note = programNote(it, a);
     if (note) { const w = document.createElement("span"); w.className = "m"; w.textContent = note; box.append(w); }
     return box;
   }
@@ -391,15 +406,9 @@ audio{width:100%;height:36px}
       const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
       eb.onclick = () => { editing.add(it.id); render(); };
       const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
-      if (stateOf(it, a) === "revert_pending") {
-        // передумали отменять: программа снова сохраняет применённый ответ
-        rb.textContent = "Не отменять"; rb.title = "Оставить применённый ответ; подготовленная отмена снимается.";
-        rb.onclick = () => send(it, {kind: "keep"}, state);
-      } else {
-        rb.textContent = "Подготовить отмену";
-        rb.title = "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось.";
-        rb.onclick = () => send(it, {kind: "revert"}, state);
-      }
+      const second = revertButton(it, a);
+      rb.textContent = second.label; rb.title = second.title;
+      rb.onclick = () => send(it, {kind: second.kind}, state);
       er.append(eb, rb); c.append(er);
     }
 
