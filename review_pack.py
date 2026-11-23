@@ -962,7 +962,7 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
         return {"id": aid, "version": answer.get("version") or man.get("version"),
                 "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
                 "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
-                "answer_sig": _sig(answer), "action": action, "outcome": outcome, "at": _now()}
+                "answer_sig_sha256": _sig_hash(answer), "action": action, "outcome": outcome, "at": _now()}
 
     for aid, outcome in outcomes.items():
         if outcome in _QUIET_OUTCOMES or aid not in answers:
@@ -985,13 +985,19 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
     _write_answers(json_path, store)
 
 
+def _sig_hash(answer):
+    """Хэш подписи ответа для журнала применения: сам ответ (текст своего ответа) в журнал не пишется."""
+    raw = json.dumps(_sig(answer), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _answer_event(events, aid, answer):
-    """Последнее событие применения именно этого ответа: то же место, источник, время и сам ответ (подпись).
-    Исключение: у событий, записанных до появления подписи, сверяются только место, источник и время."""
+    """Последнее событие применения именно этого ответа: то же место, источник, время и сам ответ (хэш подписи).
+    Исключение: у событий, записанных без хэша подписи, сверяются только место, источник и время."""
     for row in reversed(events or []):
         if (row.get("id") == aid and row.get("answer_ts") == answer.get("ts") and
                 row.get("answer_source") == answer.get("source") and
-                ("answer_sig" not in row or row["answer_sig"] == _sig(answer))):
+                ("answer_sig_sha256" not in row or row["answer_sig_sha256"] == _sig_hash(answer))):
             return row
     return None
 
