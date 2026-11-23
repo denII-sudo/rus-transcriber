@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -230,6 +231,40 @@ class Manager:
         key = hashlib.sha256((tool + ":" + session).encode()).hexdigest()
         return self.state / (key + ".json")
 
+    @staticmethod
+    def moved_path(path, cwd):
+        """Where a session's earlier binding is kept after it moved to another checkout."""
+        key = hashlib.sha256(os.path.normcase(str(cwd)).encode()).hexdigest()[:16]
+        return path.with_name(f"{path.stem}-moved-{key}.json")
+
+    def check_move(self, root, cwd, tool, session, path):
+        """Allow an OpenCode session's explicit move (session.move) to another checkout.
+
+        Claude hooks report whatever directory a session is in, so for Claude a different
+        directory is never taken as a move. The target is either this session's own earlier
+        checkout or a fresh one: clean, with no commits outside origin/main, held by no
+        other session. Taking over such a checkout cannot make anyone's work look ownerless.
+        """
+        if tool != "opencode":
+            raise ValueError("task binding cannot be silently replaced")
+        own = path.stem
+        for other_path in self.state.glob("*.json"):
+            if other_path.stem.split("-moved-")[0] == own:
+                continue
+            other = json.loads(other_path.read_text(encoding="utf-8"))
+            if (isinstance(other, dict) and not other.get("removed") and
+                    os.path.normcase(str(other.get("cwd"))) == os.path.normcase(str(cwd))):
+                raise ValueError("checkout bound to another session")
+        earlier = self.moved_path(path, str(cwd))
+        if earlier.exists() and not json.loads(earlier.read_text(encoding="utf-8")).get("removed"):
+            return
+        if git(cwd, "status", "--porcelain", "--untracked-files=all", "--ignored"):
+            raise ValueError("new checkout is not clean")
+        try:
+            git(root, "merge-base", "--is-ancestor", git(cwd, "rev-parse", "HEAD"), "origin/main")
+        except RuntimeError:
+            raise ValueError("new checkout has own commits") from None
+
     def repo_for(self, cwd):
         return next((r for r in self.config["repos"] if safe_checkout(r["root"], cwd)), None)
 
@@ -238,12 +273,19 @@ class Manager:
             str(Path(cwd).resolve()).casefold().replace("\\", "/").encode()).hexdigest()[:12]
         return self.state / "sandboxes" / key
 
+    @staticmethod
+    def bare_hook_sandbox(p):
+        """Only the empty data/temp folders a shell hook makes before registration succeeds."""
+        return all(
+            c.name in ("data", "temp") and c.is_dir() and not linked(c) and not any(c.iterdir())
+            for c in p.iterdir())
+
     def prepare_sandbox(self, cwd):
         p = self.sandbox_path(cwd)
         if any(linked(x) for x in (p, p.parent)):
             raise ValueError("linked sandbox")
         marker = p / "workspace-sandbox.marker"
-        if p.exists() and not marker.is_file():
+        if p.exists() and not marker.is_file() and not self.bare_hook_sandbox(p):
             raise ValueError("sandbox not owned")
         if marker.exists() and (linked(marker) or marker.read_text(encoding="ascii").strip() != p.name):
             raise ValueError("sandbox not owned")
@@ -290,9 +332,16 @@ class Manager:
         old = {}
         if path.exists():
             old = json.loads(path.read_text(encoding="utf-8"))
-            if old["cwd"] != str(cwd) or old.get("removed"):
+            if old["cwd"] == str(cwd) and old.get("removed"):
                 raise ValueError("task binding cannot be silently replaced")
         info = checkout_info(repo["root"], cwd, allow_locked=True)
+        if old and old["cwd"] != str(cwd):
+            self.check_move(repo["root"], cwd, tool, session, path)
+            # The old record stays as a separate file: sweep keeps judging the old
+            # checkout by it, so its unsaved work is never treated as ownerless.
+            write_json(self.moved_path(path, old["cwd"]), old)
+            self.moved_path(path, str(cwd)).unlink(missing_ok=True)
+            old = {}
         self.prepare_sandbox(cwd)
         base = old.get("base_head")
         if not old:
@@ -620,6 +669,12 @@ def write_inventory_report(path, rows, now=None):
     append_report_line(path, INVENTORY_PREFIX, entry, now)
 
 
+def reason_code(error):
+    """Only this module's fixed lowercase reasons: OS and parser errors may carry paths or data."""
+    text = str(error) if isinstance(error, (ValueError, RuntimeError)) else ""
+    return text if re.fullmatch(r"[a-z][a-z ]{2,60}", text) else "error"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -669,8 +724,9 @@ def main():
         if a.action != "claude-hook":
             print(json.dumps(out))
         return 0
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
-        print("Workspace maintenance deferred; no unverified checkout removed.", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as e:
+        print(f"Workspace maintenance deferred ({reason_code(e)}); no unverified checkout removed.",
+              file=sys.stderr)
         return 1
 
 

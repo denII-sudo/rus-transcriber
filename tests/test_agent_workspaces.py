@@ -389,6 +389,98 @@ class HousekeepingTests(unittest.TestCase):
         self.assertEqual(self.m.sweep(True)[0]["status"], "kept-unverified")
         self.assertTrue(self.cwd.exists())
 
+    def moving_session(self):
+        """An OpenCode session bound to the task checkout, plus a fresh checkout from origin/main."""
+        self.g("update-ref", "refs/remotes/origin/main", self.base)
+        self.m.register("opencode", "oc-session", str(self.cwd), project="synthetic-project")
+        nxt = self.repo / ".opencode/worktrees/next"
+        self.g("worktree", "add", "-q", "-b", "opencode/next", str(nxt), "origin/main")
+        return self.m.record_path("opencode", "oc-session"), nxt
+
+    def records(self):
+        return [json.loads(p.read_text(encoding="utf-8")) for p in self.m.state.glob("*.json")]
+
+    def test_moved_session_keeps_old_binding_and_registers_new(self):
+        path, nxt = self.moving_session()
+        (self.cwd / "unsaved.txt").write_text("old work", encoding="utf-8")
+        self.assertEqual(self.m.register("opencode", "oc-session", str(nxt),
+                                         project="synthetic-project")["status"], "registered")
+        current = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((current["cwd"], current["branch"], current["base_head"]),
+                         (str(nxt.resolve()), "opencode/next", self.base))
+        moved = self.m.moved_path(path, str(self.cwd))
+        kept = json.loads(moved.read_text(encoding="utf-8"))
+        self.assertEqual((kept["cwd"], kept["branch"]), (str(self.cwd), "feature/test"))
+        # The old checkout is still judged by its own record and keeps its unsaved work.
+        with self.assertRaisesRegex(ValueError, "unsaved or ignored files"):
+            self.m.sweep_one(moved, True)
+        self.assertTrue((self.cwd / "unsaved.txt").exists())
+
+    def test_claude_session_never_moves_to_another_checkout(self):
+        _, nxt = self.moving_session()
+        with self.assertRaisesRegex(ValueError, "cannot be silently replaced"):
+            self.m.register("claude", "synthetic-session", str(nxt))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["cwd"], str(self.cwd))
+
+    def test_move_into_checkout_held_by_other_session_is_refused(self):
+        path, nxt = self.moving_session()
+        self.m.register("opencode", "other", str(nxt), project="synthetic-project")
+        with self.assertRaisesRegex(ValueError, "checkout bound to another session"):
+            self.m.register("opencode", "oc-session", str(nxt), project="synthetic-project")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["cwd"], str(self.cwd))
+        self.assertFalse(self.m.moved_path(path, str(self.cwd)).exists())
+
+    def test_move_into_dirty_or_diverged_checkout_is_refused(self):
+        path, nxt = self.moving_session()
+        (nxt / "someone.txt").write_text("work", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "new checkout is not clean"):
+            self.m.register("opencode", "oc-session", str(nxt), project="synthetic-project")
+        aw.git(nxt, "add", ".")
+        aw.git(nxt, "commit", "-qm", "someone")
+        with self.assertRaisesRegex(ValueError, "new checkout has own commits"):
+            self.m.register("opencode", "oc-session", str(nxt), project="synthetic-project")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["cwd"], str(self.cwd))
+
+    def test_move_back_reuses_own_checkout_with_one_binding_each(self):
+        _, nxt = self.moving_session()
+        first = self.repo / ".opencode/worktrees/first"
+        self.g("worktree", "add", "-q", "-b", "opencode/first", str(first), "origin/main")
+        (first / "file.txt").write_text("own work\n", encoding="utf-8")
+        aw.git(first, "add", ".")
+        aw.git(first, "commit", "-qm", "own work")
+        path = self.m.record_path("opencode", "second-session")
+        self.m.register("opencode", "second-session", str(first), project="synthetic-project")
+        self.m.register("opencode", "second-session", str(nxt), project="synthetic-project")
+        # Back to its own earlier checkout, although that one has its own commits.
+        self.m.register("opencode", "second-session", str(first), project="synthetic-project")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["cwd"], str(first.resolve()))
+        cwds = sorted(os.path.normcase(r["cwd"]) for r in self.records()
+                      if r["session"] == "second-session")
+        self.assertEqual(cwds, sorted(os.path.normcase(str(p.resolve())) for p in (first, nxt)))
+
+    def test_removed_binding_is_not_silently_reused(self):
+        record = json.loads(self.path.read_text(encoding="utf-8"))
+        record["removed"] = True
+        self.path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "cannot be silently replaced"):
+            self.m.register("claude", "synthetic-session", str(self.cwd))
+
+    def test_refusal_names_fixed_reason_without_paths(self):
+        _, nxt = self.moving_session()
+        self.m.register("opencode", "other", str(nxt), project="synthetic-project")
+        config_file = self.root / "config.json"
+        config_file.write_text(json.dumps(self.config), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-B", str(Path(aw.__file__)), "--config",
+                              str(config_file), "register", "--tool", "opencode",
+                              "--session", "oc-session", "--cwd", str(nxt)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("deferred (checkout bound to another session)", out.stderr)
+        self.assertNotIn(str(self.root), out.stderr)
+        self.assertEqual(aw.reason_code(OSError(str(self.root))), "error")
+        self.assertEqual(aw.reason_code(ValueError("Expecting value: line 1 column 1")), "error")
+        self.assertEqual(aw.reason_code(RuntimeError("command failed")), "command failed")
+
     def test_sandbox_symlink_is_kept_without_traversal(self):
         sandbox = self.m.sandbox_path(self.cwd)
         link = sandbox / "temp" / "linked"
@@ -524,8 +616,22 @@ class HousekeepingTests(unittest.TestCase):
     def test_unknown_sandbox_is_not_adopted(self):
         sandbox = self.m.sandbox_path(self.cwd)
         (sandbox / "workspace-sandbox.marker").unlink()
+        (sandbox / "temp" / "someone.txt").write_text("x", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "sandbox not owned"):
             self.m.prepare_sandbox(self.cwd)
+        (sandbox / "temp" / "someone.txt").unlink()
+        (sandbox / "other").mkdir()
+        with self.assertRaisesRegex(ValueError, "sandbox not owned"):
+            self.m.prepare_sandbox(self.cwd)
+
+    def test_empty_sandbox_made_by_shell_hook_is_taken_over(self):
+        # The plugin's shell hook can create empty data/temp before registration succeeds;
+        # cleanup of such a folder can lose nothing, so registration marks it as its own.
+        sandbox = self.m.sandbox_path(self.cwd)
+        (sandbox / "workspace-sandbox.marker").unlink()
+        self.assertEqual(self.m.prepare_sandbox(self.cwd), sandbox)
+        self.assertEqual((sandbox / "workspace-sandbox.marker").read_text(encoding="ascii"),
+                         sandbox.name + "\n")
 
     def test_opencode_apply_moves_archives_evicts_then_removes(self):
         old = json.loads(self.path.read_text(encoding="utf-8"))

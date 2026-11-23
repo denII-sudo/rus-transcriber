@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process"
-import { readFile, mkdir, access } from "node:fs/promises"
+import { readFile, writeFile, mkdir, access } from "node:fs/promises"
 import path from "node:path"
 import { promisify } from "node:util"
 import { createHash } from "node:crypto"
@@ -103,6 +103,21 @@ export default {
         windowsHide: true, timeout: 30_000,
       })
     }
+    // Registration refusals name a fixed reason code (never paths or data). Report it
+    // into the session so the agent can explain it instead of a bare "command failed".
+    async function register(sessionID, directory) {
+      try {
+        await maintenance(["register", "--tool", "opencode", "--session", sessionID,
+          "--cwd", directory, "--project", ctx.location.project.id])
+      } catch (error) {
+        const reason = /deferred \(([a-z ]+)\)/.exec(String(error?.stderr ?? ""))?.[1]
+        if (!reason) throw error
+        throw new BlockedWorkspace(`Рабочая копия ${path.basename(directory)} не зарегистрирована ` +
+          `(причина: ${reason}), поэтому инструменты сборки заблокированы. Это не отказ в правах ` +
+          "и не повод обходить защиту: сообщи причину человеку или координатору. Если копия " +
+          "занята другой сессией, работай в своей копии или в новой.")
+      }
+    }
     async function ensure(sessionID) {
       const result = await ctx.session.get({ sessionID })
       const session = result.data ?? result
@@ -158,8 +173,7 @@ export default {
         // move() queues a control for the next safe boundary; it need not be
         // visible from inside this callback. The write guard below checks the
         // actual location before permitting any mutating tool.
-        await maintenance(["register", "--tool", "opencode", "--session", sessionID,
-          "--cwd", created.directory, "--project", ctx.location.project.id])
+        await register(sessionID, created.directory)
         return
       }
       const parent = path.dirname(directory)
@@ -173,8 +187,7 @@ export default {
             "registered and build tools stay blocked. Not a permission problem: from a session outside " +
             "this copy, create a task branch in it from origin/main (only if it is clean and holds " +
             "no unique commits), or make a new workspace.")
-        await maintenance(["register", "--tool", "opencode", "--session", sessionID,
-          "--cwd", directory, "--project", ctx.location.project.id])
+        await register(sessionID, directory)
       }
     }
     async function once(sessionID) {
@@ -249,6 +262,12 @@ export default {
       const sandbox = path.join(config.state, "sandboxes", key)
       await mkdir(path.join(sandbox, "data"), { recursive: true })
       await mkdir(path.join(sandbox, "temp"), { recursive: true })
+      // Mark it as the plugin's own, as registration does: without the marker a later
+      // registration would treat this folder as someone else's and refuse the task.
+      await writeFile(path.join(sandbox, "workspace-sandbox.marker"), key + "\n",
+        { encoding: "ascii", flag: "wx" }).catch((error) => {
+        if (error?.code !== "EEXIST") throw error
+      })
       event.env.RUS_TRANSCRIBER_DATA = path.join(sandbox, "data")
       event.env.TEMP = path.join(sandbox, "temp")
       event.env.TMP = path.join(sandbox, "temp")
