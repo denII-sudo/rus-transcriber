@@ -53,6 +53,31 @@ class AnswerPhraseSnapshotTests(unittest.TestCase):
     def test_missing_table_is_a_clear_error(self):
         self.assert_table_error("missing.tsv", None, "не удалось прочитать", 1)
 
+    def test_header_only_table_is_rejected_for_missing_categories(self):
+        self.assert_table_error(
+            "header-only.tsv", "id\tkind\ttext\tnote\n".encode("utf-8"),
+            "обязательные категории: agree, negative_prefix, negative_intensifier, negative_core", 2,
+        )
+
+    def test_each_required_category_must_be_present(self):
+        rows = (
+            ("A001", "agree", "да", ""),
+            ("N001", "negative_prefix", "нет", ""),
+            ("N002", "negative_intensifier", "совсем", ""),
+            ("N003", "negative_core", "неверно", ""),
+        )
+        for missing_kind in (
+            "agree", "negative_prefix", "negative_intensifier", "negative_core",
+        ):
+            with self.subTest(kind=missing_kind):
+                table = "id\tkind\ttext\tnote\n" + "".join(
+                    "\t".join(row) + "\n" for row in rows if row[1] != missing_kind
+                )
+                self.assert_table_error(
+                    f"missing-{missing_kind}.tsv", table.encode("utf-8"),
+                    f"обязательные категории: {missing_kind}", 5,
+                )
+
     def test_bom_is_rejected(self):
         self.assert_table_error(
             "bom.tsv", b"\xef\xbb\xbfid\tkind\ttext\tnote\n",

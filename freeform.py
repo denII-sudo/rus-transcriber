@@ -100,6 +100,13 @@ def _read_answer_phrases(path=ANSWER_PHRASES_PATH):
         raise ValueError(
             f"{path.name}, строка {line}: не удалось разобрать строку таблицы"
         ) from exc
+    missing_kinds = [kind for kind, items in phrases.items() if not items]
+    if missing_kinds:
+        line = reader.line_num + 1
+        kinds = ", ".join(missing_kinds)
+        raise ValueError(
+            f"{path.name}, строка {line}: отсутствуют обязательные категории: {kinds}"
+        )
     return phrases
 
 
