@@ -751,6 +751,37 @@ class KeepRequests(AnswerOutcomeCase):
                 self.assertEqual((rows[0]["ts"], rows[0]["source"]), ("2026-11-23T23:00:00", "cloud"))
 
 
+class EventsWithoutAnswerText(AnswerOutcomeCase):
+    """Журнал применения хранит хэш подписи ответа, а не сам ответ: текст своего ответа туда не попадает."""
+
+    SECRET = "синтетическая фраза для журнала"
+
+    def events(self, jp):
+        return review_pack.answers_state(jp).get("application_events") or []
+
+    def test_free_answer_text_not_in_events(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                ts = "2026-11-23T21:00:00"
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "text": self.SECRET, "ts": ts}],
+                                        "local", trusted_actor="human")
+                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "pending_new")   # повтор — без новых событий
+                rows = [r for r in self.events(jp) if r.get("id") == "r1" and r.get("answer_ts") == ts]
+                self.assertEqual(len(rows), 1, rows)
+                self.assertNotIn(self.SECRET, json.dumps(self.events(jp), ensure_ascii=False))
+                self.assertNotIn("answer_sig", rows[0])
+                self.assertRegex(rows[0]["answer_sig_sha256"], r"^[0-9a-f]{64}$")
+                # другой текст в то же время — другой ответ: новое событие
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "text": self.SECRET + " два",
+                                              "ts": ts}], "local", trusted_actor="human")
+                core.apply_answers_files(jp, md)
+                rows = [r for r in self.events(jp) if r.get("id") == "r1" and r.get("answer_ts") == ts]
+                self.assertEqual(len(rows), 2, rows)
+                self.assertNotEqual(rows[0]["answer_sig_sha256"], rows[1]["answer_sig_sha256"])
+
+
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
 class CloudKeepPath(AnswerOutcomeCase):
     """Настоящий ход: «Не отменять» в облаке → import_answers → cloud_bundle → облачная страница."""
