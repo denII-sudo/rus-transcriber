@@ -158,8 +158,9 @@ class Capture:
     """Подмены на время одного вызова run_words: записывают гипотезы, конвейер не меняют.
 
     words.transcribe — слова основного и второго прохода (до голосования); words.clean_whisper —
-    текст третьей модели по кускам до и после чистки; words.vote3 / words.mark_alt — какое
-    сведение выполнено и с каким списком слов третьей модели; backends.make_asr — что запрошено
+    текст третьей модели по кускам до и после чистки; words.vote3 / words.vote_n / words.mark_alt —
+    какое сведение выполнено и с каким списком слов третьей модели (vote_n при второй и третьей модели
+    и правиле «два из трёх» записывается как vote3: результат тот же); backends.make_asr — что запрошено
     и что получено (откаты); backends.TorchASR — запрет отката на PyTorch (он может скачивать)."""
 
     def __init__(self, words_mod, backends_mod, allow_torch=False):
@@ -190,6 +191,7 @@ class Capture:
     def __enter__(self):
         W, B = self.W, self.B
         orig_tr, orig_clean, orig_vote, orig_mark = W.transcribe, W.clean_whisper, W.vote3, W.mark_alt
+        orig_vote_n = getattr(W, "vote_n", None)
         cap = self
 
         def transcribe(asr, audio, chunks, *args, **kwargs):
@@ -212,6 +214,20 @@ class Capture:
             cap.vote = {"function": "vote3", "third_words": list(whisper)}
             return orig_vote(main, ctc, whisper)
 
+        def vote_n(main, others, rule, trace=None):
+            # сведение с протоколом (trace) идёт через vote_n мимо vote3; при второй и третьей модели и
+            # правиле «два из трёх» результат тот же, что у vote3, — и записывается так же
+            if not (cap.vote and cap.vote.get("function") == "vote3"):
+                roles = [role for role, _ in others]
+                hyps = dict(others)
+                same = roles == ["second", "whisper"] and rule == W.TWO_OF_THREE
+                third = hyps.get("whisper")
+                cap.vote = {"function": "vote3" if same else "vote_n",
+                            "third_words": list(third) if third is not None else None}
+                if not same:
+                    cap.vote["roles"] = roles
+            return orig_vote_n(main, others, rule, trace)
+
         def mark_alt(main, alt):
             # при частичном исключении (words.combine_hypotheses, vote3_partial) после vote3 вне
             # отрезков идёт mark_alt на каждом исключённом отрезке: запись vote3 не затирается
@@ -228,6 +244,9 @@ class Capture:
         self._saved = [(W, "transcribe", orig_tr), (W, "clean_whisper", orig_clean), (W, "vote3", orig_vote),
                        (W, "mark_alt", orig_mark)]
         W.transcribe, W.clean_whisper, W.vote3, W.mark_alt = transcribe, clean_whisper, vote3, mark_alt
+        if orig_vote_n is not None:          # прежние версии words без vote_n (lab_run запускает и их)
+            self._saved.append((W, "vote_n", orig_vote_n))
+            W.vote_n = vote_n
         if not self.allow_torch:
             self._saved.append((B, "TorchASR", B.TorchASR))
             B.TorchASR = NoTorch

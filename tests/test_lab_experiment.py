@@ -606,6 +606,33 @@ class TrialOnAudioFile(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class CaptureWithVoteTrace(unittest.TestCase):
+    """Сведение с протоколом (trace) идёт через words.vote_n мимо vote3: Capture записывает то же, что без него,
+    и mark_alt на исключённых отрезках не затирает способ сведения."""
+
+    def capture(self, trace, whisper_fails=True):
+        import backends
+        import words
+        from tests.test_combine_audit_fixes import diag_with_failed_whisper
+        from tests.test_combine_n_models import ok_diag, ten, text
+        diag = diag_with_failed_whisper("primary", "second") if whisper_fails else ok_diag("primary", "second",
+                                                                                           "whisper")
+        cap = lab_run.Capture(words, backends)
+        with cap:
+            words.combine_hypotheses({"primary": ten(), "second": ten({4: "пятак"}), "whisper": text(ten({1: "двое"}))},
+                                     diag, **({"trace": {}} if trace else {}))
+        return cap.vote
+
+    def test_same_capture_with_and_without_trace(self):
+        for fails in (True, False):
+            with self.subTest(whisper_fails=fails):
+                plain, traced = self.capture(False, fails), self.capture(True, fails)
+                self.assertEqual(plain["function"], "vote3")
+                self.assertEqual(traced, plain)
+        self.assertEqual(self.capture(True)["mark_alt_spans"], 1)
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
 class CaptureWithRealPipeline(unittest.TestCase):
     """Перехват гипотез вокруг настоящего worker.run_words (модели подменены, как в test_whisper_ct2)."""
 
