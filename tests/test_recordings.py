@@ -26,6 +26,81 @@ import storage
 import transcript
 
 
+class AnswerRevisionGuardTests(unittest.TestCase):
+    def fixture(self):
+        helper = WorkerSnapshotTests()
+        data = helper.answer_result(word_ids=True)
+        data["segments"][0]["words"] = [
+            {"w": "один", "s": 0.2, "e": 0.4, "word_id": "w1"},
+            {"w": "два", "s": 0.5, "e": 0.7, "word_id": "w2"},
+            {"w": "три", "s": 0.8, "e": 1.0, "word_id": "w3"},
+        ]
+        data["segments"][0]["text"] = "один два три"
+        data["review"] = [
+            {"id": "r1", "status": "open", "text": "один", "t": 0.2, "t1": 0.2,
+             "t2": 0.4, "speaker": "Глеб", "word_ids": ["w1"]},
+            {"id": "r2", "status": "open", "text": "три", "t": 0.8, "t1": 0.8,
+             "t2": 1.0, "speaker": "Глеб", "word_ids": ["w3"]},
+        ]
+        return helper, data
+
+    def build(self, jp):
+        return review_pack.build(jp, [
+            {"id": "r1", "question": "Проверьте", "options": [
+                {"label": "Заменить", "decision": {"text": "первый"}}]},
+            {"id": "r2", "question": "Проверьте", "options": [
+                {"label": "Оставить", "decision": {}}]},
+        ])
+
+    def answer(self, jp, pack, free=False):
+        row = {"id": "r1", "version": pack["version"]}
+        row.update({"kind": "free", "text": "первый"} if free else {"option": 0})
+        review_pack.add_answers(jp, [row], "local", trusted_actor="human")
+
+    def test_unrelated_edit_then_answer_and_undo(self):
+        helper, data = self.fixture()
+        with helper.answer_files("sqlite", data) as (jp, md):
+            pack = self.build(jp)
+            manifest = copy.deepcopy(review_pack.manifest(jp))
+            transcript.edit_span(jp, md, 0.8, 1.0, "последний", by="human")
+            self.answer(jp, pack)
+            result = core.apply_answers_files(jp, md)
+            self.assertEqual(result["applied_from_answers"], 1)
+            self.assertEqual(helper.card_state(jp)[0], ["первый", "два", "последний"])
+            self.assertEqual(review_pack.manifest(jp), manifest)
+            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "kind": "revert"}],
+                                    "local", trusted_actor="human")
+            self.assertEqual(core.apply_answers_files(jp, md)["reverted"], ["r1"])
+            self.assertEqual(helper.card_state(jp)[0], ["один", "два", "последний"])
+
+    def test_late_edit_blocks_option_and_free(self):
+        for free in (False, True):
+            helper, data = self.fixture()
+            with self.subTest(free=free), helper.answer_files("sqlite", data) as (jp, md):
+                pack = self.build(jp)
+                transcript.edit_span(jp, md, 0.2, 0.4, "ручной", by="human")
+                before = copy.deepcopy(transcript.load(jp)["segments"])
+                self.answer(jp, pack, free=free)
+                result = core.apply_answers_files(jp, md)
+                self.assertEqual(transcript.load(jp)["segments"], before)
+                self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+                self.assertEqual(result["applied_from_answers"], 0)
+                self.assertTrue(result.get("revision_conflicts"))
+
+    def test_missing_id_blocks_without_retargeting(self):
+        for backend in ("sqlite", "legacy_files"):
+            helper, data = self.fixture()
+            with self.subTest(backend=backend), helper.answer_files(backend, data) as (jp, md):
+                pack = self.build(jp)
+                transcript.edit_span(jp, md, 0.2, 0.7, "вместе", by="human")
+                before = copy.deepcopy(transcript.load(jp)["segments"])
+                self.answer(jp, pack)
+                result = core.apply_answers_files(jp, md)
+                self.assertEqual(transcript.load(jp)["segments"], before)
+                self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+                self.assertTrue(result.get("revision_conflicts"))
+
+
 class WorkerSnapshotTests(unittest.TestCase):
     def worker_result(self):
         return {
