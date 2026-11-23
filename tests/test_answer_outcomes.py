@@ -450,6 +450,13 @@ def page_script(host="127.0.0.1"):
         html.split('  // ответы этой версии вопросов')[0].split('<script>', 1)[1]
 
 
+def page_with_answers(host="127.0.0.1"):
+    """Начало скрипта и слой ответов страницы (pick, merge, прослойки) — без запуска."""
+    html = (PROJECT / "cards.html").read_text(encoding="utf-8")
+    marker = "  // ответы этой версии вопросов"
+    return page_script(host) + marker + html.split(marker, 1)[1].split("  async function cloudApi()", 1)[0]
+
+
 def run_page(test, body, host="127.0.0.1"):
     script = page_script(host) + body + "\n})();\n"
     result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
@@ -739,6 +746,80 @@ class KeepRequests(AnswerOutcomeCase):
 
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+class CloudKeepPath(AnswerOutcomeCase):
+    """Настоящий ход: «Не отменять» в облаке → import_answers → cloud_bundle → облачная страница."""
+
+    KEEP_TS = "2026-11-23T23:00:00"
+
+    def page(self, jp, body):
+        bundle = review_pack.cloud_bundle(jp)
+        text = (Path(bundle["base"]) / "cloud" / "manifest.json").read_text(encoding="utf-8")
+        keep = {"id": "r1", "version": json.loads(text)["version"], "kind": "keep", "ts": self.KEEP_TS,
+                "source": "cloud"}
+        script = page_with_answers("cards.example") + "\n  man = " + text + ";\n  live = {r1: " + \
+            json.dumps(keep) + "};\n  const it = man.items.find(x => x.id === \"r1\"), a = merge().r1;\n" + \
+            body + "\n})();\n"
+        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True,
+                                encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return text
+
+    def keep(self, jp, version, ts=None):
+        return review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "keep",
+                                              "ts": ts or self.KEEP_TS}], "cloud")
+
+    def test_accepted_keep_shows_program_state(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 0, "text": "услышанное",
+                                              "heard": True, "ts": "2026-11-23T09:00:00"}], "local",
+                                        trusted_actor="human")
+                self.apply(jp, md)
+                self.save(jp, version, kind="revert")
+                self.keep(jp, version)
+                text = self.page(jp, r'''
+                  if (stateOf(it, a) !== "applied") throw Error("состояние: " + stateOf(it, a));
+                  if (a.kind === "keep" || answerText(a, it).includes("отмена")) throw Error("ответ: " + answerText(a, it));
+                ''')
+                man = json.loads(text)
+                self.assertEqual(man["answer_states"]["r1"]["keep"],
+                                 {"ts": self.KEEP_TS, "source": "cloud", "accepted": True})
+                for leaked in ('"applied_answer"', '"keep_request"'):
+                    self.assertNotIn(leaked, text)
+
+    def test_rejected_keep_after_applied_revert_says_why(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                self.save(jp, version, kind="revert")
+                self.apply(jp, md)
+                self.keep(jp, version)
+                text = self.page(jp, r'''
+                  if (stateOf(it, a) !== "reverted") throw Error("состояние: " + stateOf(it, a));
+                  if (!programNote(it, a).includes("не принят")) throw Error("причина: " + programNote(it, a));
+                ''')
+                keep = json.loads(text)["answer_states"]["r1"]["keep"]
+                self.assertEqual(keep, {"ts": self.KEEP_TS, "source": "cloud", "accepted": False})
+
+    def test_old_rejected_keep_has_no_reason_under_newer_answer(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "revert",
+                                              "ts": "2026-11-23T10:10:00"}], "local", trusted_actor="human")
+                self.keep(jp, version, "2026-11-23T10:05:00")        # старее отмены — отклонён
+                self.assertNotIn("не принят", review_pack.answer_states(jp)["r1"].get("detail", ""))
+                self.apply(jp, md)
+                self.keep(jp, version, "2026-11-23T10:20:00")        # отмена прошла — отклонён
+                self.assertIn("не принят", review_pack.answer_states(jp)["r1"].get("detail", ""))
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 1,
+                                              "ts": "2026-11-23T10:30:00"}], "local", trusted_actor="human")
+                self.assertNotIn("не принят", review_pack.answer_states(jp)["r1"].get("detail", ""))
+
+
+@unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
 class CloudKeep(unittest.TestCase):
     """«Не отменять» на облачной странице до переноса на ноутбук: применённый ответ на месте."""
 
@@ -762,12 +843,6 @@ class CloudKeep(unittest.TestCase):
           if (b.kind !== "revert" || b.label !== "Подготовить отмену") throw Error("«Не отменять» повторно: " + JSON.stringify(b));
           const p = revertButton(one, revert);
           if (p.kind !== "keep" || p.label !== "Не отменять") throw Error("подготовленная отмена: " + JSON.stringify(p));
-        ''', host="cards.example")
-
-    def test_state_from_program_once_laptop_saw_answer(self):
-        run_page(self, self.SETUP + r'''
-          man.answer_states.r1 = {state:"applied", ts:"t3", source:"cloud"};
-          if (stateOf(one, keep) !== "applied") throw Error("состояние не из программы: " + stateOf(one, keep));
         ''', host="cards.example")
 
     def test_local_page_has_no_cloud_keep(self):
