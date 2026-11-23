@@ -228,6 +228,41 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
                 workflow.execute_model(self.store, request)
         self.assert_new_run_untouched(request)
 
+    # Содержание сменилось, пока задание ждало: без явного «начать заново» задание не переписывается.
+    def saved_task(self, request):
+        return self.store.db.execute("SELECT model_task_json FROM workflow_requests WHERE request_id=?",
+                                     (request,)).fetchone()[0]
+
+    def test_changed_content_while_waiting_is_not_continued_without_restart(self):
+        request = self.prepare_request()
+        workflow.prepare_model_task(self.store, request)
+        before = self.saved_task(request)
+        self.change_review(request)
+        with self.assertRaises(llm_provider.ProviderError) as error:
+            self.execute(request)
+        self.assertEqual(error.exception.code, "revision_changed")
+        self.assertIn("restart", str(error.exception))
+        with self.assertRaisesRegex(storage.Conflict, "restart"):
+            self.execute(request, retry_failed=True)
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.saved_task(request), before)
+        self.assertEqual(self.execute(request, restart=True)["state"], "completed")
+        self.assertEqual(self.calls, 1)
+
+    def test_agent_part_and_task_refuse_changed_content_without_restart(self):
+        request = self.prepare_request()
+        workflow.prepare_model_task(self.store, request)
+        before = self.saved_task(request)
+        self.change_review(request)
+        with self.assertRaisesRegex(storage.Conflict, "restart"):
+            workflow.model_part(self.store, request, 0)
+        with self.assertRaisesRegex(storage.Conflict, "restart"):
+            workflow.prepare_model_task(self.store, request)
+        self.assertEqual(self.saved_task(request), before)
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        workflow.prepare_model_task(self.store, request, restart=True)
+        self.assertNotEqual(self.saved_task(request), before)
+
     # Все блоки сохранены: итог собирается без создания клиента облака.
     def test_saved_blocks_are_assembled_without_creating_client(self):
         request = self.prepare_request(count=501)
