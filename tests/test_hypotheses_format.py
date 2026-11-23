@@ -39,7 +39,8 @@ class TraceDoesNotChangeResultTests(unittest.TestCase):
                 a = words.combine_hypotheses(plain, ok_diag("primary", "second", "whisper"))
                 b = words.combine_hypotheses(traced, ok_diag("primary", "second", "whisper"), trace=tr)
                 self.assertEqual(json.dumps([plain, a]), json.dumps([traced, b]))
-                self.assertEqual(tr, {})            # меньше трёх гипотез — голосования нет, протокола тоже
+                # меньше трёх гипотез — голосования нет, в протоколе причина и пустой список мест
+                self.assertEqual((tr["disabled"], tr["places"]), ({"reason": "too_few_hypotheses"}, []))
 
 
 class TraceContentTests(unittest.TestCase):
@@ -85,12 +86,13 @@ class TraceContentTests(unittest.TestCase):
         self.assertEqual((ins[0]["t"], ins[0]["winner_roles"]), (4.5, ["second", "fourth"]))
         self.assertEqual(ins[0]["variants"], {"second": "кошка", "fourth": "кошка"})
 
-    def test_two_models_have_no_vote_and_no_trace(self):
+    def test_two_models_have_no_vote_and_trace_says_why(self):
         main = ten()
         tr = {}
         words.combine_hypotheses({"primary": main, "second": ten(), "whisper": None},
                                  ok_diag("primary", "second"), trace=tr)
-        self.assertEqual(tr, {})
+        self.assertEqual(tr["disabled"], {"reason": "too_few_hypotheses"})
+        self.assertEqual(tr["places"], [])
 
     def test_skip_spans_are_recorded_with_role_and_reason(self):
         diag = ok_diag("primary", "second", "whisper", "fourth")

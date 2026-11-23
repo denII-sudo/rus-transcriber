@@ -52,5 +52,67 @@ class InsertedTimeTests(unittest.TestCase):
             self.assertEqual(json.dumps([plain, s1], ensure_ascii=False), json.dumps([traced, s2], ensure_ascii=False))
 
 
+class KeptVariantsTests(unittest.TestCase):
+    """У оставленного не всеми слова — варианты несогласных моделей."""
+
+    def test_kept_place_has_variants_of_disagreeing_roles(self):
+        main = ten()
+        trace = {}
+        words.vote_n(main, [("second", ten({2: "тройка"})), ("whisper", text(without(6)))], words.TWO_OF_THREE,
+                     trace)
+        kept = {p["main"]: p for p in trace["places"] if p["decision"] == "kept"}
+        self.assertEqual(kept["три"]["support"], ["primary", "whisper"])
+        self.assertEqual(kept["три"]["variants"], {"second": "тройка"})
+        self.assertEqual(kept["семь"]["variants"], {"whisper": ""})       # третья модель слова не слышит
+
+
+class DisabledVoteTraceTests(unittest.TestCase):
+    """Голосование отключено: в протоколе причина, роли и исключённые отрезки, мест нет."""
+
+    def combine(self, diag, whisper=True):
+        trace = {}
+        words.combine_hypotheses({"primary": ten(), "second": ten({4: "пятак"}),
+                                  "whisper": text(ten()) if whisper else None}, diag, trace=trace)
+        return trace
+
+    def check(self, trace, reason, roles):
+        self.assertEqual(trace["schema"], "vote-trace-1")
+        self.assertEqual(trace["disabled"], {"reason": reason})
+        self.assertEqual(trace["roles"], roles)
+        self.assertEqual((trace["places"], trace["unanimous"]), ([], 0))
+        self.assertIn("skip_spans", trace)
+        self.assertIn("merged_skip_spans", trace)
+        json.dumps(trace)
+
+    def test_too_few_hypotheses(self):
+        self.check(self.combine(ok_diag("primary", "second"), whisper=False), "too_few_hypotheses",
+                   ["primary", "second"])
+
+    def test_primary_failed(self):
+        diag = ok_diag("primary", "second", "whisper")
+        diag["primary"] = {"chunks": [{"state": "error", "own_span": [3.0, 6.0]},
+                                      {"state": "ok", "own_span": [0.0, 3.0]}]}
+        self.check(self.combine(diag), "primary_failed", ["primary", "second", "whisper"])
+
+    def test_all_words_in_skip_spans(self):
+        diag = ok_diag("primary", "second", "whisper")
+        diag["whisper"] = {"chunks": [{"state": "error", "own_span": [0.0, 10.0]}]}
+        trace = self.combine(diag)
+        self.check(trace, "all_in_skip_spans", ["primary", "second", "whisper"])
+        self.assertEqual(trace["merged_skip_spans"], [[0.0, 10.0]])
+        self.assertEqual([s["role"] for s in trace["skip_spans"]], ["whisper"])
+
+    def test_disabled_trace_does_not_change_result(self):
+        diag = ok_diag("primary", "second", "whisper")
+        diag["whisper"] = {"chunks": [{"state": "error", "own_span": [0.0, 10.0]}]}
+        outs = []
+        for trace in (None, {}):
+            main = ten()
+            got = words.combine_hypotheses({"primary": main, "second": ten({4: "пятак"}), "whisper": text(ten())},
+                                           copy.deepcopy(diag), **({} if trace is None else {"trace": trace}))
+            outs.append(json.dumps([main, got], ensure_ascii=False, default=str))
+        self.assertEqual(outs[0], outs[1])
+
+
 if __name__ == "__main__":
     unittest.main()

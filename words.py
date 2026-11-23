@@ -492,7 +492,9 @@ def vote_n(main, others, rule, trace=None):
                     trace["unanimous"] += 1
                 else:
                     trace["places"].append({"decision": "kept", "t": main[i]["s"], "main": main[i]["w"],
-                                            "support": ["primary"] + [h["role"] for h in hyps if h["agree"][i]]})
+                                            "support": ["primary"] + [h["role"] for h in hyps if h["agree"][i]],
+                                            "variants": {h["role"]: text_of(h, _span_j(h["bad"], i, i + 1))
+                                                         for h in hyps if not h["agree"][i]}})
             out.append(main[i])
             i += 1
             continue
@@ -645,6 +647,9 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None, trace=None):
     тот же байт в байт). При заданном trace голосование идёт через vote_n (для трёх моделей результат
     совпадает с vote3), а в протокол дописывается skip_spans — отрезки, исключённые из голосования, с ролью
     модели и причиной (error / empty_unknown / filtered), и merged_skip_spans — они же после слияния.
+    Если голосование отключено, протокол всё равно заполняется (schema, rule, roles, unanimous=0,
+    places=[]) и в нём disabled.reason: primary_failed (сбой куска основной модели), too_few_hypotheses
+    (меньше трёх гипотез) или all_in_skip_spans (все слова основной — в исключённых отрезках).
 
     -> {"quality": {vote, asr_votes, vote3_partial, vote3_skipped, asr_incomplete_chunks — что есть},
         "evidence": {"whisper": [(начало, конец, причина, проходы со словами)],
@@ -700,8 +705,20 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None, trace=None):
     others = ([("second", alt)] if alt is not None else []) \
         + ([("whisper", wh_words)] if wh_words is not None else []) + extras
     can_vote = alt is not None and len(others) >= 2 and not primary_failed
+    disabled = None if can_vote else ("primary_failed" if primary_failed else "too_few_hypotheses")
     if can_vote and skip_spans and all(_span_index(w["s"], skip_spans) is not None for w in words):
-        can_vote = False                      # вне исключённых отрезков голосовать не о чем
+        can_vote, disabled = False, "all_in_skip_spans"   # вне исключённых отрезков голосовать не о чем
+    if trace is not None:
+        whisper_spans = [{"start": s, "end": e, "role": "whisper", "reason": why}
+                         for s, e, why, _ in voting_whisper]
+        other_spans = [{"start": s, "end": e, "role": name, "reason": why}
+                       for s, e, name, why, _ in other_evidence if name == "second" or name in voting_extras]
+        trace["skip_spans"] = whisper_spans + other_spans
+        trace["merged_skip_spans"] = [[s, e] for s, e in skip_spans]
+        if disabled:
+            trace.update(schema="vote-trace-1", rule=dict(rule or TWO_OF_THREE),
+                         roles=["primary"] + [role for role, _ in others], unanimous=0, places=[],
+                         disabled={"reason": disabled})
     if can_vote:
         if trace is None and [role for role, _ in others] == ["second", "whisper"] and rule in (None, TWO_OF_THREE):
             def vote(main, hyps):             # прежний путь: лаборатория подменяет vote3
@@ -709,13 +726,6 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None, trace=None):
         else:
             def vote(main, hyps):
                 return vote_n(main, hyps, rule or TWO_OF_THREE, trace)
-        if trace is not None:
-            whisper_spans = [{"start": s, "end": e, "role": "whisper", "reason": why}
-                             for s, e, why, _ in voting_whisper]
-            other_spans = [{"start": s, "end": e, "role": name, "reason": why}
-                           for s, e, name, why, _ in other_evidence if name == "second" or name in voting_extras]
-            trace["skip_spans"] = whisper_spans + other_spans
-            trace["merged_skip_spans"] = [[s, e] for s, e in skip_spans]
         if skip_spans:
             quality["vote"] = _vote_outside_spans(words, others, skip_spans, vote)
             quality["vote3_partial"] = {"reason": partial_reason, "spans": len(skip_spans),
