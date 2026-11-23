@@ -442,5 +442,114 @@ class PageStateFromPython(unittest.TestCase):
             self.assertEqual(man["answer_states"]["r1"]["state"], "applied")
 
 
+def page_script():
+    """Начало скрипта cards.html (до функций ответов) — для проверки логики страницы в Node.js."""
+    html = (PROJECT / "cards.html").read_text(encoding="utf-8")
+    return 'global.location={hostname:"127.0.0.1"};\n' + \
+        html.split('  // ответы этой версии вопросов')[0].split('<script>', 1)[1]
+
+
+def run_page(test, body):
+    script = page_script() + body + "\n})();\n"
+    result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+    test.assertEqual(result.returncode, 0, result.stderr)
+    return result.stdout
+
+
+@unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+class PageLabels(unittest.TestCase):
+    def test_every_outcome_has_its_own_label(self):
+        out = run_page(self, "console.log(JSON.stringify(Object.keys(STATUS)));")
+        self.assertLessEqual(set(review_pack.OUTCOME_REASONS), set(json.loads(out)))
+
+    def test_failed_undo_keeps_buttons_and_says_previous_is_in_place(self):
+        run_page(self, r'''
+          const a={kind:"revert",ts:"t2",source:"local"}, one={id:"r1"};
+          man = {answer_states:{r1:{state:"undo_conflict",ts:"t2",source:"local",why:"отмена не выполнена"}}};
+          if (!holdsApplied(one,a) || !appliedCard(one,a)) throw Error("кнопок нет: " + stateOf(one,a));
+          if (cardStatus(one,a) !== "отмена не выполнена — прежний ответ на месте") throw Error(cardStatus(one,a));
+        ''')
+
+
+class SameSecondAnswers(AnswerOutcomeCase):
+    def test_new_answer_in_same_second_does_not_take_old_state(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human")
+                ts = "2026-11-23T11:00:00"
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 0, "ts": ts}], "local",
+                                        trusted_actor="human")
+                core.apply_answers_files(jp, md)
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "apply_conflict")
+                review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 1, "ts": ts}], "local",
+                                        trusted_actor="human")
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"]["option"], 1)
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "saved")
+
+
+class ReportDetails(AnswerOutcomeCase):
+    """Подробности прежнего отчёта (конфликт отмены, отмена недоступна, конфликт карточек) видны человеку."""
+
+    def lines(self, jp, rep):
+        if not shutil.which("node"):
+            self.skipTest("для проверки JavaScript нужен Node.js")
+        items = review_pack.manifest(jp)["items"]
+        out = run_page(self, "console.log(JSON.stringify(reportLines(%s, %s)));" % (
+            json.dumps(rep, ensure_ascii=False), json.dumps(items, ensure_ascii=False)))
+        return json.loads(out)
+
+    def detail(self, rep, aid):
+        return next(row for row in rep["outcomes"] if row["id"] == aid).get("detail") or ""
+
+    def test_failed_undo_names_reason(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                transcript.edit_span(jp, md, 0.7, 1.0, "ручной", by="human")
+                self.save(jp, version, kind="revert")
+                rep = core.apply_answers_files(jp, md)
+                self.check_outcomes(jp, rep)
+                self.assertEqual(self.outcomes(rep)["r1"], "undo_conflict")
+                self.assertTrue(self.detail(rep, "r1"))
+                self.assertTrue(any("Карточка 1" in line and self.detail(rep, "r1") in line
+                                    for line in self.lines(jp, rep)))
+
+    def test_applied_without_snapshot_says_undo_unavailable(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                huge = {"segments": "x" * (17 * 1024 * 1024)}
+                with mock.patch.object(transcript, "answer_snapshot", return_value=huge):
+                    rep = core.apply_answers_files(jp, md)
+                self.check_outcomes(jp, rep)
+                self.assertEqual(self.outcomes(rep)["r1"], "applied")
+                self.assertIn("r1", rep["undo_unavailable"])
+                self.assertIn("нет снимка", self.detail(rep, "r1"))
+                self.assertTrue(any("Карточка 1" in line and "нет снимка" in line for line in self.lines(jp, rep)))
+
+    def test_preflight_conflict_names_other_card(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                state = review_pack.answers_state(jp)
+                if backend == "sqlite":
+                    state["manifest"]["items"][1]["word_ids"] = ["w1"]
+                    review_pack._write_answers(jp, state)
+                else:
+                    path = review_pack.pack_dir(jp) / "manifest.json"
+                    man = review_pack._read(path, {})
+                    man["items"][1]["word_ids"] = ["w1"]
+                    review_pack._write(path, man)
+                self.save(jp, version, option=0)
+                self.save(jp, version, aid="r2", option=0)
+                rep = core.apply_answers_files(jp, md)
+                self.check_outcomes(jp, rep)
+                self.assertEqual(self.outcomes(rep), {"r1": "blocked_preflight", "r2": "blocked_preflight"})
+                self.assertIn("карточкой 2", self.detail(rep, "r1"))
+                self.assertIn("карточкой 1", self.detail(rep, "r2"))
+                lines = self.lines(jp, rep)
+                self.assertTrue(any(line.startswith("Карточка 1") and "карточкой 2" in line for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()
