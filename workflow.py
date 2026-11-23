@@ -421,8 +421,12 @@ def _task_doubts(transcript, review, task_version):
     return words, (_precise_doubts(transcript, review)[1] if task_version >= 3 else None)
 
 
-def _build_task(request, snapshots, *, task_version=model_tasks.CURRENT_VERSION):
-    """Задание из текущих снимков и цели запроса по правилам версии task_version (1, 2 или 3)."""
+def _build_task(request, snapshots, *, task_version=None):
+    """Задание из текущих снимков и цели запроса по правилам версии task_version (1–4).
+
+    Без task_version — текущей версии (model_tasks.CURRENT_VERSION на момент вызова).
+    """
+    task_version = model_tasks.CURRENT_VERSION if task_version is None else task_version
     current, review = snapshots["transcript"], snapshots["review"]
     words = _task_words(current["payload"], review["payload"], task_version=task_version)
     if task_version == 1:
@@ -431,7 +435,8 @@ def _build_task(request, snapshots, *, task_version=model_tasks.CURRENT_VERSION)
                                  request["policy"]["goal"], review["revision"])
     unlocated = _precise_doubts(current["payload"], review["payload"])[1] if task_version >= 3 else None
     return model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
-                             review["revision"], turns=_task_turns(current["payload"]), unlocated_doubts=unlocated)
+                             review["revision"], turns=_task_turns(current["payload"]), unlocated_doubts=unlocated,
+                             points=task_version >= 4)
 
 
 _REVISION_FIELDS = ("source_revision", "review_revision")
@@ -545,8 +550,8 @@ def _prepare_model_task(store, request, restart):
             and content_matches(request, saved, snapshots)):
         # То же содержание — сохранённое задание не переписывается, даже если сменились номера
         # ревизий (показ карточки, пакет, неприменённый ответ): принятые блоки (ключ — хэш задания)
-        # не теряют связи с ним. Так же, по своим правилам пометок, доигрываются задания версий 1
-        # и 2. Новое — всегда текущей версии (3).
+        # не теряют связи с ним. Так же, по своим правилам пометок и договору, доигрываются задания
+        # версий 1–3. Новое — всегда текущей версии (4).
         if request["model_run_id"] is not None:
             return saved
         task = saved
@@ -624,11 +629,14 @@ _CLOSING = "»\"”’')]"
 def _part_bounds(task):
     """Границы блоков задания: список (начало, конец) по индексам слов. Единственное место деления.
 
-    Версия 1 — ровно по MODEL_PART_WORDS слов, как раньше. Версия 2 — блок не длиннее предела
+    Версия 1 — ровно по MODEL_PART_WORDS слов, как раньше. Версии 2 и 3 — блок не длиннее предела
     и кончается на границе реплики; реплика длиннее предела делится по последнему в пределах
     блока концу предложения, а если такого нет — по пределу. Блоки идут подряд без пропусков.
+    Версия 4 — один блок на всю запись: модель отвечает границами разделов, а не перечнем слов.
     """
     words, limit = task["words"], MODEL_PART_WORDS
+    if model_tasks.version(task) == 4:
+        return [(0, len(words))] if words else []
     if model_tasks.version(task) == 1:
         return [(start, min(start + limit, len(words))) for start in range(0, len(words), limit)]
     bounds, start, end, index = [], 0, 0, 0
@@ -655,7 +663,9 @@ def _part_bounds(task):
 
 
 def _part_task(task, bounds):
-    """Задание одного блока той же версии, что и целое."""
+    """Задание одного блока той же версии, что и целое. У версии 4 блок один — само задание."""
+    if model_tasks.version(task) == 4:
+        return task
     words = task["words"][bounds[0]:bounds[1]]
     turns = None
     if model_tasks.version(task) != 1:
@@ -688,6 +698,16 @@ def section_time_spans(sections, transcript):
         spans.append({"t1": min(item[0] for item in found) if found else None,
                       "t2": max(item[1] for item in found) if found else None})
     return spans
+
+
+def _also_line(section, transcript):
+    """Строка «См. также» с временем начала каждой отсылки раздела (версия 4); иначе пусто.
+
+    Добавляется локально, в облако не передаётся; отсылка без времени слов не показывается.
+    """
+    spans = section_time_spans([{"evidence": ids} for ids in section.get("also", [])], transcript)
+    times = [f"[{_clock(span['t1'])}]" for span in spans if span["t1"] is not None]
+    return "\n\nСм. также: " + ", ".join(times) if times else ""
 
 
 def _clock(seconds):
@@ -806,6 +826,10 @@ def _accept_model_part(store, request_id, part_index, result, before):
     except ValueError:
         _record_model_error(store, request_id, before)
         raise
+    if model_tasks.version(task) == 4:
+        # Блок версии 4 хранится ответом модели как есть (границы разделов): итог из блоков
+        # проверяется заново тем же договором, а разложенный в word_id вид его не прошёл бы.
+        accepted = result
     if before["state"] == "completed":
         row = store.db.execute(
             "SELECT result_json FROM workflow_model_parts WHERE request_id=? AND task_hash=? AND part_index=?",
@@ -960,8 +984,8 @@ def _limit_problem(request, words):
         return "в стенограмме нет слов: свёртку делать не из чего. В облако ничего не отправлено."
     if words <= llm_provider.MAX_WORDS:
         return None
-    exits = ("свёртку блоками по 500 слов может сделать ИИ-агент без облака (workflow_model_part и "
-             "workflow_model_part_result); или снимите заказ конспекта (workflow_change_policy с "
+    exits = ("свёртку без облака может сделать ИИ-агент (workflow_model_task — задание по страницам, "
+             "затем workflow_model_result); или снимите заказ конспекта (workflow_change_policy с "
              "require_conspect=false), стенограмма останется.")
     if request["state"] == "failed":
         exits = "сначала начните шаг заново для ИИ-агента: workflow_model_task(restart=true); затем " + exits
@@ -1114,8 +1138,9 @@ def _accept_model_result_once(store, request_id, result):
         if _task_turns(current["payload"]) != request["model_task"]["turns"]:
             raise storage.Conflict("реплики стенограммы не совпадают с заданием; подготовьте новое задание")
         spans = section_time_spans(accepted["sections"], current["payload"])
-        text ="\n\n".join(
+        text = "\n\n".join(
             (f"[{_clock(span['t1'])}]\n" if span["t1"] is not None else "") + section["text"]
+            + _also_line(section, current["payload"])
             for section, span in zip(accepted["sections"], spans))
     data = {**current["payload"], "recording_id": request["recording_id"],
             "source_revision": current["revision"]}

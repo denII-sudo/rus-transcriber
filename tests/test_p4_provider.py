@@ -235,6 +235,11 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
 
 class AutonomousWorkflowTests(unittest.TestCase):
     def setUp(self):
+        # Договор версий 1–3 (ответ — перечень слов, блоки по 500 слов): так доделываются задания,
+        # сохранённые до этапа 7.4. Договор версии 4 проверяет tests/test_sections_contract.py.
+        patcher = mock.patch.object(model_tasks, "CURRENT_VERSION", 3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.root = Path(tempfile.mkdtemp(prefix="p4-workflow-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.source = self.root / "synthetic.wav"

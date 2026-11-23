@@ -473,7 +473,12 @@ def workflow_status(request_id):
 
 
 def workflow_model_task(request_id, offset=0, limit=1000, *, restart=False):
-    """Страница задания модели. restart — явное «начать заново», только с первой страницы."""
+    """Страница задания модели. restart — явное «начать заново», только с первой страницы.
+
+    Задание версии 4 выдаётся в том виде, какой видит модель (пункты без ID слов), страницами
+    по пунктам: offset и limit считают пункты, total_points — их число.
+    """
+    import model_tasks
     import recordings
     import workflow
     if (type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000):
@@ -483,6 +488,12 @@ def workflow_model_task(request_id, offset=0, limit=1000, *, restart=False):
     store = recordings.open_store()
     try:
         task = workflow.prepare_model_task(store, request_id, restart=restart)
+        if model_tasks.version(task) == 4:
+            view = model_tasks.model_view(task)
+            total = len(view["points"])
+            return {**view, "points": view["points"][offset:offset + limit], "offset": offset,
+                    "total_points": total, "total_words": len(task["words"]),
+                    "next_offset": offset + limit if offset + limit < total else None}
         total = len(task["words"])
         page = {**task, "words": task["words"][offset:offset + limit], "offset": offset,
                 "total_words": total, "next_offset": offset + limit if offset + limit < total else None}
@@ -509,7 +520,11 @@ def workflow_model_part(request_id, part_index):
     import workflow
     store = recordings.open_store()
     try:
-        return workflow.model_part(store, request_id, part_index)
+        part = workflow.model_part(store, request_id, part_index)
+        import model_tasks
+        if model_tasks.version(part["task"]) == 4:      # модель и ИИ-агент видят пункты, без ID слов
+            part = {**part, "task": model_tasks.model_view(part["task"])}
+        return part
     finally:
         store.close()
 

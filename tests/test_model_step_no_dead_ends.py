@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import llm_provider
+import model_tasks
 import recordings
 import storage
 import workflow
@@ -15,6 +16,11 @@ import workflow
 
 class ModelStepNoDeadEndsTests(unittest.TestCase):
     def setUp(self):
+        # Договор версий 1–3 (ответ — перечень слов, блоки по 500 слов): так доделываются задания,
+        # сохранённые до этапа 7.4. Договор версии 4 проверяет tests/test_sections_contract.py.
+        patcher = mock.patch.object(model_tasks, "CURRENT_VERSION", 3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.root = Path(tempfile.mkdtemp(prefix="model-step-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.source = self.root / "synthetic.wav"
@@ -126,7 +132,8 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "limit")
                 self.assertEqual(workflow.get(self.store, request)["state"], "processed")
         self.assertEqual(self.calls, 0)
-        self.assertIn("workflow_model_part", str(error.exception))
+        self.assertIn("workflow_model_task", str(error.exception))
+        self.assertIn("workflow_model_result", str(error.exception))
         self.assertIn("workflow_change_policy", str(error.exception))
         part = workflow.model_part(self.store, request, 0)          # выход через ИИ-агента открыт
         self.assertEqual(len(part["task"]["words"]), 6)

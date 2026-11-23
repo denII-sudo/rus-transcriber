@@ -61,7 +61,7 @@ class PreciseMarksTests(unittest.TestCase):
         marked, task = _marked([{"id": "r1", "status": "open", "t1": 1.0, "t2": 2.0}])
         self.assertEqual(marked, ["b", "c"])     # «a» лишь касается начала места концом — не помечено
         self.assertEqual(task["unlocated_doubts"], 0)
-        self.assertEqual(task["version"], 3)
+        self.assertEqual(task["version"], model_tasks.CURRENT_VERSION)
 
     def test_boundary_cases_of_the_intersection_rule(self):
         cases = (
@@ -135,7 +135,7 @@ class Version3ContractTests(unittest.TestCase):
         self.answer = {"source_revision": 1, "sections": [{"text": "Итог.", "evidence": ["w1"]}]}
 
     def test_version_3_task_has_the_count_field(self):
-        self.assertEqual(model_tasks.CURRENT_VERSION, 3)
+        self.assertIn(3, model_tasks.VERSIONS)
         self.assertEqual(self.task["version"], 3)
         self.assertEqual(self.task["unlocated_doubts"], 2)
         self.assertEqual(model_tasks.version(self.task), 3)
@@ -163,7 +163,7 @@ class Version3ContractTests(unittest.TestCase):
         without = {key: value for key, value in self.task.items() if key != "unlocated_doubts"}
         with self.assertRaises(ValueError):
             model_tasks.canonical(without)
-        for version in (4, 0, True, "3"):
+        for version in (5, 0, True, "3"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 model_tasks.version({**self.task, "version": version})
 
@@ -214,6 +214,11 @@ class StoredTaskCompatibilityTests(unittest.TestCase):
     """Задания версии 2 сверяются по прежним правилам; новые — версии 3 (через базу)."""
 
     def setUp(self):
+        # Договор версий 1–3 (ответ — перечень слов, блоки по 500 слов): так доделываются задания,
+        # сохранённые до этапа 7.4. Договор версии 4 проверяет tests/test_sections_contract.py.
+        patcher = mock.patch.object(model_tasks, "CURRENT_VERSION", 3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.root = Path(tempfile.mkdtemp(prefix="precise-doubts-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.source = self.root / "synthetic.wav"
