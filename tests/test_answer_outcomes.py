@@ -117,22 +117,17 @@ class AnswerOutcomeCase(unittest.TestCase):
     def pack_state(jp):
         return review_pack.answers_state(jp)
 
-    def apply(self, jp, md, repeat=True, rewrite=False):
-        """Применить ответы и проверить общие правила исходов; повторный запуск ничего не меняет.
-        repeat=False — только для «Оставить человеку»: его повторы — задача следующей части.
-        rewrite=True — различие режимов: в legacy_files ответ с конфликтом пробуется снова, и файл
-        стенограммы перезаписывается с тем же содержимым и новым номером source_revision."""
+    def apply(self, jp, md):
+        """Применить ответы и проверить общие правила исходов; повторный запуск ничего не меняет —
+        и у «Оставить человеку», и у ответа с конфликтом (файл стенограммы не перезаписывается
+        с новым номером source_revision ни в одном режиме)."""
         rep = core.apply_answers_files(jp, md)
         self.check_outcomes(jp, rep)
-        if not repeat:
-            return rep
         transcript_before = transcript.load(jp)
         state_before = self.pack_state(jp)
         again = core.apply_answers_files(jp, md)
         self.check_outcomes(jp, again)
         transcript_after = transcript.load(jp)
-        if rewrite:
-            self.assertEqual(transcript_after.pop("source_revision"), transcript_before.pop("source_revision") + 1)
         self.assertEqual(transcript_after, transcript_before, "повторный запуск изменил стенограмму")
         self.assertEqual(self.pack_state(jp), state_before,
                          "повторный запуск дописал события, ревизии или отметки")
@@ -309,7 +304,7 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                     self.save(jp, version, **row)
                     self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "saved"
                                      if name not in ("пропуск", "отмена без применённого") else "skipped")
-                    rep = self.apply(jp, md, repeat=name != "оставить человеку")
+                    rep = self.apply(jp, md)
                     self.assertEqual(self.outcomes(rep)["r1"], expected)
 
     def test_failed_application_has_full_map(self):
@@ -318,7 +313,7 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                 transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human")
                 self.save(jp, version, option=0)
                 self.save(jp, version, aid="r2", option=0)
-                rep = self.apply(jp, md, rewrite=backend == "legacy_files")
+                rep = self.apply(jp, md)          # повтор с конфликтом файл не перезаписывает ни в одном режиме
                 self.assertEqual(self.outcomes(rep), {"r1": "apply_conflict", "r2": "applied"})
                 self.assertEqual(self.words(jp), ["ручной", "новое"])
 
