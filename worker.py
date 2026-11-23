@@ -1047,9 +1047,11 @@ class _HypCapture:
     """Сбор гипотез для сохранения (hypstore, настройка save_hypotheses). Результат расшифровки не меняет:
     добавляется только файл в папке данных и поля hypotheses_saved/hypotheses_error в статусе задачи."""
 
-    def __init__(self, audio, cfg, a):
+    def __init__(self, audio, cfg, a, src=None):
         import runinfo
         self.cfg, self.a, self.audio = cfg, a, audio
+        self.forbid = tuple(n for n in {Path(str(src)).name if src else "",
+                                        Path(str(getattr(a, "audio", "") or "")).name} if n)
         self.third, self.trace, self.before = {}, {}, None
         self.conditions_start = _safe(lambda: runinfo.conditions(paths.JOBS, cfg.get("max_heavy_jobs", 2), 1,
                                                                  load_interval=1.0))
@@ -1175,7 +1177,7 @@ def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
                "third_words": b["whisper"], "third_plan": b["plan"]}
     rec = H.build_record(roles, legacy={"combine_rule": "vote3_partial"}, combine=combine,
                          trace=cap.trace or None, meta=meta)
-    path = hypstore.write(rec, unit_id, run_id, base)
+    path = hypstore.write(rec, unit_id, run_id, base, forbid=cap.forbid)
     try:
         hypstore._write_json_atomic(base / hypstore.ARTIFACTS_FILE, arts)
     except OSError:
@@ -1194,7 +1196,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
 
     timing = {}
     import hypstore
-    hyp = _HypCapture(audio, cfg, a) if hypstore.enabled(cfg) else None
+    hyp = _HypCapture(audio, cfg, a, src) if hypstore.enabled(cfg) else None
     refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed)
     mapping = voice_ctx.get("mapping") or {}
 

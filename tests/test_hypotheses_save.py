@@ -318,6 +318,66 @@ class StoreTests(Sandbox):
         self.assertEqual((tid1, hw1), (tid2, hw2))
 
 
+DRIVE_PATH = "D" + ":" + "\\" + "записи" + "\\" + "встреча.wav"     # собрано из частей: не путь в тексте теста
+UNC_PATH = "\\" + "\\" + "сервер" + "\\" + "общая"
+MAC_PATH = "/" + "Users" + "/" + "тест" + "/a.wav"
+
+
+class UnsafeRecordTests(Sandbox):
+    """Перед записью: ни одна строка записи (и ключ) не похожа на абсолютный путь и не содержит имени
+    исходного аудиофайла; иначе файла нет, в статусе — hypotheses_saved=false и вид ошибки без пути."""
+
+    def record(self, **meta):
+        roles = [{"role": "primary", "model": {"name": "v3_e2e_rnnt"}, "engine": {"name": "onnx-cpu"},
+                  "timing": {}, "chunks": [], "words": [], "word_times": hypotheses.available()}]
+        return hypotheses.build_record(roles, legacy={"combine_rule": "vote3_partial"}, combine={}, trace=None,
+                                       meta=meta)
+
+    def test_paths_and_audio_name_are_refused(self):
+        home = str(Path.home())
+        bad = [{"audio": {"x": DRIVE_PATH}}, {"audio": {"x": DRIVE_PATH.replace("\\", "/")}},
+               {"program": {"x": UNC_PATH}}, {"environment": {"x": MAC_PATH}},
+               {"environment": {"x": "/home/тест/a"}}, {"config": {"x": home + "\\модели"}},
+               {"config": {"x": home.replace("\\", "/") + "/модели"}}, {"ids": {DRIVE_PATH: 1}},
+               {"ids": {"note": "файл Встреча.WAV готов"}}]
+        for meta in bad:
+            with self.subTest(meta=list(meta)):
+                with self.assertRaises(hypstore.UnsafeRecord) as cm:
+                    hypstore.write(self.record(**meta), "abcdef012345", "20261124-100000-aaaaaa", self.hyp,
+                                   forbid=("встреча.wav",))
+                self.assertNotIn("встреча", str(cm.exception).lower())
+                self.assertNotIn(home.lower(), str(cm.exception).lower())
+                self.assertEqual(self.files(), [])
+
+    def test_model_name_and_legacy_paths_are_refused(self):
+        rec = self.record()
+        rec["roles"][0]["model"]["name"] = DRIVE_PATH
+        with self.assertRaises(hypstore.UnsafeRecord):
+            hypstore.write(rec, "abcdef012345", "20261124-100000-aaaaaa", self.hyp)
+        rec = self.record()
+        rec["primary"] = {"model": MAC_PATH}
+        with self.assertRaises(hypstore.UnsafeRecord):
+            hypstore.write(rec, "abcdef012345", "20261124-100000-aaaaaa", self.hyp)
+        self.assertEqual(self.files(), [])
+
+    def test_ordinary_record_and_stem_of_audio_name_are_allowed(self):
+        """Основа имени без расширения («встреча») не проверяется: она может быть словом стенограммы."""
+        rec = self.record(ids={"note": "встреча прошла", "rel": "hf/istupakov/gigaam-v3-onnx/s/v3.onnx",
+                               "time": "10:30", "ratio": "1:2"})
+        path = hypstore.write(rec, "abcdef012345", "20261124-100000-aaaaaa", self.hyp, forbid=("встреча.wav",))
+        self.assertTrue(path.is_file())
+
+    def test_run_with_path_in_record_saves_nothing_and_reports_kind_only(self):
+        with mock.patch.object(runinfo, "os_info", return_value={"name": str(Path.home() / "x")}):
+            data, calls, state = RunWordsWithSavingTests.scenario(self, "three_models")
+        self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "UnsafeRecord"})
+        self.assertEqual(self.files(), [])
+        with mock.patch.object(runinfo, "os_info", return_value={"name": "копия synthetic.WAV"}):
+            data, calls, state = RunWordsWithSavingTests.scenario(self, "three_models")
+        self.assertEqual(state["hypotheses_error"], "UnsafeRecord")
+        self.assertEqual(self.files(), [])
+
+
 class NotExportedTests(Sandbox):
     def test_export_with_jobs_does_not_take_hypotheses(self):
         import data_io

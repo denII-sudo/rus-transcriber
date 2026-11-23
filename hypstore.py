@@ -218,11 +218,55 @@ def config_snapshot(cfg, vocab=None):
     return out
 
 
-def write(record, unit_id, run_id, data_dir=None):
-    """Записать файл прогона один раз, атомарно. -> путь. Существующий файл не перезаписывается."""
+class UnsafeRecord(ValueError):
+    """В записи гипотез строка, похожая на путь, или имя исходного аудиофайла. Текст — без самих строк."""
+
+
+# Абсолютный путь: буква диска (C:\ или C:/), сетевой путь (\\сервер), папки пользователей macOS и Linux.
+_ABS_PATH_RE = re.compile(r"(?i)(?<![a-z0-9])[a-z]:[\\/]|\\\\[^\\\s]|/users/|/home/")
+
+
+def check_record(record, forbid=()):
+    """Строки и ключи записи без путей и имён исходных файлов. forbid — имена файлов с расширением
+    (основа имени без расширения не проверяется: она может совпасть со словом стенограммы).
+    -> список видов нарушений (без самих строк): absolute_path, home_dir, audio_name."""
+    home = str(Path.home()).lower()
+    homes = {h for h in (home, home.replace("\\", "/")) if len(h) > 3}
+    names = {str(n).lower() for n in forbid if n and str(n).strip()}
+    found = []
+
+    def look(text):
+        low = text.lower()
+        if _ABS_PATH_RE.search(low):
+            found.append("absolute_path")
+        if any(h in low for h in homes):
+            found.append("home_dir")
+        if any(n in low for n in names):
+            found.append("audio_name")
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                look(str(k))
+                walk(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                walk(v)
+        elif isinstance(obj, str):
+            look(obj)
+    walk(record)
+    return found
+
+
+def write(record, unit_id, run_id, data_dir=None, forbid=()):
+    """Записать файл прогона один раз, атомарно. -> путь. Существующий файл не перезаписывается.
+    Перед записью — check_record: при строке, похожей на путь, или имени исходного аудио (forbid) файла нет."""
     base = Path(data_dir) if data_dir is not None else root()
     if not UNIT_RE.match(unit_id) or not RUN_RE.match(run_id + ".json"):
         raise ValueError("неверный unit_id или run_id")
+    problems = check_record(record, forbid)
+    if problems:
+        raise UnsafeRecord(f"запись гипотез не сохранена: {', '.join(sorted(set(problems)))}")
     folder = base / unit_id
     folder.mkdir(parents=True, exist_ok=True)
     if not _inside(base, folder):
