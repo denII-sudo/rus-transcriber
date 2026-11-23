@@ -151,12 +151,21 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
         def fail_second():
             if self.calls == 2:
                 raise llm_provider.ProviderError("offline", "синтетический обрыв")
-        with self.assertRaises(llm_provider.ProviderError):
+        with self.assertRaises(llm_provider.ProviderError) as error:
             self.execute(request, before_answer=fail_second)
+        self.assertEqual(error.exception.code, "offline")
+        self.assertIn("синтетический обрыв", str(error.exception))
+        self.assertIn("сохранено блоков 1 из 2", str(error.exception))      # видит вызывающий
+        self.assertIn("retry_failed", str(error.exception))
         status = workflow.get(self.store, request)
         self.assertEqual(status["state"], "failed")
+        failed = [json.loads(step["result_json"]) for step in status["steps"]
+                  if step["state"] == "failed" and step["result_json"]]
+        self.assertIn("сохранено блоков 1 из 2", failed[-1]["message"])    # это показывает workflow_status
         task_hash = storage._hash({"task": task, "run_id": status["model_run_id"]})
         self.assertEqual(workflow.saved_part_count(self.store, request_id=request, task_hash=task_hash), 1)
+        result = self.execute(request, retry_failed=True)                  # продолжение с места остановки
+        self.assertEqual((result["state"], result["completed_parts"]), ("completed", 2))
 
     # 4. Чтение задания у готовой свёртки ничего не меняет.
     def test_reading_task_of_completed_conspect_changes_nothing(self):

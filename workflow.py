@@ -832,6 +832,11 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
         "SELECT part_index FROM workflow_model_parts WHERE request_id=? AND task_hash=?",
         (request_id, task_hash))}
     invalid_count = 0
+
+    def progress():
+        saved = saved_part_count(store, request_id=request_id, task_hash=task_hash)
+        return (f"сохранено блоков {saved} из {total}; продолжить с места остановки — "
+                "workflow_execute_model(retry_failed=true) или rt.py workflow-execute --retry-failed")
     try:
         with llm_provider.OpenCodeTextClient() as client:
             for part_index in range(total):
@@ -857,8 +862,9 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
                 and saved_part_count(store, request_id=request_id, task_hash=task_hash) == total):
             _assemble_parts(store, request_id, task, task_hash)     # блоки сохранены раньше, итога не было
     except llm_provider.ProviderError as ex:
-        _fail_model_run(store, request_id, ex.code, str(ex), invalid_count=invalid_count)
-        raise
+        message = f"{ex}; {progress()}"
+        _fail_model_run(store, request_id, ex.code, message, invalid_count=invalid_count)
+        raise llm_provider.ProviderError(ex.code, message) from ex
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
         after = get(store, request_id)
         if after["state"] == "completed":
@@ -868,14 +874,13 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
             message = ("стенограмма или разбор изменились, пока модель отвечала (например, показ карточки или "
                        "сохранённый ответ); сохранённые блоки устарели. " + RESTART_HINT)
         else:
-            code, message = "internal_error", "модельный шаг остановлен; сохранённые блоки оставлены без изменений"
+            code, message = "internal_error", f"модельный шаг остановлен; {progress()}"
         _fail_model_run(store, request_id, code, message, invalid_count=invalid_count)
         raise llm_provider.ProviderError(code, message) from ex
     after = get(store, request_id)
     if after["state"] == "completed":
         return _completed_result(store, after)
-    saved = saved_part_count(store, request_id=request_id, task_hash=task_hash)
-    message = f"модельный шаг не завершён: сохранено блоков {saved} из {total}"
+    message = f"модельный шаг не завершён: {progress()}"
     _fail_model_run(store, request_id, "internal_error", message, invalid_count=invalid_count)
     raise llm_provider.ProviderError("internal_error", message)
 
