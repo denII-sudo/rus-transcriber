@@ -62,6 +62,15 @@ class SettingTests(unittest.TestCase):
 VOCAB = {"replace": {"борька": "Борис"}}         # словарь сценариев tests/test_run_words_golden.py
 
 
+def no_seconds(obj):
+    """Без замеров времени (*_sec, в том числе elapsed_sec попыток в диагностике): они меняются от прогона к прогону."""
+    if isinstance(obj, dict):
+        return {k: no_seconds(v) for k, v in obj.items() if not str(k).endswith("_sec")}
+    if isinstance(obj, list):
+        return [no_seconds(v) for v in obj]
+    return obj
+
+
 def finish(data, saved=None):
     """Как worker.main: служебное _hyp забирается до сохранения результата, файл пишется после.
     -> поля для статуса задачи."""
@@ -449,8 +458,7 @@ class TimedThirdInRunWordsTests(Sandbox):
                 mock.patch.object(worker, "TIMED_THIRD_VERIFIED", frozenset(verified)):
             data, calls = G.run_scenario(cfg_extra=cfg)
             self.assertEqual(finish(data), {"hypotheses_saved": True})
-        data["_timing"] = {k: v for k, v in data["_timing"].items() if not k.endswith("_sec")}
-        return data
+        return no_seconds(data)
 
     def test_same_result_with_and_without_timed_path(self):
         plain = self.run_case(())

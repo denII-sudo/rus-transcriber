@@ -262,7 +262,9 @@ def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=
         raise ValueError("unit_id — 12 знаков 0-9a-f")
     base = Path(data_dir) if data_dir is not None else root()
     cutoff = None
-    if older_than_days is not None:
+    # 0 дней — все файлы сразу, без сравнения времени: иначе только что записанный файл может оказаться
+    # «новее» текущего времени из-за разной точности часов файловой системы и time.time()
+    if older_than_days is not None and float(older_than_days) > 0:
         cutoff = (time.time() if now is None else now) - max(0.0, float(older_than_days)) * 86400
     n = size = 0
     units = set()
