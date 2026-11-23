@@ -369,10 +369,8 @@ def workflow_status(request_id):
         if recording_id:
             current = store.get_current(recording_id)
             source_revision, review_revision = current["transcript"]["revision"], current["review"]["revision"]
-            if store.db.execute(
-                    "SELECT 1 FROM workflow_verifications WHERE request_id=? AND recording_id=? "
-                    "AND source_revision=? AND review_revision=? LIMIT 1",
-                    (request_id, recording_id, source_revision, review_revision)).fetchone():
+            # Отметка снимается при правке текста или сомнений, но не от одного номера ревизии разбора.
+            if workflow.verification_is_current(store, request_id, recording_id, current):
                 human_verification = "confirmed"
             review = current["review"]["payload"]
             unresolved = sum(1 for item in (review.get("review") or [])
@@ -408,9 +406,9 @@ def workflow_status(request_id):
                     "JOIN conspect_revisions r ON r.conspect_id=c.conspect_id AND r.revision=c.current_revision "
                     "JOIN conspect_outbox o ON o.conspect_id=r.conspect_id AND o.revision=r.revision "
                     "WHERE c.conspect_id=?", (conspect_id,)).fetchone()
-                has_conspect = bool(row and row["source_revision"] == current["transcript"]["revision"]
-                                    and request["model_task"]["review_revision"] == current["review"]["revision"]
-                                    and request["model_task"]["goal"] == request["policy"]["goal"])
+                # Свёртка актуальна, пока совпадает содержание её задания (слова, говорящие, сомнения,
+                # цель), а не номера ревизий: показ карточки или пакет её устаревшей не делают.
+                has_conspect = bool(row and workflow.content_matches(request, request["model_task"], current))
                 if row and row["state"] != "synced":
                     sync = row["state"]
                 elif row:

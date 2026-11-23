@@ -63,7 +63,7 @@ class ModelStepNoDeadEndsTests(unittest.TestCase):
     def change_review(self, request):
         """Изменить содержание, которое видит модель: новое открытое сомнение на первом слове.
 
-        Только номер ревизии (показ карточки) свёртку не устаревает — см. test_conspect_content_staleness."""
+        Один номер ревизии (показ карточки) свёртку устаревшей не делает — см. test_conspect_content_staleness."""
         recording = workflow.get(self.store, request)["recording_id"]
         current = self.store.get_current(recording)
         review = json.loads(json.dumps(current["review"]["payload"]))

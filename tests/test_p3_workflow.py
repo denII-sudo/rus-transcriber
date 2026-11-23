@@ -159,11 +159,16 @@ class WorkflowTests(unittest.TestCase):
         part = workflow.model_part(self.store, request, 0)
         current = self.store.get_current(recording)
         binding = recordings.document_binding(self.store, recording)
+        # Устаревает содержание (новое открытое сомнение), а не только номер ревизии разбора.
+        review = json.loads(json.dumps(current["review"]["payload"]))
+        review["review"] = review.get("review", []) + [
+            {"id": str(uuid.uuid4()), "status": "open", "word_ids": [part["task"]["words"][0]["word_id"]],
+             "t1": 0, "t2": 1}]
         self.store.commit_change_with_document(
             recording, {"source_revision": current["transcript"]["revision"],
                         "review_revision": current["review"]["revision"]},
             str(uuid.uuid4()), recordings.operation_context(self.store, "human"),
-            review=current["review"]["payload"], root_id=binding["root_id"],
+            review=review, root_id=binding["root_id"],
             generated_at="2026-01-01T00:00:01Z")
         answer = {"source_revision": part["task"]["source_revision"], "sections": [{
             "text": "Итог.", "evidence": [part["task"]["words"][0]["word_id"]]}]}

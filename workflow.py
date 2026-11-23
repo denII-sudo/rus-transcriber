@@ -324,6 +324,98 @@ def _task_turns(transcript):
                 (segment for segment in transcript.get("segments", []) if segment.get("words")), 1)]
 
 
+def _task_words(transcript, review):
+    """Слова задания версии 2 из снимков: ID, текст, признак сомнения, номер реплики."""
+    open_items = [item for item in review.get("review", []) if item.get("status", "open") in ("open", "human")]
+    unknown_spans = any(not item.get("word_ids") for item in open_items)
+    uncertain = {ident for item in open_items for ident in item.get("word_ids", [])}
+    words, turn = [], 0
+    for segment in transcript.get("segments", []):
+        if segment.get("words"):
+            turn += 1
+        for word in segment.get("words", []):
+            words.append({"word_id": word["word_id"], "text": word.get("w", word.get("text")),
+                          "uncertain": unknown_spans or word["word_id"] in uncertain, "turn": turn})
+    return words
+
+
+def _build_task(request, snapshots, *, task_version=model_tasks.CURRENT_VERSION):
+    """Задание из текущих снимков и цели запроса; task_version=1 — по правилам версии 1."""
+    current, review = snapshots["transcript"], snapshots["review"]
+    words = _task_words(current["payload"], review["payload"])
+    if task_version == 1:
+        return model_tasks.build(request["recording_id"], current["revision"],
+                                 [{key: value for key, value in word.items() if key != "turn"} for word in words],
+                                 request["policy"]["goal"], review["revision"])
+    return model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
+                             review["revision"], turns=_task_turns(current["payload"]))
+
+
+_REVISION_FIELDS = ("source_revision", "review_revision")
+
+
+def content_fingerprint(task):
+    """Отпечаток содержания задания: хэш всего, что видит модель, кроме номеров ревизий.
+
+    Входят вид и версия задания, запись, цель, слова (ID, текст, признак сомнения, номер реплики,
+    порядок) и реплики с условными метками говорящих. Считается из самого задания, поэтому
+    подходит и к заданиям, сохранённым раньше. Неизвестные поля задания отклоняются.
+    """
+    checked = model_tasks.canonical(task)
+    return storage._hash({key: value for key, value in checked.items() if key not in _REVISION_FIELDS})
+
+
+def content_matches(request, task, snapshots):
+    """Совпадает ли то, что модель видит в task, с заданием из текущих снимков и цели запроса.
+
+    Номера ревизий не сравниваются: показ карточки, сборка пакета и сохранённый неприменённый
+    ответ меняют только номер ревизии разбора. Ничего не пишет.
+    """
+    try:
+        fresh = _build_task(request, snapshots, task_version=model_tasks.version(task))
+        return content_fingerprint(fresh) == content_fingerprint(task)
+    except ValueError:
+        return False
+
+
+def verification_is_current(store, request_id, recording_id, snapshots):
+    """Действует ли отметка «проверено человеком» для текущих снимков. Только чтение.
+
+    Отметка привязана к ревизии стенограммы: любая правка текста её снимает, как раньше.
+    Новая ревизия разбора отметку не снимает, если сомнения (что модель увидела бы
+    сомнительным) те же, — так и при показе карточки, сборке пакета, неприменённом ответе.
+    """
+    transcript = snapshots["transcript"]
+    expected = _task_words(transcript["payload"], snapshots["review"]["payload"])
+    rows = store.db.execute("SELECT DISTINCT review_revision FROM workflow_verifications WHERE request_id=? "
+                            "AND recording_id=? AND source_revision=? ORDER BY review_revision DESC",
+                            (request_id, recording_id, transcript["revision"])).fetchall()
+    for row in rows:
+        if row["review_revision"] == snapshots["review"]["revision"]:
+            return True
+        try:
+            old = store.get_revision(recording_id, "review", row["review_revision"])
+        except (KeyError, ValueError, storage.StorageError):
+            continue
+        if old["source_revision"] == transcript["revision"] and _task_words(
+                transcript["payload"], old["payload"]) == expected:
+            return True
+    return False
+
+
+class _HeadMoved(storage.Conflict):
+    """Ревизия записи сменилась между чтением снимков и записью; повтор перечитает их."""
+
+
+def _retry_head_moved(action):
+    for _ in range(3):
+        try:
+            return action()
+        except _HeadMoved:
+            continue
+    raise storage.Conflict("стенограмма или разбор меняются слишком часто; повторите позже")
+
+
 RESTART_HINT = ("Начните модельный шаг заново: workflow_execute_model(restart=true) или "
                 "workflow_model_task(restart=true), в командной строке — rt.py workflow-execute --restart "
                 "или rt.py workflow-task --restart. Расшифровка не повторяется; через workflow_execute_model "
@@ -346,40 +438,32 @@ def prepare_model_task(store, request_id, *, restart=False):
         if request["state"] == "failed" and request["model_task"] is not None:
             raise storage.Conflict("модельный шаг завершился с ошибкой. " + RESTART_HINT)
         raise storage.Conflict("стенограмма ещё не готова")
+    return _retry_head_moved(lambda: _prepare_model_task(store, request, restart))
+
+
+def _prepare_model_task(store, request, restart):
+    request_id = request["request_id"]
     snapshots = store.get_current(request["recording_id"])
     current = snapshots["transcript"]
-    open_items = [item for item in snapshots["review"]["payload"].get("review", [])
-                  if item.get("status", "open") in ("open", "human")]
-    unknown_spans = any(not item.get("word_ids") for item in open_items)
-    uncertain = {ident for item in open_items for ident in item.get("word_ids", [])}
-    words, turn = [], 0
-    for segment in current["payload"].get("segments", []):
-        if segment.get("words"):
-            turn += 1
-        for word in segment.get("words", []):
-            words.append({"word_id": word["word_id"], "text": word.get("w", word.get("text")),
-                          "uncertain": unknown_spans or word["word_id"] in uncertain, "turn": turn})
-    task = None
     saved = request["model_task"]
     if (request["state"] == "waiting_model" and not restart and isinstance(saved, dict)
-            and "version" not in saved):
-        # Сохранённое задание версии 1 доигрывается без изменений; иначе принятые блоки
-        # (ключ — хэш задания) потеряли бы связь с ним. Новое задание — всегда версии 2.
-        legacy = model_tasks.build(
-            request["recording_id"], current["revision"],
-            [{key: value for key, value in word.items() if key != "turn"} for word in words],
-            request["policy"]["goal"], snapshots["review"]["revision"])
-        if legacy == saved:
-            task = legacy
-    if task is None:
-        task = model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
-                                 snapshots["review"]["revision"], turns=_task_turns(current["payload"]))
+            and content_matches(request, saved, snapshots)):
+        # То же содержание — сохранённое задание не переписывается, даже если сменились номера
+        # ревизий (показ карточки, пакет, неприменённый ответ): принятые блоки (ключ — хэш задания)
+        # не теряют связи с ним. Так же доигрывается задание версии 1. Новое — всегда версии 2.
+        if request["model_run_id"] is not None:
+            return saved
+        task = saved
+    else:
+        task = _build_task(request, snapshots)
     with store._transaction():
         store.current_identity()
         head = recordings.recording_head(store, request["recording_id"])
-        if (head is None or head["source_revision"] != current["revision"]
+        if head is None:
+            raise storage.Conflict("запись не найдена")
+        if (head["source_revision"] != current["revision"]
                 or head["review_revision"] != snapshots["review"]["revision"]):
-            raise storage.Conflict("ревизия стенограммы изменилась")
+            raise _HeadMoved("ревизия стенограммы изменилась")
         new_generation = restart or request["state"] in ("processed", "completed")
         cursor = store.db.execute("UPDATE workflow_requests SET state='waiting_model', model_task_json=?, "
                                   "model_result_json=NULL, model_attempts=CASE WHEN ? THEN 0 ELSE model_attempts END, "
@@ -616,8 +700,12 @@ def model_part(store, request_id, part_index):
 def accept_model_part(store, request_id, part_index, result):
     """Сохранить блок; итог формируется только после покрытия всех блоков."""
     before = get(store, request_id)
+    return _retry_head_moved(lambda: _accept_model_part(store, request_id, part_index, result, before))
+
+
+def _accept_model_part(store, request_id, part_index, result, before):
     try:
-        task, total, accepted = _validate_model_part(store, request_id, part_index, result, before)
+        task, total, accepted, snapshots = _validate_model_part(store, request_id, part_index, result, before)
     except ValueError:
         _record_model_error(store, request_id, before)
         raise
@@ -637,10 +725,11 @@ def accept_model_part(store, request_id, part_index, result):
         run = store.db.execute("SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='model' "
                                "AND state='waiting_model'", (request_id,)).fetchall()
         if (row["state"] != "waiting_model" or storage._loads(row["model_task_json"]) != task
-                or head["source_revision"] != task["source_revision"]
-                or head["review_revision"] != task["review_revision"] or len(run) != 1
-                or row["model_run_id"] != run[0]["run_id"]):
+                or len(run) != 1 or row["model_run_id"] != run[0]["run_id"]):
             raise storage.Conflict("задание или ревизия изменились")
+        if (head["source_revision"] != snapshots["transcript"]["revision"]
+                or head["review_revision"] != snapshots["review"]["revision"]):
+            raise _HeadMoved("ревизия изменилась после проверки содержания")
         task_hash = storage._hash({"task": task, "run_id": run[0]["run_id"]})
         old = store.db.execute("SELECT result_json FROM workflow_model_parts WHERE request_id=? "
                                "AND task_hash=? AND part_index=?", (request_id, task_hash, part_index)).fetchone()
@@ -684,17 +773,20 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
     total = len(bounds)
     if type(part_index) is not int or not 0 <= part_index < total:
         raise ValueError("неверный номер блока")
+    current = None
     if before["state"] != "completed":
+        # Сверяется содержание, а не номера ревизий: см. content_matches.
         current = store.get_current(before["recording_id"])
-        if (current["transcript"]["revision"] != task["source_revision"]
-                or current["review"]["revision"] != task["review_revision"]):
-            raise storage.Conflict("стенограмма или сомнения изменились")
+        if not content_matches(before, task, current):
+            raise storage.Conflict("содержание стенограммы или сомнений изменилось")
     subtask = _part_task(task, bounds[part_index])
+    # Ответ сверяется с заданием, которое видела модель (в том числе её source_revision); слова
+    # задания совпадают со словами текущей стенограммы — это и проверено отпечатком содержания.
     accepted = model_tasks.validate(subtask, result, current_revision=task["source_revision"])
     if before["state"] != "completed":
         import conspect
         data = {**current["transcript"]["payload"], "recording_id": before["recording_id"],
-                "source_revision": task["source_revision"]}
+                "source_revision": current["transcript"]["revision"]}
         open_review = any(item.get("status", "open") in ("open", "human")
                           for item in current["review"]["payload"].get("review", []))
         for section in accepted["sections"]:
@@ -706,7 +798,7 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
             if any(not set(part["word_ids"]) <= set(section["evidence"])
                    for quote in obj["quotes"].values() for part in quote["parts"]):
                 raise ValueError("цитата не входит в свидетельства раздела")
-    return task, total, accepted
+    return task, total, accepted, current
 
 
 def _fail_model_run(store, request_id, code, message, *, invalid_count=0):
@@ -733,10 +825,9 @@ def _resume_model_run(store, request):
     if request["model_task"]["goal"] != request["policy"]["goal"]:
         raise storage.Conflict("цель изменилась; продолжение старого модельного задания запрещено. " + RESTART_HINT)
     current = store.get_current(request["recording_id"])
-    if (current["transcript"]["revision"] != request["model_task"]["source_revision"]
-            or current["review"]["revision"] != request["model_task"]["review_revision"]):
-        raise storage.Conflict("стенограмма или разбор изменились; продолжить прежний модельный шаг нельзя. "
-                               + RESTART_HINT)
+    if not content_matches(request, request["model_task"], current):
+        raise storage.Conflict("содержание стенограммы или разбора изменилось (слова, говорящие или сомнения); "
+                               "продолжить прежний модельный шаг нельзя. " + RESTART_HINT)
     with store._transaction():
         store.current_identity()
         now = storage._now()
@@ -843,6 +934,8 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
                 if part_index in completed:
                     continue
                 part = model_part(store, request_id, part_index)
+                if get(store, request_id)["model_task"] != task:
+                    raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
                 repair_error = invalid_output = None
                 for attempt in range(2):
                     result, raw = client.generate(part["task"], repair_error=repair_error,
@@ -871,8 +964,8 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
             return _completed_result(store, after)
         if isinstance(ex, storage.Conflict):
             code = "revision_changed"
-            message = ("стенограмма или разбор изменились, пока модель отвечала (например, показ карточки или "
-                       "сохранённый ответ); сохранённые блоки устарели. " + RESTART_HINT)
+            message = ("содержание стенограммы или разбора изменилось, пока модель отвечала (слово, говорящий, "
+                       "применённый ответ на сомнение); сохранённые блоки устарели. " + RESTART_HINT)
         else:
             code, message = "internal_error", f"модельный шаг остановлен; {progress()}"
         _fail_model_run(store, request_id, code, message, invalid_count=invalid_count)
@@ -886,6 +979,16 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
 
 
 def _accept_model_result(store, request_id, result):
+    return _retry_head_moved(lambda: _accept_model_result_once(store, request_id, result))
+
+
+def _accept_model_result_once(store, request_id, result):
+    """Принять итог. Связка ревизий при совпадающем содержании, но сменившихся номерах:
+
+    model_task и model_result хранят ревизии, которые видела модель (ответ сверяется с ними);
+    свёртка сохраняется с текущей ревизией стенограммы (conspect_revisions.source_revision и
+    source_revision в её JSON), цитаты связываются с текущими словами.
+    """
     import conspect
     request = get(store, request_id)
     if request["state"] == "completed" and request["model_result"] is not None:
@@ -899,10 +1002,10 @@ def _accept_model_result(store, request_id, result):
         raise storage.Conflict("нет ожидающего модельного задания")
     snapshots = store.get_current(request["recording_id"])
     current = snapshots["transcript"]
-    if (snapshots["review"]["revision"] != request["model_task"]["review_revision"]
-            or current["revision"] != request["model_task"]["source_revision"]):
-        raise storage.Conflict("стенограмма или сомнения изменились; подготовьте новое задание")
-    accepted = model_tasks.validate(request["model_task"], result, current_revision=current["revision"])
+    if not content_matches(request, request["model_task"], snapshots):
+        raise storage.Conflict("содержание стенограммы или сомнений изменилось; подготовьте новое задание")
+    accepted = model_tasks.validate(request["model_task"], result,
+                                    current_revision=request["model_task"]["source_revision"])
     text = "\n\n".join(section["text"] for section in accepted["sections"])
     if "{{q:" in text:
         raise ValueError("служебные маркеры цитат в ответе не допускаются")
@@ -956,11 +1059,11 @@ def _accept_model_result(store, request_id, result):
         head = recordings.recording_head(store, request["recording_id"])
         row = store.db.execute("SELECT state, model_task_json FROM workflow_requests WHERE request_id=?",
                                (request_id,)).fetchone()
-        if (head["source_revision"] != current["revision"]
-                or head["review_revision"] != snapshots["review"]["revision"]
-                or row["state"] != "waiting_model"
-                or storage._loads(row["model_task_json"]) != request["model_task"]):
+        if row["state"] != "waiting_model" or storage._loads(row["model_task_json"]) != request["model_task"]:
             raise storage.Conflict("задание или ревизия изменились")
+        if (head["source_revision"] != current["revision"]
+                or head["review_revision"] != snapshots["review"]["revision"]):
+            raise _HeadMoved("ревизия изменилась после проверки содержания")
         saved = store.save_conspect(
             request["recording_id"], conspect_id, name, current["revision"], expected, obj, payload, md_bytes,
             json_path.relative_to(binding["root"]).as_posix(), md_path.relative_to(binding["root"]).as_posix(),
