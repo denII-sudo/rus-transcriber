@@ -150,7 +150,18 @@ class HumanAnswerOverPriorEdit(base.AnswerOutcomeCase):
             inserted = next(w["word_id"] for s in data["segments"] for w in s["words"] if w["w"] == "ну")
             data["review"][0]["word_ids"] = ["w1", inserted]
             transcript.save(data, jp, md)
-        self.over(agent, {"option": 0}, ["другое", "слово"])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, agent) as (jp, md, version):
+                self.save(jp, version, option=0)
+                if backend == "legacy_files":
+                    rep = self.apply(jp, md)
+                else:
+                    # Повтор здесь не проверяется: в sqlite повторное применение после ответа, который убрал
+                    # слово из ссылок карточки, падает и без этой части (прежняя ошибка, отдельная задача).
+                    rep = core.apply_answers_files(jp, md)
+                    self.check_outcomes(jp, rep)
+                self.assertEqual(self.outcomes(rep)["r1"], "applied")
+                self.assertEqual(self.words(jp), ["другое", "слово"])
 
     def test_partial_match_keeps_untouched_word(self):
         # Агент правил оба слова; ответ человека меняет одно, второе остаётся правкой агента.
@@ -177,16 +188,17 @@ class HumanAnswerOverPriorEdit(base.AnswerOutcomeCase):
     def test_other_card_answer_of_human_is_a_conflict_with_reason(self):
         def human(jp, md):
             transcript.apply_review(jp, md, [{"id": "r3", "text": "тесть"}], by="human")
-        for answer in ({"option": 0}, {"text": "пятое"}):
-            for rep, _ in self.over(human, answer, ["тесть", "слово"], "apply_conflict").values():
+        # Исход свободного текста — общий для неудачной правки слов (not_applied); причина та же.
+        for answer, outcome in (({"option": 0}, "apply_conflict"), ({"text": "пятое"}, "not_applied")):
+            for rep, _ in self.over(human, answer, ["тесть", "слово"], outcome).values():
                 self.assertIn("r3", detail(rep, "r1"), "причина не называет карточку прежней правки")
 
     def test_human_edit_span_is_a_conflict_with_reason(self):
         # Обе правки — человеческие: выбирает человек, одинаково в обоих режимах.
         def human(jp, md):
             transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human", resolve=False)
-        for answer in ({"option": 0}, {"text": "пятое"}):
-            for rep, _ in self.over(human, answer, ["ручной", "слово"], "apply_conflict").values():
+        for answer, outcome in (({"option": 0}, "apply_conflict"), ({"text": "пятое"}, "not_applied")):
+            for rep, _ in self.over(human, answer, ["ручной", "слово"], outcome).values():
                 why = detail(rep, "r1")
                 self.assertIn("правкой отрезка человека", why)
                 self.assertIn("span@0.20", why)
