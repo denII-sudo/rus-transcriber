@@ -57,6 +57,14 @@ class AnswerRevisionGuardTests(unittest.TestCase):
         row.update({"kind": "free", "text": "первый"} if free else {"option": 0})
         review_pack.add_answers(jp, [row], "local", trusted_actor="human")
 
+    @staticmethod
+    def strip_word_ids(jp):
+        """Старый вид карточки: ответ ищет место по времени, номеров слов в manifest нет."""
+        state = review_pack.answers_state(jp)
+        for item in state["manifest"]["items"]:
+            item.pop("word_ids", None)
+        review_pack._write_answers(jp, state)
+
     def test_unrelated_edit_then_answer_and_undo(self):
         helper, data = self.fixture()
         with helper.answer_files("sqlite", data) as (jp, md):
@@ -143,6 +151,55 @@ class AnswerRevisionGuardTests(unittest.TestCase):
         cases.append(changed)
         for changed in cases:
             self.assertIn("r1", core._answer_revision_conflicts(changed, manifest, state, source, sqlite=True))
+
+    def test_legacy_card_without_ids_blocks_late_edits(self):
+        cases = [
+            ((0.2, 0.4, "один", "Борис"), {"speaker": "Глеб"}),
+            ((0.2, 0.4, "Один", None), {"text": "один"}),
+        ]
+        for edit, decision in cases:
+            helper, data = self.fixture()
+            with self.subTest(edit=edit), helper.answer_files("sqlite", data) as (jp, md):
+                pack = review_pack.build(jp, [{
+                    "id": "r1", "question": "Проверьте", "options": [
+                        {"label": "Вариант", "decision": decision}]}])
+                self.strip_word_ids(jp)
+                transcript.edit_span(jp, md, *edit, by="human")
+                before = copy.deepcopy(transcript.load(jp)["segments"])
+                review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "option": 0}],
+                                        "local", trusted_actor="human")
+                result = core.apply_answers_files(jp, md)
+                self.assertEqual(transcript.load(jp)["segments"], before)
+                self.assertEqual(result["applied_from_answers"], 0)
+                self.assertTrue(result.get("revision_conflicts"))
+                self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+
+    def test_legacy_card_without_ids_blocks_insertion_in_window(self):
+        helper, data = self.fixture()
+        with helper.answer_files("sqlite", data) as (jp, md):
+            pack = self.build(jp)
+            self.strip_word_ids(jp)
+            transcript.apply_word_edits(jp, md, [{
+                "op": "insert", "s": 0.35, "e": 0.39, "text": "лишний",
+                "speaker": "Глеб", "after_id": "w1", "card": "вставка"}], by="human")
+            before = copy.deepcopy(transcript.load(jp)["segments"])
+            self.answer(jp, pack)
+            result = core.apply_answers_files(jp, md)
+            self.assertEqual(transcript.load(jp)["segments"], before)
+            self.assertEqual(result["applied_from_answers"], 0)
+            self.assertTrue(result.get("revision_conflicts"))
+            self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+
+    def test_legacy_card_without_ids_allows_unrelated_edit(self):
+        helper, data = self.fixture()
+        with helper.answer_files("sqlite", data) as (jp, md):
+            pack = self.build(jp)
+            self.strip_word_ids(jp)
+            transcript.edit_span(jp, md, 0.8, 1.0, "последний", by="human")
+            self.answer(jp, pack)
+            result = core.apply_answers_files(jp, md)
+            self.assertEqual(result["applied_from_answers"], 1)
+            self.assertEqual(helper.card_state(jp)[0], ["первый", "два", "последний"])
 
 
 class WorkerSnapshotTests(unittest.TestCase):

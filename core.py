@@ -2605,18 +2605,34 @@ def _answer_source_snapshot(store, recording_id, manifest):
 
 def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
     import review_pack
+    import transcript
     applied = review_pack._applied_map(state)
     answers = state.get("answers") or {}
 
+    def snapshot(word, speaker):
+        return (word.get("word_id"), word.get("w"), word.get("edited"),
+                word.get("provenance") or {}, speaker)
+
     def select(data, ids):
-        words = [w for segment in (data or {}).get("segments") or [] for w in segment.get("words") or []]
-        positions = [i for i, word in enumerate(words) if word.get("word_id") in ids]
+        rows = [(word, segment.get("speaker"))
+                for segment in (data or {}).get("segments") or []
+                for word in segment.get("words") or []]
+        positions = [i for i, (word, _) in enumerate(rows) if word.get("word_id") in ids]
         if (len(set(ids)) != len(ids) or len(positions) != len(ids) or not positions or
                 positions != list(range(positions[0], positions[0] + len(ids))) or
-                [words[i].get("word_id") for i in positions] != ids):
+                [rows[i][0].get("word_id") for i in positions] != ids):
             return None
-        return [(words[i].get("word_id"), words[i].get("w"), words[i].get("edited"),
-                 (words[i].get("provenance") or {}).get("text")) for i in positions]
+        return [snapshot(*rows[i]) for i in positions]
+
+    def select_by_time(data, item):
+        # Тем же правилом, что и ответ: _find_span по началу слова с допуском 0,01 с.
+        loc = transcript._find_span(data, item)
+        if loc is None:
+            return None
+        si, w1, w2 = loc
+        segment = data["segments"][si]
+        return [snapshot(word, segment.get("speaker"))
+                for word in (segment.get("words") or [])[w1:w2]]
 
     conflicts = {}
     for item in manifest.get("items") or []:
@@ -2629,6 +2645,13 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
             conflicts[aid] = "недоступна исходная ревизия карточки"
             continue
         if not ids:
+            # Старый вид карточки: ответ ищет место по времени. Сравниваем ровно те
+            # слова, которые он перезапишет, включая говорящего и все измерения provenance.
+            if sqlite and "word_ids" not in item:
+                actual = select_by_time(current, item)
+                original = select_by_time(source, item)
+                if actual is None or original is None or actual != original:
+                    conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
             continue
         actual = select(current, ids)
         original = select(source, ids) if sqlite else actual
