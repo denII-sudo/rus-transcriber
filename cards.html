@@ -138,6 +138,12 @@ audio{width:100%;height:36px}
     if (LOCAL) return "saved";
     return kindOf(a) === "keep" ? "cloud_keep" : "cloud_saved";
   };
+  // «Не отменять» из облака, который ноутбук уже обработал (принял или отклонил): страница показывает
+  // ответ программы, а не свой запрос.
+  const keepSeen = (a) => {
+    const k = ((man.answer_states || {})[a.id] || {}).keep;
+    return kindOf(a) === "keep" && !!k && k.ts === a.ts && k.source === a.source;
+  };
   const whyOf = (it) => ((man.answer_states || {})[it.id] || {}).why || "";
   const detailOf = (it) => ((man.answer_states || {})[it.id] || {}).detail || "";
   // применённая правка на месте: прежний ответ (новый ждёт отмены или не меняет его)
@@ -216,7 +222,7 @@ audio{width:100%;height:36px}
   // снимок ответов с ноутбука (в manifest) + ответы страницы: на каждое место — последний по времени
   function merge() {
     const o = {...pick(Object.values(man.answers || {}))};
-    Object.values(live).forEach(a => { if (!o[a.id] || (a.ts || "") > (o[a.id].ts || "")) o[a.id] = a; });
+    Object.values(live).forEach(a => { if (keepSeen(a)) return; if (!o[a.id] || (a.ts || "") > (o[a.id].ts || "")) o[a.id] = a; });
     return o;
   }
   const $ = (id) => document.getElementById(id);

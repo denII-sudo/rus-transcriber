@@ -442,6 +442,12 @@ class PageStateFromPython(unittest.TestCase):
             self.assertEqual(man["answer_states"]["r1"]["state"], "applied")
 
 
+def without_keep_request(answer):
+    """Ответ, возвращённый по «Не отменять», без отметки запроса — сверяется с прежним ответом целиком."""
+    assert set(answer["keep_request"]) == {"ts", "source"}, answer
+    return {k: v for k, v in answer.items() if k != "keep_request"}
+
+
 def page_script(host="127.0.0.1"):
     """Начало скрипта cards.html (до функций ответов) — для проверки логики страницы в Node.js.
     host — адрес страницы: не 127.0.0.1/localhost означает облачную страницу."""
@@ -615,7 +621,7 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
                 original = self.applied_with_heard(jp, md, version)
                 self.save(jp, version, kind="revert")
                 self.save(jp, version, kind="keep")
-                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+                self.assertEqual(without_keep_request(review_pack.answers_state(jp)["answers"]["r1"]), original)
                 self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
 
     def test_keep_after_pending_and_revert_restores_whole_answer(self):
@@ -625,7 +631,7 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
                 self.save(jp, version, option=1)
                 self.save(jp, version, kind="revert")
                 self.save(jp, version, kind="keep")
-                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+                self.assertEqual(without_keep_request(review_pack.answers_state(jp)["answers"]["r1"]), original)
 
     def test_copy_is_one_level_and_does_not_change_application(self):
         for backend in BACKENDS:
@@ -664,7 +670,7 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
                 self.save(jp, version, kind="revert")
                 review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "keep",
                                               "ts": "2026-11-23T23:00:00"}], "cloud")
-                self.assertEqual(review_pack.answers_state(jp)["answers"]["r1"], original)
+                self.assertEqual(without_keep_request(review_pack.answers_state(jp)["answers"]["r1"]), original)
                 self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
 
     def test_old_pack_without_copy_restores_by_signature_and_says_so(self):

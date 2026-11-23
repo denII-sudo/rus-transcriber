@@ -453,9 +453,15 @@ def add_answers(json_path, answers, source, *, trusted_actor="unknown"):
             return _add_answers(json_path, answers, source, trusted_actor)
 
 
+def _answer_time(answer):
+    """Время ответа для правила «более поздний побеждает». Исключение: у ответа, возвращённого по «Не отменять»,
+    время прежнее, а решение принято в момент запроса — берётся более позднее из двух."""
+    return max(answer.get("ts", ""), (answer.get("keep_request") or {}).get("ts", ""))
+
+
 def _newer(old, ans):
     """Более поздний ответ побеждает: сохранённый ответ old новее пришедшего ans — ans не сохраняется."""
-    return bool(old) and old.get("ts", "") > ans["ts"]
+    return bool(old) and _answer_time(old) > ans["ts"]
 
 
 def _reject_keep(store, ans, why):
@@ -520,7 +526,8 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
                 continue
             kept = (store["answers"].get(aid) or {}).get("applied_answer")
             if kept and _sig(kept) == previous:
-                store["answers"][aid] = copy.deepcopy(kept)
+                # keep_request — по какому запросу ответ возвращён: страница сверяет с ним свой запрос.
+                store["answers"][aid] = dict(copy.deepcopy(kept), keep_request={"ts": ans["ts"], "source": source})
                 rep["accepted"].append({"id": aid, "kind": kept.get("kind"), "answer": _desc(kept, it),
                                         "restored": True})
                 continue
@@ -528,7 +535,7 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             # с отметкой restored и временем возврата (прежнее время неизвестно).
             kind, option, text = (list(previous) + [None, None, None])[:3]
             ans.pop("text", None)
-            ans.update(kind=kind, restored=True)
+            ans.update(kind=kind, restored=True, keep_request={"ts": ans["ts"], "source": source})
             if option is not None:
                 ans["option"] = option
             if text is not None:
@@ -568,7 +575,8 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             # возвращается как был. Копия переносится и через цепочку ждущих ответов.
             kept = old if _sig(old) == applied.get(aid) else old.get("applied_answer")
             if kept and _sig(kept) == applied.get(aid):
-                ans["applied_answer"] = {k: copy.deepcopy(v) for k, v in kept.items() if k != "applied_answer"}
+                ans["applied_answer"] = {k: copy.deepcopy(v) for k, v in kept.items()
+                                         if k not in ("applied_answer", "keep_request")}
         store["answers"][aid] = ans
         rep["accepted"].append({"id": aid, "kind": ans["kind"], "answer": _desc(ans, it)})
         if ans["kind"] == "free":
@@ -884,8 +892,9 @@ def cloud_bundle(json_path, artifact_url=None):
         meta["artifact_url"] = artifact_url
     clips = {it["clip"]: pd / it["clip"] for it in man["items"]}
     have = {k: v for k, v in clips.items() if v.exists()}
-    # Копия применённого ответа (applied_answer) нужна только ноутбуку для «Не отменять» — в облако её не отдаём.
-    out = dict(man, answers={k: {f: x for f, x in v.items() if f != "applied_answer"}
+    # Копия применённого ответа (applied_answer) и отметка запроса (keep_request) нужны только ноутбуку:
+    # странице хватает answer_states (keep: ts, source, accepted).
+    out = dict(man, answers={k: {f: x for f, x in v.items() if f not in ("applied_answer", "keep_request")}
                              for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
                applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
@@ -1008,13 +1017,25 @@ def answer_states_of(store, man):
     events = store.get("application_events") or []
     snapshots = store.get("undo_snapshots") or {}
     cards = {it.get("id"): n for n, it in enumerate((man or {}).get("items") or [], 1)}
+    rejected_keeps = {r.get("id"): r for r in store.get("rejected") or [] if r.get("kind") == "keep"}
     out = {}
     for aid, answer in (store.get("answers") or {}).items():
         state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer))
         out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
                     "ts": answer.get("ts"), "source": answer.get("source")}
+        details = []
         if aid in applied and aid not in snapshots and state in ("applied", "pending_new", "kept_previous"):
-            out[aid]["detail"] = UNDO_UNAVAILABLE
+            details.append(UNDO_UNAVAILABLE)
+        # Последний обработанный запрос «Не отменять»: по нему страница узнаёт, что её запрос принят или отклонён.
+        accepted, rejected = answer.get("keep_request"), rejected_keeps.get(aid)
+        if rejected and (not accepted or rejected["ts"] > accepted.get("ts", "")):
+            out[aid]["keep"] = {"ts": rejected["ts"], "source": rejected["source"], "accepted": False}
+            if rejected["ts"] > _answer_time(answer):       # причина — только под ответом, который старше запроса
+                details.append("«Не отменять» не принят: " + rejected["why"])
+        elif accepted:
+            out[aid]["keep"] = {"ts": accepted.get("ts"), "source": accepted.get("source"), "accepted": True}
+        if details:
+            out[aid]["detail"] = " — ".join(details)
     return out
 
 
