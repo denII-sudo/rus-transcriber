@@ -3,12 +3,16 @@
 Версия 1 (без поля `version`) — только слова; так выглядят задания, сохранённые до версии 2,
 они собираются и проверяются по-прежнему. Версия 2 (`"version": 2`) добавляет реплики:
 у слова номер реплики `turn`, у задания список `turns` с условной меткой говорящего.
+Версия 3 (`"version": 3`) — те же поля и `unlocated_doubts`: число открытых мест, которые не
+удалось привязать к словам ни по ссылкам, ни по времени. Версии различаются и правилами
+пометки `uncertain` (их применяет workflow при сборке), сами поля слов те же.
 Имена говорящих в задание не попадают: метка — только «Участник N» или UNKNOWN_SPEAKER.
 """
 import re
 
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
+VERSIONS = (2, 3)       # версии с полем `version`; версия 1 — без него
 SPEAKER_LABEL = re.compile(r"Участник [1-9][0-9]{0,3}")
 UNKNOWN_SPEAKER = "Говорящий не определён"
 
@@ -21,14 +25,14 @@ def speaker_label(number):
 
 
 def version(task):
-    """1 — задание без поля версии, 2 — с репликами; иное отклоняется."""
+    """1 — задание без поля версии, 2 — с репликами, 3 — с числом непривязанных мест; иное отклоняется."""
     if not isinstance(task, dict):
         raise ValueError("некорректное задание")
     if "version" not in task:
         return 1
-    if type(task["version"]) is not int or task["version"] != CURRENT_VERSION:
+    if type(task["version"]) is not int or task["version"] not in VERSIONS:
         raise ValueError("неизвестная версия задания")
-    return CURRENT_VERSION
+    return task["version"]
 
 
 def _turns(turns):
@@ -48,11 +52,13 @@ def _turns(turns):
     return result
 
 
-def build(recording_id, source_revision, words, goal="", review_revision=1, *, turns=None):
+def build(recording_id, source_revision, words, goal="", review_revision=1, *, turns=None,
+          unlocated_doubts=None):
     """Сформировать задание из слов и их устойчивых идентификаторов.
 
     Без `turns` — версия 1 (только слова). С `turns` — версия 2: каждое слово несёт номер
-    своей реплики, реплики идут по порядку, пустых и неизвестных реплик нет.
+    своей реплики, реплики идут по порядку, пустых и неизвестных реплик нет. С `turns` и
+    `unlocated_doubts` (целое ≥ 0) — версия 3.
     """
     if not isinstance(recording_id, str) or not recording_id:
         raise ValueError("требуется идентификатор записи")
@@ -64,6 +70,11 @@ def build(recording_id, source_revision, words, goal="", review_revision=1, *, t
         raise ValueError("слова должны быть списком")
     if not isinstance(goal, str) or len(goal) > 2000:
         raise ValueError("некорректная цель")
+    if unlocated_doubts is not None:
+        if turns is None:
+            raise ValueError("число непривязанных мест есть только в задании с репликами")
+        if type(unlocated_doubts) is not int or unlocated_doubts < 0:
+            raise ValueError("некорректное число непривязанных мест")
     checked_turns = None if turns is None else _turns(turns)
     required = {"word_id", "text"} if turns is None else {"word_id", "text", "turn"}
     allowed = required | {"uncertain"}
@@ -94,9 +105,12 @@ def build(recording_id, source_revision, words, goal="", review_revision=1, *, t
             order.append(item["turn"])
     if order != [turn["turn"] for turn in checked_turns]:
         raise ValueError("слова не соответствуют списку реплик")
-    return {"kind": "conspect", "version": CURRENT_VERSION, "recording_id": recording_id,
+    task = {"kind": "conspect", "version": 2 if unlocated_doubts is None else 3, "recording_id": recording_id,
             "source_revision": source_revision, "review_revision": review_revision, "goal": goal,
             "turns": checked_turns, "words": result}
+    if unlocated_doubts is not None:
+        task["unlocated_doubts"] = unlocated_doubts
+    return task
 
 
 def canonical(task):
@@ -105,10 +119,14 @@ def canonical(task):
         checked = build(task.get("recording_id"), task.get("source_revision"), task.get("words"),
                         task.get("goal"), task.get("review_revision"))
     else:
+        number = version(task)
         if "turns" not in task:
-            raise ValueError("в задании версии 2 нет списка реплик")
+            raise ValueError(f"в задании версии {number} нет списка реплик")
+        if number == 3 and "unlocated_doubts" not in task:
+            raise ValueError("в задании версии 3 нет числа непривязанных мест")
         checked = build(task.get("recording_id"), task.get("source_revision"), task.get("words"),
-                        task.get("goal"), task.get("review_revision"), turns=task["turns"])
+                        task.get("goal"), task.get("review_revision"), turns=task["turns"],
+                        unlocated_doubts=task["unlocated_doubts"] if number == 3 else None)
     if task != checked:
         raise ValueError("неизвестные поля задания")
     return checked

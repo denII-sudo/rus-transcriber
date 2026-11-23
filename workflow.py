@@ -1,6 +1,7 @@
 """Сохранённые запросы П3. Исполнение вызывается сервисом, не при импорте."""
 
 import json
+import math
 import uuid
 from pathlib import Path
 
@@ -324,31 +325,113 @@ def _task_turns(transcript):
                 (segment for segment in transcript.get("segments", []) if segment.get("words")), 1)]
 
 
-def _task_words(transcript, review):
-    """Слова задания версии 2 из снимков: ID, текст, признак сомнения, номер реплики."""
-    open_items = [item for item in review.get("review", []) if item.get("status", "open") in ("open", "human")]
-    unknown_spans = any(not item.get("word_ids") for item in open_items)
-    uncertain = {ident for item in open_items for ident in item.get("word_ids", [])}
+def _open_places(review):
+    """Открытые места разбора: статус open (или не задан) и human — их ещё не закрыл человек."""
+    return [item for item in review.get("review", []) if item.get("status", "open") in ("open", "human")]
+
+
+# Допуск на округление времени: то же правило, по которому transcript._find_span находит
+# слова места без ссылок при применении ответа человека.
+PLACE_TIME_TOLERANCE = 0.01
+
+
+def _seconds(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _place_time(item):
+    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None (время негодно)."""
+    t1, t2 = item.get("t1"), item.get("t2")
+    return (t1, t2) if _seconds(t1) and _seconds(t2) and t1 <= t2 else None
+
+
+def _word_in_place(start, end, t1, t2):
+    """Правило пересечения слова [start, end] с местом [t1, t2] (секунды).
+
+    Слово в месте, если его начало лежит в [t1 − допуск; t2 + допуск] (у мест распознавания
+    t1 — начало первого слова, t2 — начало последнего) или если слово перекрывает место
+    отрезком положительной длины (start < t2 и end > t1). Слово, которое лишь касается
+    начала места своим концом (end == t1), в место не входит.
+    """
+    return (t1 - PLACE_TIME_TOLERANCE <= start <= t2 + PLACE_TIME_TOLERANCE
+            or (start < t2 and end > t1))
+
+
+def _precise_doubts(transcript, review):
+    """Пометки версии 3: (ID сомнительных слов или None — «все слова», число непривязанных мест).
+
+    Место со ссылками на слова помечает эти слова. Место без ссылок с годным временем —
+    слова по правилу _word_in_place; если таких слов нет (пауза), — последнее слово до t1
+    и первое после t2 (что есть). Место без ссылок и без годного времени, а также место
+    со временем в записи, где у слов нет времени, привязать нельзя: тогда, как в версии 2,
+    сомнительны все слова записи, а число таких мест идёт в задание.
+    """
+    timed = []                                        # (начало, конец, порядок, ID) слов со временем
+    for segment in transcript.get("segments", []):
+        for word in segment.get("words", []):
+            start, end = word.get("s"), word.get("e")
+            if _seconds(start):
+                timed.append((start, end if _seconds(end) and end >= start else start, len(timed),
+                              word["word_id"]))
+    marked, unlocated = set(), 0
+    for item in _open_places(review):
+        if item.get("word_ids"):
+            marked.update(item["word_ids"])
+            continue
+        span = _place_time(item)
+        if span is None or not timed:
+            unlocated += 1
+            continue
+        t1, t2 = span
+        inside = {ident for start, end, _order, ident in timed if _word_in_place(start, end, t1, t2)}
+        if not inside:                                # пауза: никакое слово не попало во время места
+            before = [word for word in timed if word[0] < t1]
+            after = [word for word in timed if word[0] > t2]
+            inside = ({max(before)[3]} if before else set()) | ({min(after)[3]} if after else set())
+        marked |= inside
+    return (None if unlocated else marked), unlocated
+
+
+def _task_words(transcript, review, *, task_version=model_tasks.CURRENT_VERSION):
+    """Слова задания из снимков: ID, текст, признак сомнения, номер реплики.
+
+    Признак сомнения — по правилам версии task_version: в версиях 1 и 2 одно открытое место
+    без ссылок на слова делает сомнительными все слова записи; в версии 3 — см. _precise_doubts.
+    """
+    if task_version >= 3:
+        uncertain, _unlocated = _precise_doubts(transcript, review)
+    else:
+        open_items = _open_places(review)
+        uncertain = (None if any(not item.get("word_ids") for item in open_items)
+                     else {ident for item in open_items for ident in item.get("word_ids", [])})
     words, turn = [], 0
     for segment in transcript.get("segments", []):
         if segment.get("words"):
             turn += 1
         for word in segment.get("words", []):
             words.append({"word_id": word["word_id"], "text": word.get("w", word.get("text")),
-                          "uncertain": unknown_spans or word["word_id"] in uncertain, "turn": turn})
+                          "uncertain": uncertain is None or word["word_id"] in uncertain, "turn": turn})
     return words
 
 
+def _task_doubts(transcript, review, task_version):
+    """Что модель видит о сомнениях в задании версии task_version: пометки слов и (версия 3) число."""
+    words = [(word["word_id"], word["uncertain"])
+             for word in _task_words(transcript, review, task_version=task_version)]
+    return words, (_precise_doubts(transcript, review)[1] if task_version >= 3 else None)
+
+
 def _build_task(request, snapshots, *, task_version=model_tasks.CURRENT_VERSION):
-    """Задание из текущих снимков и цели запроса; task_version=1 — по правилам версии 1."""
+    """Задание из текущих снимков и цели запроса по правилам версии task_version (1, 2 или 3)."""
     current, review = snapshots["transcript"], snapshots["review"]
-    words = _task_words(current["payload"], review["payload"])
+    words = _task_words(current["payload"], review["payload"], task_version=task_version)
     if task_version == 1:
         return model_tasks.build(request["recording_id"], current["revision"],
                                  [{key: value for key, value in word.items() if key != "turn"} for word in words],
                                  request["policy"]["goal"], review["revision"])
+    unlocated = _precise_doubts(current["payload"], review["payload"])[1] if task_version >= 3 else None
     return model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
-                             review["revision"], turns=_task_turns(current["payload"]))
+                             review["revision"], turns=_task_turns(current["payload"]), unlocated_doubts=unlocated)
 
 
 _REVISION_FIELDS = ("source_revision", "review_revision")
@@ -358,7 +441,7 @@ def content_fingerprint(task):
     """Отпечаток содержания задания: хэш всего, что видит модель, кроме номеров ревизий.
 
     Входят вид и версия задания, запись, цель, слова (ID, текст, признак сомнения, номер реплики,
-    порядок) и реплики с условными метками говорящих. Считается из самого задания, поэтому
+    порядок), реплики с условными метками говорящих и (версия 3) число непривязанных мест. Считается из самого задания, поэтому
     подходит и к заданиям, сохранённым раньше. Неизвестные поля задания отклоняются.
     """
     checked = model_tasks.canonical(task)
@@ -384,9 +467,21 @@ def verification_is_current(store, request_id, recording_id, snapshots):
     Отметка привязана к ревизии стенограммы: любая правка текста её снимает, как раньше.
     Новая ревизия разбора отметку не снимает, если сомнения (что модель увидела бы
     сомнительным) те же, — так и при показе карточки, сборке пакета, неприменённом ответе.
+
+    Обе стороны сравнения считаются по правилам одной версии: версии сохранённого задания
+    запроса (то, что модель видела или увидит при доигрывании), а без задания — текущей.
+    Поэтому отметка у свёртки, сделанной до этапа 7.3, ведёт себя как прежде.
     """
     transcript = snapshots["transcript"]
-    expected = _task_words(transcript["payload"], snapshots["review"]["payload"])
+    row = store.db.execute("SELECT model_task_json FROM workflow_requests WHERE request_id=?",
+                           (request_id,)).fetchone()
+    task_version = model_tasks.CURRENT_VERSION
+    if row is not None and row["model_task_json"] is not None:
+        try:
+            task_version = model_tasks.version(storage._loads(row["model_task_json"]))
+        except ValueError:
+            pass
+    expected = _task_doubts(transcript["payload"], snapshots["review"]["payload"], task_version)
     rows = store.db.execute("SELECT DISTINCT review_revision FROM workflow_verifications WHERE request_id=? "
                             "AND recording_id=? AND source_revision=? ORDER BY review_revision DESC",
                             (request_id, recording_id, transcript["revision"])).fetchall()
@@ -397,8 +492,8 @@ def verification_is_current(store, request_id, recording_id, snapshots):
             old = store.get_revision(recording_id, "review", row["review_revision"])
         except (KeyError, ValueError, storage.StorageError):
             continue
-        if old["source_revision"] == transcript["revision"] and _task_words(
-                transcript["payload"], old["payload"]) == expected:
+        if old["source_revision"] == transcript["revision"] and _task_doubts(
+                transcript["payload"], old["payload"], task_version) == expected:
             return True
     return False
 
@@ -450,7 +545,8 @@ def _prepare_model_task(store, request, restart):
             and content_matches(request, saved, snapshots)):
         # То же содержание — сохранённое задание не переписывается, даже если сменились номера
         # ревизий (показ карточки, пакет, неприменённый ответ): принятые блоки (ключ — хэш задания)
-        # не теряют связи с ним. Так же доигрывается задание версии 1. Новое — всегда версии 2.
+        # не теряют связи с ним. Так же, по своим правилам пометок, доигрываются задания версий 1
+        # и 2. Новое — всегда текущей версии (3).
         if request["model_run_id"] is not None:
             return saved
         task = saved
@@ -566,7 +662,8 @@ def _part_task(task, bounds):
         used = {word["turn"] for word in words}
         turns = [turn for turn in task["turns"] if turn["turn"] in used]
     return model_tasks.build(task["recording_id"], task["source_revision"], words,
-                             task["goal"], task["review_revision"], turns=turns)
+                             task["goal"], task["review_revision"], turns=turns,
+                             unlocated_doubts=task.get("unlocated_doubts"))
 
 
 def section_time_spans(sections, transcript):

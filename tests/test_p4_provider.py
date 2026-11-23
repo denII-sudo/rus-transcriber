@@ -302,7 +302,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
                             request, str(self.source), self.source.name, str(self.root), "speaker_names"):
                 self.assertNotIn(private, prompt)
             sent = json.loads(prompt.split("Задание:\n", 1)[1])
-            self.assertEqual(set(sent), {"kind", "source_revision", "review_revision", "goal", "turns", "words"})
+            self.assertEqual(set(sent), {"kind", "source_revision", "review_revision", "goal", "turns",
+                                         "unlocated_doubts", "words"})
+            self.assertEqual(sent["unlocated_doubts"], 0)
             self.assertEqual(sent["goal"], "синтетическая цель")
             self.assertTrue(all(set(word) == {"word_id", "text", "uncertain", "turn"} for word in sent["words"]))
             self.assertTrue(all(set(turn) == {"turn", "speaker"} for turn in sent["turns"]))

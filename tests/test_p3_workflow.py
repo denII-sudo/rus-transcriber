@@ -393,14 +393,14 @@ class WorkflowTests(unittest.TestCase):
         root = recordings.document_binding(self.store, recording_id)["root"]
         return saved["payload"], (root / saved["md_relative"]).read_text(encoding="utf-8")
 
-    def test_new_task_is_version_2_with_labels_instead_of_names(self):
+    def test_new_task_is_version_3_with_labels_instead_of_names(self):
         request, _ = self.ready_request(segments=[
             self.segment("Анна Синтетическая", ["добрый", "день."]),
             self.segment("Спикер 2", ["да"], start=2),
             self.segment(None, ["шум"], start=3),
             self.segment("Анна Синтетическая", ["начнём"], start=4)])
         task = workflow.prepare_model_task(self.store, request)
-        self.assertEqual(task["version"], 2)
+        self.assertEqual((task["version"], task["unlocated_doubts"]), (3, 0))
         self.assertEqual(task["turns"], [
             {"turn": 1, "speaker": "Участник 1"}, {"turn": 2, "speaker": "Участник 2"},
             {"turn": 3, "speaker": "Говорящий не определён"}, {"turn": 4, "speaker": "Участник 1"}])
@@ -518,9 +518,9 @@ class WorkflowTests(unittest.TestCase):
                              "Итог блока.\n\nИтог блока.\n")
         self.assertNotIn("speaker_labels", payload)
         self.assertEqual(len(self.store.list_conspects(recording)), 1)
-        # новое поколение задания для того же запроса (явное «начать заново») — уже версии 2
+        # новое поколение задания для того же запроса (явное «начать заново») — уже текущей версии 3
         self.assertEqual(workflow.prepare_model_task(self.store, request), legacy)
-        self.assertEqual(workflow.prepare_model_task(self.store, request, restart=True)["version"], 2)
+        self.assertEqual(workflow.prepare_model_task(self.store, request, restart=True)["version"], 3)
 
     def test_conspect_file_explains_labels_and_gives_section_time(self):
         request, recording = self.ready_request(
@@ -661,7 +661,7 @@ class WorkflowTests(unittest.TestCase):
         with mock.patch("recordings.open_store", side_effect=lambda: storage.open_store(dbpath)):
             first = core.workflow_model_task(request, 0, 2)
             second = core.workflow_model_task(request, 2, 2)
-        self.assertEqual((first["version"], first["total_words"], first["next_offset"]), (2, 3, 2))
+        self.assertEqual((first["version"], first["total_words"], first["next_offset"]), (3, 3, 2))
         self.assertEqual(first["turns"], [{"turn": 1, "speaker": "Участник 1"}])
         self.assertEqual(second["turns"], [{"turn": 2, "speaker": "Участник 2"}])
         self.assertIsNone(second["next_offset"])
