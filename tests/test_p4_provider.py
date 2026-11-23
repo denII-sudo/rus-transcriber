@@ -180,7 +180,23 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
 
         kill = terminate
 
-    def start(self, owners):
+    LISTED = {"data": [{"providerID": llm_provider.PROVIDER_ID, "id": llm_provider.MODEL_ID}]}
+
+    @staticmethod
+    def routes(models):
+        """Поддельный _request: /api/info — версия 2, /api/model — по очереди ответы из models."""
+        models = list(models)
+
+        def request(route, payload, *, timeout):
+            if route == "/api/info":
+                return {"version": "2.4.0"}
+            answer = models.pop(0) if len(models) > 1 else models[0]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        return request
+
+    def start(self, owners, models=None):
         procs = []
 
         def popen(*args, **kwargs):
@@ -198,7 +214,7 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
              mock.patch.object(llm_provider, "listener_pids", return_value=owners), \
              mock.patch.object(llm_provider, "process_tree", return_value={111, 112}), \
              mock.patch.object(llm_provider.OpenCodeTextClient, "close", fake_close), \
-             mock.patch.object(client, "_request", return_value={"version": "2.0.1"}) as request:
+             mock.patch.object(llm_provider.time, "sleep"),              mock.patch.object(client, "_request", side_effect=self.routes(models or [self.LISTED])) as request:
             try:
                 result = client.__enter__()
             except llm_provider.ProviderError as ex:
@@ -216,7 +232,33 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
     def test_own_child_listener_is_accepted(self):
         result, request, procs = self.start({112})
         self.assertIsInstance(result, llm_provider.OpenCodeTextClient)
-        request.assert_called_once()
+        self.assertEqual([c.args[0] for c in request.call_args_list], ["/api/info", "/api/model"])
+        self.assertEqual(len(procs), 1)
+
+    def test_client_waits_until_opencode_lists_the_model(self):
+        # OpenCode 2.4: /api/info уже отвечает, а список моделей первые доли секунды пуст —
+        # запрос в этот промежуток получал «модель не найдена» (проба 7.4б, 23.11.2026).
+        other = {"data": [{"providerID": "openai", "id": "другая-модель"}]}
+        result, request, procs = self.start({112}, models=[{"data": []}, {"data": []}, other, self.LISTED])
+        self.assertIsInstance(result, llm_provider.OpenCodeTextClient)
+        routes = [c.args[0] for c in request.call_args_list]
+        self.assertEqual(routes, ["/api/info"] + ["/api/model"] * 4)
+        self.assertEqual(len(procs), 1)
+        self.assertFalse(procs[0].stopped)
+
+    def test_model_never_listed_is_a_clear_error_without_sending_text(self):
+        with mock.patch.object(llm_provider, "STARTUP_TIMEOUT_SEC", 0.05):
+            result, request, procs = self.start({112}, models=[{"data": []}])
+        self.assertIsInstance(result, llm_provider.ProviderError)
+        self.assertEqual(result.code, "model_unavailable")
+        self.assertIn(f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}", str(result))
+        self.assertTrue(all(c.args[0] in ("/api/info", "/api/model") for c in request.call_args_list))
+        self.assertTrue(all(p.stopped for p in procs))
+
+    def test_opencode_without_model_list_route_is_accepted_as_before(self):
+        missing = llm_provider.ProviderError("model_unavailable", "модель OpenAI недоступна в OpenCode")
+        result, request, procs = self.start({112}, models=[missing])
+        self.assertIsInstance(result, llm_provider.OpenCodeTextClient)
         self.assertEqual(len(procs), 1)
 
     def test_listener_pids_sees_own_socket(self):

@@ -236,7 +236,7 @@ class OpenCodeTextClient:
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         self.auth = "Basic " + token
         deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
-        verified = False
+        verified = version_checked = False
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.close()
@@ -257,18 +257,40 @@ class OpenCodeTextClient:
                         raise _PortTaken()
                 verified = True
             try:
-                info = self._request("/api/info", None, timeout=1)
-                if not isinstance(info, dict) or not str(info.get("version", "")).startswith("2."):
-                    self.close()
-                    raise ProviderError("unsupported_version", "исполнителю требуется OpenCode V2")
-                return self
+                if not version_checked:
+                    info = self._request("/api/info", None, timeout=1)
+                    if not isinstance(info, dict) or not str(info.get("version", "")).startswith("2."):
+                        self.close()
+                        raise ProviderError("unsupported_version", "исполнителю требуется OpenCode V2")
+                    version_checked = True
+                # OpenCode 2.4 отвечает на /api/info раньше, чем загрузит список моделей; запрос
+                # в этот промежуток получает «модель не найдена». Текст уходит только после появления модели.
+                if self._model_listed():
+                    return self
             except ProviderError as ex:
                 if ex.code not in ("offline", "timeout"):
                     self.close()
                     raise
-                time.sleep(0.1)
+            time.sleep(0.1)
         self.close()
+        if version_checked:
+            raise ProviderError("model_unavailable",
+                                f"OpenCode не показал модель {PROVIDER_ID}/{MODEL_ID} за {STARTUP_TIMEOUT_SEC} с: "
+                                "проверьте вход в OpenAI в OpenCode. В облако ничего не отправлено")
         raise ProviderError("unavailable", "OpenCode API не запустился за отведённое время")
+
+    def _model_listed(self):
+        """Есть ли нужная модель в списке OpenCode. Нет маршрута списка (иная версия 2.x) — не ждать, как раньше."""
+        try:
+            listed = self._request("/api/model", None, timeout=1)
+        except ProviderError as ex:
+            if ex.code == "model_unavailable":      # HTTP 404/422 — маршрута списка нет
+                return True
+            raise
+        models = listed.get("data") if isinstance(listed, dict) else None
+        return isinstance(models, list) and any(
+            isinstance(model, dict) and model.get("providerID") == PROVIDER_ID and model.get("id") == MODEL_ID
+            for model in models)
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
