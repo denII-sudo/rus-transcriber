@@ -345,6 +345,16 @@ TWO_OF_THREE = {"keep": 2, "replace": 2}
 # и лаборатория); у дополнительных ролей (четвёртая и следующие модели) — по имени роли.
 _VOTED_LABEL = {"second": "ctc", "whisper": "whisper"}
 _ALT_FIELD = {"second": "alt", "whisper": "alt_whisper"}
+# Занятые поля слова с приставкой alt_: имя дополнительной роли не должно давать такое поле.
+_RESERVED_ALT_FIELDS = {"alt_span", "alt_ins", "alt_place"}
+
+
+def check_role(role):
+    """Имя дополнительной роли: непустая строка, из которой поле alt_<роль> не совпадает с занятым полем слова
+    (alt_span — длина спорного отрезка, alt_ins, alt_place). -> role или ValueError."""
+    if not isinstance(role, str) or not role or "alt_" + role in _RESERVED_ALT_FIELDS:
+        raise ValueError(f"имя роли модели {role!r} не подходит: поле alt_<роль> занято или имя пусто")
+    return role
 
 
 def check_rule(rule, models):
@@ -405,6 +415,9 @@ def vote_n(main, others, rule):
     Изменяет main на месте. -> статистика: agree<N> — слова, поддержанные N моделями (от всех до keep),
     replaced, inserted, disputed."""
     check_rule(rule, len(others) + 1)
+    for role, _ in others:
+        if role not in _ALT_FIELD:
+            check_role(role)
     keep_min, need = rule["keep"], rule["replace"]
     a = [norm_word(w["w"]) for w in main]
     hyps = []
@@ -585,7 +598,7 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
                      "other": [(начало, конец, проход, причина, проходы со словами)]}}
     """
     words, alt, wh_words = hypotheses["primary"], hypotheses.get("second"), hypotheses.get("whisper")
-    extra_roles = [role for role in hypotheses if role not in ("primary", "second", "whisper")]
+    extra_roles = [check_role(role) for role in hypotheses if role not in ("primary", "second", "whisper")]
     extras = [(role, hypotheses[role]) for role in extra_roles if hypotheses[role] is not None]
     present = 1 + (alt is not None) + (wh_words is not None) + len(extras)
     if rule is None and present > 3:
@@ -621,11 +634,14 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
             other_evidence.append((start, end, name, state, sources))
     quality = {}
     reason = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
+    # Модель без гипотезы голосование не ограничивает: её сбойные куски остаются в evidence, но не в skip_spans.
+    voting_whisper = whisper_evidence if wh_words is not None else []
+    partial_reason = "whisper_incomplete" if voting_whisper else "asr_incomplete"
     # Сбой основной модели отключает голосование целиком; сбой другой модели — только свой отрезок.
     # Модель без гипотезы (None) в голосовании не участвует, и её сбойные куски его не ограничивают.
     voting_extras = {role for role, _ in extras}
     primary_failed = any(name == "primary" for _, _, name, _, _ in other_evidence)
-    skip_spans = _merge_spans([(s, e) for s, e, _, _ in whisper_evidence]
+    skip_spans = _merge_spans([(s, e) for s, e, _, _ in voting_whisper]
                               + [(s, e) for s, e, name, _, _ in other_evidence
                                  if name == "second" or name in voting_extras])
     others = ([("second", alt)] if alt is not None else []) \
@@ -642,7 +658,7 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None):
                 return vote_n(main, hyps, rule or TWO_OF_THREE)
         if skip_spans:
             quality["vote"] = _vote_outside_spans(words, others, skip_spans, vote)
-            quality["vote3_partial"] = {"reason": reason, "spans": len(skip_spans),
+            quality["vote3_partial"] = {"reason": partial_reason, "spans": len(skip_spans),
                                         "seconds": round(sum(e - s for s, e in skip_spans), 1)}
         else:
             quality["vote"] = vote(words, others)
