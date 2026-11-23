@@ -100,6 +100,50 @@ class AnswerRevisionGuardTests(unittest.TestCase):
                 self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
                 self.assertTrue(result.get("revision_conflicts"))
 
+    def test_missing_source_revision_is_a_conflict(self):
+        helper, data = self.fixture()
+        with helper.answer_files("sqlite", data) as (jp, md):
+            pack = self.build(jp)
+            self.answer(jp, pack)
+            before = copy.deepcopy(transcript.load(jp)["segments"])
+            with mock.patch.object(core, "_answer_source_snapshot", return_value=None):
+                result = core.apply_answers_files(jp, md)
+            self.assertTrue(result["revision_conflicts"])
+            self.assertEqual(transcript.load(jp)["segments"], before)
+            self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+
+    def test_free_answer_cannot_change_neighbor(self):
+        helper, data = self.fixture()
+        with helper.answer_files("sqlite", data) as (jp, md):
+            pack = self.build(jp)
+            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
+                                          "kind": "free", "text": "один другой три"}],
+                                    "local", trusted_actor="human")
+            before = copy.deepcopy(transcript.load(jp)["segments"])
+            result = core.apply_answers_files(jp, md)
+            self.assertTrue(result.get("revision_conflicts"))
+            self.assertEqual(transcript.load(jp)["segments"], before)
+            self.assertNotIn("r1", review_pack.answers_state(jp)["applied_answers"])
+
+    def test_comparison_checks_order_and_edit_metadata(self):
+        helper, data = self.fixture()
+        item = {"id": "r1", "word_ids": ["w1", "w2"]}
+        manifest = {"items": [item]}
+        state = {"answers": {"r1": {"kind": "option", "option": 0}}}
+        source = copy.deepcopy(data)
+        cases = []
+        changed = copy.deepcopy(data)
+        changed["segments"][0]["words"][0]["edited"] = "span@0.20"
+        cases.append(changed)
+        changed = copy.deepcopy(data)
+        changed["segments"][0]["words"][0]["provenance"] = {"text": {"by": "human"}}
+        cases.append(changed)
+        changed = copy.deepcopy(data)
+        changed["segments"][0]["words"][:2] = reversed(changed["segments"][0]["words"][:2])
+        cases.append(changed)
+        for changed in cases:
+            self.assertIn("r1", core._answer_revision_conflicts(changed, manifest, state, source, sqlite=True))
+
 
 class WorkerSnapshotTests(unittest.TestCase):
     def worker_result(self):

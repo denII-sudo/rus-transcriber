@@ -2542,7 +2542,11 @@ def apply_answers_files(jp, md):
                 state = recordings.read_review_pack_state(jp)
                 expected = state["_expected_versions"]
                 context = recordings.operation_context(store, "human")
+                manifest = state.get("manifest") or {}
+                source = _answer_source_snapshot(store, binding["recording_id"], manifest)
+                guard = _answer_revision_conflicts(initial, manifest, state, source, sqlite=True)
                 with recordings.answer_draft(jp, initial, state, context) as draft:
+                    draft["revision_conflicts"] = guard
                     report = _apply_answers_files_locked(jp, md)
                     candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
                 if candidate == initial:
@@ -2558,9 +2562,20 @@ def apply_answers_files(jp, md):
                     except Exception as ex:
                         raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
                     return report
+                def verify_guard(transaction_store):
+                    import storage
+                    head = recordings.recording_head(transaction_store, binding["recording_id"])
+                    if head is None or dict(head) != expected:
+                        raise storage.Conflict("recording changed while applying answers")
+                    current = transaction_store.get_revision(
+                        binding["recording_id"], "transcript", expected["source_revision"])["payload"]
+                    original = _answer_source_snapshot(transaction_store, binding["recording_id"], manifest)
+                    if _answer_revision_conflicts(current, manifest, state, original, sqlite=True) != guard:
+                        raise storage.Conflict("answer source changed while applying answers")
+
                 result = recordings.commit_recording_data(
                     store, binding["recording_id"], candidate, expected,
-                    context=context)
+                    context=context, precommit=verify_guard)
                 completed = recordings.materialize_recording(store, binding["recording_id"])
                 if (binding["recording_id"], result["document_revision"]) not in completed:
                     raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
@@ -2573,20 +2588,85 @@ def apply_answers_files(jp, md):
         finally:
             store.close()
     with conspect.write_lock(jp):
-        return _apply_answers_files_locked(jp, md)
+        import transcript
+        manifest = review_pack.manifest(jp) or {}
+        state = review_pack.answers_state(jp, {"answers": {}})
+        guard = _answer_revision_conflicts(transcript.load(jp), manifest, state, None, sqlite=False)
+        return _apply_answers_files_locked(jp, md, guard)
 
 
-def _apply_answers_files_locked(jp, md):
+def _answer_source_snapshot(store, recording_id, manifest):
+    import storage
+    try:
+        return store.get_revision(recording_id, "transcript", manifest.get("source_revision"))["payload"]
+    except (KeyError, ValueError, storage.StorageError):
+        return None
+
+
+def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
+    import review_pack
+    applied = review_pack._applied_map(state)
+    answers = state.get("answers") or {}
+
+    def select(data, ids):
+        words = [w for segment in (data or {}).get("segments") or [] for w in segment.get("words") or []]
+        positions = [i for i, word in enumerate(words) if word.get("word_id") in ids]
+        if (len(set(ids)) != len(ids) or len(positions) != len(ids) or not positions or
+                positions != list(range(positions[0], positions[0] + len(ids))) or
+                [words[i].get("word_id") for i in positions] != ids):
+            return None
+        return [(words[i].get("word_id"), words[i].get("w"), words[i].get("edited"),
+                 (words[i].get("provenance") or {}).get("text")) for i in positions]
+
+    conflicts = {}
+    for item in manifest.get("items") or []:
+        aid = item.get("id")
+        answer = answers.get(aid)
+        ids = item.get("word_ids")
+        if not answer or aid in applied:
+            continue
+        if sqlite and source is None:
+            conflicts[aid] = "недоступна исходная ревизия карточки"
+            continue
+        if not ids:
+            continue
+        actual = select(current, ids)
+        original = select(source, ids) if sqlite else actual
+        if actual is None or original is None or actual != original:
+            conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
+    return conflicts
+
+
+def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     import review_pack as P
     import transcript
+    import recordings
+    draft = recordings.answer_draft_for(jp)
+    if revision_conflicts is None and draft is not None:
+        revision_conflicts = draft.get("revision_conflicts")
+    revision_conflicts = dict(revision_conflicts or {})
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
+    if draft is not None:
+        items = {item["id"]: item for item in (P.manifest(jp) or {}).get("items") or []}
+        already_applied = P._applied_map(draft["state"])
+        for aid, answer in free.items():
+            ids = (items.get(aid) or {}).get("word_ids")
+            if not ids or aid in already_applied or aid in (revision_conflicts or {}):
+                continue
+            preview = P.apply_free(jp, md, {aid: answer}, dry_run=True)
+            targets = set((preview.get("target_ids") or {}).get(aid) or [])
+            if targets - set(ids):
+                revision_conflicts[aid] = "свободный ответ затрагивает слова вне карточки"
     requested_ids = {d.get("id") for d in decisions if d.get("id")} | set(free)
     preflight = P.preflight_answers(jp, md, decisions, free)
-    blocked = {aid for conflict in preflight for aid in conflict["cards"]}
+    revision_conflicts = revision_conflicts or {}
+    blocked = {aid for conflict in preflight for aid in conflict["cards"]} | set(revision_conflicts)
     blocked_free = {aid: answer for aid, answer in free.items() if aid in blocked}
     decisions = [d for d in decisions if d.get("id") not in blocked]
     free = {aid: answer for aid, answer in free.items() if aid not in blocked}
+    if revision_conflicts:
+        rep["revision_conflicts"] = [{"id": aid, "why": why} for aid, why in revision_conflicts.items()]
     if preflight:
         rep["preflight_conflicts"] = preflight
         rep["human"] = list(dict.fromkeys((rep.get("human") or []) + sorted(blocked)))
@@ -2645,8 +2725,9 @@ def _apply_answers_files_locked(jp, md):
     free_items = []
     if blocked_free:
         free_items.append({"conflicts": preflight,
-                           "left_to_human": [{"id": aid, "why": "конфликт с другой карточкой до применения",
-                                              "answer": answer.get("text")} for aid, answer in blocked_free.items()]})
+                           "left_to_human": [{"id": aid, "why": revision_conflicts.get(
+                                               aid, "конфликт с другой карточкой до применения"),
+                                               "answer": answer.get("text")} for aid, answer in blocked_free.items()]})
     if free:
         # Свободные ответы нередко затрагивают одни и те же слова. Применяем их
         # отдельно, чтобы у каждого успешного ответа был обратимый структурный
@@ -2677,6 +2758,8 @@ def _apply_answers_files_locked(jp, md):
     for aid in requested_ids:
         if aid in successful:
             outcomes[aid] = "reverted" if aid in undone else "applied"
+        elif aid in revision_conflicts:
+            outcomes[aid] = "apply_conflict"
         elif aid in blocked:
             outcomes[aid] = "blocked_preflight"
         elif aid in undo_failed:

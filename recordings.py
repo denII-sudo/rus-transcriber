@@ -299,6 +299,7 @@ def write_review_pack_state(document_path, state):
         if "manifest" in state:
             manifest = copy.deepcopy(state["manifest"])
             review["questions"] = copy.deepcopy(manifest.get("items") or []) if manifest else []
+        _prune_missing_word_ids(current["transcript"]["payload"], review)
         for field in ("answers", "conflicts", "rejected"):
             if field in state:
                 review[field] = copy.deepcopy(state[field])
@@ -653,7 +654,7 @@ def commit_worker_result(store, data, location, root_id, context, *,
 
 
 def commit_recording_data(store, recording_id, data, expected_versions, operation_id=None,
-                          context=None, root_id=None, generated_at=None):
+                          context=None, root_id=None, generated_at=None, precommit=None):
     """Сохранить изменённое transcript/review-представление через storage."""
     if not isinstance(data, dict) or data.get("recording_id") != recording_id:
         raise ValueError("recording identity mismatch")
@@ -663,6 +664,7 @@ def commit_recording_data(store, recording_id, data, expected_versions, operatio
             or data.get("review_revision") != expected_versions["review_revision"]):
         raise storage.Conflict("stale recording snapshot")
     candidate = copy.deepcopy(data)
+    _prune_missing_word_ids(candidate, candidate)
     for key in ("recording_id", "source_revision", "review_revision", "document_revision",
                 "document_sync", "json", "markdown", "manifest"):
         candidate.pop(key, None)
@@ -685,11 +687,29 @@ def commit_recording_data(store, recording_id, data, expected_versions, operatio
     root_id = root_id or binding["root_id"]
     generated_at = generated_at or datetime.now(timezone.utc).isoformat()
     # Изменение source всегда получает новый согласованный review-снимок.
-    return store.commit_change_with_document(
-        recording_id, expected_versions, operation_id, context,
-        transcript=transcript if transcript_changed else None,
-        review=review if (review_changed or transcript_changed) else None,
-        root_id=root_id, generated_at=generated_at)
+    with store._transaction():
+        if precommit is not None:
+            precommit(store)
+        return store.commit_change_with_document(
+            recording_id, expected_versions, operation_id, context,
+            transcript=transcript if transcript_changed else None,
+            review=review if (review_changed or transcript_changed) else None,
+            root_id=root_id, generated_at=generated_at)
+
+
+def _prune_missing_word_ids(transcript, review):
+    """Убрать только исчезнувшие ссылки из производных списков разбора."""
+    ids = {word.get("word_id") for segment in transcript.get("segments") or []
+           for word in segment.get("words") or [] if word.get("word_id")}
+    for field in ("review", "questions"):
+        for item in review.get(field) or []:
+            refs = item.get("word_ids")
+            if isinstance(refs, list):
+                remaining = [ident for ident in refs if ident in ids]
+                if remaining:
+                    item["word_ids"] = remaining
+                else:
+                    item.pop("word_ids", None)
 
 
 def _ensure_ids(transcript, recording_id):
