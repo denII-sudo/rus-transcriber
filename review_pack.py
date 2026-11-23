@@ -869,7 +869,9 @@ def cloud_bundle(json_path, artifact_url=None):
         meta["artifact_url"] = artifact_url
     clips = {it["clip"]: pd / it["clip"] for it in man["items"]}
     have = {k: v for k, v in clips.items() if v.exists()}
-    out = dict(man, answers={k: v for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
+    # Копия применённого ответа (applied_answer) нужна только ноутбуку для «Не отменять» — в облако её не отдаём.
+    out = dict(man, answers={k: {f: x for f, x in v.items() if f != "applied_answer"}
+                             for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
                applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
