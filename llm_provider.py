@@ -29,9 +29,10 @@ STARTUP_TIMEOUT_SEC = 20
 class ProviderError(RuntimeError):
     """Безопасная для показа ошибка без текста запроса, ответа или credentials."""
 
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, http_status=None):
         super().__init__(message)
         self.code = code
+        self.http_status = http_status      # HTTP-код ответа OpenCode, если ошибка пришла ответом сервера
 
 
 def _opencode_executable():
@@ -276,15 +277,19 @@ class OpenCodeTextClient:
         if version_checked:
             raise ProviderError("model_unavailable",
                                 f"OpenCode не показал модель {PROVIDER_ID}/{MODEL_ID} за {STARTUP_TIMEOUT_SEC} с: "
-                                "проверьте вход в OpenAI в OpenCode. В облако ничего не отправлено")
+                                "проверьте вход в OpenAI в OpenCode. В этой попытке текст в облако не отправлялся")
         raise ProviderError("unavailable", "OpenCode API не запустился за отведённое время")
 
     def _model_listed(self):
-        """Есть ли нужная модель в списке OpenCode. Нет маршрута списка (иная версия 2.x) — не ждать, как раньше."""
+        """Есть ли нужная модель в списке OpenCode.
+
+        Исключение: HTTP 404 на сам список означает, что у этой версии OpenCode 2.x маршрута нет, —
+        тогда не ждать, как раньше. Другие ошибки (в том числе 422) — отказ до отправки текста.
+        """
         try:
             listed = self._request("/api/model", None, timeout=1)
         except ProviderError as ex:
-            if ex.code == "model_unavailable":      # HTTP 404/422 — маршрута списка нет
+            if ex.http_status == 404:
                 return True
             raise
         models = listed.get("data") if isinstance(listed, dict) else None
@@ -336,7 +341,7 @@ class OpenCodeTextClient:
                 "offline": "OpenCode или OpenAI временно недоступен",
                 "provider_error": f"ошибка OpenCode/OpenAI (HTTP {ex.code})",
             }[code]
-            raise ProviderError(code, message) from None
+            raise ProviderError(code, message, http_status=ex.code) from None
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
             raise ProviderError("offline", "не удалось связаться с OpenCode/OpenAI") from None
         except (UnicodeError, json.JSONDecodeError):

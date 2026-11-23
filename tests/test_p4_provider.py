@@ -252,14 +252,37 @@ class OpenCodePortOwnershipTests(unittest.TestCase):
         self.assertIsInstance(result, llm_provider.ProviderError)
         self.assertEqual(result.code, "model_unavailable")
         self.assertIn(f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}", str(result))
+        # Говорит только о своей попытке: при продолжении прежние блоки той же работы могли уже уйти.
+        self.assertIn("В этой попытке текст в облако не отправлялся", str(result))
+        self.assertNotIn("В облако ничего не отправлено", str(result))
         self.assertTrue(all(c.args[0] in ("/api/info", "/api/model") for c in request.call_args_list))
         self.assertTrue(all(p.stopped for p in procs))
 
     def test_opencode_without_model_list_route_is_accepted_as_before(self):
-        missing = llm_provider.ProviderError("model_unavailable", "модель OpenAI недоступна в OpenCode")
+        missing = llm_provider.ProviderError("model_unavailable", "модель OpenAI недоступна в OpenCode",
+                                             http_status=404)
         result, request, procs = self.start({112}, models=[missing])
         self.assertIsInstance(result, llm_provider.OpenCodeTextClient)
         self.assertEqual(len(procs), 1)
+
+    def test_other_model_list_error_is_not_taken_for_a_missing_route(self):
+        # 422 (как и любой ответ, кроме 404) не доказывает, что маршрута списка нет: пропускать
+        # ожидание нельзя, текст не уходит — запуск заканчивается отказом.
+        refused = llm_provider.ProviderError("model_unavailable", "модель OpenAI недоступна в OpenCode",
+                                             http_status=422)
+        result, request, procs = self.start({112}, models=[refused])
+        self.assertIsInstance(result, llm_provider.ProviderError)
+        self.assertEqual(result.code, "model_unavailable")
+        self.assertTrue(all(p.stopped for p in procs))
+
+    def test_http_status_is_kept_on_provider_error(self):
+        client = llm_provider.OpenCodeTextClient()
+        client.base_url, client.auth = "http://127.0.0.1:9", "Basic x"
+        error = llm_provider.urllib.error.HTTPError("http://127.0.0.1:9/api/model", 404, "nf", {}, None)
+        with mock.patch.object(llm_provider.urllib.request.OpenerDirector, "open", side_effect=error):
+            with self.assertRaises(llm_provider.ProviderError) as caught:
+                client._request("/api/model", None, timeout=1)
+        self.assertEqual((caught.exception.code, caught.exception.http_status), ("model_unavailable", 404))
 
     def test_listener_pids_sees_own_socket(self):
         with socket.socket() as sock:
