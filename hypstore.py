@@ -85,26 +85,51 @@ def _norm(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
-def _model_files(model, cache_dir):
-    """Файлы весов модели в кэше программы: снимки Hugging Face (models--…) и локальные папки gigaam,
-    onnx-models. Имя репозитория с «/» сравнивается точно; короткое имя (multilingual_large_ctc) — без
-    учёта знаков: gigaam-multilingual-large-ctc-onnx. -> [(относительное имя, путь)]."""
+def _own_file(name, filename):
+    """Файл принадлежит модели с коротким именем: v3_e2e_ctc.int8.onnx, v3_e2e_rnnt_encoder.onnx — да;
+    у v3_e2e_ctc файл v3_e2e_rnnt_encoder.onnx — нет (в одном хранилище gigaam-v3-onnx лежат несколько моделей)."""
+    low, n = filename.lower(), name.lower()
+    return low.startswith(n + ".") or low.startswith(n + "_")
+
+
+def _model_files(model, cache_dir, engine=None):
+    """Файлы весов модели в кэше программы. -> [(относительное имя, путь)].
+
+    Имя с «/» (Whisper) — снимок Hugging Face этого репозитория целиком. Короткое имя GigaAM
+    (v3_e2e_ctc, multilingual_large_ctc) — файлы, имя которых начинается с имени модели, в снимках
+    istupakov/gigaam-* (варианты v3 — в общем gigaam-v3-onnx) и в onnx-models; веса PyTorch (gigaam/*.ckpt) —
+    только при движке torch, при других движках они не используются. engine=None — все места."""
     cache_dir = Path(cache_dir)
     name = str(model or "")
     if not name:
         return []
     hub = Path(os.environ.get("HF_HOME") or (cache_dir / "huggingface")) / "hub"
+    exact = "/" in name
     short = _norm(name.rsplit("/", 1)[-1])
     if not short:
         return []
+    torch = engine is None or str(engine).startswith("torch")
+    onnx = engine is None or not str(engine).startswith("torch")
     roots = []
-    if hub.is_dir():
+    if hub.is_dir() and (exact or onnx):
         for d in sorted(hub.glob("models--*")):
             repo = d.name[len("models--"):].replace("--", "/")
-            if (repo == name) if "/" in name else short in _norm(repo):
-                roots.append((d / "snapshots", "hf/" + repo, True))
-    for sub in ("gigaam", "onnx-models"):
-        roots.append((cache_dir / sub, sub, False))
+            if exact and str(engine or "").startswith("whisper-ct2"):
+                # faster-whisper грузит свою сборку той же модели: …/faster-whisper-large-v3-turbo
+                hit = repo.rsplit("/", 1)[-1] == "faster-" + name.rsplit("/", 1)[-1]
+            elif exact:
+                hit = repo == name
+            else:
+                tail = _norm(repo.rsplit("/", 1)[-1])
+                hit = tail.startswith("gigaam") and (short in tail or (name.startswith("v3_")
+                                                                          and tail == "gigaamv3onnx"))
+            if hit:
+                roots.append((d / "snapshots", "hf/" + repo, exact))
+    if not exact:
+        if onnx:
+            roots.append((cache_dir / "onnx-models", "onnx-models", False))
+        if torch:
+            roots.append((cache_dir / "gigaam", "gigaam", False))
     found = []
     for base, label, whole in roots:
         if not base.is_dir():
@@ -113,18 +138,18 @@ def _model_files(model, cache_dir):
             for fn in sorted(files):
                 p = Path(dirpath) / fn
                 rel = p.relative_to(base).as_posix()
-                if (whole or short in _norm(rel)) and p.suffix.lower() in WEIGHT_SUFFIXES:
+                if (whole or _own_file(name, fn)) and p.suffix.lower() in WEIGHT_SUFFIXES:
                     found.append((f"{label}/{rel}", p))
     return found
 
 
-def model_artifact(model, cache_dir, cache):
+def model_artifact(model, cache_dir, cache, engine=None):
     """Артефакт модели: файлы весов (имя в кэше, размер, время изменения, SHA-256). cache — словарь
     _artifacts.json, дополняется на месте. Хэш считается один раз на файл; пересчёт — при смене размера
     или времени изменения. -> словарь или not_measured."""
     import runinfo
     files = []
-    for rel, p in _model_files(model, cache_dir):
+    for rel, p in _model_files(model, cache_dir, engine):
         try:
             st = p.stat()
         except OSError:

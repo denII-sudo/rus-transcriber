@@ -1045,7 +1045,7 @@ def _emotions(audio, segments, cfg, a, quality, timing):
 
 class _HypCapture:
     """Сбор гипотез для сохранения (hypstore, настройка save_hypotheses). Результат расшифровки не меняет:
-    добавляется только файл в папке данных и поле quality.hypotheses_saved."""
+    добавляется только файл в папке данных и поля hypotheses_saved/hypotheses_error в статусе задачи."""
 
     def __init__(self, audio, cfg, a):
         import runinfo
@@ -1067,16 +1067,24 @@ class _HypCapture:
         self.conditions_end = _safe(lambda: runinfo.conditions(paths.JOBS, self.cfg.get("max_heavy_jobs", 2), 1,
                                                                load_interval=0))
 
-    def save(self, quality, timing, vocab):
-        """Сбой записи гипотез расшифровку не роняет: причина без пути — в quality."""
+    def save(self, quality, timing, vocab, recording_id=None):
+        """Запись файла после сохранения результата задачи. Сбой записи задачу не роняет.
+        -> поля для статуса задачи: hypotheses_saved и при сбое hypotheses_error (вид ошибки без текста и пути)."""
         try:
-            path = _save_hypotheses(self, quality, timing, vocab)
-            quality["hypotheses_saved"] = True
+            path = _save_hypotheses(self, quality, timing, vocab, recording_id)
             print(f"[words] гипотезы моделей сохранены ({path.parent.name}/{path.name})", file=sys.stderr, flush=True)
+            return {"hypotheses_saved": True}
         except Exception as ex:
-            quality["hypotheses_saved"] = False
-            quality["hypotheses_error"] = type(ex).__name__
             print(f"[words] гипотезы моделей не сохранены: {type(ex).__name__}", file=sys.stderr, flush=True)
+            return {"hypotheses_saved": False, "hypotheses_error": type(ex).__name__}
+
+
+def _finish_hypotheses(hyp, quality, timing, vocab, saved):
+    """Файл гипотез — только у задачи, результат которой уже сохранён (main, после _save_worker_result).
+    Отменённая или упавшая задача файла не оставляет. -> поля для статуса задачи ({} — настройка выключена)."""
+    if hyp is None:
+        return {}
+    return hyp.save(quality, timing, vocab, (saved or {}).get("recording_id"))
 
 
 def _safe(fn):
@@ -1086,8 +1094,8 @@ def _safe(fn):
         return {"status": "not_measured", "reason": type(ex).__name__}
 
 
-def _save_hypotheses(cap, quality, timing, vocab):
-    """Запись файла гипотез hyp-2 (hypstore) после сведения. -> путь файла."""
+def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
+    """Запись файла гипотез hyp-2 (hypstore) после сохранения результата задачи. -> путь файла."""
     import platform
     import hypotheses as H
     import hypstore
@@ -1108,8 +1116,8 @@ def _save_hypotheses(cap, quality, timing, vocab):
     diag = b["diagnostics"]
     arts = hypstore._read_json(base / hypstore.ARTIFACTS_FILE, {})
 
-    def artifact(model):
-        return {"name": model, "artifact": _safe(lambda: hypstore.model_artifact(model, paths.CACHE, arts))}
+    def artifact(model, engine):
+        return {"name": model, "artifact": _safe(lambda: hypstore.model_artifact(model, paths.CACHE, arts, engine))}
 
     def chunks_of(name):
         return [{k: rec.get(k) for k in ("index", "audio_span", "own_span", "state")}
@@ -1118,12 +1126,12 @@ def _save_hypotheses(cap, quality, timing, vocab):
     def absent(why):
         return {k: H.not_available(why) for k in ("model", "engine", "timing", "words", "word_times")}
 
-    roles = [{"role": "primary", "model": artifact(timing.get("asr_model")),
+    roles = [{"role": "primary", "model": artifact(timing.get("asr_model"), timing.get("asr_backend")),
               "engine": {"name": timing.get("asr_backend"), "fallbacks": quality.get("asr_fallbacks")},
               "timing": {"pass_sec": timing.get("asr_sec"), "chunks": timing.get("asr_chunks")},
               "chunks": chunks_of("primary"), "words": b["primary"], "word_times": H.available()}]
     if b["second"] is not None:
-        roles.append({"role": "second", "model": artifact(timing.get("asr2_model")),
+        roles.append({"role": "second", "model": artifact(timing.get("asr2_model"), (diag.get("second") or {}).get("backend")),
                       "engine": {"name": (diag.get("second") or {}).get("backend")},
                       "timing": {"pass_sec": timing.get("asr2_sec")},
                       "chunks": chunks_of("second"), "words": b["second"], "word_times": H.available()})
@@ -1140,7 +1148,7 @@ def _save_hypotheses(cap, quality, timing, vocab):
             wt = tw = H.not_measured("повтор кусков на CPU: времена не полные")
         else:
             wt = tw = H.not_measured("text_mismatch: совпадение текста со временами для этой модели не проверено")
-        roles.append({"role": "third", "model": artifact(third_model),
+        roles.append({"role": "third", "model": artifact(third_model, (t3.get("engine") or {}).get("name")),
                       "engine": {**(t3.get("engine") or {}), "mode": b["plan"]["mode"],
                                  "pieces": timing.get("asr3_pieces"), "fallbacks": timing.get("asr3_fallbacks")},
                       "timing": {"pass_sec": timing.get("asr3_sec"), "load_sec": timing.get("asr3_load_sec"),
@@ -1160,7 +1168,7 @@ def _save_hypotheses(cap, quality, timing, vocab):
             "config": hypstore.config_snapshot(cap.cfg, vocab),
             "ids": {"run_id": run_id, "unit_id": unit_id,
                     "job_id": Path(cap.a.status).stem if getattr(cap.a, "status", "") else None,
-                    "recording_id": H.not_measured("запись в базу идёт после сохранения гипотез"),
+                    "recording_id": recording_id or H.not_available("хранение json: записи в базе нет"),
                     "written_utc": runinfo.utc_now()}}
     combine = {"function": "vote_n", "rule": cap.trace.get("rule") or dict(W.TWO_OF_THREE),
                "partial": quality.get("vote3_partial"), "skipped": quality.get("vote3_skipped"),
@@ -1212,8 +1220,6 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     fused = W.combine_hypotheses({"primary": words, "second": alt, "whisper": wh_words},
                                  quality["asr_diagnostics"], **({"trace": hyp.trace} if hyp else {}))
     quality.update(fused["quality"])
-    if hyp:
-        hyp.save(quality, timing, vocab)
 
     _apply_vocab(words, vocab, quality)
 
@@ -1241,6 +1247,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             "_timing": timing}
     if names:
         data.update(speaker_names=names, names_source="voices", names_confirmed=False)
+    if hyp:
+        data["_hyp"] = hyp      # служебное, как _timing: main забирает и пишет файл после сохранения результата
     return data
 
 
@@ -1623,10 +1631,12 @@ def main():
                 data["no_profile"] = True
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
+            hyp = data.pop("_hyp", None)
             saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
+            hyp_state = _finish_hypotheses(hyp, quality, timing, vocab, saved)
             model = _execute_workflow_model(st)
             st.set(state="done", stage="готово", progress=100, markdown=str(md_path), json=str(json_path),
-                   **saved, **model,
+                   **saved, **model, **hyp_state,
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
                                             "review_items": len(data.get("review", [])),

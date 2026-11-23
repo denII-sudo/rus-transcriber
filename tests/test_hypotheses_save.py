@@ -1,8 +1,8 @@
 """Сохранение гипотез моделей (РАР-4.2, шаг 3, PR Б2): настройка save_hypotheses, файл hyp-2, удаление.
 
 Только синтетика: модели подменены (как в tests/test_run_words_golden.py), папка гипотез и соль стенда —
-во временной папке, опрос компьютера и условий подменён. Главное условие: включённая настройка меняет
-результат расшифровки только полем quality.hypotheses_saved; выключенная — не меняет ничего.
+во временной папке, опрос компьютера и условий подменён. Главное условие: включённая настройка результат
+расшифровки не меняет (отметка о записи — в статусе задачи), файл пишется только после сохранения результата.
 """
 import json
 import os
@@ -59,25 +59,73 @@ class SettingTests(unittest.TestCase):
         self.assertEqual(paths.HYPOTHESES, paths.DATA_DIR / "hypotheses")
 
 
+VOCAB = {"replace": {"борька": "Борис"}}         # словарь сценариев tests/test_run_words_golden.py
+
+
+def finish(data, saved=None):
+    """Как worker.main: служебное _hyp забирается до сохранения результата, файл пишется после.
+    -> поля для статуса задачи."""
+    return worker._finish_hypotheses(data.pop("_hyp", None), data["quality"], data["_timing"], VOCAB, saved)
+
+
 class RunWordsWithSavingTests(Sandbox):
-    def scenario(self, name, save=True):
+    def scenario(self, name, save=True, saved=None):
+        """-> (данные расшифровки, журнал вызовов, поля статуса задачи)."""
         params = dict(G.SCENARIOS[name])
         params["cfg_extra"] = {**params.get("cfg_extra", {}), **({"save_hypotheses": True} if save else {})}
-        return G.run_scenario(**params)
+        data, calls = G.run_scenario(**params)
+        return data, calls, finish(data, saved)
 
-    def test_result_is_the_same_except_saved_flag(self):
+    def test_result_is_the_same_with_setting_on(self):
         for name in ("three_models", "whisper_doubt", "whisper_fails", "second_fails", "whisper_off",
                      "primary_chunk_error", "gpu_then_cpu"):
             with self.subTest(scenario=name):
-                data, calls = self.scenario(name)
-                self.assertIs(data["quality"].pop("hypotheses_saved"), True)
-                # настройка в cfg в результат не попадает; вызовы моделей и ход статуса прежние
+                data, calls, state = self.scenario(name)
+                self.assertEqual(state, {"hypotheses_saved": True})
+                # настройка в cfg и отметка о записи в результат не попадают; вызовы моделей и ход статуса прежние
                 self.assertEqual(G.digest(data, calls), G.EXPECTED[name])
 
     def test_setting_off_writes_nothing(self):
-        data, calls = self.scenario("three_models", save=False)
-        self.assertNotIn("hypotheses_saved", data["quality"])
+        params = dict(G.SCENARIOS["three_models"])
+        data, calls = G.run_scenario(**params)
+        self.assertNotIn("_hyp", data)
+        self.assertEqual(finish(data), {})
         self.assertFalse(self.hyp.exists())
+
+    def test_no_file_until_result_is_saved(self):
+        """Файл пишет main после _save_worker_result: run_words сам ничего не пишет."""
+        params = dict(G.SCENARIOS["three_models"])
+        params["cfg_extra"] = {**params.get("cfg_extra", {}), "save_hypotheses": True}
+        data, calls = G.run_scenario(**params)
+        self.assertIn("_hyp", data)
+        self.assertEqual(self.files(), [])
+
+    def test_failed_task_after_combine_leaves_no_file(self):
+        params = dict(G.SCENARIOS["three_models"])
+        params["cfg_extra"] = {**params.get("cfg_extra", {}), "save_hypotheses": True}
+        with mock.patch.object(worker, "_emotions", side_effect=RuntimeError("сбой после сведения")):
+            with self.assertRaises(RuntimeError):
+                G.run_scenario(**params)
+        self.assertEqual(self.files(), [])
+        self.assertFalse(self.hyp.exists())
+
+    def test_main_writes_file_after_result_and_reports_in_status(self):
+        src = (Path(worker.__file__)).read_text(encoding="utf-8")
+        main = src[src.index("def main("):src.index("def _save_worker_result(")]
+        pop, save, finish_at = (main.index('hyp = data.pop("_hyp", None)'), main.index("saved = _save_worker_result("),
+                                main.index("_finish_hypotheses(hyp,"))
+        self.assertLess(pop, save)
+        self.assertLess(save, finish_at)
+        self.assertIn("**hyp_state", main[finish_at:])
+
+    def test_recording_id_from_saved_result(self):
+        self.scenario("three_models", saved={"recording_id": "rec-synthetic-1"})
+        self.scenario("whisper_off")
+        recs = [json.loads(p.read_text(encoding="utf-8")) for p in self.files()]
+        ids = sorted(json.dumps(r["ids"]["recording_id"], ensure_ascii=False) for r in recs)
+        self.assertIn('"rec-synthetic-1"', ids)
+        other = next(r["ids"]["recording_id"] for r in recs if r["ids"]["recording_id"] != "rec-synthetic-1")
+        self.assertEqual(other["status"], "not_available")
 
     def test_file_has_votes_of_every_model_before_vote_and_trace(self):
         self.scenario("three_models")
@@ -126,9 +174,8 @@ class RunWordsWithSavingTests(Sandbox):
 
     def test_failure_to_save_does_not_break_transcription(self):
         with mock.patch.object(hypstore, "write", side_effect=OSError("диск <путь> полон")):
-            data, calls = self.scenario("three_models")
-        self.assertIs(data["quality"].pop("hypotheses_saved"), False)
-        self.assertEqual(data["quality"].pop("hypotheses_error"), "OSError")     # без текста и пути
+            data, calls, state = self.scenario("three_models")
+        self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "OSError"})   # без текста и пути
         self.assertEqual(G.digest(data, calls), G.EXPECTED["three_models"])
         self.assertEqual(self.files(), [])
 
@@ -218,6 +265,42 @@ class StoreTests(Sandbox):
         self.assertNotEqual(first["files"][0]["sha256"], second["files"][0]["sha256"])
         self.assertEqual(first["files"][0]["file"], "gigaam/v3_e2e_rnnt.onnx")
         self.assertTrue(hypotheses.is_missing(hypstore.model_artifact("нет-такой", self.root / "cache", {})))
+
+    def test_weight_files_are_those_the_engine_loads(self):
+        """В общем хранилище gigaam-v3-onnx — только файлы своей модели; .ckpt PyTorch — только при движке torch;
+        faster-whisper — своя сборка модели."""
+        cache = self.root / "cache"
+        snap = cache / "huggingface" / "hub"
+        layout = {"models--istupakov--gigaam-v3-onnx/snapshots/s1": ["v3_e2e_ctc.int8.onnx", "v3_e2e_ctc.onnx",
+                                                                     "v3_e2e_ctc_vocab.txt",
+                                                                     "v3_e2e_rnnt_encoder.int8.onnx"],
+                  "models--istupakov--gigaam-multilingual-large-ctc-onnx/snapshots/s2": ["multilingual_large_ctc.int8.onnx"],
+                  "models--istupakov--gigaam-multilingual-ctc-onnx/snapshots/s3": ["multilingual_ctc.int8.onnx"],
+                  "models--onnx-community--whisper-large-v3-turbo/snapshots/s4/onnx": ["encoder_model.onnx"],
+                  "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo/snapshots/s5": ["model.bin"]}
+        for d, names in layout.items():
+            (snap / d).mkdir(parents=True)
+            for n in names:
+                (snap / d / n).write_bytes(b"0")
+        (cache / "gigaam").mkdir()
+        (cache / "gigaam" / "v3_e2e_rnnt.ckpt").write_bytes(b"0")
+
+        def names(model, engine):
+            return [rel for rel, _ in hypstore._model_files(model, cache, engine)]
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HF_HOME", None)
+            self.assertEqual(names("v3_e2e_ctc", "onnx-cpu"),
+                             ["hf/istupakov/gigaam-v3-onnx/s1/v3_e2e_ctc.int8.onnx",
+                              "hf/istupakov/gigaam-v3-onnx/s1/v3_e2e_ctc.onnx"])
+            self.assertEqual(names("v3_e2e_rnnt", "openvino:GPU"),
+                             ["hf/istupakov/gigaam-v3-onnx/s1/v3_e2e_rnnt_encoder.int8.onnx"])
+            self.assertEqual(names("v3_e2e_rnnt", "torch:cpu"), ["gigaam/v3_e2e_rnnt.ckpt"])
+            self.assertEqual(names("multilingual_ctc", "onnx-cpu"),
+                             ["hf/istupakov/gigaam-multilingual-ctc-onnx/s3/multilingual_ctc.int8.onnx"])
+            self.assertEqual(names("onnx-community/whisper-large-v3-turbo", "onnx-cpu"),
+                             ["hf/onnx-community/whisper-large-v3-turbo/s4/onnx/encoder_model.onnx"])
+            self.assertEqual(names("onnx-community/whisper-large-v3-turbo", "whisper-ct2:int8:t8"),
+                             ["hf/mobiuslabsgmbh/faster-whisper-large-v3-turbo/s5/model.bin"])
 
     def test_testbed_is_cached_for_a_day(self):
         tid1, hw1 = hypstore.testbed(None, self.hyp.parent, now=1000.0)
@@ -365,7 +448,7 @@ class TimedThirdInRunWordsTests(Sandbox):
         with mock.patch.object(G, "FakeTexts", factory), \
                 mock.patch.object(worker, "TIMED_THIRD_VERIFIED", frozenset(verified)):
             data, calls = G.run_scenario(cfg_extra=cfg)
-        data["quality"].pop("hypotheses_saved")
+            self.assertEqual(finish(data), {"hypotheses_saved": True})
         data["_timing"] = {k: v for k, v in data["_timing"].items() if not k.endswith("_sec")}
         return data
 

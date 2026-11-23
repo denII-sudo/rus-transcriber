@@ -416,6 +416,9 @@ class PipelineEngine:
         import words
         import worker
         st = LabStatus(f"{shared.unit['unit_id']} × {conf['id']}: ", self.log)
+        # Гипотезы лаборатория пишет сама (Capture); save_hypotheses здесь выключена принудительно: при ней
+        # сведение идёт через vote_n с протоколом мимо words.vote3, и подмена vote3 в Capture не сработала бы.
+        cfg = {**cfg, "save_hypotheses": False}
         a = SimpleNamespace(whisper="", whisper_max_repeat=-1, no_emotions=True)
         emb = shared.emb
         emb_before = emb.seconds

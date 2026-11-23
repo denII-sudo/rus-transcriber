@@ -698,9 +698,11 @@ def combine_hypotheses(hypotheses, diagnostics, rule=None, trace=None):
             def vote(main, hyps):
                 return vote_n(main, hyps, rule or TWO_OF_THREE, trace)
         if trace is not None:
-            trace["skip_spans"] = [{"start": s, "end": e, "role": "whisper", "reason": why}
-                                   for s, e, why, _ in voting_whisper]                 + [{"start": s, "end": e, "role": name, "reason": why}
-                   for s, e, name, why, _ in other_evidence if name == "second" or name in voting_extras]
+            whisper_spans = [{"start": s, "end": e, "role": "whisper", "reason": why}
+                             for s, e, why, _ in voting_whisper]
+            other_spans = [{"start": s, "end": e, "role": name, "reason": why}
+                           for s, e, name, why, _ in other_evidence if name == "second" or name in voting_extras]
+            trace["skip_spans"] = whisper_spans + other_spans
             trace["merged_skip_spans"] = [[s, e] for s, e in skip_spans]
         if skip_spans:
             quality["vote"] = _vote_outside_spans(words, others, skip_spans, vote)
