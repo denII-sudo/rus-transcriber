@@ -105,7 +105,10 @@ class CardAnswerClosesTests(Base):
                  ("удаление всех слов места", delete(("w3", "дальше", 2.5), ("w6", "идём", 2.75)),
                   ["начало", "вот", "та"]),
                  ("слияние двух слов", [{"op": "place_text", "t1": 2.5, "t2": 2.75, "word_ids": ["w3", "w6"],
-                                         "text": "дальшеидём", "card": "r3"}], ["начало", "вот", "дальшеидём", "та"]))
+                                         "text": "дальшеидём", "card": "r3"}], ["начало", "вот", "дальшеидём", "та"]),
+                 ("вставка внутри места", [{"op": "insert", "s": 2.71, "e": 2.74, "text": "же", "speaker": "Анна",
+                                            "after_id": "w3", "card": "r3"}],
+                  ["начало", "вот", "дальше", "же", "идём", "та"]))
         for name, edits, words in cases:
             for backend in BACKENDS:
                 with self.subTest(case=name, backend=backend), files(backend, result()) as (jp, md, _v):
@@ -179,6 +182,12 @@ class CardAnswerDoesNotCloseTests(Base):
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, result()) as (jp, md, _v):
                 transcript.edit_span(jp, md, 2.5, 2.7, "дальнейшем", by="human")
+                self.assertIn("дальнейшем", self.texts(jp))
+                self.still_open(jp)
+            # правка с via (правка отрезка) отметку не ставит, даже если вызывающий передал listened_by
+            with self.subTest(backend=backend, how="via"), files(backend, result()) as (jp, md, _v):
+                edit = {"op": "replace", "t": 2.5, "w": "дальше", "word_id": "w3", "text": "дальнейшем", "card": "r3"}
+                transcript.apply_word_edits(jp, md, [edit], by="human", via="edit_span", listened_by="human")
                 self.assertIn("дальнейшем", self.texts(jp))
                 self.still_open(jp)
 
