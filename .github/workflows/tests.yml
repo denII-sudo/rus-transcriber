@@ -5,12 +5,12 @@ on:
     branches: [main]
     # No ready_for_review: the commit is already tested, automerge.yml reuses that result.
     types: [opened, synchronize, reopened]
-  # A merge is not tested again (branch protection requires an up-to-date, tested branch).
-  # main runs only to fill the dependency cache that every PR can read: when this file
-  # changes and every few days, because GitHub drops a cache unused for 7 days.
+  # Every push to main (a merge) and a schedule run the full suite sequentially, in one process, as a control for
+  # the parallel run in pull requests: a hidden dependency between modules would show as "green in parallel,
+  # red in sequence". It also fills the dependency cache that every PR can read (GitHub drops a cache unused for
+  # 7 days, hence the schedule). automerge.yml ignores these runs: it queues only pull_request ones.
   push:
     branches: [main]
-    paths: [".github/workflows/tests.yml"]
   schedule:
     - cron: "41 1 */5 * *"
 
@@ -117,7 +117,7 @@ jobs:
       - name: Run unit tests (parallel groups)
         if: steps.scope.outputs.scope != 'docs' && github.event_name == 'pull_request'
         run: python -B tests/run_parallel.py -v --shuffle --durations
-      # Контроль по расписанию и после изменения этого файла в main — прежний последовательный прогон одним
+      # Контроль по расписанию и на каждый push в main (слияние) — прежний последовательный прогон одним
       # процессом: «параллельно зелёно, последовательно красно» показало бы скрытую зависимость модулей.
       - name: Run unit tests (sequential control)
         if: steps.scope.outputs.scope != 'docs' && github.event_name != 'pull_request'

@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import run_parallel as rp
 
@@ -21,7 +22,12 @@ REAL_TESTS = Path(__file__).resolve().parent
 
 OK_MODULE = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n\n    def test_b(self):\n        pass\n"
 ENV_MODULE = ("import os\nimport unittest\n\n\nclass T(unittest.TestCase):\n    def test_env(self):\n"
-              "        print('ENV', os.environ['RUS_TRANSCRIBER_DATA'], os.environ['TEMP'], os.environ['TMP'])\n")
+              "        keys = ('RUS_TRANSCRIBER_DATA', 'TEMP', 'TMP', 'HF_HOME', 'TORCH_HOME', 'HF_HUB_CACHE')\n"
+              "        print('ENV|' + '|'.join(os.environ.get(k, '-') for k in keys))\n")   # «|», чтобы пробел в пути не мешал
+ENV_FIELD = r"([^|\r\n]*)"
+ENV_LINE = "ENV\\|" + "\\|".join([ENV_FIELD] * 6)
+EXIT3_MODULE = ("import atexit\nimport os\nimport unittest\n\natexit.register(lambda: os._exit(3))   # код выхода 3 после «OK»\n\n\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
 
 
 def fail_module():
@@ -46,8 +52,19 @@ class Synthetic(unittest.TestCase):
 
     def run_launcher(self, *args, mutate=None):
         out = io.StringIO()
-        code = rp.run(list(args), repo=self.repo, out=out, mutate=mutate)
+        try:
+            code = rp.run(list(args), repo=self.repo, out=out, mutate=mutate)
+        finally:
+            self.clean_left_sandboxes(out.getvalue())
         return code, out.getvalue()
+
+    def left_sandboxes(self, text):
+        return [Path(p) for p in re.findall(r"песочница оставлена для разбора: (.+)", text)]
+
+    def clean_left_sandboxes(self, text):
+        # запускатель после неудачи оставляет песочницу (AGENTS.md); тест её убирает в конце, а не оставляет мусор в TEMP
+        for path in self.left_sandboxes(text):
+            self.addCleanup(shutil.rmtree, path, ignore_errors=True)
 
 
 class DiscoveryAndPlanTests(unittest.TestCase):
@@ -199,7 +216,7 @@ class LegacyEstimateTests(Synthetic):
     def test_table_is_rebuilt_from_a_saved_log_with_prefixes_and_timestamps(self):
         self.module("test_m", CLASSIFIED)
         self.module("test_keep")
-        self.table(test_keep=7.0)
+        self.table(test_keep=7.0, test_gone=9.0)                                     # test_gone в наборе уже нет
         log = self.repo / "run.log"
         log.write_text("tests\tRun\t2026-11-25T01:00:00.1Z .....\n"
                        "tests\tRun\t2026-11-25T01:00:01.0Z [g1] Slowest test durations\n"
@@ -210,8 +227,9 @@ class LegacyEstimateTests(Synthetic):
         code, text = self.run_launcher("--table-from", str(log))
         self.assertEqual(code, 0, text)
         data = json.loads((self.repo / "tests" / "parallel_durations.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["modules"], {"test_keep": 7.0, "test_m": 12.5})     # неупомянутый модуль сохранён
+        self.assertEqual(data["modules"], {"test_keep": 7.0, "test_m": 12.5})     # неупомянутый модуль сохранён, ушедший убран
         self.assertEqual(data["after_legacy_removal"]["test_m"], 10.5)
+        self.assertNotIn("test_gone", data["after_legacy_removal"])
         code, text = self.run_launcher("--table-from", str(self.repo / "tests" / "test_m.py"))
         self.assertEqual(code, 2, text)                                              # в файле нет блока длительностей
 
@@ -337,18 +355,79 @@ class RunTests(Synthetic):
     def test_every_group_gets_its_own_sandbox_which_is_removed(self):
         for name in ("test_a", "test_b", "test_c"):
             self.module(name, ENV_MODULE)
-        code, text = self.run_launcher("--jobs", "3", "-v")
+        with mock.patch.dict(os.environ, {"HF_HOME": "outer-hf-home", "HF_HUB_CACHE": "outer-hub-cache"}):
+            code, text = self.run_launcher("--jobs", "3", "-v")
         self.assertEqual(code, 0, text)
-        seen = re.findall(r"ENV (\S+) (\S+) (\S+)", text)
+        seen = re.findall(ENV_LINE, text)
         self.assertEqual(len(seen), 3, text)
         self.assertEqual(len({s[0] for s in seen}), 3)                      # разные каталоги данных
         self.assertEqual(len({s[1] for s in seen}), 3)
-        for data, temp, tmp in seen:
+        for data, temp, tmp, hf_home, torch_home, hub_cache in seen:
+            sandbox = Path(data).parent.parent
             self.assertEqual(temp, tmp)
             self.assertIn(Path(temp), Path(data).parents)               # как требует test_data_safety: данные под TEMP
             self.assertNotEqual(data, os.environ.get("RUS_TRANSCRIBER_DATA"))
-            self.assertFalse(Path(data).parent.parent.exists(), "песочница не убрана")
+            self.assertIn(sandbox, Path(hf_home).parents)                # кэши моделей — в песочнице группы, не внешние
+            self.assertIn(sandbox, Path(torch_home).parents)
+            self.assertEqual(hub_cache, "-", "HF_HUB_CACHE снаружи не должен доходить до группы")
+            self.assertFalse(sandbox.exists(), "песочница не убрана")
+        self.assertEqual(len({s[3] for s in seen}), 3)
         self.assertRegex(text, r"\[g\d\] ")
+        self.assertNotIn("песочница оставлена", text)
+
+    def test_sandbox_stays_after_a_failure_and_its_path_is_printed(self):
+        self.module("test_good")
+        self.module("test_broken", fail_module())
+        code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 1, text)
+        left = self.left_sandboxes(text)
+        self.assertEqual(len(left), 1, text)
+        self.assertTrue(left[0].is_dir(), "песочница после неудачного прогона должна остаться")
+        self.assertTrue((left[0] / "g1").exists() or (left[0] / "g2").exists())
+        self.assertTrue(text.rstrip().splitlines()[-1].startswith("песочница оставлена"), text)   # путь — в итоге
+
+    def test_group_that_prints_ok_but_exits_with_a_nonzero_code_is_a_failure(self):
+        self.module("test_good")
+        self.module("test_exit3", EXIT3_MODULE)
+        code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 1, text)
+        self.assertRegex(text, r"НАРУШЕНИЕ: g\d: итог unittest OK, но процесс вышел с кодом 3")
+        self.assertIn("FAILED", text)
+        self.assertEqual(text.count("полный вывод упавшей группы"), 1)
+
+    def test_interrupt_kills_the_groups_and_leaves_the_sandbox(self):
+        self.module("test_good")
+        self.module("test_hangs", "import time\nimport unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n"
+                                  "        time.sleep(120)\n")
+        spawned = []
+        real_spawn = rp.spawn
+
+        def spy(argv, cwd, env):
+            proc = real_spawn(argv, cwd, env)
+            spawned.append(proc)
+            return proc
+
+        real_wait = rp.Run.wait
+
+        def interrupted(run, deadline):
+            if run.label == "g1":
+                time.sleep(1.5)                         # группы уже начаты
+                raise KeyboardInterrupt
+            return real_wait(run, deadline)
+
+        out = io.StringIO()
+        with mock.patch.object(rp, "spawn", spy), mock.patch.object(rp.Run, "wait", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                rp.run(["--jobs", "2", "--no-count"], repo=self.repo, out=out)
+        self.clean_left_sandboxes(out.getvalue())
+        self.assertGreaterEqual(len(spawned), 2)
+        deadline = time.time() + 30
+        while time.time() < deadline and any(p.poll() is None for p in spawned):
+            time.sleep(0.2)
+        self.assertTrue(all(p.poll() is not None for p in spawned), "группы остались работать после прерывания")
+        left = self.left_sandboxes(out.getvalue())
+        self.assertEqual(len(left), 1, out.getvalue())
+        self.assertTrue(left[0].is_dir())
 
     def test_leftover_in_the_group_temp_is_a_warning_and_strict_makes_it_a_failure(self):
         self.module("test_leaks", "import os\nimport tempfile\nimport unittest\n\n\nclass T(unittest.TestCase):\n"
@@ -399,6 +478,23 @@ class RunTests(Synthetic):
         self.assertEqual(code, 0, text)
         data = json.loads((self.repo / "tests" / "parallel_durations.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(data["modules"]), ["test_a", "test_b"])
+
+    @unittest.skipIf(sys.version_info < (3, 12), "--durations есть в Python 3.12")
+    def test_update_table_with_a_module_in_the_table_that_is_not_in_the_suite(self):
+        # раньше имя `after` в запускателе было занято и таблицей, и снимком дерева: падение при модуле «из таблицы, не из набора»
+        slow = ("import time\nimport unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n"
+                "        time.sleep(0.05)\n")
+        self.module("test_a", slow)
+        self.module("test_b", slow)
+        (self.repo / "tests" / "parallel_durations.json").write_text(json.dumps({
+            "modules": {"test_a": 1.0, "test_gone": 9.0}, "after_legacy_removal": {"test_a": 1.0, "test_gone": 9.0},
+            "together": []}), encoding="utf-8")
+        code, text = self.run_launcher("--jobs", "2", "--update-table")
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("Traceback", text)
+        data = json.loads((self.repo / "tests" / "parallel_durations.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(data["modules"]), ["test_a", "test_b"])
+        self.assertEqual(sorted(data["after_legacy_removal"]), ["test_a", "test_b"])
 
 
 if __name__ == "__main__":

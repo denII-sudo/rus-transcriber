@@ -15,7 +15,10 @@
   * дерево репозитория после запуска то же, что до него (`git status --porcelain --ignored`).
 Остаток файлов во временной папке группы — предупреждение (`--strict-tmp` делает его отказом).
 
-У каждой группы свои каталоги `data` и `tmp` в новой песочнице: `RUS_TRANSCRIBER_DATA`, `TEMP`, `TMP`.
+У каждой группы свои каталоги `data` и `tmp` в новой песочнице: `RUS_TRANSCRIBER_DATA`, `TEMP`, `TMP`, а также кэши
+моделей `HF_HOME` и `TORCH_HOME` (тесты не видят кэш установленной программы). Успешный запуск песочницу убирает;
+неудачный, исключение или Ctrl-C (группы при этом убиваются) оставляют её, путь печатается последней строкой итога.
+Группа с ненулевым кодом выхода считается упавшей, даже если unittest напечатал OK.
 Переменные окружения, патчи и модульные кэши между группами не делятся (разные процессы); общее вне процесса
 (порты, файлы, git) разобрано в аудите плана ускорения тестов; для git задано GIT_OPTIONAL_LOCKS=0.
 
@@ -270,6 +273,17 @@ def build_table(test_times, tests_dir, together=()):
             "together": [list(g) for g in together]}
 
 
+def keep_old_seconds(table, seconds, after, modules):
+    """Модуль набора, которого не было в журнале, остаётся с прежними числами; модуль, которого в наборе уже нет
+    (удалён или переименован), из таблицы уходит."""
+    for m in set(seconds) & set(modules) - set(table["modules"]):
+        table["modules"][m] = round(seconds[m], 1)
+        table["after_legacy_removal"][m] = round(after.get(m, seconds[m]), 1)
+    for section in ("modules", "after_legacy_removal"):
+        table[section] = {m: v for m, v in table[section].items() if m in modules}
+    return table
+
+
 def write_table(path, table):
     Path(path).write_text(json.dumps(table, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
 
@@ -281,9 +295,13 @@ def group_env(sandbox, tests_dir):
     temp = Path(sandbox) / "tmp"
     data = temp / DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
+    # кэши моделей — тоже в песочнице: тесты не должны видеть кэш установленной программы (защита в глубину к №163)
+    cache = Path(sandbox) / "cache"
     env = dict(os.environ, RUS_TRANSCRIBER_DATA=str(data), TEMP=str(temp), TMP=str(temp),
+               HF_HOME=str(cache / "huggingface"), TORCH_HOME=str(cache / "torch"),
                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
                GIT_OPTIONAL_LOCKS="0")
+    env.pop("HF_HUB_CACHE", None)
     old = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(tests_dir) + (os.pathsep + old if old else "")
     return env, temp
@@ -321,6 +339,7 @@ class Run:
         self.started = self.ended = None
         self.timed_out = False
         self.summary = None
+        self.returncode = None
         self.leftover = []
 
     def start(self):
@@ -344,16 +363,25 @@ class Run:
             kill_tree(self.proc)
             self.proc.wait()
         self.thread.join(timeout=30)
-        try:
-            self.proc.stdout.close()
-        except (OSError, ValueError):
-            pass
+        if self.thread.is_alive():                 # внучатый процесс держит конец трубы: добить дерево, не ждать вечно
+            kill_tree(self.proc)
+            self.thread.join(timeout=10)
+        self.returncode = self.proc.returncode
+        closer = threading.Thread(target=self._close_stdout, daemon=True)
+        closer.start()
+        closer.join(timeout=10)                    # close() в Windows может зависнуть, пока кто-то читает трубу
         self.ended = time.time()
         self.summary = parse_summary(self.output)
         try:
             self.leftover = sorted(p.name for p in self.tmp.iterdir() if p.name != DATA_SUBDIR)
         except OSError:
             self.leftover = []
+
+    def _close_stdout(self):
+        try:
+            self.proc.stdout.close()
+        except (OSError, ValueError):
+            pass
 
     @property
     def output(self):
@@ -446,9 +474,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
             print("в журнале нет блока «Slowest test durations»: запустите с --durations", file=out)
             return 2
         table = build_table(times, tests_dir, together)
-        for m in set(seconds) - set(table["modules"]):         # модуля не было в журнале — прежние числа
-            table["modules"][m] = round(seconds[m], 1)
-            table["after_legacy_removal"][m] = round(after.get(m, seconds[m]), 1)
+        keep_old_seconds(table, seconds, after, modules)
         write_table(table_path, table)
         print(f"таблица пересчитана из журнала: {len(table['modules'])} модулей, {sum(table['modules'].values()):.0f} с "
               f"сейчас, {sum(table['after_legacy_removal'].values()):.0f} с после ухода legacy_files (оценка)", file=out)
@@ -480,112 +506,120 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
             return 2
 
     root = Path(tempfile.mkdtemp(prefix="rt-par-"))
-    before = tree_state(repo)
+    tree_before = tree_state(repo)
     extra = (["-v"] if args.verbose else []) + (["--durations", "0"] if args.update_table or args.durations else [])
-    runs = []
-    if args.sequential:
-        runs.append(Run("seq", [py, "-B", "-m", "unittest", "discover", "-s", "tests", *extra], repo, tests_dir, root,
-                        modules, args.verbose, say))
-    else:
-        for i, g in enumerate(groups, 1):
-            runs.append(Run(f"g{i}", [py, "-B", "-m", "unittest", *extra, *g], repo, tests_dir, root, g,
-                            args.verbose, say))
-    counter = None
-    if not args.sequential and not args.no_count:
-        counter = Run("count", [py, "-B", "-c", COUNT_CODE], repo, tests_dir, root, [], False, say)
-    started = time.time()
-    if seed is not None:
-        say(f"порядок модулей в группах: seed={seed} (повтор: python -B tests/run_parallel.py --jobs {len(groups)} --shuffle {seed})")
-    say(f"запуск: {'последовательно, один процесс' if args.sequential else f'{len(runs)} групп(ы) параллельно'}"
-        f", модулей {len(modules)}")
-    for r in runs:
-        r.start()
-        say(f"{r.label}: начата" + ("" if args.sequential else f", модулей {len(r.modules)}"))
-    if counter:
-        counter.start()
-    deadline = started + args.timeout
-    for r in runs:
-        r.wait(deadline)
-        s = r.summary
-        say(f"{r.label}: " + ("не уложилась в %d с, убита" % args.timeout if r.timed_out else
-                              "нет итоговой строки unittest" if not s else
-                              f"Ran {s['ran']} за {s['seconds']:.1f} с, {'OK' if s['ok'] else 'FAILED'}")
-            + f" (по часам {r.seconds:.1f} с)")
-    if counter:
-        counter.wait(time.time() + args.timeout)
-    wall = time.time() - started
-
-    # сверки
-    totals = dict.fromkeys(("ran", "failures", "errors", "skipped", "expected", "unexpected"), 0)
-    for r in runs:
-        if r.timed_out:
-            problems.append(f"{r.label}: превышен срок {args.timeout} с, группа убита")
-        elif not r.summary:
-            problems.append(f"{r.label}: нет итоговой строки unittest (процесс вылетел или вывод оборван)")
+    runs, counter, clean = [], None, False
+    try:
+        if args.sequential:
+            runs.append(Run("seq", [py, "-B", "-m", "unittest", "discover", "-s", "tests", *extra], repo, tests_dir, root,
+                            modules, args.verbose, say))
         else:
-            for k in totals:
-                totals[k] += r.summary[k]
-            if r.leftover:
-                text = f"{r.label}: во временной папке группы остались {len(r.leftover)} объектов (первые: " \
-                       f"{', '.join(r.leftover[:3])})"
-                if args.strict_tmp:
-                    problems.append(text)
-                else:
-                    say("предупреждение: " + text)
-    if counter:
-        counts = read_counts(counter)
-        if counts is None:
-            problems.append("не удалось посчитать тесты через discover: " + (counter.output.strip()[-300:] or "нет вывода"))
-        else:
-            if sorted(counts) != modules:
-                problems.append("список модулей не совпал с найденным discover: только в discover "
-                                f"{sorted(set(counts) - set(modules))}, только у запускателя {sorted(set(modules) - set(counts))}")
-            for r in runs:
-                want = sum(counts.get(m, 0) for m in r.modules)
-                if r.summary and r.summary["ran"] != want:
-                    problems.append(f"{r.label}: запущено {r.summary['ran']} тестов, по discover у её модулей {want}")
-    after = tree_state(repo)
-    if before is not None and after is not None and before != after:
-        changed = sorted(set(before) ^ set(after))
-        problems.append("дерево репозитория изменилось за время запуска: " + "; ".join(changed[:5]))
-
-    bad = [r for r in runs if r.timed_out or not r.summary or not r.summary["ok"]]
-    if args.update_table and not bad and not problems:
-        times = {}
+            for i, g in enumerate(groups, 1):
+                runs.append(Run(f"g{i}", [py, "-B", "-m", "unittest", *extra, *g], repo, tests_dir, root, g,
+                                args.verbose, say))
+        if not args.sequential and not args.no_count:
+            counter = Run("count", [py, "-B", "-c", COUNT_CODE], repo, tests_dir, root, [], False, say)
+        started = time.time()
+        if seed is not None:
+            say(f"порядок модулей в группах: seed={seed} (повтор: python -B tests/run_parallel.py --jobs {len(groups)} --shuffle {seed})")
+        say(f"запуск: {'последовательно, один процесс' if args.sequential else f'{len(runs)} групп(ы) параллельно'}"
+            f", модулей {len(modules)}")
         for r in runs:
-            times.update(test_durations(r.output))
-        table = build_table(times, tests_dir, together)
-        for m in set(seconds) - set(table["modules"]):         # нет в этом запуске — оставить прежнее число
-            table["modules"][m] = round(seconds[m], 1)
-            table["after_legacy_removal"][m] = round(after.get(m, seconds[m]), 1)
-        write_table(table_path, table)
-        say(f"таблица длительностей записана: {table_path.name}")
-    for r in bad:
-        say(f"===== {r.label}: полный вывод упавшей группы =====")
-        say(r.output.rstrip("\n"))
-        say(f"===== конец вывода {r.label} =====")
-    for p in problems:
-        say("НАРУШЕНИЕ: " + p)
+            r.start()
+            say(f"{r.label}: начата" + ("" if args.sequential else f", модулей {len(r.modules)}"))
+        if counter:
+            counter.start()
+        deadline = started + args.timeout
+        for r in runs:
+            r.wait(deadline)
+            s = r.summary
+            say(f"{r.label}: " + ("не уложилась в %d с, убита" % args.timeout if r.timed_out else
+                                  "нет итоговой строки unittest" if not s else
+                                  f"Ran {s['ran']} за {s['seconds']:.1f} с, {'OK' if s['ok'] else 'FAILED'}")
+                + f" (по часам {r.seconds:.1f} с)")
+        if counter:
+            counter.wait(time.time() + args.timeout)
+        wall = time.time() - started
 
-    parts = []
-    if totals["failures"] or bad:
-        parts.append(f"failures={totals['failures']}")
-    if totals["errors"]:
-        parts.append(f"errors={totals['errors']}")
-    if problems:
-        parts.append(f"run problems={len(problems)}")
-    failed = bool(bad or problems or totals["failures"] or totals["errors"] or totals["unexpected"])
-    for key, label in (("skipped", "skipped"), ("expected", "expected failures"), ("unexpected", "unexpected successes")):
-        if totals[key]:
-            parts.append(f"{label}={totals[key]}")
-    say("----------------------------------------------------------------------")
-    say(f"Ran {totals['ran']} tests in {wall:.3f}s\n")
-    say(("FAILED" if failed else "OK") + (f" ({', '.join(parts)})" if parts else ""))
-    if not args.sequential:
-        say(f"групп {len(runs)}" + (f", seed {seed}" if seed is not None else "") +
-            "; суммарное время групп " + f"{sum(r.seconds for r in runs):.0f} с")
-    shutil.rmtree(root, ignore_errors=True)
-    return 1 if failed else 0
+        # сверки
+        totals = dict.fromkeys(("ran", "failures", "errors", "skipped", "expected", "unexpected"), 0)
+        for r in runs:
+            if r.timed_out:
+                problems.append(f"{r.label}: превышен срок {args.timeout} с, группа убита")
+            elif not r.summary:
+                problems.append(f"{r.label}: нет итоговой строки unittest (процесс вылетел или вывод оборван)")
+            else:
+                for k in totals:
+                    totals[k] += r.summary[k]
+                if r.returncode != 0 and r.summary["ok"]:
+                    problems.append(f"{r.label}: итог unittest OK, но процесс вышел с кодом {r.returncode}")
+                if r.leftover:
+                    text = f"{r.label}: во временной папке группы остались {len(r.leftover)} объектов (первые: " \
+                           f"{', '.join(r.leftover[:3])})"
+                    if args.strict_tmp:
+                        problems.append(text)
+                    else:
+                        say("предупреждение: " + text)
+        if counter:
+            counts = read_counts(counter)
+            if counts is None:
+                problems.append("не удалось посчитать тесты через discover: " + (counter.output.strip()[-300:] or "нет вывода"))
+            else:
+                if sorted(counts) != modules:
+                    problems.append("список модулей не совпал с найденным discover: только в discover "
+                                    f"{sorted(set(counts) - set(modules))}, только у запускателя {sorted(set(modules) - set(counts))}")
+                for r in runs:
+                    want = sum(counts.get(m, 0) for m in r.modules)
+                    if r.summary and r.summary["ran"] != want:
+                        problems.append(f"{r.label}: запущено {r.summary['ran']} тестов, по discover у её модулей {want}")
+        tree_after = tree_state(repo)
+        if tree_before is not None and tree_after is not None and tree_before != tree_after:
+            changed = sorted(set(tree_before) ^ set(tree_after))
+            problems.append("дерево репозитория изменилось за время запуска: " + "; ".join(changed[:5]))
+
+        bad = [r for r in runs if r.timed_out or not r.summary or not r.summary["ok"] or r.returncode != 0]
+        if args.update_table and not bad and not problems:
+            times = {}
+            for r in runs:
+                times.update(test_durations(r.output))
+            table = build_table(times, tests_dir, together)
+            keep_old_seconds(table, seconds, after, modules)
+            write_table(table_path, table)
+            say(f"таблица длительностей записана: {table_path.name}")
+        for r in bad:
+            say(f"===== {r.label}: полный вывод упавшей группы =====")
+            say(r.output.rstrip("\n"))
+            say(f"===== конец вывода {r.label} =====")
+        for p in problems:
+            say("НАРУШЕНИЕ: " + p)
+
+        parts = []
+        if totals["failures"] or bad:
+            parts.append(f"failures={totals['failures']}")
+        if totals["errors"]:
+            parts.append(f"errors={totals['errors']}")
+        if problems:
+            parts.append(f"run problems={len(problems)}")
+        failed = bool(bad or problems or totals["failures"] or totals["errors"] or totals["unexpected"])
+        for key, label in (("skipped", "skipped"), ("expected", "expected failures"), ("unexpected", "unexpected successes")):
+            if totals[key]:
+                parts.append(f"{label}={totals[key]}")
+        say("----------------------------------------------------------------------")
+        say(f"Ran {totals['ran']} tests in {wall:.3f}s\n")
+        say(("FAILED" if failed else "OK") + (f" ({', '.join(parts)})" if parts else ""))
+        if not args.sequential:
+            say(f"групп {len(runs)}" + (f", seed {seed}" if seed is not None else "") +
+                "; суммарное время групп " + f"{sum(r.seconds for r in runs):.0f} с")
+        clean = not failed
+        return 1 if failed else 0
+    finally:
+        for r in runs + ([counter] if counter else []):    # Ctrl-C или исключение: группы не остаются работать
+            if r.proc is not None and r.proc.poll() is None:
+                kill_tree(r.proc)
+        if clean:
+            shutil.rmtree(root, ignore_errors=True)
+        else:                                              # AGENTS.md: песочница после неудачного прогона остаётся
+            say(f"песочница оставлена для разбора: {root}")
 
 
 if __name__ == "__main__":
