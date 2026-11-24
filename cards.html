@@ -367,13 +367,16 @@ audio{width:100%;height:36px}
     const v = speechSynthesis.getVoices().find(v => /^ru/i.test(v.lang)); if (v) u.voice = v;
     speechSynthesis.speak(u);
   }
+  // примечание человека — только на карточке противоречия (PR 13б, В-3); ответом оно не разбирается
+  function humanNote(it, stateEl) {
+    const el = it.seen_fp && stateEl.parentElement && stateEl.parentElement.querySelector(".human-note");
+    return el ? el.value.trim() : "";
+  }
   async function send(it, a, stateEl) {
     stateEl.textContent = "Сохраняю…";
     editing.delete(it.id);
     try {
-      // примечание человека — только на карточке противоречия (PR 13б, В-3); ответом оно не разбирается
-      const noteEl = it.seen_fp && stateEl.parentElement && stateEl.parentElement.querySelector(".human-note");
-      const note = noteEl ? noteEl.value.trim() : "";
+      const note = humanNote(it, stateEl);
       const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a, ...(note ? {human_note: note} : {})});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
