@@ -242,6 +242,15 @@ class MissingFilesAreRestoredAfterTheCheck(WriteOrderCase):
         self.assertEqual(env.materialize(), [(rid, 1)])
         self.assertEqual(env.versions(rid), {"md": 1, "json": 1, "manifest": 1})   # «заменить» вернуло версию программы
 
+    def test_edited_file_later_in_the_order_blocks_restoring_of_earlier_ones(self):
+        env, rid = self.synced(revised=False)
+        env.file(rid, "md").unlink()
+        env.file(rid, "manifest").write_bytes(b"external")
+        env.materialize()
+        self.assertIsNone(env.version(rid, "md"))            # пропавший md не восстановлен: manifest изменён снаружи
+        self.assertEqual(env.conflicts(), [(rid, "manifest")])
+        self.assertEqual(env.store.db.execute("SELECT count(*) FROM materialization_events").fetchone()[0], 0)
+
     def test_all_missing_are_restored_in_order(self):
         env, rid = self.synced(revised=False)
         for kind in KINDS:
