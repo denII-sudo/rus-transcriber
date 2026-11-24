@@ -11,6 +11,7 @@ import re
 import unittest
 from unittest import mock
 
+import storage
 import test_pause_buttons_short_answers as six
 from test_pause_buttons_short_answers import BACKENDS, files
 
@@ -320,11 +321,15 @@ class NewRevisionAfterOpenTests(Base):
 
     def test_failed_replacement_heals_on_the_next_apply(self):
         """Сбой между фиксацией ответа и заменой карточки: ответ применён, карточка прежняя, отчёт называет
-        сбой; следующее «Применить» карточку заменяет."""
-        for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
+        сбой; следующее «Применить» карточку заменяет. Р3: и при storage.Conflict (запись сменилась между
+        фиксацией и заменой) отчёт применения не теряется."""
+        cases = [(backend, OSError("диск занят")) for backend in BACKENDS] + \
+            [("sqlite", storage.Conflict("запись изменилась"))]
+        for backend, error in cases:
+            with self.subTest(backend=backend, error=type(error).__name__), \
+                    files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
-                with mock.patch.object(review_pack, "upsert_cards", side_effect=OSError("диск занят")):
+                with mock.patch.object(review_pack, "upsert_cards", side_effect=error):
                     rep = core.apply_answers_files(jp, md)
                 self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
                 self.assertEqual([row["id"] for row in rep.get("cards_not_replaced") or []], ["r3"])

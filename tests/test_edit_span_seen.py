@@ -26,6 +26,26 @@ SEEN_1 = {"by": "human", "edit": "span@0.20", "via": "edit_span"}
 ORIGINAL = hc.result_data
 
 
+def only_place_changed(test, before, after, rid):
+    """PR 13б: противоречие ничего лишнего не меняет. Реплики и журнал правок прежние; в review изменилось
+    только место rid — предложение (`contradiction`), причина «contradiction» и статус."""
+    test.assertEqual(after["segments"], before["segments"])
+    test.assertEqual(after.get("edits"), before.get("edits"))
+
+    def strip(review):
+        out = []
+        for item in review or []:
+            item = dict(item)
+            if item.get("id") == rid:
+                item.pop("contradiction", None)
+                item.pop("status", None)
+                item["reasons"] = [r for r in item.get("reasons") or [] if r != "contradiction"]
+            out.append(item)
+        return out
+    test.assertEqual(strip(after.get("review")), strip(before.get("review")))
+    test.assertTrue(next(i for i in after["review"] if i["id"] == rid)["contradiction"]["proposals"])
+
+
 def many_words():
     data = ORIGINAL()
     data["segments"][0]["words"].append({"w": "дальше", "s": 1.2, "e": 1.5, "word_id": "w3"})
@@ -197,11 +217,11 @@ class AgentChangesSeenWords(unittest.TestCase):
             with self.subTest(backend=backend), files(backend) as (jp, md):
                 human_sees_all(jp, md)
                 transcript.apply_review(jp, md, [{"id": "r2", "text": "новое"}], by="human")   # w2 — слово человека
-                before = transcript.load(jp)["segments"]
+                before = transcript.load(jp)
                 # PR 13б: не ошибка, а противоречие — слова и отметки «видел» не меняются, у места — предложение
                 _, rep = transcript.edit_span(jp, md, 0.2, 1.5, "тесто новое дальше", by="claude")
                 self.assertIs(rep["written"], False)
-                self.assertEqual(transcript.load(jp)["segments"], before)
+                only_place_changed(self, before, transcript.load(jp), rep["contradiction"])
                 self.assertEqual(seen_of(jp, "w1"), SEEN_1)
 
     def test_failed_save_leaves_no_mark_and_retry_works(self):

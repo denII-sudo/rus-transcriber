@@ -12,6 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+import storage
 import test_pause_buttons_short_answers as six
 from test_pause_buttons_short_answers import BACKENDS, files
 
@@ -222,6 +223,33 @@ class ProposalInsteadOfRefusalTests(Base):
     def answer_r4_by_review(self, jp, md):
         transcript.apply_review(jp, md, [{"id": "r4", "text": "тот"}], by="human")
 
+    def test_card_failure_after_writing_the_proposal_is_in_the_result(self):
+        """Р3: сбой постановки карточки после записи предложения — в результате (`cards_not_replaced`), а не
+        исключением мимо MCP; повтор той же правки ставит карточку."""
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for error in (RuntimeError("занято"), OSError("диск занят"), storage.Conflict("запись изменилась")):
+            with self.subTest(error=type(error).__name__, how="edit_span"), files("sqlite") as (jp, md, version):
+                self.answer_r4(jp, md, version)
+                with mock.patch.object(review_pack, "upsert_cards", side_effect=error):
+                    rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
+                self.not_written(rep, "r4")
+                self.assertEqual(rep["card"], "not_replaced")
+                self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
+                self.assertEqual(self.card(jp, "r4")["rev"], 1)
+                self.contradiction(jp, "r4")
+                rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
+                self.assertEqual(rep["card"], "updated")
+                self.assertNotIn("cards_not_replaced", rep)
+            with self.subTest(error=type(error).__name__, how="apply_review"), files("sqlite") as (jp, md, version):
+                self.answer_r4(jp, md, version)
+                with mock.patch.object(review_pack, "upsert_cards", side_effect=error):
+                    rep = core.apply_review_files(jp, md, [{"id": "r4", "text": "тут"}], by="claude")
+                self.assertEqual(rep.get("contradictions"), ["r4"])
+                self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
+                self.assertEqual(rep["cards"], {"r4": "not_replaced"})
+                self.assertEqual(self.word(jp, "w5")["w"], "тот")
+                self.contradiction(jp, "r4")
+
 
 class ChoiceTests(Base):
     """Тесты 15, 16, 17, 23: варианты, подписи, выбор, слова изменились после показа, отмена выбора."""
@@ -318,6 +346,59 @@ class ChoiceTests(Base):
                 self.assertNotEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
                 self.assertEqual(self.word(jp, "w5")["w"], "тота")
                 self.assertEqual(self.card(jp, "r4")["rev"], rev + 1)
+
+    def test_free_text_when_words_changed(self):
+        """Свой текст на карточке противоречия сверяется с показанными словами так же, как вариант."""
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        with files("sqlite") as (jp, md, version):
+            self.contradicted(jp, md, version)
+            rev = self.card(jp, "r4")["rev"]
+            self.save(jp, version, "r4", rev=rev, text="те")
+            data = transcript.load(jp)
+            next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w5")["w"] = "тота"
+            transcript.save(data, jp, md)
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "source_conflict", rep.get("outcomes"))
+            self.assertEqual(self.word(jp, "w5")["w"], "тота")
+            self.assertEqual(self.card(jp, "r4")["rev"], rev + 1)
+
+    def test_only_word_times_changed_the_choice_applies(self):
+        """Р2: изменилось только время слов — человек видел те же слова, выбор применяется (отпечаток
+        показанного — ID и текст слов, без времени)."""
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        with files("sqlite") as (jp, md, version):
+            self.contradicted(jp, md, version)
+            self.choose(jp, version, "r4", ACCEPT)
+            data = transcript.load(jp)
+            w5 = next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w5")
+            w5["s"], w5["e"] = 3.01, 3.19
+            transcript.save(data, jp, md)
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
+            self.assertEqual(self.word(jp, "w5")["w"], "тут")
+
+    def test_two_word_place_contradiction_on_one_word(self):
+        """Р1: место из двух слов, противоречие — по одному. Отпечаток показанного строится и сверяется по
+        словам противоречия, выбор ложится только на них; второе слово места не меняется."""
+        data = six.result()
+        data["review"] = [i for i in data["review"] if i["id"] != "r3"]
+        r4 = next(i for i in data["review"] if i["id"] == "r4")
+        r4.update(t=2.5, t1=2.5, text="дальше та", word_ids=["w3", "w5"])
+        qs = [q for q in six.questions() if q["id"] != "r3"]
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, data, qs) as (jp, md, version):
+                self.press(jp, version, "Оставить как есть", "r4")
+                core.apply_answers_files(jp, md)
+                rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
+                self.not_written(rep, "r4")
+                self.assertEqual(self.contradiction(jp, "r4")["words"], ["w5"])
+                self.assertEqual(self.card(jp, "r4")["word_ids"], ["w5"])
+                self.choose(jp, version, "r4", ACCEPT)
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "тут"])
+                place = self.place_of(jp, "r4")
+                self.assertEqual((place["status"], place["contradiction"]["proposals"]), ("resolved", []))
 
     def test_undo_of_the_choice_returns_the_words(self):
         """Тест 23: «Отменить» применённый выбор возвращает прежние слова."""

@@ -11,6 +11,7 @@
 import unittest
 from unittest import mock
 
+import test_edit_span_seen as seen  # noqa: E402  (сверка «ничего лишнего» при противоречии)
 import test_human_confirmation as hc  # noqa: E402  (тот же sandbox и те же карточки)
 
 import core  # noqa: E402
@@ -162,12 +163,12 @@ class HumanSpanOverHumanCardAnswer(unittest.TestCase):
         for backend in BACKENDS:
             with self.subTest(backend=backend), hc.files(backend) as (jp, md, _):
                 transcript.apply_review(jp, md, [{"id": "r1", "text": "другое"}], by="human")
-                words = [w["w"] for s in transcript.load(jp)["segments"] for w in s["words"]]
+                before = transcript.load(jp)
                 _, rep = transcript.edit_span(jp, md, 0.2, 0.5, "третье", by="human")
                 self.assertIs(rep["written"], False)
                 self.assertTrue(rep["text"].startswith("не записано: противоречие, карточка r1"), rep["text"])
                 data = transcript.load(jp)
-                self.assertEqual([w["w"] for s in data["segments"] for w in s["words"]], words)
+                seen.only_place_changed(self, before, data, "r1")
                 place = next(i for i in data["review"] if i["id"] == "r1")
                 self.assertEqual([p["text"] for p in place["contradiction"]["proposals"]], ["третье"])
 
