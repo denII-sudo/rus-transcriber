@@ -742,6 +742,15 @@ def _mark_provenance(word, dimension, by, edit):
 HELD_FOR_HUMAN = "место оставлено человеку"
 
 
+def human_touched(word):
+    """Человек тронул слово: он автор слова, его текста или его говорящего (by или provenance).
+    Единственное место этого правила; агент такое слово не меняет. Другой вопрос — у `prior_edit`
+    (чья последняя правка), и другое правило — у `voices` (подтверждённый говорящий для голосов)."""
+    provenance = word.get("provenance")
+    return word.get("by") == "human" or isinstance(provenance, dict) and any(
+        v.get("by") == "human" for v in provenance.values() if isinstance(v, dict))
+
+
 def prior_edit(word, data=None):
     """Чья прежняя правка у слова и каким способом. -> None, если слово не правили, иначе
     {"id": правка, "by": автор или None, "via": "edit_span" | "card"}.
@@ -977,10 +986,6 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
 
     def check(eds):
         """Причина, по которой правки карточки нельзя применить целиком, или None."""
-        def protected(w):
-            return w.get("by") == "human" or any(
-                v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))
-
         def held(k):
             return k is not None and id(flat[k]["w"]) in held_words
 
@@ -1021,7 +1026,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 current = [flat[k]["w"] for k in ks]
                 if not current and not e.get("speaker"):
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
-                if by != "human" and any(protected(flat[k]["w"]) for k in ks):
+                if by != "human" and any(human_touched(flat[k]["w"]) for k in ks):
                     return "на отрезке есть подтверждённые человеком слова"
                 if any(held(k) for k in ks) or (not ks and any(
                         a <= e["t2"] + 0.01 and e["t1"] - 0.01 <= b for a, b in held_spans)):
@@ -1033,7 +1038,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             k = find(e["t"], e.get("w"), strict=True, word_id=e.get("word_id"))
             if k is None:
                 return f"слово «{e.get('w')}» ({e['t']} с) не найдено — стенограмма изменилась"
-            if by != "human" and protected(flat[k]["w"]):
+            if by != "human" and human_touched(flat[k]["w"]):
                 return "слово подтверждено человеком"
             if held(k):
                 return HELD_FOR_HUMAN
@@ -1356,9 +1361,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         before = {"text": " ".join(w["w"] for w in ws[w1:w2]), "speaker": seg["speaker"]}
         if by != "human" and ((d.get("text") and d["text"] != before["text"]) or
                               (d.get("speaker") and d["speaker"] != before["speaker"])):
-            protected = [w for w in ws[w1:w2] if w.get("by") == "human" or any(
-                v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))]
-            if protected:
+            if any(human_touched(w) for w in ws[w1:w2]):
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": ["human"]})
                 continue
         if (not d.get("text") or d["text"] == before["text"]) and d.get("speaker") in (None, seg["speaker"]):
