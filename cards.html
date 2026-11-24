@@ -150,8 +150,9 @@ audio{width:100%;height:36px}
   // undo_conflict: отмена не выполнилась — прежняя правка на месте, кнопки «Изменить» и «Отмена» нужны
   // revert_pending: отмена подготовлена, но не применена — правка тоже ещё на месте
   // cloud_keep: отмена снята в облаке — применённая правка на месте
-  const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous", "undo_conflict", "revert_pending",
-                                   "cloud_keep"].includes(stateOf(it, a));
+  // applied_open: ответ применён, место осталось открытым (PR 7) — правка на месте, отмена доступна
+  const holdsApplied = (it, a) => ["applied", "applied_open", "pending_new", "kept_previous", "undo_conflict",
+                                   "revert_pending", "cloud_keep"].includes(stateOf(it, a));
   // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
   const revertButton = (it, a) => stateOf(it, a) === "revert_pending" ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
@@ -191,6 +192,7 @@ audio{width:100%;height:36px}
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
   // Неуспешные исходы — «не применён — …» с краткой причиной; полная причина — строкой под ответом.
   const STATUS = {saved: "ответ сохранён", applied: "применён ответ", pending_new: "новый ответ — не применён",
+                  applied_open: "применён ответ, место открыто — нужно прослушивание",
                   revert_pending: "отмена подготовлена — нажмите «Применить»; прежний ответ на месте",
                   kept_previous: "применён прежний ответ", reverted: "ответ отменён", skipped: "пропущено",
                   negative: "не применён — место открыто", left_for_human: "требует проверки",

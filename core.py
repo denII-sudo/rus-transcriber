@@ -357,6 +357,7 @@ def workflow_status(request_id):
     import product_policy
     import recordings
     import storage
+    import transcript
     import workflow
     store = recordings.open_store()
     try:
@@ -373,8 +374,7 @@ def workflow_status(request_id):
             if workflow.verification_is_current(store, request_id, recording_id, current):
                 human_verification = "confirmed"
             review = current["review"]["payload"]
-            unresolved = sum(1 for item in (review.get("review") or [])
-                             if item.get("status", "open") in ("open", "human"))
+            unresolved = sum(1 for item in (review.get("review") or []) if transcript.place_unresolved(item))
             quality = current["transcript"]["payload"].get("quality") or {}
             diagnostics = quality.get("asr_diagnostics")
             incomplete = bool(quality.get("asr_incomplete_chunks")) or not isinstance(diagnostics, dict) or not diagnostics
@@ -563,6 +563,7 @@ def workflow_questions(request_id):
     """Показать ограниченный пакет добровольных уточнений без автоматического ответа."""
     import recordings
     import storage
+    import transcript
     import workflow
     store = recordings.open_store()
     try:
@@ -572,7 +573,7 @@ def workflow_questions(request_id):
             return {"questions": [], "budget": budget, "recording_id": request["recording_id"]}
         current = store.get_current(request["recording_id"])
         items = [item for item in (current["review"]["payload"].get("review") or [])
-                 if item.get("status", "open") in ("open", "human") and isinstance(item.get("id"), str)]
+                 if transcript.place_unresolved(item) and isinstance(item.get("id"), str)]
         with store._transaction():
             store.current_identity()
             head = recordings.recording_head(store, request["recording_id"])
@@ -2188,7 +2189,7 @@ def build_review_pack(job_id, items=None):
         data = transcript.load(jp)
         items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
                   "options": [{"label": "Оставить как есть", "decision": {}}]}
-                 for it in data.get("review", []) if it.get("status", "open") in ("open", "human")]
+                 for it in data.get("review", []) if transcript.place_unresolved(it)]
     return P.build(jp, items)
 
 
@@ -2788,6 +2789,13 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "pending_new"
         elif aid in undo_conflict_ids:
             outcomes[aid] = "undo_conflict"
+    # Итог — после всех ответов: ответ применён, а его место открыто (нужно прослушивание, или слова интервала
+    # изменил другой ответ или правка) — исход applied_open, не applied (PR 7). Ответ остаётся применённым:
+    # подпись и снимок для отмены не снимаются; повтор «Применить» такое место сам не закроет.
+    places_now = {r.get("id"): r for r in transcript.load(jp).get("review") or []}
+    for aid, outcome in outcomes.items():
+        if outcome == "applied" and aid in places_now and transcript.place_unresolved(places_now[aid]):
+            outcomes[aid] = "applied_open"
     failed_outcomes = {aid: outcome for aid, outcome in outcomes.items()
                        if outcome not in ("applied", "reverted")}
     if failed_outcomes:
@@ -2812,6 +2820,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             add_detail(aid, "с карточкой " + ", ".join(str(x) for x in others) if others else conflict.get("why"))
     for aid, why in revision_conflicts.items():
         add_detail(aid, why)
+    for aid in stored:
+        if outcomes[aid] == "applied_open":
+            note = (places_now.get(aid) or {}).get("note") or ""
+            add_detail(aid, "слова интервала изменились после ответа" if "нужна новая проверка" in note else
+                       "ответ не исправил слова, в которых модели расходятся, или место требует прослушивания")
     for row in free_report.get("left_to_human") or []:
         add_detail(row.get("id"), row.get("why"))
     for aid, why in (free_report.get("failed") or {}).items():
