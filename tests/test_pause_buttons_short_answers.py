@@ -343,6 +343,88 @@ class PauseButtonsApplyTests(Case):
         data["review"][0]["listening"]["result"] = "silence"
         self.assertNotIn(MARK, transcript.render_md(data))
 
+    def test_layout_boundary_and_tail(self):
+        """Правило места пометки: реплика с началом ровно в начале паузы — пометка перед ней (>=);
+        позже паузы ни одна реплика не начинается — пометка в конце."""
+        item = {"id": "r1", "gap": [1.0, 2.0], "reasons": ["missed"], "t1": 1.0, "t2": 2.0,
+                "listening": {"by": "human", "result": "interjections"}}
+        line = f"_{MARK} 00:00:01–00:00:02_"
+        self.assertEqual(transcript.interjection_layout([{"start": 0.5}, {"start": 1.0}], [item]), ({1: [line]}, []))
+        self.assertEqual(transcript.interjection_layout([{"start": 0.5}, {"start": 1.01}], [item]),
+                         ({1: [line]}, []))
+        self.assertEqual(transcript.interjection_layout([{"start": 0.5}], [item]), ({}, [line]))
+        for result_ in ("words", "silence"):
+            with self.subTest(result=result_):
+                other = dict(item, listening={"by": "human", "result": result_})
+                self.assertEqual(transcript.interjection_layout([{"start": 0.5}], [other]), ({}, []))
+
+    def test_one_speaker_around_the_pause_gets_the_mark_after_the_reply(self):
+        """Один говорящий до и после паузы: сохранение сливает реплики в одну, начатую до паузы, —
+        пометка встаёт после этой реплики (хвостовое правило), в обоих отрисовщиках."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                self.press(jp, version, INTERJECTIONS)
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertEqual(len(transcript.load(jp)["segments"]), 1)
+                text = md.read_text(encoding="utf-8")
+                self.assertEqual("## Текст" in text, backend == "sqlite")
+                self.assertEqual(text.count(MARK), 1, text)
+                short = transcript.render_md(transcript.load(jp), text_only=True)
+                for shown in (text, short):
+                    lines = shown.splitlines()
+                    reply = [n for n, line in enumerate(lines) if "начало" in line and "дальше" in line]
+                    mark = [n for n, line in enumerate(lines) if MARK in line]
+                    self.assertEqual((len(reply), len(mark)), (1, 1), shown)
+                    self.assertLess(reply[0], mark[0], shown)
+
+    def test_words_and_silence_buttons_give_no_mark(self):
+        """Пометку даёт только «только междометия»: «слова верны» и «слов нет» — без пометки."""
+        for backend in BACKENDS:
+            for label, data in ((WORDS, result(inside=True)), (SILENCE, two_replies())):
+                with self.subTest(backend=backend, label=label), files(backend, data) as (jp, md, version):
+                    self.press(jp, version, label)
+                    rep = self.apply(jp, md)
+                    self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
+                    self.assertEqual(self.place_of(jp, "r1")["status"], "resolved")
+                    self.assertNotIn(MARK, md.read_text(encoding="utf-8"))
+                    self.assertNotIn(MARK, transcript.render_md(transcript.load(jp), text_only=True))
+
+    def test_listening_record_stays_on_this_computer(self):
+        """В публичный разбор документа — только итог прослушивания; отпечаток интервала — не в облачный пакет."""
+        review = {"review": [{"id": "r1", "status": "resolved", "t": 1.0, "t1": 1.0, "t2": 2.0, "gap": [1.0, 2.0],
+                              "reasons": ["missed"], "text": "",
+                              "listening": {"by": "human", "result": "interjections",
+                                            "at": "2026-11-24T10:00:00Z", "fingerprint": "f" * 64}}]}
+        public = documents._public_review(review)
+        self.assertEqual(public["review"][0]["listening"], {"result": "interjections"})
+        with files("legacy_files") as (jp, _md, _version):
+            self.assertIn("listen_fp", next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1"))
+            bundle = review_pack.cloud_bundle(jp)
+            cloud = review_pack._read(Path(bundle["base"]) / bundle["files"]["manifest.json"], {})
+            self.assertTrue(cloud["items"])
+            for item in cloud["items"]:
+                self.assertFalse({"listen_fp", "listening"} & set(item), item)
+            # локальный пакет не тронут: сверка кнопок по-прежнему по отпечатку
+            self.assertIn("listen_fp", next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1"))
+
+    def test_refusal_on_a_place_without_gap_is_not_a_pause_outcome(self):
+        """Отказ прослушивания на месте с проблемой распознавания без пропуска — не «нужна кнопка паузы»."""
+        asr = {"id": "r5", "status": "open", "t": 3.0, "t1": 3.0, "t2": 3.2, "gap": [3.0, 3.2],
+               "speaker": "Анна", "text": "та", "reasons": ["asr"],
+               "asr_problem": {"model": "whisper", "state": "empty_unknown", "words_from": []}}
+        with files("legacy_files", result(extra_review=[asr]),
+                   questions() + [{"id": "r5", "options": [AS_IS]}]) as (jp, md, _v):
+            _, rep = transcript.apply_review(jp, md, [{"id": "r5", "listened": "silence"}], by="human")
+            self.assertEqual([c["id"] for c in rep.get("conflicts") or []], ["r5"])
+            self.assertNotIn("r5", rep.get("pause_refused") or [])
+            _, rep = transcript.apply_review(jp, md, [{"id": "r5", "listened": "interjections"}], by="human")
+            self.assertEqual([c["id"] for c in rep.get("conflicts") or []], ["r5"])
+            self.assertNotIn("r5", rep.get("pause_refused") or [])
+            # для сравнения: тот же отказ на пропуске — исход паузы
+            _, rep = transcript.apply_review(jp, md, [{"id": "r1", "listened": "words"}], by="human")
+            self.assertIn("r1", rep.get("pause_refused") or [])
+
     def test_mark_is_dropped_when_words_appear_in_the_pause(self):
         """Тест 8: слово в паузе после «только междометия» — место открыто, пометки нет."""
         with files("legacy_files") as (jp, md, version):
@@ -448,6 +530,25 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(freeform.classify("Анна: согласна", NAMES), {"kind": "text"})
         self.assertEqual(freeform.classify("не согласен", NAMES), {"kind": "negative"})
         self.assertEqual(freeform.classify("нет", NAMES), {"kind": "short_word"})
+
+    def test_evaluation_limit_is_exactly_four_words(self):
+        self.assertEqual(freeform.EVALUATION_MAX_WORDS, 4)
+        for answer, kind in (("мы с ним согласны", "evaluation"), ("я с этим совершенно согласен", "text"),
+                             ("ну это было верно", "evaluation"), ("ну это было вполне верно", "text")):
+            with self.subTest(answer=answer):
+                self.assertEqual(len(answer.split()), 4 if kind == "evaluation" else 5)
+                self.assertEqual(freeform.classify(answer, NAMES), {"kind": kind})
+
+    def test_hint_quotes_the_answer_as_written(self):
+        """Подсказка повторяет фразу человека без нормализации: ё и регистр сохраняются."""
+        pause = man_items()["r1"]
+        hint = freeform._short_answer(pause, "confirm", "Всё  верно", [], True)
+        self.assertIn("«Имя: Всё верно»", hint)
+        place = [{"w": "та", "s": 3.0}]
+        hint = freeform._short_answer(man_items()["r4"], "short_word", "Ага", place, False)
+        self.assertIn("«Ага»", hint)
+        self.assertIn("«Имя: Ага»", hint)
+        self.assertNotIn("Имя: ага", hint)
 
 
 def flat_words(data):
@@ -613,6 +714,17 @@ class VoiceMatchTests(unittest.TestCase):
         self.assertEqual(review_pack.match("2", item), {"kind": "option", "option": 1})
         self.assertEqual(review_pack.match("оставь человеку", item)["kind"], "human")
         self.assertEqual(review_pack.match("повтори", item)["kind"], "repeat")
+
+    def test_option_number_next_to_confirm_selects_option(self):
+        """Номер варианта рядом со словом подтверждения или оценки выбирает вариант, как до 6б."""
+        item = {"options": [{"label": "Оставить как есть"}, {"label": "Заменить на «тот»"},
+                            {"label": "Заменить на «этот»"}], "recommended": 1}
+        for said, n in (("верно, второй", 1), ("согласен, первый", 0), ("правильно, второй вариант", 1),
+                        ("второй, верно", 1), ("верно 2", 1), ("да, второй", 1), ("Да, третий.", 2)):
+            with self.subTest(said=said):
+                self.assertEqual(review_pack.match(said, item), {"kind": "option", "option": n})
+        # номер вне списка вариантов — не номер: короткий ответ разбирается таблицей
+        self.assertEqual(review_pack.match("верно, пятый", item), {"kind": "free"})
 
 
 if __name__ == "__main__":

@@ -508,28 +508,29 @@ def _pause_answer(item, rep, flat, words, inside):
 
 # Подсказки на короткий ответ (В8): место остаётся открытым, стенограмма не меняется.
 HINT_PAUSE_CONFIRM = ("паузу коротким ответом не закрыть: нажмите «" + T.LISTEN_SILENCE + "» или «" +
-                      T.LISTEN_INTERJECTIONS + "»; если в паузе сказано это слово — напишите «Имя: {key}»")
+                      T.LISTEN_INTERJECTIONS + "»; если в паузе сказано это слово — напишите «Имя: {answer}»")
 HINT_EVALUATION = ("ответ похож на оценку, а не на услышанные слова: место осталось открытым; "
                    "выберите вариант или напишите «Имя: слова»")
 HINT_WORD = ("короткий ответ «{answer}» не совпадает со словами места («{place}»): чтобы вписать его, "
-             "напишите «Имя: {key}»; чтобы подтвердить слова — «верно» или вариант «как есть»")
+             "напишите «Имя: {answer}»; чтобы подтвердить слова — «верно» или вариант «как есть»")
 HINT_DISAGREE = "модели расходятся — короткое «{answer}» не говорит, чей вариант верен: "
 HINT_DISAGREE_OPTION = "выберите вариант «{label}» или впишите услышанные слова"
 HINT_DISAGREE_WORDS = "впишите услышанные слова"
 
 
 def _short_answer(item, kind, text, place, is_gap):
-    """Короткий ответ по таблице В8. -> "as_is" (подтвердить слова места), текст подсказки или None (это слова)."""
+    """Короткий ответ по таблице В8. -> "as_is" (подтвердить слова места), текст подсказки или None (это слова).
+    В подсказке фраза человека как есть (ё и регистр сохраняются); сравнение со словами места — по ключу."""
     answer, key = " ".join(text.split()), _phrase_key(text)
     if kind == "evaluation":
         return HINT_EVALUATION
     if is_gap:
-        return None if kind == "short_word" else HINT_PAUSE_CONFIRM.format(key=key)
+        return None if kind == "short_word" else HINT_PAUSE_CONFIRM.format(answer=answer)
     if kind == "short_word":
         here = " ".join(norm(w["w"]) for w in place if norm(w["w"]))
         if place and here == key:
             return "as_is"
-        return HINT_WORD.format(answer=answer, key=key, place=" ".join(w["w"] for w in place) or "—")
+        return HINT_WORD.format(answer=answer, place=" ".join(w["w"] for w in place) or "—")
     if "asr" in (item.get("reasons") or []):       # «модели расходятся»: «верно» не говорит, чей вариант
         label = next((str(o.get("label", "")) for o in item.get("options") or []
                       if not {k for k in (o.get("decision") or {}) if k != "note"}), None)

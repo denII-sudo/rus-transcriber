@@ -431,11 +431,9 @@ def match(text, item):
         return {"kind": "human"}
     if re.search(r"пропус|дальше|следующ", j) and len(w) <= 3:
         return {"kind": "skip"}
-    if freeform.classify(text, [])["kind"] in freeform.SHORT_KINDS:
-        # голос = текст (В8): «да», «верно», «согласен» разбирает таблица слов, рекомендацию они не выбирают
-        return {"kind": "free"}
     opts = item.get("options") or []
     if len(w) <= 4:
+        # номер варианта выбирает вариант и рядом со словом подтверждения или оценки: «верно, второй», «да 2»
         for x in w:
             if x.isdigit() and 1 <= int(x) <= len(opts):
                 return {"kind": "option", "option": int(x) - 1}
@@ -443,6 +441,9 @@ def match(text, item):
             for stem, n in _ORD:
                 if x.startswith(stem) and n < len(opts):
                     return {"kind": "option", "option": n}
+    if freeform.classify(text, [])["kind"] in freeform.SHORT_KINDS:
+        # голос = текст (В8): «да», «верно», «согласен» без номера разбирает таблица слов, рекомендацию они не выбирают
+        return {"kind": "free"}
     # совпадение по словам варианта (имена, слова текста): берём вариант с наибольшим числом
     # отличительных слов — тех, что есть только в нём
     sets = [set(_norm(o["label"])) for o in opts]
@@ -961,7 +962,9 @@ def cloud_bundle(json_path, artifact_url=None):
     have = {k: v for k, v in clips.items() if v.exists()}
     # Копия применённого ответа (applied_answer) и отметка запроса (keep_request) нужны только ноутбуку:
     # странице хватает answer_states (keep: ts, source, accepted).
-    out = dict(man, answers={k: {f: x for f, x in v.items() if f not in ("applied_answer", "keep_request")}
+    # Отпечаток слов интервала паузы (listen_fp) нужен только сверке на ноутбуке (decisions): в облако не уходит.
+    out = dict(man, items=[{f: x for f, x in it.items() if f != "listen_fp"} for it in man["items"]],
+               answers={k: {f: x for f, x in v.items() if f not in ("applied_answer", "keep_request")}
                              for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
                applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
