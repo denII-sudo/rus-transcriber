@@ -243,6 +243,14 @@ def _place_words(data, it):
     return [by_id[wid] for wid in ids if wid in by_id]
 
 
+def _seen_fp(data, it):
+    """Отпечаток слов, которые человек видел на карточке противоречия: ID и текст слов противоречия
+    (_place_words). Строится при сборке и сверяется в decisions одной функцией. Время слов не входит: вопрос
+    и варианты от него не зависят, и смена одного времени не делает выбор устаревшим."""
+    content = [[w.get("word_id"), w.get("w")] for w in _place_words(data, it)]
+    return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def _contradiction_options(T, data, it):
     """Варианты карточки противоречия (PR 13б): «Оставить подтверждённое», «Принять новое» на каждое
     предложение (последние), «Как распознано» — только если отличается от обоих. Не больше четырёх."""
@@ -312,6 +320,9 @@ def _card(T, data, it, q):
     row = _context(T, data, it)
     loc = T._find_span(data, it)
     target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
+    if contradiction:
+        # цель карточки противоречия — слова предложения: выбор и свой текст ложатся только на них
+        target_words = _place_words(data, it)
     ids = [w.get("word_id") for w in target_words]
     # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
     target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) \
@@ -345,7 +356,7 @@ def _card(T, data, it, q):
         "note": q.get("note")}
     if contradiction:
         # варианты привязаны к словам, которые видел человек: ответ сверяется с ними при «Применить»
-        manifest_item["seen_fp"] = T._listening_fingerprint(target_words)
+        manifest_item["seen_fp"] = _seen_fp(data, it)
     if gap:
         # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
         manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
@@ -1037,7 +1048,7 @@ def decisions(json_path):
             out.append({"id": aid, "_undo_snapshot": snapshot})
             continue
         if "seen_fp" in it and T.contradiction_pending(places.get(aid) or {}) and \
-                T._listening_fingerprint(_place_words(data, places[aid])) != it["seen_fp"]:
+                _seen_fp(data, places[aid]) != it["seen_fp"]:
             rep.setdefault("source_conflict", CONTRADICTION_STALE)
             rep["source_conflict_ids"].append(aid)
             rep.setdefault("source_conflict_why", {})[aid] = CONTRADICTION_STALE
