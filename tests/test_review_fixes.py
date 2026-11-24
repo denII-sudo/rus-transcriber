@@ -225,18 +225,18 @@ class SpanAndReopen(unittest.TestCase):
         self.assertEqual(c.lines(data)[0], "Борис: версия 2.19.3 готова")
         self.assertEqual(rep["resolved"], ["r1"])
         self.assertEqual(data["edits"][-1]["note"], "правка отрезка: версия по экрану")
-        data, _ = T.edit_span(c.json, c.md, 2.0, 2.0, "ага", speaker="Борис")
+        data, _ = T.edit_span(c.json, c.md, 2.0, 2.0, "ага", speaker="Борис", by="claude")
         self.assertEqual(c.lines(data), ["Борис: версия 2.19.3 готова ага"])
 
     def test_edit_span_insert_delete_and_errors(self):
         c = self._case()
         with self.assertRaises(ValueError):
-            T.edit_span(c.json, c.md, 5.0, 6.0, "тихо")             # нет слов и нет говорящего
+            T.edit_span(c.json, c.md, 5.0, 6.0, "тихо", by="claude")             # нет слов и нет говорящего
         with self.assertRaises(ValueError):
-            T.edit_span(c.json, c.md, 0.0, 0.3, "x", speaker="Глеб")   # нет такого участника
-        data, _ = T.edit_span(c.json, c.md, 5.0, 6.0, "тихо сказала", speaker="Анна")
+            T.edit_span(c.json, c.md, 0.0, 0.3, "x", speaker="Глеб", by="claude")   # нет такого участника
+        data, _ = T.edit_span(c.json, c.md, 5.0, 6.0, "тихо сказала", speaker="Анна", by="claude")
         self.assertEqual(c.lines(data)[-1], "Анна: ага тихо сказала")
-        data, _ = T.edit_span(c.json, c.md, 0.6, 0.6, "")
+        data, _ = T.edit_span(c.json, c.md, 0.6, 0.6, "", by="claude")
         self.assertEqual(c.lines(data)[0], "Борис: версия 219.3")
 
     def test_reopen(self):

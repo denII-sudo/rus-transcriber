@@ -2877,12 +2877,14 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     return {**rep, "review": report}
 
 
-def edit_span(job_id, t1, t2, text, speaker="", note="", by="claude"):
-    """Правка отрезка t1–t2 (с): текст и говорящий; без пересборки карточек."""
+def edit_span(job_id, t1, t2, text, speaker="", note="", by=None):
+    """Правка отрезка t1–t2 (с): текст и говорящий; без пересборки карточек. Автор by обязателен."""
     import transcript
+    try:
+        transcript.check_edit_span_author(by)
+    except ValueError as ex:
+        raise CoreError(str(ex))
     s = _done_json(job_id)
-    if by not in ("claude", "human"):
-        raise CoreError('by: "claude" или "human"')
     try:
         _, rep = transcript.edit_span(s["json"], s["markdown"], t1, t2, text, speaker or None, note or None, by)
     except ValueError as ex:
