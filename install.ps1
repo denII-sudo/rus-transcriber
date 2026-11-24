@@ -778,6 +778,7 @@ if ($Source -ne $Target) {
         "core.py"
         "core_voices.py"
         "core_screen.py"
+        "core_conflicts.py"
         "confirm.py"
         "tmpfiles.py"
         "selfcheck.py"
