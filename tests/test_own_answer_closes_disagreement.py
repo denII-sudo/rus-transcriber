@@ -9,6 +9,7 @@ import ast
 import copy
 import re
 import unittest
+from unittest import mock
 
 import test_pause_buttons_short_answers as six
 from test_pause_buttons_short_answers import BACKENDS, files
@@ -130,7 +131,8 @@ class CardAnswerDoesNotCloseTests(Base):
                 self.still_open(jp)
 
     def test_repeated_apply_does_not_run_the_answer_again(self):
-        """applied_open — применённый ответ: повтор «Применить» его второй раз не прогоняет, карточка не падает."""
+        """applied_open: повтор «Применить» ответ второй раз не прогоняет. После 13б карточка уже заменена
+        новой редакцией, прежний ответ — в её истории и исхода больше не получает."""
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
@@ -138,30 +140,32 @@ class CardAnswerDoesNotCloseTests(Base):
                 before = transcript.load(jp)
                 again = core.apply_answers_files(jp, md)
                 self.assertEqual(transcript.load(jp), before)
-                self.assertEqual(self.outcomes(again)["r3"]["outcome"], "applied_open")
+                self.assertNotIn("r3", self.outcomes(again))
                 place = self.still_open(jp)
                 self.assertEqual(place["status"], "open")
                 self.assertNotIn("ответ не применён", place.get("note") or "")
-                self.assertIn("r3", review_pack._applied_map(review_pack.answers_state(jp)))
+                self.assertNotIn("r3", review_pack._applied_map(review_pack.answers_state(jp)))
 
     def test_applied_open_place_stays_among_open_places(self):
         """Место с applied_open не прячется: оно среди нерешённых и помечено в тексте; причина — прослушать."""
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
-                row = self.outcomes(self.apply(jp, md))["r3"]
+                row = self.outcomes(core.apply_answers_files(jp, md))["r3"]
                 data = transcript.load(jp)
                 self.assertIn("r3", [i["id"] for i in transcript.unresolved(data)])
                 self.assertFalse(data["review_done"])
                 self.assertIn("r3", {rid for marks in transcript.doubt_marks(data).values() for rid in marks.values()})
                 self.assertIn("прослушайте интервал", row["why"])
-                self.assertEqual(review_pack.answer_states(jp)["r3"]["state"], "applied_open")
+                self.assertEqual(row["outcome"], "applied_open")
+                # 13б: страница показывает новую редакцию карточки без ответа, а не прежний ответ
+                self.assertNotIn("r3", review_pack.answer_states(jp))
 
     def test_failed_pass_is_not_closed_by_an_answer(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальнейшем идём")
-                rep = self.apply(jp, md)
+                rep = core.apply_answers_files(jp, md)
                 self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
                 self.still_open(jp)
 
@@ -216,7 +220,7 @@ class LaterChangeTests(Base):
                 transcript.save(data, jp, md)
                 self.assertIn(REMINDER, self.still_open(jp).get("note", ""))
                 # Т7: простое повторное применение место не закрывает, исход честный
-                rep = self.apply(jp, md)
+                rep = core.apply_answers_files(jp, md)
                 self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
                 self.still_open(jp)
                 self.check_outcome_matches_place(jp, rep)
@@ -247,6 +251,92 @@ class LaterChangeTests(Base):
                 self.still_open(jp)
 
 
+class NewRevisionAfterOpenTests(Base):
+    """PR 13б: ответ применён, место осталось открытым (applied_open) — карточка сразу получает новую редакцию
+    (rev + 1, механизм 13а) с вопросом «Ответ применён, место осталось открытым…». «Я прослушал…» на новой
+    редакции применяется, а не ждёт отмены прежнего ответа (pending_new)."""
+
+    LISTENED = "Я прослушал: слова в стенограмме верны"
+
+    def card(self, jp, rid="r3"):
+        return next(i for i in review_pack.manifest(jp)["items"] if i["id"] == rid)
+
+    def press_rev(self, jp, version, label, rid="r3"):
+        item = self.card(jp, rid)
+        option = [o["label"] for o in item["options"]].index(label)
+        return self.save(jp, version, rid, rev=item["rev"], option=option)
+
+    def test_open_answer_gets_a_new_revision_and_listening_closes_it(self):
+        """Т25: applied_open → rev 2 с новым вопросом; прежний ответ в истории; «Я прослушал» на rev 2 закрывает."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
+                self.assertEqual(rep.get("replaced_cards"), ["r3"])
+                card = self.card(jp)
+                self.assertEqual(card["rev"], 2)
+                self.assertTrue(card["question"].startswith(review_pack.OPEN_AFTER_ANSWER), card["question"])
+                self.assertEqual([row["answer"].get("text") for row in card.get("history") or []], ["дальше пойдём"])
+                self.assertEqual(review_pack.manifest(jp)["version"], version)
+                self.press_rev(jp, version, self.LISTENED)
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertNotIn("r3", rep.get("pending_new") or [])
+                place = self.place_of(jp, "r3")
+                self.assertEqual(place["status"], "resolved", place)
+                self.assertEqual((place.get("listening") or {}).get("by"), "human", place)
+                self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "пойдём", "та"])
+                self.assertEqual(self.card(jp)["rev"], 2)
+
+    def test_closed_answer_keeps_its_revision(self):
+        """Т26: обычный applied новой редакции не создаёт; повтор «Применить» после rev 2 ничего не пишет."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальнейшем идём")
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertFalse(rep.get("replaced_cards"))
+                self.assertEqual(self.card(jp)["rev"], 1)
+            with self.subTest(backend=backend, how="repeat"), \
+                    files(backend, result(state="empty_unknown")) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                core.apply_answers_files(jp, md)
+                pack_rev = review_pack.manifest(jp).get("pack_rev")
+                rep = core.apply_answers_files(jp, md)
+                self.assertFalse(rep.get("replaced_cards"))
+                self.assertEqual((self.card(jp)["rev"], review_pack.manifest(jp).get("pack_rev")), (2, pack_rev))
+
+    def test_failed_replacement_heals_on_the_next_apply(self):
+        """Сбой между фиксацией ответа и заменой карточки: ответ применён, карточка прежняя, отчёт называет
+        сбой; следующее «Применить» карточку заменяет."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                with mock.patch.object(review_pack, "upsert_cards", side_effect=OSError("диск занят")):
+                    rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
+                self.assertEqual([row["id"] for row in rep.get("cards_not_replaced") or []], ["r3"])
+                self.assertEqual(self.card(jp)["rev"], 1)
+                self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "пойдём", "та"])
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(rep.get("replaced_cards"), ["r3"])
+                self.assertEqual(self.card(jp)["rev"], 2)
+
+    def test_new_text_on_the_new_revision_is_not_a_two_human_edit_conflict(self):
+        """Т27: свой текст на rev 2 по словам, изменённым ответом rev 1 той же карточки, применяется:
+        прежняя правка — той же карточки, правило двух человеческих правок не срабатывает."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                core.apply_answers_files(jp, md)
+                self.save(jp, version, "r3", rev=2, text="дальше пришли")
+                rep = core.apply_answers_files(jp, md)
+                self.assertNotIn(self.outcomes(rep)["r3"]["outcome"], ("apply_conflict", "pending_new"),
+                                 rep.get("outcomes"))
+                self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "пришли", "та"])
+
+
 class DoubtsSectionTests(Base):
     """Т8: «Сомнения» — текущее слово, русский статус, округлённое время; пропуск — только у пропуска."""
 
@@ -256,7 +346,7 @@ class DoubtsSectionTests(Base):
     def test_sqlite_doubts(self):
         with files("sqlite", result(state="empty_unknown")) as (jp, md, version):
             self.save(jp, version, "r3", text="дальше пойдём")
-            self.apply(jp, md)
+            core.apply_answers_files(jp, md)
             text = md.read_text(encoding="utf-8")
             doubts = text.split("## Сомнения", 1)[1]
             line = next(x for x in doubts.splitlines() if "r3" in x)
@@ -272,7 +362,7 @@ class DoubtsSectionTests(Base):
     def test_legacy_doubts(self):
         with files("legacy_files", result(state="empty_unknown")) as (jp, md, version):
             self.save(jp, version, "r3", text="дальше пойдём")
-            self.apply(jp, md)
+            core.apply_answers_files(jp, md)
             section = md.read_text(encoding="utf-8").split("## Сомнительные места", 1)[1]
             line = next(x for x in section.splitlines() if "00:00:02" in x and "пойдём" in x)
             self.assertIn("«дальше пойдём»", line)
