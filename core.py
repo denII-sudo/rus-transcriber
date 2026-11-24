@@ -2550,18 +2550,7 @@ def apply_answers_files(jp, md):
                     report = _apply_answers_files_locked(jp, md)
                     candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
                 if candidate == initial:
-                    latest = recordings.document_binding(store, binding["recording_id"])
-                    if recordings.document_sync_state(store, binding["recording_id"],
-                                                      latest["document_revision"]) != "synced":
-                        completed = recordings.materialize_recording(store, binding["recording_id"])
-                        if (binding["recording_id"], latest["document_revision"]) not in completed:
-                            raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
-                    report["document_sync"] = "synced"
-                    try:
-                        report["conspects"] = recordings.refresh_conspects(store, binding["recording_id"], jp)
-                    except Exception as ex:
-                        raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
-                    return report
+                    return _answers_synced(store, binding["recording_id"], jp, report)
                 def verify_guard(transaction_store):
                     import storage
                     head = recordings.recording_head(transaction_store, binding["recording_id"])
@@ -2576,15 +2565,12 @@ def apply_answers_files(jp, md):
                 result = recordings.commit_recording_data(
                     store, binding["recording_id"], candidate, expected,
                     context=context, precommit=verify_guard)
+                if result.get("unchanged"):     # commit ничего не записал: как при candidate == initial
+                    return _answers_synced(store, binding["recording_id"], jp, report)
                 completed = recordings.materialize_recording(store, binding["recording_id"])
                 if (binding["recording_id"], result["document_revision"]) not in completed:
                     raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
-                report["document_sync"] = "synced"
-                try:
-                    report["conspects"] = recordings.refresh_conspects(store, binding["recording_id"], jp)
-                except Exception as ex:
-                    raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
-                return report
+                return _answers_refreshed(store, binding["recording_id"], jp, report)
         finally:
             store.close()
     with conspect.write_lock(jp):
@@ -2593,6 +2579,27 @@ def apply_answers_files(jp, md):
         state = review_pack.answers_state(jp, {"answers": {}})
         guard = _answer_revision_conflicts(transcript.load(jp), manifest, state, None, sqlite=False)
         return _apply_answers_files_locked(jp, md, guard)
+
+
+def _answers_synced(store, recording_id, jp, report):
+    """Записывать нечего: довести текущую ревизию документа, если она ещё не записана на диск."""
+    import recordings
+    latest = recordings.document_binding(store, recording_id)
+    if recordings.document_sync_state(store, recording_id, latest["document_revision"]) != "synced":
+        completed = recordings.materialize_recording(store, recording_id)
+        if (recording_id, latest["document_revision"]) not in completed:
+            raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
+    return _answers_refreshed(store, recording_id, jp, report)
+
+
+def _answers_refreshed(store, recording_id, jp, report):
+    import recordings
+    report["document_sync"] = "synced"
+    try:
+        report["conspects"] = recordings.refresh_conspects(store, recording_id, jp)
+    except Exception as ex:
+        raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
+    return report
 
 
 def _answer_source_snapshot(store, recording_id, manifest):

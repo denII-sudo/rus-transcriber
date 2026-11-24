@@ -153,13 +153,7 @@ class HumanAnswerOverPriorEdit(base.AnswerOutcomeCase):
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, agent) as (jp, md, version):
                 self.save(jp, version, option=0)
-                if backend == "legacy_files":
-                    rep = self.apply(jp, md)
-                else:
-                    # Повтор здесь не проверяется: в sqlite повторное применение после ответа, который убрал
-                    # слово из ссылок карточки, падает и без этой части (прежняя ошибка, отдельная задача).
-                    rep = core.apply_answers_files(jp, md)
-                    self.check_outcomes(jp, rep)
+                rep = self.apply(jp, md)
                 self.assertEqual(self.outcomes(rep)["r1"], "applied")
                 self.assertEqual(self.words(jp), ["другое", "слово"])
 

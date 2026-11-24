@@ -794,7 +794,13 @@ class ChunkWordCountTests(unittest.TestCase):
         import backends
         tmp = Path(tempfile.mkdtemp(prefix="rt-bench-one-", dir=_TMP))
         npy = tmp / "audio.npy"
-        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))      # 20 + 20 + 5 с
+        # bench-2: куски — words.make_chunks, как в расшифровке (у основной 4 куска, у Whisper — 2)
+        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))
+        import types
+
+        def res(*toks):
+            return types.SimpleNamespace(tokens=[" " + t for t in toks], logprobs=None,
+                                         timestamps=[0.5 + 0.3 * i for i in range(len(toks))])
 
         class FakeOnnx:
             name = "cpu"
@@ -802,11 +808,10 @@ class ChunkWordCountTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            def transcribe(self, piece):
-                return "раз"
-
-            def transcribe_many(self, pieces):
-                return ["", ". , —", "раз два три"][:len(pieces)]
+            def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
+                if diagnostics is not None:
+                    diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                return [res(), res(".", ",", "—"), res("раз", "два", "три"), res("раз", "два", "три")][:len(pieces)]
 
         class FakeWhisper:
             name = "whisper-ct2"
@@ -814,7 +819,9 @@ class ChunkWordCountTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            def transcribe_texts(self, pieces):
+            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                if diagnostics is not None:
+                    diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
                 return ["Продолжение следует...", " ".join(f"слово{i}" for i in range(40))][:len(pieces)]
 
         out = io.StringIO()
@@ -825,13 +832,15 @@ class ChunkWordCountTests(unittest.TestCase):
             bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
                           "v3_e2e_rnnt", 20.0)
             # max_repeat родителя (asr_third_max_repeat) доходит до подсчёта слов кусков
-            FakeWhisper.transcribe_texts = lambda self, pieces: ["да " * 6, "слово"][:len(pieces)]
+            FakeWhisper.transcribe_texts = lambda self, pieces, progress=None, diagnostics=None: (
+                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                if diagnostics is not None else None) or ["да " * 6, "слово"][:len(pieces)]
             bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
                           "v3_e2e_rnnt", 20.0, 2)
         got = [json.loads(line[len("@@RESULT@@"):]) for line in out.getvalue().splitlines()
                if line.startswith("@@RESULT@@")]
         self.assertEqual([(r["chunks"], r["chunk_words"], r["empty_chunks"]) for r in got],
-                         [(3, [0, 0, 3], 2), (2, [0, 40], 1), (2, [2, 1], 0)])
+                         [(4, [0, 0, 3, 3], 2), (2, [0, 40], 1), (2, [2, 1], 0)])
 
 
 class ConditionsReportTests(unittest.TestCase):
@@ -955,6 +964,65 @@ class RunFileFromMainTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--max-repeat") + 1], "1")
         rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
         self.assertEqual(rec["params"]["third_max_repeat"], 1)
+
+    def test_speed_is_to_audio_length_and_words_stay_out_of_run_file(self):
+        # РАР-4.2, шаг 4: куски с нахлёстом длиннее звука, но скорость — к длине отрывка, как в расшифровке;
+        # слова со временами нужны только голосованию отчёта и в файл прогона не попадают
+        words = [{"w": "раз", "s": 0.1, "e": 0.4, "c": 0.9}, {"w": "два", "s": 1.0, "e": 1.3, "c": 0.9}]
+        diag = [{"index": 0, "state": "ok", "attempts": [], "audio_span": [0.0, 3.0], "own_span": [0.0, 2.75]},
+                {"index": 1, "state": "ok", "attempts": [], "audio_span": [2.5, 5.0], "own_span": [2.75, 5.0]}]
+        for vid in ("onnx-cpu", "ctc-cpu"):
+            self.overrides[vid] = {"hyp_words": words, "diagnostics": diag, "text": "раз два", "chunks": 2}
+        st, _ = self.run_main("20260101-000300-b00004")
+        raw = Path(st["run_file"]).read_text(encoding="utf-8")
+        rec = json.loads(raw)
+        by_id = {r["id"]: r for r in rec["results"]}
+        self.assertEqual(by_id["onnx-cpu"]["rtfx"], 2.5)        # 5 с звука / 2 с работы, не 5,5 с кусков
+        self.assertEqual(by_id["ctc-cpu"]["rtfx"], 5.0)
+        for r in by_id.values():
+            self.assertNotIn("hyp_words", r)
+            self.assertNotIn("diagnostics", r)
+        self.assertNotIn("\"раз\"", raw)
+
+    def test_vote_in_report_uses_timed_words_and_roles_of_chunk_diagnostics(self):
+        # РАР-4.2, шаг 4, сквозной: основная, вторая и третья модели отдают слова со временами и сведения
+        # о кусках, у второй кусок 0 сбойный; голосование в отчёте — как words.combine_hypotheses с ролями
+        # primary/second/whisper, а эталон PyTorch (только текст) голосование не подменяет
+        import copy
+        import words as W
+
+        def wd(w, s):
+            return {"w": w, "s": float(s), "e": float(s) + 0.3, "c": 0.9}
+
+        def diag(*states):
+            spans = [[0.0, 2.75], [2.75, 5.0]]
+            return [{"index": i, "state": st, "attempts": [], "audio_span": spans[i], "own_span": spans[i]}
+                    for i, st in enumerate(states)]
+        main = [wd("раз", 0.1), wd("два", 1.0), wd("три", 3.0), wd("четыре", 4.0)]
+        ctc = [wd("раз", 0.1), wd("два", 1.0), wd("пять", 3.0), wd("четыре", 4.0)]     # кусок 0 — сбой
+        third = ["раз", "два", "пять", "четыре"]
+        d_main, d_ctc = diag("ok", "ok"), diag("error", "ok")
+        d_third = [{"index": 0, "state": "ok", "attempts": [], "audio_span": [0.0, 3.5], "own_span": [0.0, 3.5]},
+                   {"index": 1, "state": "error", "attempts": [], "audio_span": [3.5, 5.0],
+                    "own_span": [3.5, 5.0]}]                              # у третьей сбой в конце: свой отрезок
+        self.overrides["onnx-cpu"] = {"hyp_words": main, "diagnostics": d_main, "text": "раз два три четыре"}
+        self.overrides["ctc-cpu"] = {"hyp_words": ctc, "diagnostics": d_ctc, "text": "раз два пять четыре"}
+        self.overrides["ml-cpu"] = {"hyp_words": third, "diagnostics": d_third, "text": " ".join(third)}
+        self.overrides["torch-cpu"] = {"text": "раз два три четыре"}           # слов со временами нет
+        expected = W.combine_hypotheses({"primary": copy.deepcopy(main), "second": copy.deepcopy(ctc),
+                                         "whisper": list(third)},
+                                        {"primary": {"chunks": copy.deepcopy(d_main)},
+                                         "second": {"chunks": copy.deepcopy(d_ctc)},
+                                         "whisper": {"chunks": copy.deepcopy(d_third)}})["quality"]
+        st, _ = self.run_main("20260101-000400-b00005", only="onnx-cpu,ctc-cpu,ml-cpu,torch-cpu")
+        rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
+        vote = {r["id"]: r for r in rec["results"]}["ml-cpu"]["vote"]
+        ev = expected["vote"]
+        self.assertEqual((vote["for_ctc"], vote["unresolved"], vote["inserted"]),
+                         (ev["replaced"], ev["disputed"], ev["inserted"]))
+        self.assertEqual(vote["skipped_spans"], 2)              # путь по словам (не текстовый); отрезки второй и третьей
+        self.assertEqual(vote["skipped_spans"], expected["vote3_partial"]["spans"])
+        self.assertNotIn("vote", {r["id"]: r for r in rec["results"]}["torch-cpu"])
 
     def test_every_run_leaves_its_own_file(self):
         import runinfo
