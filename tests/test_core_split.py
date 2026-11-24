@@ -1,4 +1,4 @@
-"""Разрезка `core.py` на модули: имена, порядок загрузки, свободные имена (первый перенос — раздел «голоса»).
+"""Разрезка `core.py` на модули: имена, порядок загрузки, свободные имена (перенос 1 — «голоса», перенос 2 — «экран»).
 
 `core.py` остаётся прослойкой: все прежние имена `core.X` работают, но каждое определено в одном месте — в новом
 модуле (`core_voices.X.__module__ == "core_voices"`, `core.X is core_voices.X`). Всё, что новый модуль берёт из
@@ -25,6 +25,11 @@ SPLIT = {
         "backup_voice_profile", "backup_voice_profiles", "preview_voice_learning", "prepare_voice_action",
         "revoke_voice_source", "set_voice_auto_learn", "set_voice_quality_policy", "start_voice_update",
         "voice_action_lines", "voice_profiles", "voice_quality", "voice_refresh_plan",
+    ),
+    "core_screen": (
+        "_conspect_screen_sections", "prepare_restore_snapshot", "quote_repair_state", "quote_repair_view",
+        "read_recording_revision", "recording_conspects", "recording_revisions", "restore_recording_revision",
+        "workflow_list", "workflow_repair_quotes", "workflow_repair_quotes_info", "workflow_repair_quotes_prepare",
     ),
 }
 
