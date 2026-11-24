@@ -180,6 +180,22 @@ class ProposalInsteadOfRefusalTests(Base):
                                  (["contradiction"], ["w1"], "open"))
                 self.assertEqual(self.card(jp, "r5")["rev"], 1)
 
+    def test_human_span_over_own_span_edit(self):
+        """В-1, владелец: «Карточка противоречия (Recommended)». Человек правит отрезок поверх своей прежней
+        правки отрезка (карточки не было): не прежний отказ, а противоречие на новом месте."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                transcript.edit_span(jp, md, 0.5, 0.5, "начала", by="human")
+                rep = core.edit_span_files(jp, md, 0.45, 0.6, "начали", by="human")
+                self.not_written(rep, "r5")
+                self.assertEqual(self.word(jp, "w1")["w"], "начала")
+                c = self.contradiction(jp, "r5")
+                self.assertEqual((c["confirmed"]["via"], c["confirmed"]["card"]), ("edit_span", "span@0.50"))
+                self.assertEqual([(p["by"], p["via"]) for p in c["proposals"]], [("human", "edit_span")])
+                self.choose(jp, version, "r5", ACCEPT)
+                core.apply_answers_files(jp, md)
+                self.assertEqual(self.word(jp, "w1")["w"], "начали")
+
     def test_without_pack_the_card_waits_for_the_build(self):
         """Тест 20: пакета нет — место создаётся (card: pending); сборка сама добавляет его карточку."""
         for backend in BACKENDS:
