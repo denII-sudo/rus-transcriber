@@ -3,8 +3,8 @@
 Запрет по каждой цитате, а не на всю запись: чистая цитата — в «», задевшая неразобранное место
 печатается без кавычек с пометкой, после разбора кавычки возвращаются при пересборке. Правило «может ли
 место держать цитату» — одна функция `workflow.place_holds_quote`; поле `word["seen"]` (PR 3в линии 1)
-она не читает. Названное исключение `PAUSE_UNTIL_6A`: открытое место-пауза задевает все цитаты записи
-до PR 6а.
+она не читает. Открытое место-пауза (слов внутри нет) задевает цитату, только если её слово — сосед паузы
+(последнее слово до неё или первое после, `transcript.place_words(..., pause_neighbors=True)`, PR 6а; этап 7.5б).
 """
 import copy
 import json
@@ -110,12 +110,58 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(workflow.quote_blockers(data, ["w2"]), [{"id": "r2", "reason": "unlocated"}])
         self.assertEqual(workflow.quote_blockers(data, ["w7"]), [])
 
-    def test_pause_until_6a_blocks_every_quote_as_strictly_as_before(self):
-        # PAUSE_UNTIL_6A: до PR 6а открытое место-пауза (слов внутри нет) задевает все цитаты записи
-        self.assertTrue(workflow.PAUSE_UNTIL_6A)
+    def test_the_old_exception_is_gone(self):
+        self.assertFalse(hasattr(workflow, "PAUSE_UNTIL_6A"))
+
+    def test_a_pause_between_the_words_of_a_quote_blocks_it(self):
+        # случай 12: открытая пауза между w5 и w6; цитата из слов по обе стороны паузы
         data = make_data([OPEN_PAUSE])
-        for ids in (["w1", "w2"], ["w7", "w8"]):
-            self.assertEqual(workflow.quote_blockers(data, ids), [{"id": "r3", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w5", "w6"]), [{"id": "r3", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w4", "w5", "w6", "w7"]), [{"id": "r3", "reason": "open"}])
+
+    def test_a_pause_next_to_the_edge_of_a_quote_blocks_it(self):
+        data = make_data([OPEN_PAUSE])
+        self.assertEqual(workflow.quote_blockers(data, ["w3", "w4", "w5"]), [{"id": "r3", "reason": "open"}])  # w5 — сосед
+        self.assertEqual(workflow.quote_blockers(data, ["w6", "w7"]), [{"id": "r3", "reason": "open"}])        # w6 — сосед
+
+    def test_a_pause_aside_does_not_touch_a_quote(self):
+        data = make_data([OPEN_PAUSE])
+        for ids in (["w1", "w2"], ["w2", "w3", "w4"], ["w7", "w8"], ["w7", "w8", "w9"]):
+            self.assertEqual(workflow.quote_blockers(data, ids), [], ids)
+
+    def test_a_missed_gap_pause_works_the_same_way(self):
+        gap = dict(OPEN_PAUSE, reasons=["missed"])
+        data = make_data([gap])
+        self.assertEqual(workflow.quote_blockers(data, ["w5"]), [{"id": "r3", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w6", "w7"]), [{"id": "r3", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w2", "w3"]), [])
+        self.assertEqual(workflow.quote_blockers(data, ["w8", "w9"]), [])
+
+    def test_a_pause_at_the_start_or_the_end_of_the_record_has_one_neighbour(self):
+        before_all = {"id": "r8", "status": "open", "t1": -3.0, "t2": -2.0}
+        after_all = {"id": "r9", "status": "open", "t1": 20.0, "t2": 21.0}
+        data = make_data([before_all, after_all])
+        self.assertEqual(workflow.quote_blockers(data, ["w1", "w2"]), [{"id": "r8", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w8", "w9"]), [{"id": "r9", "reason": "open"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w3", "w4"]), [])
+
+    def test_a_resolved_pause_does_not_block_a_neighbour_quote(self):
+        data = make_data([dict(OPEN_PAUSE, status="resolved")])
+        self.assertEqual(workflow.quote_blockers(data, ["w5", "w6"]), [])
+
+    def test_a_pause_blocker_follows_the_place_words_function(self):
+        data = make_data([OPEN_PAUSE])
+        with mock.patch.object(T, "place_words", return_value=(["w2"], True)) as called:
+            self.assertEqual(workflow.quote_blockers(data, ["w2"]), [{"id": "r3", "reason": "open"}])
+            self.assertEqual(workflow.quote_blockers(data, ["w5"]), [])
+        self.assertEqual(called.call_args.kwargs, {"pause_neighbors": True})
+
+    def test_a_place_that_cannot_be_tied_to_words_still_blocks_every_quote(self):
+        def nothing(data, item, *, pause_neighbors=False):
+            return None
+        data = make_data([OPEN_PAUSE])
+        with mock.patch.object(T, "place_words", nothing):
+            self.assertEqual(workflow.quote_blockers(data, ["w1"]), [{"id": "r3", "reason": "unlocated"}])
 
     def test_seen_field_is_not_read(self):
         # PR 3в линии 1: «человек видел неизменённое слово». Это не подтверждение: слово только с seen
@@ -214,6 +260,16 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Итог: Участник 1: решили перенести (по распознаванию, не проверено, 00:00:01) и "
                       "Участник 2: «согласен».", md)
         self.assertIn("Цитат: 1 в кавычках, 1 без проверки", md)
+
+    def test_a_pause_marks_only_the_quotes_next_to_it(self):
+        data = make_data([OPEN_PAUSE])           # пауза между w5 и w6: соседи — w5 и w6
+        md, _ = self.render(data, "Итог: «решили перенести», «перенести срок релиза», «согласен» и «срок релиза точно».")
+        body = md.split("Итог:")[1]
+        self.assertIn("«решили перенести»", body)             # w2 w3 — в стороне
+        self.assertIn("«срок релиза точно»", body)            # w7 w8 w9 — в стороне
+        self.assertNotIn("«перенести срок релиза»", body)     # w3 w4 w5: w5 — сосед
+        self.assertNotIn("«согласен»", body)                  # w6 — сосед
+        self.assertIn("Цитат: 2 в кавычках, 2 без проверки", md)
 
     def test_unlocated_place_marks_every_quote(self):
         md, _ = self.render(make_data([OPEN_NOWHERE]), "Итог: «решили перенести» и «согласен».")
