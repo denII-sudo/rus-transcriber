@@ -109,17 +109,20 @@ audio{width:100%;height:36px}
   const pageSession = typeof window !== "undefined" && window.crypto && window.crypto.randomUUID ?
     window.crypto.randomUUID() :
     `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const visibleThisSession = new Set();
+  // Номер редакции карточки: замена карточки в том же пакете растит его; ответ и событие несут номер своей редакции.
+  const revOf = (it) => (it && it.rev) || 1;
+  const STALE = "вопрос обновлён";
+  const visibleThisSession = new Set();          // «id#редакция»: заменённая карточка показывается заново
   const sendInteraction = (it, type) => {
-    if (api && api.event) api.event({id: it.id, version: man.version, type, session: pageSession}).catch(() => {});
+    if (api && api.event) api.event({id: it.id, version: man.version, rev: revOf(it), type, session: pageSession}).catch(() => {});
   };
   const cardObserver = typeof window !== "undefined" && "IntersectionObserver" in window ?
     new window.IntersectionObserver(entries => {
     entries.forEach(entry => {
       if (!entry.isIntersecting || entry.intersectionRatio < 0.5) return;
-      const id = entry.target.dataset.id;
-      if (visibleThisSession.has(id)) return;
-      visibleThisSession.add(id);
+      const id = entry.target.dataset.id, key = `${id}#${entry.target.dataset.rev}`;
+      if (visibleThisSession.has(key)) return;
+      visibleThisSession.add(key);
       const it = man.items.find(item => item.id === id);
       if (it) sendInteraction(it, "card_visible");
       cardObserver.unobserve(entry.target);
@@ -218,8 +221,9 @@ audio{width:100%;height:36px}
   }
   // ответы этой версии вопросов из базы страницы: {id: ответ}, при повторах — более поздний
   function pick(list) {
-    const o = {};
-    list.filter(a => a && a.id && a.version === man.version)
+    const o = {}, items = new Map((man.items || []).map(it => [it.id, it]));
+    // ответ прежней редакции заменённой карточки к новому вопросу не относится (он в истории карточки)
+    list.filter(a => a && a.id && a.version === man.version && (!items.has(a.id) || (a.rev || 1) === revOf(items.get(a.id))))
         .forEach(a => { if (!o[a.id] || (a.ts || "") > (o[a.id].ts || "")) o[a.id] = a; });
     return o;
   }
@@ -235,7 +239,10 @@ audio{width:100%;height:36px}
   function localApi() {
     return {
       voiceMode: "record",
-      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json(); man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
+      async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json();
+        // карточки заменены или дописаны (pack_rev) или пакет пересобран (version): перечитать manifest.json
+        if (s.pack_version !== undefined && (s.pack_version !== man.version || (s.pack_rev || 0) !== (man.pack_rev || 0))) await reloadManifest();
+        man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
@@ -246,8 +253,8 @@ audio{width:100%;height:36px}
         if (!r.ok) throw new Error(r.status);
         return r.json();
       },
-      async voice(id, blob) {
-        const r = await fetch(`api/voice?id=${encodeURIComponent(id)}&version=${encodeURIComponent(man.version)}`,
+      async voice(it, blob) {
+        const r = await fetch(`api/voice?id=${encodeURIComponent(it.id)}&version=${encodeURIComponent(man.version)}&rev=${revOf(it)}`,
           {method: "POST", headers: {"Content-Type": blob.type || "audio/webm"}, body: blob});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
         return j;
@@ -257,8 +264,8 @@ audio{width:100%;height:36px}
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
         answers = await this.load(); return j;
       },
-      async preview(id, text) {
-        const r = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id, text, version: man.version})});
+      async preview(it, text) {
+        const r = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: it.id, rev: revOf(it), text, version: man.version})});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j;
       },
       subscribe() {}
@@ -277,12 +284,12 @@ audio{width:100%;height:36px}
         live[a.id] = doc; answers = merge(); render();
         await col.doc(`${man.version}--${a.id}`).set(doc); return {};
       },
-      async voice(id, file) {
+      async voice(it, file) {
         const t = (file.type || "").toLowerCase();
         const type = t.includes("webm") ? "video/webm" : (t.includes("mp4") || t.includes("m4a") || t.includes("aac")) ? "video/mp4" : null;
         if (!type) throw new Error("Нужна запись m4a/mp4 или webm (диктофон телефона подходит).");
         const up = await assets.upload(file, {type});
-        return this.answer({id, version: man.version, kind: "voice", audio_id: up.id});
+        return this.answer({id: it.id, version: man.version, rev: revOf(it), kind: "voice", audio_id: up.id});
       },
       subscribe() {
         let timer = setTimeout(() => note("Ответы из базы пока не получены — показываю без них.", "warn"), 10000);
@@ -363,31 +370,68 @@ audio{width:100%;height:36px}
     stateEl.textContent = "Сохраняю…";
     editing.delete(it.id);
     try {
-      const r = await api.answer({id: it.id, version: man.version, ...a});
+      const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
       render();
-      if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
+      if (rejected && r.rejected[0].why === STALE) flash(it.id, STALE_TEXT);
+      else if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
       else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
       else if (a.kind === "keep") flash(it.id, "Отмена снята: применённый ответ остаётся");
       else if (a.kind === "revert") flash(it.id, "Отмена подготовлена: нажмите «Применить сохранённые ответы»");
       else flash(it.id, acc && acc.answer ? "Сохранено (ещё не применено): " + acc.answer : "Ответ записан");
     } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
   }
+  const STALE_TEXT = "Не принято: вопрос обновлён — карточка показана заново, ваш текст остался в поле";
+  // Отказ «вопрос обновлён» на голос или предпросмотр: забрать новую редакцию и показать её.
+  async function staleShown(e, it) {
+    if (!e || e.message !== STALE) return false;
+    try { answers = await api.load(); render(); } catch (_) { /* покажем то, что есть */ }
+    flash(it.id, STALE_TEXT);
+    return true;
+  }
   function flash(id, text) { const el = document.querySelector(`[data-id="${id}"] .state`); if (el) el.textContent = text; }
 
+  // Прежние редакции заменённой карточки и ответы на них: на новый вопрос ответ не переносится.
+  function historyNote(it) {
+    const box = document.createElement("div"); box.className = "note"; box.style.whiteSpace = "pre-line";
+    box.textContent = it.history.map(h => {
+      const a = h.answer, opts = h.options || [];
+      let what = "ответа не было";
+      if (a) what = (a.option != null && opts[a.option] ? `ответ: ${a.option + 1} — ${opts[a.option].label}` :
+        a.text ? `ответ: «${a.text}»` : "ответ: " + ({human: "оставлено человеку", skip: "пропущено"}[kindOf(a)] || kindOf(a))) +
+        (h.applied ? " (был применён к стенограмме)" : "");
+      return `Прежний вопрос (редакция ${h.rev}${h.why ? ", " + h.why : ""}): «${h.question || ""}» — ${what}.`;
+    }).join("\n");
+    return box;
+  }
+  // Готовая карточка перерисовывается, только если изменилось то, что на ней показано: так сохраняются набранный
+  // текст, идущая запись голоса и сообщения у остальных карточек.
+  const cardCache = new Map();
+  const cardSig = (it) => JSON.stringify([man.version, revOf(it), answers[it.id] || null, (man.answer_states || {})[it.id] || null,
+    editing.has(it.id), (man.conflicts || []).some(c => c.id === it.id), !!man.clips_removed, api && api.voiceMode]);
+  function cardFor(it) {
+    const sig = cardSig(it), hit = cardCache.get(it.id);
+    if (hit && hit.sig === sig) return hit.el;
+    const el = card(it);
+    const was = hit && hit.el.querySelector(".free input"), now = el.querySelector(".free input");
+    if (was && now && was.value && !now.value) now.value = was.value;     // набранный текст переходит в новую редакцию
+    cardCache.set(it.id, {sig, el});
+    return el;
+  }
   function card(it) {
     const a = answers[it.id];
     const c = document.createElement("article");
-    c.className = "card"; c.dataset.id = it.id; c.dataset.done = a ? "1" : "0"; c.dataset.applied = appliedCard(it, a) ? "1" : "0";
+    c.className = "card"; c.dataset.id = it.id; c.dataset.rev = String(revOf(it)); c.dataset.done = a ? "1" : "0"; c.dataset.applied = appliedCard(it, a) ? "1" : "0";
     const head = document.createElement("div"); head.className = "head";
     head.innerHTML = `<span class="tc"></span><span class="who"></span><span class="reasons"></span>`;
     head.querySelector(".tc").textContent = it.t;
     head.querySelector(".who").textContent = it.speaker || "";
     (it.reasons || []).forEach(r => { const s = document.createElement("span"); s.className = "chip"; s.textContent = REASONS[r] || r; head.querySelector(".reasons").append(s); });
+    if (revOf(it) > 1) { const s = document.createElement("span"); s.className = "chip"; s.textContent = "вопрос обновлён"; head.querySelector(".reasons").append(s); }
     c.append(head);
 
-    if (!man.clips_removed) {
+    if (!man.clips_removed && it.clip) {         // карточка без звука: нет исходной записи или клип не нарезался
       const au = document.createElement("audio"); au.controls = true; au.preload = "none"; au.src = it.clip;
       au.addEventListener("play", () => sendInteraction(it, "audio_play"));
       au.addEventListener("ended", () => sendInteraction(it, "audio_ended"));
@@ -401,6 +445,7 @@ audio{width:100%;height:36px}
     c.append(ctx);
 
     const q = document.createElement("p"); q.className = "q"; q.textContent = it.question; c.append(q);
+    if ((it.history || []).length) c.append(historyNote(it));
     if (it.automation_diagnostic) {
       const d = it.automation_diagnostic, candidate = d.candidate || {}, interval = d.speech_interval || {};
       const seconds = value => Number(value).toLocaleString("ru-RU", {maximumFractionDigits: 3});
@@ -455,7 +500,7 @@ audio{width:100%;height:36px}
             stream.getTracks().forEach(t => t.stop()); b.classList.remove("rec-on"); b.textContent = "Ответить голосом";
             const blob = new Blob(chunks, {type: rec.mimeType || "audio/webm"}); rec = null;
             state.textContent = "Распознаю ответ…";
-            try { const r = await api.voice(it.id, blob);
+            try { const r = await api.voice(it, blob);
                   const proposed = r.match || {}; const selected = proposed.option != null && it.options[proposed.option];
                   state.replaceChildren(document.createTextNode(`Услышано: «${r.heard || ""}». Предполагаемый ответ: ${selected ? selected.label : proposed.kind || "не распознан"}. `));
                   const edit = document.createElement("input"); edit.value = r.heard || ""; edit.setAttribute("aria-label", "Исправить распознанный текст");
@@ -464,7 +509,7 @@ audio{width:100%;height:36px}
                   const repeat = document.createElement("button"); repeat.type = "button"; repeat.textContent = "Повторить";
                   repeat.onclick = () => { state.textContent = "Запишите ответ заново."; };
                   state.append(edit, confirm, repeat); }
-            catch (e) { state.textContent = "Не получилось: " + e.message; }
+            catch (e) { if (!(await staleShown(e, it))) state.textContent = "Не получилось: " + e.message; }
           };
           rec.start(); b.classList.add("rec-on"); b.textContent = "Стоп";
         } catch (e) { state.textContent = "Микрофон недоступен: " + e.message; }
@@ -474,7 +519,7 @@ audio{width:100%;height:36px}
       const lab = document.createElement("label"); lab.className = "btn"; lab.htmlFor = id; lab.textContent = "Голосовой ответ (запись)";
       const inp = document.createElement("input"); inp.type = "file"; inp.accept = "audio/*"; inp.capture = "user"; inp.id = id; inp.hidden = true;
       inp.onchange = async () => { const f = inp.files[0]; if (!f) return; state.textContent = "Загружаю запись…";
-        try { await api.voice(it.id, f); render(); } catch (e) { state.textContent = "Не загрузилось: " + e.message; } };
+        try { await api.voice(it, f); render(); } catch (e) { state.textContent = "Не загрузилось: " + e.message; } };
       row.append(lab, inp);
     }
     c.append(row);
@@ -489,11 +534,11 @@ audio{width:100%;height:36px}
     if (LOCAL && api.preview) {
       const preview = document.createElement("button"); preview.type = "button"; preview.className = "btn"; preview.textContent = "Предпросмотр";
       preview.onclick = async () => { if (!inp.value.trim()) return; state.textContent = "Проверяю без записи…";
-        try { const r = await api.preview(it.id, inp.value.trim()); const one = (r.cards || [])[0];
+        try { const r = await api.preview(it, inp.value.trim()); const one = (r.cards || [])[0];
           if ((r.preflight_conflicts || []).length) { state.textContent = "Предпросмотр не применим: конфликт с другой сохранённой карточкой. Требуется проверка человеком."; return; }
           state.textContent = "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
             ((r.left_to_human || []).length ? "; требуется проверка человеком" : "") + ((r.not_found || []).length ? "; место не найдено" : "") + ". Результат может измениться при последующих правках.";
-        } catch (e) { state.textContent = "Предпросмотр недоступен: " + e.message; } };
+        } catch (e) { if (!(await staleShown(e, it))) state.textContent = "Предпросмотр недоступен: " + e.message; } };
       free.append(preview);
     }
     free.onsubmit = (e) => { e.preventDefault(); if (inp.value.trim()) send(it, {text: inp.value.trim()}, state); };
@@ -509,18 +554,31 @@ audio{width:100%;height:36px}
     $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
     const show = man.items.filter(it => showAll || !answers[it.id]);
     const active = document.activeElement && document.activeElement.id;
-    list.replaceChildren(...(show.length ? show.map(card) : [Object.assign(document.createElement("div"),
+    list.replaceChildren(...(show.length ? show.map(cardFor) : [Object.assign(document.createElement("div"),
       {className: "empty", textContent: LOCAL ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки." : "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
     if (cardObserver) list.querySelectorAll(".card").forEach(c => cardObserver.observe(c));
     else list.querySelectorAll(".card").forEach(c => {
-      const id = c.dataset.id;
-      if (!visibleThisSession.has(id)) {
-        visibleThisSession.add(id);
+      const id = c.dataset.id, key = `${id}#${c.dataset.rev}`;
+      if (!visibleThisSession.has(key)) {
+        visibleThisSession.add(key);
         const it = man.items.find(item => item.id === id);
         if (it) sendInteraction(it, "card_rendered");
       }
     });
     if (active && $(active)) $(active).focus();
+  }
+
+  function header() {
+    $("title").textContent = "Разбор: " + (man.audio || "").replace(/\.[^.]+$/, "");
+    $("sub").textContent = `${man.items.length} мест · версия ${man.version}` + (man.pack_rev ? ` · карточки обновлялись: ${man.pack_rev}` : "") +
+      (LOCAL ? " · на этом компьютере" : " · облако");
+  }
+  // Карточки заменены или дописаны в том же пакете (или пакет пересобран): новый manifest; render перерисует
+  // только изменённые и новые карточки.
+  async function reloadManifest() {
+    const r = await fetch("manifest.json", {cache: "no-store"});
+    if (!r.ok) throw new Error("manifest.json не найден");
+    man = await r.json(); header();
   }
 
   $("f-open").onclick = () => { showAll = false; $("f-open").setAttribute("aria-pressed", "true"); $("f-all").setAttribute("aria-pressed", "false"); render(); };
@@ -541,8 +599,7 @@ audio{width:100%;height:36px}
       if (!r.ok) throw new Error("manifest.json не найден");
       man = await r.json();
     } catch (e) { $("sub").textContent = "Пакет разбора не найден: " + e.message; return; }
-    $("title").textContent = "Разбор: " + (man.audio || "").replace(/\.[^.]+$/, "");
-    $("sub").textContent = `${man.items.length} мест · версия ${man.version}` + (LOCAL ? " · на этом компьютере" : " · облако");
+    header();
     answers = merge();
     if (man.applied) { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false");
       note(`Ответы применены к стенограмме ${when(man.applied_at)}.` + (man.clips_removed ? " Клипы удалены." : "")
@@ -552,6 +609,10 @@ audio{width:100%;height:36px}
       answers = await api.load();
       $("apply").hidden = !LOCAL;
       api.subscribe();
+      // вернулись на вкладку: карточки могли замениться или дописаться, пока страница была скрыта
+      if (LOCAL) document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") api.load().then(a => { answers = a; render(); }).catch(() => {});
+      });
       if (!LOCAL && !man.applied) note(api.voiceMode ? "Голосовой ответ — файлом с диктофона (m4a или webm). Ответы применяются на ноутбуке." :
                                        "Голосовые ответы здесь недоступны — отвечайте касанием или текстом.");
     } catch (e) {
