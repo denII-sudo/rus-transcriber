@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS_TIMEOUT = 600
+TESTS_TIMEOUT = 720            # 12 мин: предел, о котором пишет шаг 10 install.ps1 (решение владельца 24.11.2026)
 MORPH_SAMPLE = ["Если", "Есть", "Тетрадями", "Quartzline", "Москва"]
 MORPH_EXPECT = ["Quartzline", "Москва"]
 
@@ -84,7 +84,7 @@ def run_tests(timeout=TESTS_TIMEOUT):
             if not res["ran"]:
                 res["output_tail"] = (r.stderr or r.stdout)[-800:]
         except subprocess.TimeoutExpired:
-            res = {"ran": 0, "ok": False, "error": f"тесты не уложились в {timeout} с"}
+            res = {"ran": 0, "ok": False, "error": f"тесты не уложились в {timeout // 60} мин ({timeout} с)"}
         except OSError as ex:
             res = {"ran": 0, "ok": False, "error": f"не удалось запустить тесты: {ex}"}
     res["wall_sec"] = round(time.time() - t0, 1)

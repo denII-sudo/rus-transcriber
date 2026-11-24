@@ -1046,6 +1046,8 @@ if ($SkipSelfCheck) {
     Write-Host "  пропущено (-SkipSelfCheck); запустить позже: & '$py' '$Target\selfcheck.py'"
 } else {
     # selfcheck.py сам изолирует папку данных и TEMP для тестов; настоящие данные не трогаются
+    # «12 мин» — TESTS_TIMEOUT в selfcheck.py (сверяет tests/test_selfcheck.py)
+    Write-Host "  идут тесты: обычно несколько минут, предел — 12 мин. Окно не закрывайте, это не зависание"
     $prevEnc = [Console]::OutputEncoding
     $prevUtf8 = $env:PYTHONUTF8; $prevIo = $env:PYTHONIOENCODING
     try {
@@ -1063,12 +1065,17 @@ if ($SkipSelfCheck) {
     } else {
         $selfCheckOk = [bool]$sc.ok
         $t = $sc.tests
-        $line = "  {0}: тестов {1}, падений {2}, ошибок {3}, пропусков {4}" -f $sc.summary, $t.ran, $t.failures, $t.errors, $t.skipped
-        # Ожидаемые падения (@unittest.expectedFailure) — известные ограничения, не падения; показываются отдельно
-        if ([int]$t.expected_failures -gt 0) { $line += ", ожидаемых падений {0}" -f $t.expected_failures }
-        if ([int]$t.unexpected_successes -gt 0) { $line += ", неожиданных успехов {0} (имена — запуск тестов с -v)" -f $t.unexpected_successes }
-        if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
-        foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
+        if ($t -and $t.error) {
+            # тесты не запустились или не уложились в предел: чисел нет, причина — текстом
+            Write-Host "  самопроверка: $($t.error); запустите вручную: & '$py' '$Target\selfcheck.py'" -ForegroundColor Yellow
+        } else {
+            $line = "  {0}: тестов {1}, падений {2}, ошибок {3}, пропусков {4}" -f $sc.summary, $t.ran, $t.failures, $t.errors, $t.skipped
+            # Ожидаемые падения (@unittest.expectedFailure) — известные ограничения, не падения; показываются отдельно
+            if ([int]$t.expected_failures -gt 0) { $line += ", ожидаемых падений {0}" -f $t.expected_failures }
+            if ([int]$t.unexpected_successes -gt 0) { $line += ", неожиданных успехов {0} (имена — запуск тестов с -v)" -f $t.unexpected_successes }
+            if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
+            foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
+        }
         if ($sc.check_repo -and $sc.check_repo.partial) { Write-Host "  проверка файлов частичная: $($sc.check_repo.note)" -ForegroundColor DarkGray }
     }
 }
