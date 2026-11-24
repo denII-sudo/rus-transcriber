@@ -153,13 +153,11 @@ class BusyFile(OutcomeCase):
 
     def test_busy_neighbour_does_not_break_my_write(self):
         env = self.env
-        other = env.create()
-        env.materialize()
-        env.change(other, "два")
+        other = env.create()        # чужая запись: её первая ревизия ещё не записана, а файл занят
         with busy(self.names(other)):
             completed = env.materialize(recording_id=self.rid)
         self.assertIn((self.rid, 2), completed)
-        self.assertEqual(env.outbox(other, 2), ("pending", "busy"))
+        self.assertEqual(env.outbox(other, 1), ("pending", "busy"))
 
     def test_the_outcome_says_which_file_will_be_updated_later(self):
         env, rid = self.env, self.rid

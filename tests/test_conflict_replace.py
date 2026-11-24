@@ -1058,10 +1058,11 @@ class ConflictReplaceTests(ScreenCase):
         snapshot = self.snapshot(case)
         self.change_text(other, "другая запись")
         with failing_replace(other.files["md"]):
-            self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
-        self.assertEqual(case.path.read_bytes(), case.saved)
-        self.assertIs(self.item(case)["can_retry"], True)
-        self.assertEqual(self.retry(case)["outcome"], "replaced")
+            result = self.replace(snapshot)
+        # PR 5б-2: чужая недописанная запись не останавливает эту (раньше — «не записано», нужен был повтор)
+        self.assertEqual(result["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
+        self.assertEqual(self.item(case)["status"], "resolved")
 
     def test_document_replaced_while_second_file_waits(self):
         case = self.conflict("document", kind="json")
@@ -1471,6 +1472,12 @@ class ConflictMCPCompatibilityTests(ScreenCase):
                 case = self.conflict(scope)
                 with failing_replace(case.path):
                     answer = self.resolve(case)
+                if scope == "document":
+                    # PR 5б-2: занятый файл документа — не исключение: решение записано, исход назван словами
+                    shown = json.loads(answer)
+                    self.assertEqual((shown["materialized"], shown["outcome"]), (False, "later"))
+                    self.assertIn(case.path.name, shown["reason"])
+                    continue
                 self.assertTrue(answer.startswith("Ошибка:"), answer)
                 self.assertIn("synthetic busy file", answer)
 

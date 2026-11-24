@@ -62,6 +62,18 @@ class NotWritten(storage.Conflict):
         self.status = status
 
 
+class NotSynced(storage.StorageError, RuntimeError):
+    """Записано в базу, но файлы записи ещё не обновлены: ревизия есть, файлы допишет повтор.
+
+    status: later — файл занят другой программой или запись до него не дошла; changed — файл изменили во время
+    записи (конфликт зарегистрирован, файл не тронут); error — запись файла не удалась. Сообщение по-русски.
+    RuntimeError — чтобы вызывающие, ловившие прежнюю английскую ошибку, не потеряли её."""
+
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
 def _not_reparse(path):
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
@@ -417,6 +429,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
             (root_id,)).fetchall()
         blocked = set()
         damaged = {}
+        failed = {}       # сбой записи файла: чужой не мешает вызывающему, свой не теряется
         for row in rows:
             rid, rev = row["recording_id"], row["document_revision"]
             if rid in blocked or row["state"] == "conflict":
@@ -482,11 +495,21 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
                     store.db.execute("UPDATE document_outbox SET state='error', error_code='unclassified_conflict' "
                                      "WHERE recording_id=? AND document_revision=? AND state!='synced'", (rid, rev))
                 blocked.add(rid)
-            except Exception:
+            except PermissionError:
+                # файл занят другой программой (в Windows замена файла отказывает): ревизия остаётся недописанной,
+                # следующий вызов запишет её; вызывающему исключение не нужно, исход он узнаёт по очереди
+                with store._transaction():
+                    store.db.execute("UPDATE document_outbox SET state='pending', error_code='busy' "
+                                     "WHERE recording_id=? AND document_revision=? AND state!='synced'", (rid, rev))
+                blocked.add(rid)
+            except Exception as exc:
                 with store._transaction():
                     store.db.execute("UPDATE document_outbox SET state='error', error_code='io_or_interrupted' "
                                      "WHERE recording_id=? AND document_revision=? AND state!='synced'", (rid, rev))
-                raise
+                if recording_id is None:
+                    raise
+                blocked.add(rid)
+                failed.setdefault(rid, exc)
         latest = store.db.execute(
             "SELECT o.recording_id, o.document_revision FROM document_outbox o "
             "WHERE o.root_id=? AND o.state='synced' AND NOT EXISTS "
@@ -515,15 +538,86 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
                                              (str(uuid.uuid4()), rid, rev, kind, "missing_restored", storage._now()))
             except _FileConflict as exc:
                 _record_conflict(store, root_id, rid, rev, exc)
-            except Exception:
+            except Exception as exc:
                 with store._transaction():
                     store.db.execute("UPDATE document_outbox SET state='error', error_code='io_or_interrupted' "
                                      "WHERE recording_id=? AND document_revision=? AND state='synced'", (rid, rev))
-                raise
+                if recording_id is None:
+                    raise
+                failed.setdefault(rid, exc)
     for rid, exc in damaged.items():
         if recording_id in (None, rid):
             raise exc
+    if recording_id in failed:
+        raise failed[recording_id]
     return completed
+
+
+def _names(items):
+    return ", ".join(f"«{name}»" for name in items)
+
+
+def _lagging_files(store, recording_id):
+    """Имена файлов текущей ревизии, которые ещё не равны версии программы. Только чтение."""
+    row, document, paths = _head(store, recording_id)
+    try:
+        root = _authorized_root(store, row["root_id"], row["root_path"])
+    except (OSError, ValueError):
+        return [Path(paths[kind]).name for kind in WRITE_ORDER]
+    names = []
+    for kind in WRITE_ORDER:
+        try:
+            target, exists = _read_only_target(root, paths[kind])
+            current = _file_hash(target) if exists else None
+        except (OSError, ValueError):
+            current = False
+        if current != _digest(document[kind]):
+            names.append(Path(paths[kind]).name)
+    return names
+
+
+def unsynced(store, recording_id, revision, completed=()):
+    """Исход после записи в базу: None — файлы этой ревизии записаны, иначе NotSynced со словами для человека.
+
+    completed — то, что вернула запись файлов; уже записанное другим вызовом исходом не считается."""
+    if (recording_id, revision) in completed:
+        return None
+    row = store.db.execute("SELECT state, error_code FROM document_outbox WHERE recording_id=? AND "
+                           "document_revision=?", (recording_id, revision)).fetchone()
+    if row is not None and row["state"] == "synced":
+        return None
+    state = None if row is None else row["state"]
+    if state == "conflict":
+        names = [Path(found["relative_path"]).name for found in store.db.execute(
+            "SELECT relative_path FROM document_conflicts WHERE recording_id=? AND document_revision=? "
+            "AND resolution_operation_id IS NULL ORDER BY rowid", (recording_id, revision))]
+        return NotSynced(
+            f"Записано в базу, но файл {_names(names or _lagging_files(store, recording_id))} изменили во время "
+            "записи: он остался как есть, поэтому файлы записи не обновлены. Откройте экран конфликтов "
+            "(rt.py screen) и решите, что делать с этим файлом.", "changed")
+    lagging = _names(_lagging_files(store, recording_id))
+    if state == "error":
+        return NotSynced(
+            "Записано в базу, но обновление документа не завершено: запись файла не удалась (не обновлены: "
+            f"{lagging}). Повторите действие позже или запустите sync_recording_documents; если не помогает, "
+            "закройте программы, где открыты файлы записи.", "error")
+    if row is not None and row["error_code"] == "busy":
+        return NotSynced(
+            "Записано в базу, но обновление документа не завершено: файл занят другой программой, поэтому "
+            f"не обновлены {lagging}, они обновятся позже. Закройте файл в других программах и повторите "
+            "действие: программа допишет файлы при следующей записи (или запустите sync_recording_documents).",
+            "later")
+    return NotSynced(
+        "Записано в базу, но обновление документа не завершено: запись файлов не дошла до "
+        f"{lagging}. Повторите действие позже: программа допишет файлы при следующей записи "
+        "(или запустите sync_recording_documents).", "later")
+
+
+def require_written(store, recording_id, revision, completed=()):
+    """Сразу после записи в базу: если файлы ревизии не дописаны, сказать исход словами (NotSynced)."""
+    failure = unsynced(store, recording_id, revision, completed)
+    if failure is not None:
+        raise failure
 
 
 VERIFY_STATUSES = ("ok", "missing", "modified", "unconfirmed", "unresolved_conflict",
