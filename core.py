@@ -1835,6 +1835,22 @@ def _damaged_copies_warning(copies):
             *(f"- «{item['relative_path']}» — конфликт {item['conflict_id']}" for item in copies)]
 
 
+def _not_written_warning(rows):
+    """Предупреждение о ревизиях, которые восстановление могло записать, но не записало (очередь pending).
+
+    Конфликты и сбои, пришедшие из резерва, сюда не входят: они видны на экране конфликтов, как и раньше.
+    Первая строка без путей и имён: её получает и агент."""
+    if not rows:
+        return []
+    count = len({row["recording_id"] for row in rows})
+    return [f"Восстановлено, но не все файлы записей сформированы: записей — {count}, ревизий — {len(rows)}. "
+            "Если файл занят другой программой или защищён от записи, закройте его или снимите защиту; затем "
+            "запустите sync_recording_documents для записи или повторите действие с ней — файлы допишутся.",
+            *(f"- запись {row['recording_id']}, ревизия {row['document_revision']}: " +
+              ("файл занят другой программой или защищён от записи" if row["error_code"] == "busy"
+               else "ждёт предыдущую ревизию этой записи") for row in rows)]
+
+
 def backup_store(destination):
     """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии."""
     import recordings
@@ -1900,6 +1916,10 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
             materialized = []
             for root_id, path in mapping.items():
                 materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
+            # PR 5б-2: занятый или защищённый от записи файл больше не обрывает восстановление — называем, что осталось
+            not_written = [dict(row) for row in store.db.execute(
+                "SELECT recording_id, document_revision, error_code FROM document_outbox "
+                "WHERE state = 'pending' ORDER BY recording_id, document_revision")]
             validation = storage.validate_copy(staged, allow_damaged_copies=True)
         finally:
             store.close()
@@ -1918,10 +1938,10 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
     except OSError as ex:
         raise CoreError(f"не удалось опубликовать восстановленную базу (возможно, программа "
                         f"запущена — закройте её и повторите); файл остался: {staged}") from ex
-    warning = _damaged_copies_warning(validation.get("damaged_copies"))
+    warning = _not_written_warning(not_written) + _damaged_copies_warning(validation.get("damaged_copies"))
     return {"destination": str(destination), "installation_id": installation_id,
             "previous_saved_as": previous_saved_as, "validation": validation,
-            "materialized": materialized, **({"warning": warning} if warning else {})}
+            "materialized": materialized, "not_written": not_written, **({"warning": warning} if warning else {})}
 
 
 def live(s, job_id):

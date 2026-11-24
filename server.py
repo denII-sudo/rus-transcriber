@@ -504,7 +504,7 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
                 data, unknown = transcript.rename(s["json"], s["markdown"], names,
                                                   expected_versions=expected)
             except (ValueError, storage.StorageError) as ex:
-                raise core.CoreError(str(ex)) from ex
+                raise core.CoreError(core.say_error(ex)) from ex
             msg = {"speakers": data["speakers"], "mapping": data["speaker_names"], "markdown": s["markdown"]}
             if data.get("_conspects"):
                 msg["conspects"] = data["_conspects"]
@@ -596,7 +596,7 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
             return "Правку с авторством человека вносите через локальную карточку с подтверждением"
         return json.dumps(core.edit_span(job_id, t1, t2, text, speaker, note, by), ensure_ascii=False, indent=1)
     except (core.CoreError, storage.StorageError, ValueError) as ex:
-        return str(ex)
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -605,8 +605,8 @@ def reopen_review(job_id: str, ids: str) -> str:
     решить их заново через apply_review. Карточки пересобирать не нужно."""
     try:
         return json.dumps(core.reopen_review(job_id, ids), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # запись ревизии: исход недописанного файла словами
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -619,8 +619,8 @@ def legacy_speaker_review(job_id: str, build_pack: bool = False) -> str:
     подтверждает. После применения ответов — preview_voice_profiles и update_voice_profiles."""
     try:
         return json.dumps(core.legacy_speaker_review(job_id, build_pack), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # build_pack пишет запись
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -833,7 +833,7 @@ def initialize_recording_store(display_name: str = "") -> str:
                            "identity": identity, "recording_backend": settings.recording_backend()},
                           ensure_ascii=False, indent=2)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"initialized": False, "error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"initialized": False, "error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -1122,8 +1122,8 @@ def build_review_pack(job_id: str, items: list[dict] | None = None) -> str:
     2–4 варианта. Пересборка меняет version: ответы на прежние вопросы не применятся."""
     try:
         return json.dumps(core.build_review_pack(job_id, items), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # состояние пакета пишется в запись
+        return core.say_error(ex)
 
 
 @mcp.tool()
