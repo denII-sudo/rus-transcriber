@@ -1013,8 +1013,12 @@ class Store:
                            (recording_id,)).fetchone():
             raise Conflict("unresolved document conflict")
 
-    def resolve_document_conflict(self, conflict_id, operation_id, context):
-        """Сохранённые внешние байты остаются в БД; повтор сверит их хэш перед заменой."""
+    def resolve_document_conflict(self, conflict_id, operation_id, context, *, without_copy=False):
+        """Сохранённые внешние байты остаются в БД; повтор сверит их хэш перед заменой.
+
+        without_copy — файл был больше предела и копии нет: решение принимается только по просьбе вызывающего,
+        который проверил, что файл уже равен версии программы. Позже писатель такой файл не заменит: без копии
+        он видит «испорченную копию» и останавливается."""
         _uuid(conflict_id)
         _uuid(operation_id)
         _context(context)
@@ -1033,8 +1037,9 @@ class Store:
             if row["kind"].startswith("archive_"):
                 raise Conflict("immutable archive conflict requires separate resolution")
             if row["observed_bytes"] is None:
-                raise Conflict("external file too large to preserve; manual resolution required")
-            if (len(row["observed_bytes"]) != row["observed_size"] or
+                if not without_copy:
+                    raise Conflict("external file too large to preserve; manual resolution required")
+            elif (len(row["observed_bytes"]) != row["observed_size"] or
                     _hash_bytes(row["observed_bytes"]) != row["observed_hash"]):
                 raise StorageError("document conflict copy hash mismatch")
             if row["resolution_operation_id"] is not None:
@@ -1054,8 +1059,10 @@ class Store:
                                 (row["recording_id"], row["document_revision"]))
             return result
 
-    def resolve_conspect_conflict(self, conflict_id, operation_id, context):
-        """Зафиксировать решение человека; повторно заменять только те же внешние байты."""
+    def resolve_conspect_conflict(self, conflict_id, operation_id, context, *, without_copy=False):
+        """Зафиксировать решение человека; повторно заменять только те же внешние байты.
+
+        without_copy — как у resolve_document_conflict: копии нет (файл больше предела), файл уже равен версии."""
         _uuid(conflict_id)
         _uuid(operation_id)
         _context(context)
@@ -1072,8 +1079,9 @@ class Store:
             if row is None:
                 raise KeyError(conflict_id)
             if row["observed_bytes"] is None:
-                raise Conflict("external file too large to preserve; manual resolution required")
-            if (len(row["observed_bytes"]) != row["observed_size"] or
+                if not without_copy:
+                    raise Conflict("external file too large to preserve; manual resolution required")
+            elif (len(row["observed_bytes"]) != row["observed_size"] or
                     _hash_bytes(row["observed_bytes"]) != row["observed_hash"]):
                 raise StorageError("conspect conflict copy hash mismatch")
             if row["resolution_operation_id"] is not None:

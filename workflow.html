@@ -345,7 +345,12 @@ async function prepareRestore(kind, rev, sourceRevision, reviewRevision) {
     const ok = document.createElement("button");
     ok.textContent = "Подтвердить возврат";
     ok.onclick = async () => {
-      try { await post("api/restore/confirm", {snapshot: snap}); say("Возврат выполнен."); loadStatus(); loadHistory(kind); loadConflicts(); }
+      try {
+        const r = await post("api/restore/confirm", {snapshot: snap});
+        if (r && r.materialized === false) say(r.reason || "Возврат записан в базу, но файлы записи ещё не обновлены.", true);
+        else say("Возврат выполнен.");
+        loadStatus(); loadHistory(kind); loadConflicts();
+      }
       catch (ex) { say(ex.message, true); }
     };
     const cancel = document.createElement("button");
@@ -460,12 +465,15 @@ function conflictCard(c) {
     box.append(node("p", c.problem || "Эту строку не удалось проверить.", "bad"));
   }
   if (c.status === "open") {
-    if (archive || !c.preserved || c.copy_problem) {
+    if (archive || (!c.preserved && !c.can_replace) || c.copy_problem) {
       box.append(node("p", c.copy_problem ? "Заменить такой файл здесь нельзя: его копия повреждена." : archive
         ? "Это архивная копия прежней версии: заменить её здесь нельзя."
         : "Заменить такой файл здесь нельзя: у программы нет его копии.", "warn"),
         node("p", "Решить такой конфликт на этом экране нельзя, поэтому новые правки этой записи будут " +
           "отклоняться, пока он остаётся. Файл на диске программа не меняет.", "warn"));
+    } else if (!c.preserved) {
+      box.append(node("p", "Файл больше 8 МиБ, копия не сохранена, но он уже равен версии программы. Конфликт можно " +
+        "закрыть: сам файл при этом не изменится.", "ok"));
     } else {
       box.append(node("p", "Пока конфликт не решён, программа может отклонять новые правки этой записи.", "warn"),
         node("p", "Ваша правка файла в стенограмму не попадает. Чтобы исправить слова в стенограмме, внесите " +
@@ -473,7 +481,8 @@ function conflictCard(c) {
           "которые программа отклонила, пока конфликт был открыт."));
     }
   }
-  const look = node("button", c.can_replace ? "Заменить файл версией программы…" : "Показать сравнение");
+  const look = node("button", c.can_replace ? (c.preserved ? "Заменить файл версией программы…" : "Закрыть конфликт…")
+    : "Показать сравнение");
   look.onclick = guarded(box, () => showCompare(box, panel, c));
   bar.append(look);
   if (c.status === "not_written") {

@@ -52,6 +52,15 @@ def safe_error(ex):
     """Причина ошибки запроса по-русски для страницы: известная причина или общая фраза с кодом.
     Текст исключения, пути и ответы на страницу не попадают."""
     code = type(ex).__name__
+    import core
+    import documents
+    if isinstance(ex, (documents.NotWritten, documents.NotSynced)):
+        return str(ex)       # исход записи по-русски: имя файла и следующий шаг, пути и текст ответов в нём нет
+    if code == "Conflict" and type(ex).__module__ == "storage" and str(ex) in (
+            "unresolved document conflict", "unresolved conspect conflict"):
+        return core.say_error(ex)
+    if code == "CoreError" and ex.args and isinstance(ex.args[0], str) and ex.args[0].startswith("Записано в базу, но"):
+        return ex.args[0]
     if code == "Conflict" and type(ex).__module__ == "storage":
         return ("запись изменилась, пока применялись ответы; ничего не применено — обновите страницу "
                 f"и повторите (код: {code})")

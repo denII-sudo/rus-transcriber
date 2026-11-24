@@ -1053,18 +1053,29 @@ class ConflictReplaceTests(ScreenCase):
         self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
         self.assertEqual(self.item(case)["status"], "resolved")
 
-    def test_write_stopped_by_other_recording_can_be_retried(self):
+    def test_busy_file_of_other_recording_does_not_stop_this_replacement(self):
         root = self.base / "common"
         other = self.recording(root=root, ident="00000000-0000-4000-8000-000000000001")
         mine = self.recording(root=root, ident="ffffffff-0000-4000-8000-000000000001")
         case = self.conflict("document", rec=mine)
         snapshot = self.snapshot(case)
+        before = other.files["md"].read_bytes()
         self.change_text(other, "другая запись")
+        revision = self.store.db.execute("SELECT max(document_revision) FROM document_versions WHERE recording_id=?",
+                                         (other.rid,)).fetchone()[0]
         with failing_replace(other.files["md"]):
-            self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
-        self.assertEqual(case.path.read_bytes(), case.saved)
-        self.assertIs(self.item(case)["can_retry"], True)
-        self.assertEqual(self.retry(case)["outcome"], "replaced")
+            result = self.replace(snapshot)
+        # PR 5б-2: чужая недописанная запись не останавливает эту (раньше — «не записано», нужен был повтор)
+        self.assertEqual(result["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
+        self.assertEqual(self.item(case)["status"], "resolved")
+        # чужая запись: ревизия ждёт в очереди с кодом busy, её файл не тронут; следующая запись допишет его
+        state = self.store.db.execute("SELECT state, error_code FROM document_outbox WHERE recording_id=? AND "
+                                      "document_revision=?", (other.rid, revision)).fetchone()
+        self.assertEqual(tuple(state), ("pending", "busy"))
+        self.assertEqual(other.files["md"].read_bytes(), before)
+        self.assertIn((other.rid, revision), self.materialize(other, "document"))
+        self.assertEqual(other.files["md"].read_bytes(), self.program(other, "document", "md"))
 
     def test_document_replaced_while_second_file_waits(self):
         case = self.conflict("document", kind="json")
@@ -1474,6 +1485,12 @@ class ConflictMCPCompatibilityTests(ScreenCase):
                 case = self.conflict(scope)
                 with failing_replace(case.path):
                     answer = self.resolve(case)
+                if scope == "document":
+                    # PR 5б-2: занятый файл документа — не исключение: решение записано, исход назван словами
+                    shown = json.loads(answer)
+                    self.assertEqual((shown["materialized"], shown["outcome"]), (False, "later"))
+                    self.assertIn(case.path.name, shown["reason"])
+                    continue
                 self.assertTrue(answer.startswith("Ошибка:"), answer)
                 self.assertIn("synthetic busy file", answer)
 

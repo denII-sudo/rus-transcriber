@@ -1822,9 +1822,9 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
         status.set(recording_id=recording_id, source_revision=result["source_revision"],
                    review_revision=result["review_revision"], document_revision=result["document_revision"],
                    document_sync=result["document_sync"])
+        import documents
         completed = recordings.materialize_recording(store, recording_id)
-        if (recording_id, result["document_revision"]) not in completed:
-            raise RuntimeError("SQLite commit succeeded but document materialization is pending")
+        documents.require_written(store, recording_id, result["document_revision"], completed)
         return {"recording_id": recording_id, "source_revision": result["source_revision"],
                 "review_revision": result["review_revision"], "document_revision": result["document_revision"],
                 "document_sync": "synced"}
