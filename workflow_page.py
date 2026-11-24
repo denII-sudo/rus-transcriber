@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402,F401
 import core  # noqa: E402
+import llm_provider  # noqa: E402
 import storage  # noqa: E402
 
 SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
@@ -256,6 +257,17 @@ def make_server(port):
                         str(body.get("request_id", ""))))
                 if u == "api/verify/confirm":
                     return self._send(200, core.workflow_confirm_verification(body.get("snapshot")))
+                if u == "api/quotes/repair/prepare":
+                    return self._send(200, core.workflow_repair_quotes_prepare(str(body.get("request_id", ""))))
+                if u == "api/quotes/repair/confirm":
+                    # Облако вызывается только по явному согласию из окна и по снимку того, что человек видел.
+                    if body.get("allow_cloud_model") is not True:
+                        return self._send(400, {"error": "Нужно явное согласие на отправку: ничего не отправлено."})
+                    snapshot = body.get("snapshot")
+                    if not isinstance(snapshot, dict):
+                        return self._send(400, {"error": "Нет снимка того, что уйдёт в облако: откройте окно заново."})
+                    return self._send(200, core.workflow_repair_quotes(
+                        str(snapshot.get("request_id", "")), via="screen", snapshot=snapshot, allow_cloud_model=True))
                 if u == "api/restore/prepare":
                     return self._send(200, core.prepare_restore_snapshot(
                         str(body.get("recording_id", "")), int(body.get("source_revision", 0)),
@@ -283,6 +295,8 @@ def make_server(port):
                 return self._send(400, {"error": core.explain_error(ex)})
             except (ValueError, KeyError) as ex:
                 return self._send(400, {"error": f"не удалось обработать запрос: {ex}"})
+            except llm_provider.ProviderError as ex:     # отказ облачного исполнителя: человек видит его причину
+                return self._send(400, {"error": str(ex), "error_code": ex.code})
             except Exception as ex:    # неизвестный сбой: человек видит русское пояснение и причину, а не оборванную связь
                 return self._send(500, {"error": core.explain_error(ex)})
 

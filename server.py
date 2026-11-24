@@ -51,6 +51,8 @@ rus-transcriber: расшифровка речи на этом компьюте�
 по умолчанию false; передавайте true, лишь если человек прямо согласился на отправку текста стенограммы
 в OpenAI для этого запроса. Без согласия заказанный конспект ждёт исполнителя и ничего не отправляется.
 Не пытайтесь заменять модельный ответ или подтверждать его от имени человека.
+Ненайденные цитаты готовой свёртки модель исправляет только по просьбе человека: workflow_repair_quotes
+(allow_cloud_model=true — лишь при его прямом согласии на эту отправку) или кнопка на экране П5.
 П5: для человека есть локальный экран (rt.py screen); он же показывает историю, конфликты и резерв.
 Реальные и старые данные не подключать до отдельной миграции.
 
@@ -85,7 +87,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.24.8"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.24.9"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -255,6 +257,33 @@ def workflow_execute_model(request_id: str, retry_failed: bool = False, restart:
     import llm_provider
     try:
         return json.dumps(core.workflow_execute_model(request_id, retry_failed=retry_failed, restart=restart),
+                          ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+    except llm_provider.ProviderError as ex:
+        return json.dumps({"error_code": ex.code, "error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_repair_quotes(request_id: str, allow_cloud_model: bool = False) -> str:
+    """Попросить облачную модель исправить цитаты готовой модельной свёртки, не найденные в стенограмме.
+    Доступно, когда таких цитат не меньше 3 и не меньше 20 % всех цитат свёртки и политика запроса разрешает
+    облако. allow_cloud_model=false (по умолчанию) ничего не отправляет: сообщает, доступно ли исправление,
+    почему нет, сколько цитат, разделов и слов уйдёт. allow_cloud_model=true передавайте, только если человек
+    прямо согласился на эту отправку: в OpenAI GPT-6 Luna через OpenCode уйдут только разделы свёртки с
+    ненайденными цитатами — текст раздела, сами цитаты и текущий текст стенограммы этих мест (с исправлениями,
+    делением на реплики, условными метками «Участник N» и пометками ⟦…⟧); имена и сведения, произнесённые там,
+    уходят вместе с текстом. Подписи говорящих именами, аудио, время слов, пути, биометрия, журналы, цель и
+    остальной текст не передаются. Один вызов на одно обращение, без автоповтора; программа сама его не
+    запускает. Ответ — модельное предложение, а не подтверждение человека: каждая новая цитата проверяется
+    локально, не найденная остаётся с пометкой. Повторяйте только по новой просьбе человека."""
+    import llm_provider
+    try:
+        if type(allow_cloud_model) is not bool:
+            raise ValueError("allow_cloud_model — логическое значение true или false")
+        if not allow_cloud_model:
+            return json.dumps(core.workflow_repair_quotes_info(request_id), ensure_ascii=False)
+        return json.dumps(core.workflow_repair_quotes(request_id, via="mcp", allow_cloud_model=True),
                           ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)

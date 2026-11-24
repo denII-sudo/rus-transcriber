@@ -292,7 +292,8 @@ class SqliteSlotTests(unittest.TestCase):
         request, recording, task = self.two_sections()
         with mock.patch.object(paths, "STATE_DB", self.root / "state.sqlite3"):
             item = core.recording_conspects(recording)[0]
-        self.assertEqual(item["quote_repair"], {"unlinked": 3, "total": 5, "needed": True})
+        self.assertEqual({key: item["quote_repair"][key] for key in ("unlinked", "total", "needed")},
+                         {"unlinked": 3, "total": 5, "needed": True})
         self.assertEqual(core.quote_repair_view({"quote_policy": 1, "quotes": {"1": {}, "2": {}}, "unlinked": []}),
                          {"unlinked": 0, "total": 2, "needed": False})
         self.assertEqual(core.quote_repair_view({"quote_policy": 1, "quotes": {"1": {}, "2": {}},
@@ -308,7 +309,6 @@ class SqliteSlotTests(unittest.TestCase):
         # условие показа и текст строки — как в утверждённом виде («N из M», только при N > 0)
         self.assertIn("if (c.quote_repair && c.quote_repair.unlinked > 0) {", page)
         self.assertIn("`Не найдено в стенограмме цитат: ${c.quote_repair.unlinked} из ${c.quote_repair.total}.`", page)
-        self.assertNotIn("api/quotes/repair", page)                # кнопки и вызова в шаге 1 нет
 
 
 if __name__ == "__main__":

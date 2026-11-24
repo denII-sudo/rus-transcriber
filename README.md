@@ -226,7 +226,9 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
 неразобранное место — без кавычек с пометкой «по распознаванию, не проверено» и временем
 (после разбора кавычки возвращаются при пересборке, без облака); не найденная в стенограмме —
 без кавычек с пометкой «не найдено» (на экране П5 у такой свёртки — строка «Не найдено в
-стенограмме цитат: N из M»). Подробности и временные ограничения — в
+стенограмме цитат: N из M»; если таких цитат не меньше 3 и не меньше 20 %, а запрос разрешает
+облако, человек может по кнопке или через `workflow_repair_quotes` попросить модель исправить их:
+в облако уйдут только разделы с такими цитатами, один вызов на нажатие, ничего без согласия). Подробности и временные ограничения — в
 `docs/2026-11-17-p4-opencode-openai-handoff.md`. Старые записи в базу автоматически не
 переносятся: это отдельный перенос П7
 ([`docs/legacy-migration.md`](docs/legacy-migration.md); итог на установке владельца —
@@ -282,7 +284,7 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
 Остальные инструменты сервера (полный список — в описаниях инструментов, которые видит клиент):
 - процесс П3/П4: `start_workflow`, `workflow_status`, `workflow_list`, `workflow_questions`, `workflow_change_policy`,
   `workflow_mark_reviewed`, `workflow_abandon_request`, модельные задания `workflow_model_task`,
-  `workflow_model_part`, `workflow_model_part_result`, `workflow_model_result`, `workflow_execute_model`;
+  `workflow_model_part`, `workflow_model_part_result`, `workflow_model_result`, `workflow_execute_model`, `workflow_repair_quotes`;
 - записи в SQLite: `initialize_recording_store`, `set_recording_backend`, `set_recording_display_name`,
   `find_recording_results`, `read_recording_result`, `recording_history`, `read_recording_revision`,
   `restore_recording_revision`, `sync_recording_documents`, `list_document_conflicts`, `resolve_document_conflict`,

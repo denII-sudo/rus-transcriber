@@ -342,3 +342,79 @@ def validate(task, response, *, current_revision):
         raise ValueError("не все слова источника охвачены ссылками ответа")
     return {"source_revision": current_revision, "sections": sections,
             "actor_kind": "model", "human_verification": "none"}
+
+
+# ---------- Исправление ненайденных цитат (РАР-7, этап 7.5в, шаг 2) ----------
+# Задание не про запись целиком, а про разделы готовой свёртки, где есть цитаты, не найденные в стенограмме.
+# В нём нет записи, ревизий, цели, ID слов, времени и имён: текст раздела, его ненайденные цитаты и пункты
+# стенограммы [условная метка, текст], на которые раздел опирается.
+REPAIR_KIND = "quote_repair"
+REPAIR_WHY = ("none", "several")
+MAX_REPAIR_QUOTE_CHARS = 500
+_REPAIR_ID = re.compile(r"[1-9][0-9]{0,5}")
+
+
+def _repair_text(value, what):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{what}: нужна непустая строка")
+    return value
+
+
+def quote_repair(task):
+    """Канонический вид задания исправления цитат; неизвестные поля, имена вместо меток и повторы — ошибка."""
+    if (not isinstance(task, dict) or set(task) != {"kind", "version", "sections"}
+            or task["kind"] != REPAIR_KIND or type(task["version"]) is not int or task["version"] != 1):
+        raise ValueError("неизвестный вид задания исправления цитат")
+    if not isinstance(task["sections"], list) or not task["sections"]:
+        raise ValueError("в задании исправления нет разделов")
+    seen, sections = set(), []
+    for section in task["sections"]:
+        if not isinstance(section, dict) or set(section) != {"text", "quotes", "points"}:
+            raise ValueError("неизвестные поля раздела задания исправления")
+        if not isinstance(section["quotes"], list) or not section["quotes"]:
+            raise ValueError("у раздела нет цитат для исправления")
+        quotes = []
+        for item in section["quotes"]:
+            if not isinstance(item, dict) or set(item) != {"id", "quote", "why"}:
+                raise ValueError("неизвестные поля цитаты задания исправления")
+            if (not isinstance(item["id"], str) or not _REPAIR_ID.fullmatch(item["id"]) or item["id"] in seen
+                    or item["why"] not in REPAIR_WHY):
+                raise ValueError("номер или причина цитаты негодны")
+            seen.add(item["id"])
+            quotes.append({"id": item["id"], "quote": _repair_text(item["quote"], "цитата"), "why": item["why"]})
+        if not isinstance(section["points"], list) or not section["points"]:
+            raise ValueError("у раздела нет пунктов стенограммы")
+        points = []
+        for point in section["points"]:
+            if not isinstance(point, list) or len(point) != 2:
+                raise ValueError("пункт — пара [метка, текст]")
+            label = point[0]
+            if not isinstance(label, str) or not (SPEAKER_LABEL.fullmatch(label) or label == UNKNOWN_SPEAKER):
+                raise ValueError("метка говорящего — только «Участник N» или «Говорящий не определён»")
+            points.append([label, _repair_text(point[1], "пункт")])
+        sections.append({"text": _repair_text(section["text"], "текст раздела"), "quotes": quotes,
+                         "points": points})
+    return {"kind": REPAIR_KIND, "version": 1, "sections": sections}
+
+
+def validate_quote_repair(task, response):
+    """Ответ модели на задание исправления -> {номер цитаты: отрывок или None}. Формат строгий, целиком.
+
+    Содержание (найдётся ли отрывок) здесь не проверяется: это делает workflow по одной цитате.
+    """
+    wanted = {quote["id"] for section in quote_repair(task)["sections"] for quote in section["quotes"]}
+    if not isinstance(response, dict) or set(response) != {"quotes"} or not isinstance(response["quotes"], list):
+        raise ValueError("ответ — объект с единственным полем quotes (список)")
+    result = {}
+    for item in response["quotes"]:
+        if not isinstance(item, dict) or set(item) != {"id", "quote"}:
+            raise ValueError("элемент ответа — объект с полями id и quote")
+        ident, quote = item["id"], item["quote"]
+        if not isinstance(ident, str) or ident not in wanted or ident in result:
+            raise ValueError("неизвестный или повторный номер цитаты")
+        if quote is not None and (not isinstance(quote, str) or len(quote) > MAX_REPAIR_QUOTE_CHARS):
+            raise ValueError("quote — строка не длиннее %d знаков или null" % MAX_REPAIR_QUOTE_CHARS)
+        result[ident] = quote
+    if set(result) != wanted:
+        raise ValueError("в ответе есть не каждая цитата задания")
+    return result
