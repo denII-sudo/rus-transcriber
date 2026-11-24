@@ -53,6 +53,33 @@ class ComparisonTests(unittest.TestCase):
         core._diff_lines(["а", "правка", "б"], ["а", "б"], details=details)
         self.assertFalse(details["approximate"])
 
+    @staticmethod
+    def wide_pair():
+        # 400 × 400 строк больше CONFLICT_DIFF_CELLS: точное сравнение идёт только через опоры и бюджет уточнения
+        original = [f"строка {index}" for index in range(400)]
+        changed = original.copy()
+        changed[0], changed[-1] = "первая правка", "последняя правка"
+        return changed, original
+
+    def test_patched_anchors_reach_the_comparison(self):
+        # подмена через core должна действовать и на вызов внутри core_conflicts._diff_lines
+        changed, original = self.wide_pair()
+        details = {}
+        gone, came = core._diff_lines(changed, original, details=details)
+        self.assertEqual((set(gone), set(came), details["approximate"]), ({0, 399}, {0, 399}, False))
+        with mock.patch.object(core, "_anchors", return_value=[]) as anchors:
+            core._diff_lines(changed, original, details=details)
+        self.assertTrue(anchors.called, "подмена core._anchors не дошла до _diff_lines")
+        self.assertTrue(details["approximate"])
+
+    def test_patched_refinement_budget_reaches_the_comparison(self):
+        # без бюджета уточнения та же пара сравнивается грубо; без подмены — точно (предыдущий тест)
+        changed, original = self.wide_pair()
+        details = {}
+        with mock.patch.object(core, "CONFLICT_DIFF_WORK", 0):
+            core._diff_lines(changed, original, details=details)
+        self.assertTrue(details["approximate"], "подмена core.CONFLICT_DIFF_WORK не дошла до _diff_lines")
+
 
 class DiagnosticTests(fixtures.ScreenCase):
     def test_unrelated_journal_is_not_named_as_a_blocker(self):
