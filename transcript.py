@@ -692,7 +692,8 @@ def place_words(data, item, *, pause_neighbors=False):
         else:
             before = [(w["s"], pos, w) for pos, w in timed if w["s"] < t1 - WORD_PLACE_TOLERANCE]
             after = [(w["s"], pos, w) for pos, w in timed if w["s"] > t2 + WORD_PLACE_TOLERANCE]
-            chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else [])                 + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
+            chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else []) \
+                + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
     if any(not isinstance(w.get("word_id"), str) or not w.get("word_id") for w in chosen):
         return None
     return [w["word_id"] for w in chosen], not inside

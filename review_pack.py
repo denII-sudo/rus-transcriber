@@ -178,7 +178,8 @@ def build(json_path, items, base_url_note=None):
         target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
         ids = [w.get("word_id") for w in target_words]
         # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
-        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids)             and not T.is_gap_place(it) else {}
+        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) \
+            and not T.is_gap_place(it) else {}
         question = q.get("question") or "Как правильно?"
         if it.get("asr_problem"):
             problem = it["asr_problem"]

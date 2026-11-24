@@ -377,6 +377,23 @@ class PauseAsIsTests(PauseCase):
                 self.assertIn("text", inside.get("provenance") or {})
                 self.assertUntouchedNeighbors(jp)
 
+    def test_pause_with_bad_time_does_not_stop_the_other_cards(self):
+        """Чек-лист раздела 6: одно место с негодным временем среди годных не роняет сборку и применение."""
+        for backend in ("legacy_files",):       # sqlite такое время не принимает: storage.validate_pair отказывает до записи
+            for bad in ("1", None, 3.0):
+                with self.subTest(backend=backend, t1=bad):
+                    data = pause_result()
+                    data["review"][0] = {"id": "r1", "status": "open", "t": 1.0, "t1": bad, "t2": 2.0, "speaker": "Анна",
+                                         "reasons": ["missed"], "text": ""}
+                    if bad is None:
+                        data["review"][0].pop("t1")
+                    with pause_files(backend, data) as (jp, md, version):
+                        self.save(jp, version, aid="r2", option=0)
+                        rep = self.apply(jp, md)
+                        self.assertEqual(self.outcomes(rep)["r2"]["outcome"], "applied", rep.get("outcomes"))
+                        self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
+                        self.assertEqual(self.place_of(jp, "r1")["status"], "open")
+
     def test_build_does_not_give_pause_the_neighbor_word(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), pause_files(backend) as (jp, md, _version):
