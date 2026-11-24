@@ -383,6 +383,12 @@ def _is_timed(ws):
     raise ValueError("гипотеза — либо слова со временами (словари), либо только текст (строки)")
 
 
+def _group_key(toks):
+    """Ключ группы вариантов: нормализованные слова через пробел (пустые пропускаются). «ab c» и «a bc» —
+    разные варианты; склейка без пробелов («ab c» = «abc») остаётся только в _ops и mark_alt."""
+    return " ".join(t for t in toks if t)
+
+
 def _winner(cands, need, need_text):
     """Вариант, который поддержали не меньше need других моделей и у которого есть времена слов.
 
@@ -469,7 +475,7 @@ def vote_n(main, others, rule, trace=None):
     final_time = []                           # (место протокола, поле, итоговое слово)
     i = 0
     while i <= len(main):
-        ins = [(h, h["ins"][i], "".join(h["toks"][h["ins"][i][0]:h["ins"][i][1]])) for h in hyps if i in h["ins"]]
+        ins = [(h, h["ins"][i], _group_key(h["toks"][h["ins"][i][0]:h["ins"][i][1]])) for h in hyps if i in h["ins"]]
         win = _winner(ins, need, need_text=False)
         if win:
             h, js, label, win_roles = win
@@ -505,7 +511,7 @@ def vote_n(main, others, rule, trace=None):
             k += 1
         spans = [(h, _span_j(h["bad"], i, k)) for h in hyps]
         span = main[i:k]
-        win = _winner([(h, sj, "".join(h["toks"][sj[0]:sj[1]])) for h, sj in spans if sj], need, need_text=True)
+        win = _winner([(h, sj, _group_key(h["toks"][sj[0]:sj[1]])) for h, sj in spans if sj], need, need_text=True)
         if trace is not None:
             trace["places"].append({"decision": "replaced" if win else "disputed", "t": span[0]["s"],
                                     "main": " ".join(w["w"] for w in span),
