@@ -23,6 +23,9 @@
         # мастер восстановления: новые корни и установка, документы формируются заново,
         # прежняя база сохраняется рядом; спрашивает подтверждение на клавиатуре
     python rt.py self-check [--no-tests]       # тесты, проверка файлов на личные данные, морфология
+    python rt.py bench-db status | load [--apply] [--historical ФАЙЛ] | compare ПРОГОН:ВАРИАНТ ПРОГОН:ВАРИАНТ
+        # база прогонов теста скорости; без --apply только показ. База только дописывается: лишний или
+        # ошибочный прогон убирается удалением файла базы и повторной загрузкой из runs/*.json; код ничего не удаляет
 
     Данные (опасные действия: спрашивают согласие на клавиатуре, только в настоящем терминале):
     python rt.py export [--group g] [--dest папка] [--with-jobs]
@@ -245,6 +248,15 @@ def build():
     dbr.add_argument("--root", action="append", default=[], metavar="ID=ПУТЬ",
                      help="новый путь документного корня; недостающие мастер спросит в терминале")
     sc = sub.add_parser("self-check"); sc.add_argument("--no-tests", action="store_true")
+    bdb = sub.add_parser("bench-db", help="база прогонов теста скорости (только дописывается; ошибочный прогон — "
+                                          "удаление файла базы и повторная загрузка из runs/*.json)")
+    bsub = bdb.add_subparsers(dest="bench_cmd", required=True)
+    bsub.add_parser("status", help="прогоны в базе по методикам и не загруженные файлы; только чтение")
+    bl = bsub.add_parser("load", help="показать (или с --apply загрузить) файлы прогонов; учтённые пропускаются")
+    bl.add_argument("--apply", action="store_true", help="записать в базу; без него только показ")
+    bl.add_argument("--historical", default=None, metavar="ФАЙЛ", help="файл исторических замеров bench-historical-1")
+    bc = bsub.add_parser("compare", help="сравнить два измерения скорости по осям сравнимости; только чтение")
+    bc.add_argument("first", metavar="ПРОГОН:ВАРИАНТ"); bc.add_argument("second", metavar="ПРОГОН:ВАРИАНТ")
     e = sub.add_parser("export"); e.add_argument("--group", default=""); e.add_argument("--dest", default=""); e.add_argument("--with-jobs", action="store_true")
     i = sub.add_parser("import"); i.add_argument("zip"); i.add_argument("--replace", action="store_true"); i.add_argument("--apply", action="store_true")
     d = sub.add_parser("delete-group"); d.add_argument("name"); d.add_argument("--permanent", action="store_true")
@@ -296,6 +308,9 @@ def run(a):
             say("\n".join(warning))
     elif c == "db-restore":
         return cmd_db_restore(a)
+    elif c == "bench-db":
+        import benchdb
+        return benchdb.cli(a)
     elif c == "workflow-confirm":
         snapshot = core.workflow_verification_snapshot(a.request)
         return gated("Подтверждение проверки стенограммы",
