@@ -235,7 +235,8 @@ class RequestTextTests(unittest.TestCase):
 
 class ConsentTextTests(unittest.TestCase):
     def test_screen_consent_is_the_text_approved_for_this_stage(self):
-        # Текст утверждён владельцем дословно 23.11.2026 вместе с договором версии 4.
+        # Текст утверждён владельцем дословно 23.11.2026 вместе с договором версии 4; фраза о частях —
+        # решение владельца 24.11.2026 для этапа 7.4в.
         html = (Path(__file__).resolve().parent.parent / "workflow.html").read_text(encoding="utf-8")
         note = html.split('id="cloud-note">', 1)[1].split("</p>", 1)[0]
         self.assertEqual(" ".join(note.split()), (
@@ -243,7 +244,8 @@ class ConsentTextTests(unittest.TestCase):
             "согласие отправить ей по этой записи: весь текст стенограммы с внесёнными исправлениями, деление "
             "на реплики с условными метками («Участник 1», «Участник 2»…), пометки сомнительных мест, номер "
             "версии стенограммы и вашу цель. Имена и сведения, произнесённые в записи или написанные в цели, "
-            "отправляются вместе с текстом. Подписи говорящих именами, аудио, время слов, путь к файлу, "
+            "отправляются вместе с текстом. Запись длиннее 10 000 слов отправляется частями; к каждой части "
+            "прилагается изложение предыдущих, составленное моделью. Подписи говорящих именами, аудио, время слов, путь к файлу, "
             "голосовые профили и журналы не отправляются. Без отметки всё остаётся на этом компьютере."))
 
 
@@ -398,7 +400,8 @@ class SectionsWorkflowTests(unittest.TestCase):
 
     def test_limit_is_checked_before_the_cloud(self):
         request = self.prepare_request()
-        with mock.patch("llm_provider.MAX_WORDS", 1000), self.assertRaises(llm_provider.ProviderError) as error:
+        with (mock.patch("llm_provider.MAX_WORDS", 1000), mock.patch("llm_provider.MAX_PARTS", 1),
+              self.assertRaises(llm_provider.ProviderError) as error):
             self.execute(request)
         self.assertEqual((error.exception.code, len(self.sent)), ("limit", 0))
         self.assertIn("workflow_model_task", str(error.exception))
