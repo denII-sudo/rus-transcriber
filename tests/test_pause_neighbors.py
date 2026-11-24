@@ -399,6 +399,38 @@ class PauseAsIsTests(PauseCase):
                 self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
 
 
+class PauseWithWordsTests(PauseCase):
+    def test_find_span_of_a_pause_never_reads_word_ids(self):
+        data = pause_result()
+        self.assertIsNone(transcript._find_span(data, gap(1.0, 2.0, word_ids=["w2"])))
+        inside = pause_result(inside=True)
+        self.assertEqual(transcript._find_span(inside, gap(1.0, 2.0, word_ids=["w2"])), (0, 1, 2))
+        self.assertEqual(transcript._find_span(inside, place(2.0, word_ids=["w2"])), (0, 2, 3))
+
+    def test_build_gives_a_pause_with_words_no_word_ids_either(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend, pause_result(inside=True)) as (jp, _md, _v):
+                items = {i["id"]: i for i in review_pack.manifest(jp)["items"]}
+                self.assertNotIn("word_ids", items["r1"])
+                self.assertEqual(items["r2"]["word_ids"], ["w2"])
+
+    def test_old_pack_neighbor_edit_does_not_block_and_pause_word_does_in_sqlite(self):
+        """Старый пакет с ID соседа в word_ids паузы: сверяются слова паузы, а не соседа."""
+        for neighbor_edited in (True, False):
+            with self.subTest(neighbor_edited=neighbor_edited), pause_files("sqlite") as (jp, md, version):
+                state = review_pack.answers_state(jp)
+                next(i for i in state["manifest"]["items"] if i["id"] == "r1")["word_ids"] = ["w2"]
+                review_pack._write_answers(jp, state)
+                if neighbor_edited:
+                    transcript.edit_span(jp, md, 2.0, 2.2, "ну", by="human")
+                else:
+                    transcript.edit_span(jp, md, 1.4, 1.6, "ага", speaker="Анна", by="human")
+                self.save(jp, version, text="Анна: угу")
+                rep = self.apply(jp, md)
+                want = "applied" if neighbor_edited else "apply_conflict"
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], want, rep.get("outcomes"))
+
+
 class PauseSqliteGuardTests(PauseCase):
     def test_free_answer_on_empty_pause_is_applied(self):
         for backend in BACKENDS:
@@ -501,6 +533,43 @@ class HeldPauseTests(PauseCase):
                 self.assertEqual(self.place_of(jp, "r1")["status"], "human")
 
 
+class HeldSpanBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        data = pause_result(r1_status="human")
+        data["review"].append(place(0.5, 0.9, id="r3", status="human", word_ids=["w1"]))
+        self.words, self.spans = transcript._held_places(data)
+        self.data = data
+
+    def test_held_pause_holds_only_its_own_words(self):
+        pause = pause_result(inside=True, r1_status="human")
+        held_words, _spans = transcript._held_places(pause)
+        held = {w["word_id"] for seg in pause["segments"] for w in seg["words"] if id(w) in held_words}
+        self.assertEqual(held, {"w4"})
+
+    def test_time_boundaries_of_a_held_pause_are_half_open(self):
+        only_pause = transcript._held_places(pause_result(r1_status="human"))[1]
+        self.assertTrue(transcript._span_has_time(only_pause, 1.0))
+        self.assertTrue(transcript._span_has_time(only_pause, 1.994))
+        self.assertFalse(transcript._span_has_time(only_pause, 1.996))
+        self.assertFalse(transcript._span_has_time(only_pause, 2.0))
+        self.assertFalse(transcript._span_has_time(only_pause, 0.994))
+        self.assertFalse(transcript._span_has_time(only_pause, None))
+
+    def test_explicit_span_overlap_with_a_held_pause(self):
+        only_pause = transcript._held_places(pause_result(r1_status="human"))[1]
+        self.assertFalse(transcript._span_overlaps(only_pause, 2.0, 2.5))
+        self.assertFalse(transcript._span_overlaps(only_pause, 0.5, 0.99))
+        self.assertTrue(transcript._span_overlaps(only_pause, 0.5, 1.0))
+        self.assertTrue(transcript._span_overlaps(only_pause, 1.9, 2.5))
+
+    def test_word_place_keeps_closed_interval_with_tolerance(self):
+        word_span = [s for s in self.spans if not s[2]]
+        self.assertTrue(transcript._span_has_time(word_span, 0.5 - 0.01))
+        self.assertTrue(transcript._span_overlaps(word_span, 0.9, 1.5))
+        self.assertTrue(transcript._span_overlaps(word_span, 0.905, 1.5))
+        self.assertFalse(transcript._span_overlaps(word_span, 0.93, 1.5))
+
+
 class VoiceSuggestionTests(unittest.TestCase):
     @staticmethod
     def data(pause_words=()):
@@ -519,6 +588,241 @@ class VoiceSuggestionTests(unittest.TestCase):
         found = voices.legacy_speaker_places(self.data((own,)))
         self.assertEqual([p["id"] for p in found["places"]], ["r1"])
         self.assertEqual((found["places"][0]["w1"], found["places"][0]["w2"]), (1, 2))
+
+
+# ---------- свободные ответы на паузу: узнавание соседнего слова, отказы, пересечение карточек ----------
+def custom_result(words, review):
+    """words — [(word_id, слово, начало, говорящий)]; соседние слова одного говорящего — одна реплика."""
+    segments = []
+    for wid, text, s, speaker in words:
+        if not segments or segments[-1]["speaker"] != speaker:
+            segments.append({"start": s, "end": s + 0.2, "label": "speaker-1", "speaker": speaker,
+                             "text": "", "words": []})
+        segments[-1]["words"].append(word(wid, text, s))
+    for seg in segments:
+        seg["text"] = " ".join(w["w"] for w in seg["words"])
+        seg["end"] = seg["words"][-1]["e"]
+    data = pause_result()
+    data["segments"], data["review"] = segments, review
+    data["speakers"] = sorted({w[3] for w in words})
+    return data
+
+
+def one_question(rid="r1"):
+    return [{"id": rid, "question": "Проверьте", "recommended": 0, "options": [{"label": "Вариант", "decision": {}}]}]
+
+
+class FreeAnswerCase(PauseCase):
+    def run_answer(self, backend, data, text, questions=None, aid="r1"):
+        """Ответ текстом на карточку aid; -> (отчёт, стенограмма) внутри открытых файлов не возвращается:
+        возвращаются тексты слов, чтобы файлы можно было закрыть."""
+        with pause_files(backend, data, questions or one_question(aid)) as (jp, md, version):
+            self.save(jp, version, aid=aid, text=text)
+            rep = self.apply(jp, md)
+            return rep, self.texts(jp), transcript.load(jp)
+
+
+class NeighborRecognitionTests(FreeAnswerCase):
+    DATA = staticmethod(lambda: custom_result(
+        [("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 2.0, "Анна"), ("w3", "дальше", 2.5, "Анна")],
+        [gap(1.0, 2.0, id="r1")]))
+
+    def test_neighbor_after_the_pause_is_recognized(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, texts, data = self.run_answer(backend, self.DATA(), "Анна: Вот. Ну")
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied")
+                self.assertEqual(texts, ["начало", "Вот.", "Ну", "дальше"])
+                neighbor = next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w2")
+                for key in ("by", "provenance", "edited"):
+                    self.assertNotIn(key, neighbor)
+
+    def test_neighbor_before_the_pause_is_recognized(self):
+        data = custom_result([("w1", "Ну", 0.5, "Анна"), ("w3", "дальше", 2.5, "Анна")], [gap(1.0, 2.0, id="r1")])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, texts, _ = self.run_answer(backend, data, "Анна: Ну вот")
+                self.assertEqual(texts, ["Ну", "вот", "дальше"])
+
+    def test_one_answer_token_is_one_transcript_word(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, texts, _ = self.run_answer(backend, self.DATA(), "Анна: ну, ну")
+                self.assertEqual(texts, ["начало", "ну,", "Ну", "дальше"])
+
+    def test_other_speaker_or_far_neighbor_is_not_recognized(self):
+        other = custom_result([("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 2.0, "Борис"), ("w3", "дальше", 2.5, "Борис")],
+                              [gap(1.0, 2.0, id="r1")])
+        far = custom_result([("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 4.5, "Анна")], [gap(1.0, 2.0, id="r1")])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend, case="другой говорящий"):
+                _, texts, _ = self.run_answer(backend, other, "Анна: Вот. Ну")
+                self.assertEqual(texts, ["начало", "Вот.", "Ну", "Ну", "дальше"])
+            with self.subTest(backend=backend, case="дальше предела"):
+                _, texts, _ = self.run_answer(backend, far, "Анна: Вот. Ну")
+                self.assertEqual(texts, ["начало", "Вот.", "Ну", "Ну"])
+
+    def test_answer_equal_to_the_neighbor_goes_to_human_with_reason(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, texts, data = self.run_answer(backend, self.DATA(), "Анна: Ну")
+                self.assertEqual(texts, ["начало", "Ну", "дальше"])
+                place_ = next(i for i in data["review"] if i["id"] == "r1")
+                self.assertEqual(place_["status"], "human")
+                self.assertIn("совпадает со словами стенограммы рядом с паузой", place_.get("note", ""))
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "left_for_human")
+
+    def test_rebuilt_pack_with_the_same_answer_does_not_duplicate(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend, self.DATA(), one_question()) as (jp, md, version):
+                self.save(jp, version, text="Анна: вот")
+                self.apply(jp, md)
+                self.assertEqual(self.texts(jp), ["начало", "вот", "Ну", "дальше"])
+                again = review_pack.build(jp, one_question())
+                self.save(jp, again["version"], text="Анна: вот")
+                self.apply(jp, md)
+                self.assertEqual(self.texts(jp), ["начало", "вот", "Ну", "дальше"])
+                self.assertEqual(self.place_of(jp, "r1")["status"], "resolved")
+
+    def test_open_pause_with_equal_words_is_closed_and_confirmed_by_human(self):
+        """Ответ совпал со словами, уже стоящими в паузе: место закрывается, слова подтверждены, соседи — нет."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), \
+                    pause_files(backend, pause_result(inside=True), one_question()) as (jp, md, version):
+                self.save(jp, version, text="Анна: ага")
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertEqual(self.texts(jp), ["начало", "ага", "Ну", "дальше"])
+                self.assertEqual(self.place_of(jp, "r1")["status"], "resolved")
+                self.assertEqual(self.word(jp, "w4").get("by"), "human")
+                self.assertUntouchedNeighbors(jp)
+
+    def test_closed_pause_with_equal_words_changes_nothing(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), \
+                    pause_files(backend, pause_result(inside=True, r1_status="resolved"),
+                                one_question()) as (jp, md, version):
+                before = transcript.load(jp)
+                self.save(jp, version, text="Анна: ага")
+                self.apply(jp, md)
+                after = transcript.load(jp)
+                self.assertEqual(after["segments"], before["segments"])
+                self.assertEqual(self.place_of(jp, "r1")["status"], "resolved")
+                self.assertNotIn("by", self.word(jp, "w4"))
+
+    def test_other_words_in_a_filled_pause_go_to_human_without_insert(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), \
+                    pause_files(backend, pause_result(inside=True), one_question()) as (jp, md, version):
+                self.save(jp, version, text="Анна: вот")
+                rep = self.apply(jp, md)
+                self.assertEqual(self.texts(jp), ["начало", "ага", "Ну", "дальше"])
+                item = self.place_of(jp, "r1")
+                self.assertEqual(item["status"], "human")
+                self.assertIn("в паузе уже есть слова", item.get("note", ""))
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "left_for_human")
+
+
+class PauseOverlapAnswersTests(FreeAnswerCase):
+    def test_pause_and_word_next_to_it_are_answered_together(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend) as (jp, md, version):
+                self.save(jp, version, aid="r1", text="Анна: вот")
+                self.save(jp, version, aid="r2", option=0)
+                rep = self.apply(jp, md)
+                rows = self.outcomes(rep)
+                self.assertEqual((rows["r1"]["outcome"], rows["r2"]["outcome"]), ("applied", "applied"))
+                self.assertFalse(rep.get("preflight_conflicts"))
+                self.assertEqual((self.place_of(jp, "r1")["status"], self.place_of(jp, "r2")["status"]),
+                                 ("resolved", "resolved"))
+                self.assertEqual(self.texts(jp), ["начало", "вот", "Ну", "дальше"])
+
+    def test_plan_does_not_close_the_neighbor_word_place_through_the_pause(self):
+        import freeform
+        data = pause_result()
+        item = {"id": "r1", "t1": 1.0, "t2": 2.0, "speaker": "Анна", "reasons": ["missed"], "text": ""}
+        _edits, _reports, closed, _conflicts = freeform.plan(
+            {"items": [item]}, {"r1": {"text": "Анна: вот", "ts": "2026-11-23T10:00:00"}}, data)
+        self.assertEqual(closed, {})
+
+    def test_plan_closes_a_word_place_inside_the_pause(self):
+        import freeform
+        data = pause_result(inside=True)
+        data["review"].append(place(1.4, id="r3", word_ids=["w4"]))
+        item = {"id": "r1", "t1": 1.0, "t2": 2.0, "speaker": "Анна", "reasons": ["missed"], "text": ""}
+        _edits, _reports, closed, _conflicts = freeform.plan(
+            {"items": [item]}, {"r1": {"text": "Анна: ага", "ts": "2026-11-23T10:00:00"}}, data)
+        self.assertEqual(closed, {"r3": "r1"})
+
+    def test_three_answers_one_refusal_does_not_stop_the_others(self):
+        data = pause_result()
+        data["review"].append(gap(2.2, 2.5, id="r5"))
+        questions = [
+            {"id": "r1", "question": "Проверьте", "recommended": 0, "options": [{"label": "Как есть", "decision": {}}]},
+            {"id": "r2", "question": "Проверьте", "recommended": 0,
+             "options": [{"label": "ну", "decision": {"text": "ну"}}]},
+            {"id": "r5", "question": "Проверьте", "recommended": 0, "options": [{"label": "Как есть", "decision": {}}]}]
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend, data, questions) as (jp, md, version):
+                self.save(jp, version, aid="r1", option=0)
+                self.save(jp, version, aid="r2", option=0)
+                self.save(jp, version, aid="r5", text="Анна: эээ")
+                rep = self.apply(jp, md)
+                rows = {k: v["outcome"] for k, v in self.outcomes(rep).items()}
+                self.assertEqual(rows, {"r1": "apply_conflict", "r2": "applied", "r5": "applied"})
+                self.assertEqual(self.texts(jp), ["начало", "ну", "эээ", "дальше"])
+                self.assertEqual(self.place_of(jp, "r1")["status"], "open")
+
+
+class NameOnPauseTests(FreeAnswerCase):
+    def test_name_alone_on_empty_pause_goes_to_human_with_reason(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, texts, data = self.run_answer(backend, pause_result(), "Анна")
+                self.assertEqual(texts, ["начало", "Ну", "дальше"])
+                item = next(i for i in data["review"] if i["id"] == "r1")
+                self.assertEqual(item["status"], "human")
+                self.assertIn("в паузе нет слов: одно имя ничего не подписывает", item.get("note", ""))
+                neighbor = next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w2")
+                self.assertNotIn("by", neighbor)
+
+    def test_name_relabels_only_the_words_of_the_pause(self):
+        data = custom_result([("w1", "начало", 0.5, "Анна"), ("w4", "ага", 1.4, "Борис"), ("w2", "Ну", 2.0, "Борис")],
+                             [gap(1.0, 2.0, id="r1")])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                rep, _texts, result = self.run_answer(backend, data, "Анна")
+                speakers = {w["word_id"]: s["speaker"] for s in result["segments"] for w in s["words"]}
+                self.assertEqual(speakers, {"w1": "Анна", "w4": "Анна", "w2": "Борис"})
+
+
+class OldPackFreeAnswersTests(FreeAnswerCase):
+    @staticmethod
+    def manifest_sha(jp):
+        import hashlib
+        import json
+        return hashlib.sha256(json.dumps(review_pack.manifest(jp), sort_keys=True, ensure_ascii=False)
+                              .encode("utf-8")).hexdigest()
+
+    def test_old_pack_is_read_by_the_new_rule_and_not_rewritten(self):
+        data = custom_result([("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 2.0, "Анна"), ("w3", "дальше", 2.5, "Анна")],
+                             [gap(1.0, 2.0, id="r1")])
+        cases = (("как есть", {"option": 0}, ["начало", "Ну", "дальше"], "apply_conflict"),
+                 ("имя", {"text": "Анна"}, ["начало", "Ну", "дальше"], "left_for_human"),
+                 ("слова", {"text": "Анна: Вот. Ну"}, ["начало", "Вот.", "Ну", "дальше"], "applied"))
+        for backend in BACKENDS:
+            for name, answer, want_texts, want_outcome in cases:
+                with self.subTest(backend=backend, answer=name), pause_files(backend, data, one_question()) as (jp, md, version):
+                    state = review_pack.answers_state(jp)
+                    state["manifest"]["items"][0]["word_ids"] = ["w2"]
+                    review_pack._write_answers(jp, state)
+                    sha = self.manifest_sha(jp)
+                    self.save(jp, version, **answer)
+                    rep = self.apply(jp, md)
+                    self.assertEqual(self.outcomes(rep)["r1"]["outcome"], want_outcome, rep.get("outcomes"))
+                    self.assertEqual(self.texts(jp), want_texts)
+                    self.assertUntouchedNeighbors(jp)
+                    self.assertEqual(self.manifest_sha(jp), sha)
 
 
 if __name__ == "__main__":
