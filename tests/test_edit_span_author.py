@@ -101,7 +101,7 @@ class MarkAcceptedThroughEditSpan(unittest.TestCase):
                     note = hc.item(jp, "r1")["note"]
                     self.assertEqual(note, f"решено правкой отрезка span@0.20 ({who})")
                     self.assertNotIn("решено человеком", note)
-                    self.assertIn(f"({who}, правка отрезка)", transcript.render_md(data))
+                    self.assertIn(f"({who}, правка отрезка)", transcript.render_md({**data, "review_done": True}))
                     if backend == "sqlite":      # публичный документ в sqlite поле не показывает (не расширяется)
                         self.assertNotIn("edit_span", jp.read_text(encoding="utf-8"))
                     else:

@@ -263,8 +263,8 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
 - `review_items` — сомнительные места готовой расшифровки с контекстом;
 - `apply_review` — применить решения по ним (журнал правок сохраняется);
 - `conversation_hotspots` — по запросу: горячие места разговора (эвристика для навигации, не оценка людей);
-- `edit_span` — поправить отрезок стенограммы по словам человека (остатки после разбора: слово не на
-  месте, неверное число); `reopen_review` — снова открыть решённые места разбора;
+- `edit_span` — поправить отрезок стенограммы (остатки после разбора: слово не на месте, неверное число); автор
+  `by` обязателен: агент передаёт `claude`, без автора правка не принимается; `reopen_review` — снова открыть решённые места разбора;
 - `check_quotes` — проверить цитаты конспекта по стенограмме (файл конспекта вне папки данных — с подтверждением человека);
 - `conspect_link` — связать цитаты конспекта с местами стенограммы по ID слов; `conspect_render` — пересобрать
   связанный конспект из текущей стенограммы;
@@ -651,7 +651,7 @@ gigaam 0.2.0 requires onnxruntime, which is not installed
   по команде — `python rt.py <команда> --help`). Вывод — JSON, коды возврата 0 / 1 (ошибка) / 2 (отказ или нет
   терминала для подтверждения). Команды:
   - задачи и расшифровки: `transcribe`, `status --wait`, `jobs`, `read`, `cancel`, `settings`, `self-check`;
-  - разбор и правки: `review` (список мест), `review-build`, `review-page`, `review-apply`, `edit-span`, `reopen`;
+  - разбор и правки: `review` (список мест), `review-build`, `review-page`, `review-apply`, `edit-span` (обязателен `--by human|claude`), `reopen`;
   - конспект: `conspect-confirm`, `conspect-candidates`, `conspect-select`;
   - голоса: `profiles`, `voice-preview`, `voice-update`, `voice-revoke`, `voice-refresh-plan`, `voice-quality`,
     `voice-quality-policy`, `voice-auto-learn`, `voice-backup` (изменяющие команды спрашивают согласие в терминале);

@@ -6,7 +6,7 @@
     python rt.py read ЗАДАЧА [--fmt md|json] [--extra] [--offset 0]
     python rt.py review ЗАДАЧА [--offset 0 --limit 40] [--reasons voice,gender] [--min-sec 1] [--brief] [--status open]
     python rt.py hotspots ЗАДАЧА [--limit 20] [--min-score 0.5]  # горячие места разговора (эвристика, по запросу)
-    python rt.py edit-span ЗАДАЧА T1 T2 "текст" [--speaker Имя] [--note ...] [--by human]
+    python rt.py edit-span ЗАДАЧА T1 T2 "текст" --by human|claude [--speaker Имя] [--note ...]   # автор обязателен
     python rt.py reopen ЗАДАЧА r57,r88
     python rt.py cancel ЗАДАЧА
     python rt.py settings | profiles | audit    # audit: абсолютные пути в данных
@@ -218,7 +218,7 @@ def build():
     hs.add_argument("--min-score", type=float, default=0.0)
     es = sub.add_parser("edit-span"); es.add_argument("job"); es.add_argument("t1", type=float); es.add_argument("t2", type=float)
     es.add_argument("text"); es.add_argument("--speaker", default=""); es.add_argument("--note", default="")
-    es.add_argument("--by", default="human", choices=["human", "claude"])
+    es.add_argument("--by", default=None, choices=["human", "claude"], help="автор правки, обязателен")
     rb = sub.add_parser("review-build"); rb.add_argument("job"); rb.add_argument("--items", help="JSON-файл с вопросами; без него — нейтральные карточки")
     rp = sub.add_parser("review-page"); rp.add_argument("job"); rp.add_argument("--port", type=int, default=8765)
     ra = sub.add_parser("review-apply"); ra.add_argument("job")

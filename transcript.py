@@ -285,7 +285,10 @@ def render_md(data, text_only=False):
                         ch.append(f"«{b.get('text')}» → «{a.get('text')}»")
                     if b.get("speaker") != a.get("speaker"):
                         ch.append(f"{b.get('speaker')} → {a.get('speaker')}")
-                    lines.append(f"- {hms(e['t'])} ({e.get('by', '?')}): " + "; ".join(ch)
+                    who = e.get("by", "?")
+                    if e.get("via") == "edit_span":
+                        who = ("человек" if who == "human" else "агент") + ", правка отрезка"
+                    lines.append(f"- {hms(e['t'])} ({who}): " + "; ".join(ch)
                                  + (f" — {e['note']}" if e.get("note") else ""))
                 lines.append("")
         else:
@@ -661,12 +664,18 @@ def review_list(json_path, offset=0, limit=40, reasons=None, min_sec=0.0, brief=
     return res
 
 
-@recording_locked
-def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="claude", resolve=True):
+def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by=None, resolve=True):
     """Правка произвольного отрезка стенограммы: слова, начинающиеся в [t1, t2] с, заменяются текстом text
-    (по словам: совпадающие сохраняют время), speaker — подписать отрезок этим говорящим (реплика делится).
-    Пустой text — удалить слова отрезка. На отрезке без слов text вставляется (тогда speaker обязателен).
+    (по словам: совпадающие сохраняют время и прежние отметки), speaker — подписать отрезок этим говорящим
+    (реплика делится). Пустой text — удалить слова отрезка. На отрезке без слов text вставляется (тогда
+    speaker обязателен). by — автор правки, обязателен: "claude" или "human"; без него правка не принимается.
     resolve — места разбора, целиком лежащие в отрезке, считаются решёнными. -> (data, отчёт)"""
+    check_edit_span_author(by)
+    return _edit_span_locked(json_path, md_path, t1, t2, text, speaker, note, by, resolve)
+
+
+@recording_locked
+def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None, by="claude", resolve=True):
     data = load(json_path)
     t1, t2 = float(t1), float(t2)
     if t2 < t1:
@@ -692,17 +701,13 @@ def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="cla
                 if by != "human" and it.get("status") == "human":
                     raise ValueError(f"{HELD_FOR_HUMAN} ({it['id']}): агент его не меняет и не закрывает")
                 closed[it["id"]] = card
-    data2, rep = apply_word_edits(json_path, md_path, [e], by=by, closed=closed,
-                                  log_note="правка отрезка" + (f": {note}" if note else ""))
+    who = "человек" if by == "human" else "агент"
+    data2, rep = apply_word_edits(json_path, md_path, [e], by=by, closed=closed, via="edit_span",
+                                  log_note="правка отрезка" + (f": {note}" if note else ""),
+                                  close_note=f"решено правкой отрезка {card} ({who})", close_held=by == "human")
     if card in rep["failed"]:
-        raise ValueError(rep["failed"][card])
-    if resolve:                               # закрытые правкой отрезка человека — и оставленные человеку
-        items = {i["id"]: i for i in data2.get("review") or []}
-        for rid in closed:
-            if items.get(rid):
-                items[rid]["status"], items[rid]["note"] = "resolved", f"решено правкой отрезка {card}"
-        data2["review_done"] = not any(i.get("status", "open") == "open" for i in data2.get("review") or [])
-        save(data2, json_path, md_path)
+        reason = rep["failed"][card]
+        raise ValueError(reason + (SPAN_REOPEN_HINT if "ответом человека на карточку" in reason else ""))
     c = rep["cards"].get(card, {})
     return data2, {"card": card, "before": c.get("before"), "after": c.get("after"), "resolved": sorted(closed),
                    "conspects": rep.get("conspects")}
@@ -733,13 +738,24 @@ def _wkey(s):
     return re.sub(r"[^\w-]", "", s.lower().replace("ё", "е"))
 
 
-def _mark_provenance(word, dimension, by, edit):
+def _mark_provenance(word, dimension, by, edit, via=None):
     provenance = copy.deepcopy(word.get("provenance") or {})
-    provenance[dimension] = {"by": by, "edit": edit}
+    provenance[dimension] = {"by": by, "edit": edit, **({"via": via} if via else {})}
     word["provenance"] = provenance
 
 
 HELD_FOR_HUMAN = "место оставлено человеку"
+EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правки by — "claude" (правка агента, в том числе по поручению '
+                             'человека) или "human" (текст продиктовал человек, только командной строкой); '
+                             'без автора правка не принимается')
+SPAN_REOPEN_HINT = "; чтобы решить заново — reopen_review (rt.py reopen)"
+
+
+def check_edit_span_author(by):
+    """Автор правки отрезка обязателен: только "claude" или "human". Проверяется до любой записи и до
+    `recording_locked`, который считает пустого автора человеком."""
+    if by not in ("claude", "human"):
+        raise ValueError(EDIT_SPAN_AUTHOR_REQUIRED)
 
 
 def human_touched(word):
@@ -770,7 +786,10 @@ def prior_edit(word, data=None):
                    if e.get("id") == edit_id and e.get("by")), None)
     if by == "unknown":
         by = None
-    return {"id": edit_id, "by": by, "via": "edit_span" if str(edit_id).startswith("span@") else "card"}
+    marked = next((v.get("via") for v in (word.get("provenance") or {}).values()
+                   if isinstance(v, dict) and v.get("edit") == edit_id and v.get("via")), None)
+    via = marked or ("edit_span" if str(edit_id).startswith("span@") else "card")
+    return {"id": edit_id, "by": by, "via": via}
 
 
 def overwrite_refusal(word, data, writer, card):
@@ -915,7 +934,8 @@ def vocab_candidate(word, data=None):
 
 
 @recording_locked
-def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False):
+def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False,
+                     via=None, close_note=None, close_held=False):
     """Правки по словам, а не по местам (свободные ответы человека, freeform.py; правка отрезка edit_span).
     edits: [{"op": "relabel", "t", "speaker"} | {"op": "replace", "t", "text"} |
             {"op": "insert", "s", "e", "text", "speaker", "after_t"?, "before_t"?} |
@@ -928,7 +948,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     какое-то слово не найдено или у вставки нет говорящего — карточка не применяется и идёт человеку с причиной.
     Реплика делится там, где внутри неё меняется говорящий. closed — {id места: карточка}, которые
     ответ человека покрыл (решено через другую карточку). answers — {карточка: текст ответа} для журнала.
-    -> (data, отчёт)"""
+    via — способ правки ("edit_span"): пишется в журнал и в отметки слов, и тогда помечаются только изменённые
+    слова. close_note — заметка закрытых мест (по умолчанию «решено человеком (через карточку)»); close_held —
+    закрывать и места, оставленные человеку. -> (data, отчёт)"""
     data = load(json_path)
     original = copy.deepcopy(data)
     answers = answers or {}
@@ -1094,11 +1116,14 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 old_text = {w.get("word_id"): w["w"] for w in old if w.get("word_id")}
                 speaker_changed = bool(e.get("speaker") and any(flat[k]["spk"] != e["speaker"] for k in ks))
                 for w in new_ws:
+                    text_changed = not w.get("word_id") or old_text.get(w["word_id"]) != w["w"]
+                    if via and not (text_changed or speaker_changed):
+                        continue                  # правка отрезка: неизменённое слово сохраняет прежние отметки
                     w["edited"], w["by"] = card, by
-                    if not w.get("word_id") or old_text.get(w["word_id"]) != w["w"]:
-                        _mark_provenance(w, "text", by, card)
+                    if text_changed:
+                        _mark_provenance(w, "text", by, card, via)
                     if speaker_changed:
-                        _mark_provenance(w, "speaker", by, card)
+                        _mark_provenance(w, "speaker", by, card, via)
                 pos = ks[0]
                 spk, si = e.get("speaker") or flat[pos]["spk"], flat[pos]["seg"]
                 if spk != flat[pos]["spk"]:
@@ -1125,7 +1150,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     before_words.append(f["w"]["w"])
                     f["spk"] = e["speaker"]
                     f["w"]["by"], f["w"]["edited"] = by, card
-                    _mark_provenance(f["w"], "speaker", by, card)
+                    _mark_provenance(f["w"], "speaker", by, card, via)
                     rep["relabel"] += 1
             elif op == "replace":
                 if f["w"]["w"] != e["text"]:
@@ -1133,7 +1158,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     f["w"].setdefault("model", f["w"].get("raw", f["w"]["w"]))
                     f["w"]["w"] = e["text"]
                     f["w"]["by"], f["w"]["edited"], f["w"]["c"] = by, card, 1.0
-                    _mark_provenance(f["w"], "text", by, card)
+                    _mark_provenance(f["w"], "text", by, card, via)
                     if e.get("note"):
                         f["w"]["typo"] = e["note"]
                     after_words.append(e["text"])
@@ -1143,7 +1168,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             w = {"w": e["text"], "s": e["s"], "e": max(e["s"], e.get("e", e["s"])), "c": 1.0, "by": by,
                  "edited": card, "inserted": True}
             for dimension in ("text", "speaker", "order"):
-                _mark_provenance(w, dimension, by, card)
+                _mark_provenance(w, dimension, by, card, via)
             item = {"w": w, "spk": e["speaker"], "seg": -1}
             pos = put_after(e.get("after_t"), card, item, e.get("after_id"))
             if pos is None and (e.get("before_t") is not None or e.get("before_id") is not None):
@@ -1169,7 +1194,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             reindex()
             f["w"]["overlap"] = True
             f["w"]["by"] = f["w"].get("by") or "model"
-            _mark_provenance(f["w"], "order", by, card)
+            _mark_provenance(f["w"], "order", by, card, via)
             if put_after(e.get("after_t"), card, f, e.get("after_id")) is None:
                 flat.insert(k, f)
             reindex()
@@ -1226,19 +1251,19 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         brows = [r for r in snap if a_ <= r[0] <= b_]
         arows = [r for r in final if a_ <= r[0] <= b_ + 0.05]
         bt, at = txt(brows), txt(arows)
-        log.append({"id": card, "t": rg["t1"], "by": by, "kind": "words",
+        log.append({"id": card, "t": rg["t1"], "by": by, "kind": "words", **({"via": via} if via else {}),
                     "before": {"text": bt, "speaker": who(brows)}, "after": {"text": at, "speaker": who(arows)},
                     "answer": answers.get(card), "note": log_note or "ответ человека в карточке",
                     "pairs": sorted({tuple(p) for p in pairs.get(card, [])})})
         rg.update(before=bt, after=at)
     # места: закрытые ответом на другую карточку и сами карточки
     items = {i["id"]: i for i in data.get("review") or []}
-    for rid, via in (closed or {}).items():
-        if any(via == c for c in rep["failed"]):
+    for rid, card_via in (closed or {}).items():
+        if any(card_via == c for c in rep["failed"]):
             continue
         it = items.get(rid)
-        if it and it.get("status", "open") != "human":
-            it["status"], it["note"] = "resolved", f"решено человеком (через {via})"
+        if it and (close_held or it.get("status", "open") != "human"):
+            it["status"], it["note"] = "resolved", close_note or f"решено человеком (через {card_via})"
     for card in groups:
         it = items.get(card)
         if not it:
