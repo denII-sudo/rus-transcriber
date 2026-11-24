@@ -89,6 +89,16 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(workflow.quote_blockers(data, ["w6", "w7"]), [])        # чистая цитата рядом
         self.assertEqual(workflow.quote_blockers(make_data([RESOLVED]), ["w2", "w3"]), [])
 
+    def test_place_with_word_ids_is_judged_by_the_words_not_by_its_time(self):
+        # у места есть ссылки на слова: время места при этом может указывать совсем в другое место записи
+        elsewhere = {"id": "r6", "status": "open", "word_ids": ["w2"], "t1": 50.0, "t2": 50.0}
+        data = make_data([elsewhere])
+        self.assertEqual(workflow.quote_blockers(data, ["w2", "w3"]), [{"id": "r6", "reason": "open"}])
+        at_w4 = {"id": "r7", "status": "open", "word_ids": ["w2"], "t1": 3.0, "t2": 3.0}   # время w4, слова w2
+        data = make_data([at_w4])
+        self.assertEqual(workflow.quote_blockers(data, ["w4", "w5"]), [])
+        self.assertEqual(workflow.quote_blockers(data, ["w2"]), [{"id": "r7", "reason": "open"}])
+
     def test_unlocated_open_place_blocks_every_quote(self):
         data = make_data([OPEN_NOWHERE])
         for ids in (["w2"], ["w7", "w8"]):
@@ -161,6 +171,31 @@ class LinkTests(unittest.TestCase):
         self.assertIsNone(obj["quotes"]["2"]["written_label"])
 
 
+    def test_unknown_name_before_a_quote_without_labels_is_cut_with_the_mark(self):
+        # прежний режим (labels=False): имя, которого нет в стенограмме, — цитата не связывается
+        data = make_data()
+        obj, report = conspect.link("Сказал Иван: «срок релиза» и дальше.", data, within=set(A), unlinked="mark")
+        self.assertEqual(report["unlinked"], ["срок релиза"])
+        self.assertEqual(obj["template"], "Сказал срок релиза (не найдено в стенограмме) и дальше.")
+        self.assertEqual((obj["quotes"], obj["unlinked_count"]), ({}, 1))
+        plain, report = conspect.link("Сказал Иван: «срок релиза» и дальше.", data, within=set(A))
+        self.assertEqual(plain["template"], "Сказал Иван: «срок релиза» и дальше.")
+        self.assertEqual(report["unlinked"], ["срок релиза"])
+
+    def test_known_speaker_name_before_a_quote_is_cut_when_labels_are_on(self):
+        data = make_data()
+        data["segments"][0]["speaker"] = "Анна"                          # имя без цифр: так его читает QUOTE
+        obj, _ = conspect.link("Анна: «решили перенести» и «согласен».", data, unlinked="mark", labels=True)
+        self.assertEqual(obj["template"], "{{q:1}} и {{q:2}}.")
+        self.assertEqual(obj["quotes"]["1"]["written_label"], "Анна")
+        self.assertIsNone(obj["quotes"]["2"]["written_label"])
+        self.assertEqual([quote["parts"][0]["word_ids"] for quote in obj["quotes"].values()],
+                         [["w2", "w3"], ["w6"]])
+        obj, _ = conspect.link("Итог: «срок релиза» в разделе.", data, within=set(A), unlinked="mark", labels=True)
+        self.assertEqual(obj["template"], "Итог: {{q:1}} в разделе.")      # «Итог:» — обычный текст, не имя
+        self.assertIsNone(obj["quotes"]["1"]["written_label"])
+
+
 class RenderTests(unittest.TestCase):
     def render(self, data, text):
         obj, _ = policy_obj(text, data, within=set(A) | set(B))
@@ -184,6 +219,17 @@ class RenderTests(unittest.TestCase):
         md, _ = self.render(make_data([OPEN_NOWHERE]), "Итог: «решили перенести» и «согласен».")
         self.assertNotIn("«", md.split("Итог:")[1])
         self.assertIn("Цитат: 0 в кавычках, 2 без проверки", md)
+
+    def test_speaker_without_a_label_gets_the_header_name(self):
+        # говорящий появился после приёма: метки у него нет — имя по правилу шапки
+        data = make_data([RESOLVED])
+        obj, _ = policy_obj("Итог: «решили перенести» и «согласен».", data, within=set(A) | set(B))
+        obj["speaker_labels"] = [{"label": "Участник 1", "word_ids": ["w1"]}]
+        md, rep = conspect.render(obj, data, update_last=False)
+        self.assertIn("Участник 1: «решили перенести» и имя не указано (в стенограмме: Спикер 2): «согласен»", md)
+        data["speaker_names"] = {"Спикер 2": "Борис"}
+        md, _ = conspect.render(obj, data, update_last=False)
+        self.assertIn("Участник 1: «решили перенести» и Борис: «согласен»", md)
 
     def test_wrong_label_is_replaced_and_reported(self):
         data = make_data()
@@ -245,6 +291,55 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("author_corrected", rep)
 
 
+class RerenderClosesStoreTests(unittest.TestCase):
+    def test_store_is_closed_when_reading_fails(self):
+        for failing in ("get_current", "load"):
+            store = mock.MagicMock()
+            binding = {"recording_id": "rec"}
+            if failing == "get_current":
+                store.get_current.side_effect = RuntimeError("чтение")
+            with self.subTest(failing=failing), \
+                    mock.patch.object(recordings, "open_for_document", return_value=(store, binding)), \
+                    mock.patch.object(T, "load", side_effect=RuntimeError("чтение")):
+                with self.assertRaises(RuntimeError):
+                    conspect._rerender_locked(Path("x.transcript.json"))
+                store.close.assert_called_once()
+
+
+class RefreshConspectsTests(unittest.TestCase):
+    """recordings.refresh_conspects: что пересобирается при смене только ревизии разбора."""
+
+    @staticmethod
+    def run_refresh(payloads, source_revision=5, review_revision=2):
+        store = mock.MagicMock()
+        store.db.execute.return_value.fetchone.return_value = None           # очередь файлов пуста
+        store.get_current.return_value = {"transcript": {"revision": source_revision},
+                                          "review": {"revision": review_revision}}
+        store.list_conspects.return_value = [{"name": name, "payload": payload}
+                                             for name, payload in payloads.items()]
+        with mock.patch.object(recordings, "materialize_conspects"), \
+                mock.patch.object(conspect, "rerender", return_value={}) as rerender:
+            recordings.refresh_conspects(store, "rec", Path("doc.json"))
+        return [call.args[1] for call in rerender.call_args_list]
+
+    def test_old_conspect_is_not_rebuilt_by_a_review_only_change(self):
+        old = {"assembly_revision": 5, "assembly_review_revision": 1}              # нет quote_policy
+        self.assertEqual(self.run_refresh({"old": old}), [])
+        self.assertEqual(self.run_refresh({"old": {"assembly_revision": 5}}), [])
+
+    def test_policy_conspect_is_rebuilt_once_by_a_review_only_change(self):
+        stale = {"assembly_revision": 5, "assembly_review_revision": 1, "quote_policy": 1}
+        fresh = {"assembly_revision": 5, "assembly_review_revision": 2, "quote_policy": 1}
+        self.assertEqual(self.run_refresh({"new": stale, "old": {"assembly_revision": 5}}), ["new"])
+        self.assertEqual(self.run_refresh({"new": fresh}), [])                      # повтор — уже свежая
+        self.assertEqual(self.run_refresh({"new": {"assembly_revision": 5, "quote_policy": 1}}), ["new"])
+
+    def test_any_conspect_is_rebuilt_when_the_transcript_changed(self):
+        self.assertEqual(self.run_refresh({"old": {"assembly_revision": 4}}), ["old"])
+        self.assertEqual(self.run_refresh({"new": {"assembly_revision": 4, "assembly_review_revision": 2,
+                                                   "quote_policy": 1}}), ["new"])
+
+
 class SqliteModeTests(unittest.TestCase):
     """Модельная свёртка в базе: приём ответа, разбор человеком, пересборка без облака."""
     make_recording = p3.WorkflowTests.make_recording
@@ -267,12 +362,15 @@ class SqliteModeTests(unittest.TestCase):
         self.store = storage.initialize(self.root / "state.sqlite3", initial_display_name="Тест")
         self.addCleanup(self.store.close)
 
-    def prepared(self, review):
+    def prepared(self, review, segments=None, version=None):
+        """version=1 — задание прежнего вида (без реплик и меток), как у записи, заданной до этапа 7.3."""
         request, recording = self.ready_request(
             review=review,
-            segments=[self.segment("Спикер 1", ["мы", "решили", "перенести", "срок", "релиза"]),
-                      self.segment("Спикер 2", ["согласен", "с", "этим", "предложением"], start=5)])
-        return request, recording, workflow.prepare_model_task(self.store, request)
+            segments=segments or [self.segment("Спикер 1", ["мы", "решили", "перенести", "срок", "релиза"]),
+                                  self.segment("Спикер 2", ["согласен", "с", "этим", "предложением"], start=5)])
+        with mock.patch.object(model_tasks, "CURRENT_VERSION", version or model_tasks.CURRENT_VERSION):
+            task = workflow.prepare_model_task(self.store, request)
+        return request, recording, task
 
     @staticmethod
     def answer(task, text):
@@ -311,6 +409,53 @@ class SqliteModeTests(unittest.TestCase):
         self.assertIn("Цитат: 1 в кавычках, 1 без проверки", md)
         self.assertEqual(workflow.get(self.store, request)["state"], "completed")
 
+    def test_two_sections_number_quotes_through_and_sum_the_unlinked(self):
+        request, recording, task = self.prepared([self.OPEN])
+        ids = [word["word_id"] for word in task["words"]]
+        answer = {"source_revision": task["source_revision"], "sections": [
+            {"text": "Итог: «решили перенести», «срок релиза» и «нет такого».", "evidence": ids[:5]},
+            {"text": "Потом «согласен с этим» и «тоже нет».", "evidence": ids[5:]}]}
+        workflow.accept_model_result(self.store, request, answer)
+        payload, md = self.conspect_files(recording)
+        self.assertEqual(sorted(payload["quotes"]), ["1", "2", "3"])
+        self.assertEqual([payload["quotes"][key]["parts"][0]["word_ids"] for key in ("1", "2", "3")],
+                         [ids[1:3], ids[3:5], ids[5:8]])
+        self.assertEqual(payload["unlinked_count"], 2)
+        for number in (1, 2, 3):
+            self.assertEqual(payload["template"].count("{{q:%d}}" % number), 1)
+        self.assertLess(payload["template"].index("{{q:2}}"), payload["template"].index("{{q:3}}"))
+        # «решили перенести» задевает открытое место (время 1 с); остальные две связанные чисты
+        self.assertIn("решили перенести (по распознаванию, не проверено, 00:00:01)", md)
+        self.assertIn("«срок релиза»", md)
+        self.assertIn("«согласен с этим»", md)
+        self.assertIn("нет такого (не найдено в стенограмме)", md)
+        self.assertIn("тоже нет (не найдено в стенограмме)", md)
+        self.assertIn("Цитат: 2 в кавычках, 3 без проверки", md)
+
+    def test_accept_saves_the_review_revision_of_the_assembly(self):
+        request, recording, task = self.prepared([self.OPEN])
+        workflow.accept_model_result(self.store, request, self.answer(task, self.TEXT))
+        payload, _ = self.conspect_files(recording)
+        self.assertEqual(payload["assembly_review_revision"],
+                         self.store.get_current(recording)["review"]["revision"])
+        self.assertIsNotNone(payload["assembly_review_revision"])
+
+    def test_quote_is_looked_for_among_the_words_of_its_own_section(self):
+        # «срок релиза» есть в обеих репликах; в разделе первой реплики место одно — within его выбирает
+        segments = [self.segment("Спикер 1", ["мы", "решили", "перенести", "срок", "релиза"]),
+                    self.segment("Спикер 2", ["согласен", "срок", "релиза", "точно"], start=5)]
+        request, recording, task = self.prepared([], segments)
+        ids = [word["word_id"] for word in task["words"]]
+        answer = {"source_revision": task["source_revision"], "sections": [
+            {"text": "Итог: «срок релиза» сдвинут.", "evidence": ids[:5]},
+            {"text": "Потом «срок релиза» подтвердили.", "evidence": ids[5:]}]}
+        workflow.accept_model_result(self.store, request, answer)
+        payload, md = self.conspect_files(recording)
+        self.assertEqual([payload["quotes"][key]["parts"][0]["word_ids"] for key in ("1", "2")],
+                         [ids[3:5], ids[6:8]])
+        self.assertEqual(payload["unlinked_count"], 0)
+        self.assertIn("Цитат: 2 в кавычках, 0 без проверки", md)
+
     def test_unlinked_quote_does_not_reject_the_answer(self):
         request, recording, task = self.prepared([])
         workflow.accept_model_result(self.store, request, self.answer(task, "Он сказал «такого нет вовсе»."))
@@ -327,22 +472,40 @@ class SqliteModeTests(unittest.TestCase):
 
     def test_saved_version_1_task_keeps_the_whole_record_ban(self):
         # задание версии 1 (без реплик и меток) доделывается по-прежнему: цитата при открытом сомнении — отказ
-        request, recording, task = self.prepared([self.OPEN])
-        legacy = model_tasks.build(
-            task["recording_id"], task["source_revision"],
-            [{**{key: value for key, value in word.items() if key != "turn"}, "uncertain": True}
-             for word in task["words"]],     # версия 1: открытое место без ссылок — сомнительны все слова
-            task["goal"], task["review_revision"])
-        with self.store._transaction():
-            self.store.db.execute("UPDATE workflow_requests SET model_task_json=? WHERE request_id=?",
-                                  (storage._json(legacy), request))
-        ids = [word["word_id"] for word in legacy["words"]]
-        answer = {"source_revision": legacy["source_revision"],
-                  "sections": [{"text": "Итог: «согласен с этим».", "evidence": ids}]}
+        request, recording, task = self.prepared([self.OPEN], version=1)
+        self.assertEqual(model_tasks.version(task), 1)
+        answer = self.answer(task, "Тогда «согласен с этим» верно.")
         with self.assertRaises(ValueError):
             workflow.accept_model_result(self.store, request, answer)
         self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
         self.assertEqual(self.store.list_conspects(recording), [])
+
+    def test_version_1_open_place_bans_a_clean_linked_quote_on_accept_and_on_part(self):
+        # запрет из-за открытого сомнения — сам по себе: цитата связывается однозначно и входит в свидетельства
+        request, recording, task = self.prepared([self.OPEN], version=1)
+        answer = self.answer(task, "Тогда «согласен с этим» верно.")
+        with self.assertRaisesRegex(ValueError, "неразрешённые сомнения"):
+            workflow.accept_model_result(self.store, request, answer)
+        with self.assertRaisesRegex(ValueError, "неразрешённые сомнения"):
+            workflow._validate_model_part(self.store, request, 0, answer)
+        self.assertEqual(self.store.list_conspects(recording), [])
+
+    def test_version_1_unlinked_quote_bans_without_any_open_place(self):
+        # запрет из-за несвязанной цитаты — сам по себе: сомнений нет
+        request, recording, task = self.prepared([], version=1)
+        answer = self.answer(task, "Он сказал «такого нет вовсе».")
+        with self.assertRaisesRegex(ValueError, "не найдены"):
+            workflow.accept_model_result(self.store, request, answer)
+        with self.assertRaisesRegex(ValueError, "неоднозначна"):
+            workflow._validate_model_part(self.store, request, 0, answer)
+        self.assertEqual(self.store.list_conspects(recording), [])
+
+    def test_version_1_clean_quote_without_open_places_is_accepted(self):
+        request, recording, task = self.prepared([], version=1)
+        answer = self.answer(task, "Тогда «согласен с этим» верно.")
+        workflow.accept_model_result(self.store, request, answer)
+        self.assertEqual(workflow.get(self.store, request)["state"], "completed")
+        self.assertNotIn("quote_policy", self.conspect_files(recording)[0])
 
     def test_quotes_return_after_the_place_is_resolved_without_the_cloud(self):
         request, recording, task = self.prepared([self.OPEN])
