@@ -1216,12 +1216,14 @@ def _copy_problem(store, row):
     return None
 
 
-def _damaged_stops(store, row, rows, program, row_state):
-    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row.
+def _set_stops(store, row, rows, program, row_state):
+    """Файлы с принятым решением, на которых запись встанет, не дойдя до файла row: (все такие, из них изменённые).
 
-    row_state — состояние файла row. Файлы документа сверяются все до первой замены в порядке `documents.WRITE_ORDER`:
-    копия раньше row в этом порядке останавливает запись всегда, позже — только если row не изменён после решения
-    (изменённый файл даёт новый конфликт раньше, чем сверка дойдёт до копии)."""
+    Каждый сверяется тем же правилом, что и при записи (`documents.file_verdict`): изменён после решения — запись
+    откроет по нему новый конфликт; повреждена копия решения — встанет без конфликта. row_state — состояние файла row.
+    Порядок отказов документа — `documents.stopped_by`: файл раньше row останавливает запись всегда, позже — только
+    если row не изменён после решения (изменённый row даёт новый конфликт раньше). У свёртки правки ищутся по всем
+    файлам сразу, порядка нет. Файл, исчезнувший после решения, здесь не назван (как и раньше)."""
     import documents
     decided = {}
     for other in rows:
@@ -1234,19 +1236,44 @@ def _damaged_stops(store, row, rows, program, row_state):
         decided[(other["revision"], other["relative_path"])] = other
     table, column, revision = (("document_outbox", "recording_id", "document_revision") if row["scope"] == "document"
                                else ("conspect_outbox", "conspect_id", "revision"))
-    found = set()
+    found = []    # (решение, изменён ли файл после решения)
+    own = (row["revision"], row["relative_path"])
     for other in decided.values():
-        if row["scope"] == "document" and other["revision"] == row["revision"] and row_state != "same":
-            order = documents.WRITE_ORDER
-            if order.index(other["kind"]) > order.index(row["kind"]):
-                continue
         state, digest = _file_at(store, other, other["relative_path"])
-        if state != "ok" or digest != other["observed_hash"] or digest == documents._digest(program[other["kind"]]):
+        program_hash = documents._digest(program[other["kind"]])
+        if state != "ok" or digest == program_hash:
             continue
-        if store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
-                            (row["object"][1], other["revision"])).fetchone() and _copy_problem(store, other):
-            found.add(Path(other["relative_path"]).name)
-    return sorted(found)
+        if not store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
+                                (row["object"][1], other["revision"])).fetchone():
+            continue
+        if digest == other["observed_hash"]:    # принятые байты: встанет, только если копия решения повреждена
+            if _copy_problem(store, other):
+                found.append((other, False))
+        elif ((other["revision"], other["relative_path"]) != own    # свой файл: его состояние — row_state
+              and documents.file_verdict(digest, program_hash, None, other) == "external"):
+            found.append((other, True))
+    if row["scope"] == "document":
+        verdicts = {other["kind"]: "external" if changed else "damaged_copy" for other, changed in found
+                    if other["revision"] == row["revision"] and (other["revision"], other["relative_path"]) != own}
+        verdicts[row["kind"]] = "accepted" if row_state == "same" else "refused"
+        allowed = set(documents.stopped_by(verdicts, row["kind"]))
+        found = [(other, changed) for other, changed in found
+                 if other["revision"] != row["revision"] or (other["revision"], other["relative_path"]) == own
+                 or other["kind"] in allowed]
+    return (sorted({Path(other["relative_path"]).name for other, _ in found}),
+            sorted({Path(other["relative_path"]).name for other, changed in found if changed}))
+
+
+def _stops_words(stops, changed):
+    """Чем остановится запись, словами: повреждённые копии и файлы, изменённые после решения."""
+    damaged = [name for name in stops if name not in changed]
+    parts = []
+    if damaged:
+        parts.append("повреждённая копия файла " + ", ".join(f"«{name}»" for name in damaged))
+    if changed:
+        parts.append("файл " + ", ".join(f"«{name}»" for name in changed) + ": его изменили после принятого решения, "
+                     "и программа покажет по нему новый конфликт")
+    return "; ".join(parts)
 
 
 def _effect(row, state, waits, stops):
@@ -1281,6 +1308,7 @@ def replacement_effect(recording_id, conflict_id, kind):
             raise CoreError(facts["reason"])
         blocked = bool(_unresolvable_wait(store, row, _conflict_rows(store, kind)))
         return {"effect": facts["effect"], "waits": facts["waits_for"], "stops": facts["stops_for"],
+                "stops_changed": facts["stops_changed"],
                 "changed": facts["file_state"] == "changed", "blocked": blocked}
     finally:
         store.close()
@@ -1304,15 +1332,15 @@ def _conflict_facts(store, row):
     also = [] if reason else _also_replaced(store, row, program)
     rows = [] if reason else _conflict_rows(store, row["scope"])
     waits = [] if reason else _waits_for(row, rows)
-    stops = [] if reason else _damaged_stops(store, row, rows, program, state)
+    stops, changed = ([], []) if reason else _set_stops(store, row, rows, program, state)
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
-            "also_replaces": also, "waits_for": waits, "stops_for": stops,
+            "also_replaces": also, "waits_for": waits, "stops_for": stops, "stops_changed": changed,
             "effect": None if reason else _effect(row, state, waits, stops), "can_replace": reason is None, "reason": reason,
             "snapshot": None if reason else {
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
                 "program_hash": program_hash, "also_replaces": also, "waits_for": waits,
-                "stops_for": stops}}
+                "stops_for": stops, "stops_changed": changed}}
 
 
 def _lines(text):
@@ -1539,6 +1567,7 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "also_replaces": facts["also_replaces"] if can_replace else [],
                 "waits_for": facts["waits_for"] if can_replace else [], "waits_blocked": bool(waits),
                 "stops_for": facts["stops_for"] if can_replace else [],
+                "stops_changed": facts["stops_changed"] if can_replace else [],
                 "effect": facts["effect"] if can_replace else None,
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
@@ -1680,7 +1709,7 @@ def _next_step(store, row, rows, problem):
     found, digest = _file_at(store, row, row["relative_path"])
     state = found if found != "ok" else "same" if digest == row["observed_hash"] else "changed"
     waits = _waits_for(row, rows)
-    stops = _damaged_stops(store, row, rows, program, state)
+    stops, changed = _set_stops(store, row, rows, program, state)
     effect = _effect(row, state, waits, stops)
     waiting = ""
     if waits:
@@ -1709,6 +1738,9 @@ def _next_step(store, row, rows, problem):
     if effect == "recopy":
         return effect, ("Файл изменён после принятого решения, поэтому заменён не будет: при повторе программа "
                         "покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+    if effect == "stopped" and changed:
+        return effect, ("Этот файл сейчас не будет записан: запись встанет раньше — " + _stops_words(stops, changed)
+                        + ". Выход указан в карточке того файла.")
     if effect == "stopped":
         return effect, ("Этот файл не будет записан, пока не разобрана повреждённая копия: "
                         + ", ".join(f"«{name}»" for name in stops) + ". Выход указан в карточке того файла.")
