@@ -2785,6 +2785,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "blocked_preflight"
         elif aid in undo_failed:
             outcomes[aid] = "undo_conflict"
+        elif aid in (report.get("already_decided") or []):
+            outcomes[aid] = "already_decided"
         elif aid in rep.get("human", []):
             outcomes[aid] = "left_for_human"
         elif aid in apply_conflicts or aid in free_conflicts:

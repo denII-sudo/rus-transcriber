@@ -689,12 +689,14 @@ def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="cla
         for it in data.get("review") or []:
             a_, b_ = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
             if a_ is not None and t1 - 0.01 <= a_ and b_ <= t2 + 0.01 and it.get("status", "open") != "resolved":
+                if by != "human" and it.get("status") == "human":
+                    raise ValueError(f"{HELD_FOR_HUMAN} ({it['id']}): агент его не меняет и не закрывает")
                 closed[it["id"]] = card
     data2, rep = apply_word_edits(json_path, md_path, [e], by=by, closed=closed,
                                   log_note="правка отрезка" + (f": {note}" if note else ""))
     if card in rep["failed"]:
         raise ValueError(rep["failed"][card])
-    if resolve:                               # закрытые правкой отрезка — даже если раньше оставлены человеку
+    if resolve:                               # закрытые правкой отрезка человека — и оставленные человеку
         items = {i["id"]: i for i in data2.get("review") or []}
         for rid in closed:
             if items.get(rid):
@@ -737,15 +739,83 @@ def _mark_provenance(word, dimension, by, edit):
     word["provenance"] = provenance
 
 
-def _diff_words(old, new_text, item_id):
+HELD_FOR_HUMAN = "место оставлено человеку"
+
+
+def prior_edit(word, data=None):
+    """Чья прежняя правка у слова и каким способом. -> None, если слово не правили, иначе
+    {"id": правка, "by": автор или None, "via": "edit_span" | "card"}.
+    Автор: `by` слова → `provenance` (текст, затем говорящий) → последняя запись журнала `edits` с тем же
+    id → не определён (None; так бывает в старых записях). Способ: правка отрезка (`span@…`) или ответ
+    на карточку. Одна функция для проверки и применения ответов и для правил правки отрезка."""
+    edit_id = word.get("edited")
+    if not edit_id:
+        return None
+    by = word.get("by")
+    if not by:
+        provenance = word.get("provenance") or {}
+        by = next((v["by"] for v in (provenance.get("text"), provenance.get("speaker"))
+                   if isinstance(v, dict) and v.get("by")), None)
+    if not by and data:
+        by = next((e["by"] for e in reversed(data.get("edits") or [])
+                   if e.get("id") == edit_id and e.get("by")), None)
+    if by == "unknown":
+        by = None
+    return {"id": edit_id, "by": by, "via": "edit_span" if str(edit_id).startswith("span@") else "card"}
+
+
+def overwrite_refusal(word, data, writer, card):
+    """Можно ли правке `card` автора `writer` перезаписать слово. -> None (можно) или причина отказа,
+    которая называет автора и способ прежней правки. Ответ человека главнее правки агента и старой
+    правки без автора; поверх ответа другой карточки и правки отрезка человека — конфликт: обе правки
+    человеческие, выбирает человек. Агент не перезаписывает ничью прежнюю правку."""
+    prior = prior_edit(word, data)
+    if prior is None or prior["id"] == card:
+        return None
+    if writer == "human" and prior["by"] != "human":
+        return None
+    span = prior["via"] == "edit_span"
+    if prior["by"] == "human":
+        how = "правкой отрезка человека" if span else "ответом человека на карточку"
+    elif prior["by"]:
+        how = "правкой отрезка агента" if span else "правкой агента по карточке"
+    else:
+        how = "прежней правкой без автора"
+    return f"слово «{word.get('w')}» уже исправлено {how} ({prior['id']})"
+
+
+def _held_places(data):
+    """Места, оставленные человеку (статус human): (id() их слов, их отрезки). Агент их не меняет и не
+    закрывает, пока нет правила о поручении такого места ИИ."""
+    words, spans = set(), []
+    all_words = [w for seg in data.get("segments") or [] for w in seg.get("words") or []]
+    for it in data.get("review") or []:
+        if it.get("status") != "human":
+            continue
+        t1, t2 = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
+        if t1 is not None and t2 is not None:
+            spans.append((t1 - 0.01, t2 + 0.01))
+        ids = it.get("word_ids")
+        if ids:
+            words.update(id(w) for w in all_words if w.get("word_id") in ids)
+        elif t1 is not None and t2 is not None:
+            words.update(id(w) for w in all_words if t1 - 0.01 <= w["s"] <= t2 + 0.01)
+    return words, spans
+
+
+def _diff_words(old, new_text, item_id, refuse=None):
     """Правка текста места по словам: меняются только отличающиеся слова, у остальных сохраняются время,
-    уверенность и прежние правки (на время слов опираются ссылки конспекта). Слово, уже исправленное
-    другой правкой, не перезаписывается — оно возвращается в списке конфликтов.
-    -> (новые слова, [id правок, которые сохранены вместо этой])."""
+    уверенность и прежние правки (на время слов опираются ссылки конспекта). Слово с прежней правкой,
+    которую нельзя перезаписать (refuse(слово) -> причина или None; по умолчанию — любая другая
+    правка), не перезаписывается — оно возвращается в списке конфликтов.
+    -> (новые слова, [id правок, которые сохранены вместо этой], [причины])."""
     import difflib
+    if refuse is None:
+        def refuse(w):
+            return "слово уже исправлено прежней правкой" if w.get("edited") and w["edited"] != item_id else None
     new = new_text.split()
     sm = difflib.SequenceMatcher(None, [_wkey(w["w"]) for w in old], [_wkey(x) for x in new], autojunk=False)
-    out, conflicts = [], []
+    out, conflicts, reasons = [], [], []
 
     def mk(text, src, s, e):
         result = {"w": text, "s": s, "e": e, "c": 1.0, "edited": item_id,
@@ -762,9 +832,10 @@ def _diff_words(old, new_text, item_id):
             for w, x in zip(src, new[j1:j2]):          # пунктуация и регистр — из правки
                 out.append(w if w["w"] == x else {**w, "w": x, "edited": w.get("edited", item_id)})
             continue
-        prior = [w["edited"] for w in src if w.get("edited") and w["edited"] != item_id]
-        if prior:
-            conflicts += prior
+        refused = [(w["edited"], why) for w in src for why in [refuse(w)] if why]
+        if refused:
+            conflicts += [edit for edit, _ in refused]
+            reasons += [why for _, why in refused if why not in reasons]
             out.extend(src)
             continue
         if op == "delete":
@@ -777,7 +848,7 @@ def _diff_words(old, new_text, item_id):
             out.extend(mk(x, [w], w["s"], w["e"]) for w, x in zip(src, new[j1:j2]))
         else:
             out.append(mk(" ".join(new[j1:j2]), src, src[0]["s"], src[-1]["e"]))
-    return out, sorted(set(conflicts))
+    return out, sorted(set(conflicts)), reasons
 
 
 def _common_word(w):
@@ -850,6 +921,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     ответ человека покрыл (решено через другую карточку). answers — {карточка: текст ответа} для журнала.
     -> (data, отчёт)"""
     data = load(json_path)
+    original = copy.deepcopy(data)
     answers = answers or {}
     name_to_label = {v: k for k, v in (data.get("speaker_names") or {}).items()}
     flat = []
@@ -898,12 +970,22 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     groups = {}
     for e in edits:
         groups.setdefault(e.get("card", "?"), []).append(e)
+    held_words, held_spans = _held_places(data) if by != "human" else (set(), [])
+
+    def refuse(e):
+        return lambda w: overwrite_refusal(w, data, by, e.get("card", "?"))
 
     def check(eds):
         """Причина, по которой правки карточки нельзя применить целиком, или None."""
         def protected(w):
             return w.get("by") == "human" or any(
                 v.get("by") == "human" for v in (w.get("provenance") or {}).values() if isinstance(v, dict))
+
+        def held(k):
+            return k is not None and id(flat[k]["w"]) in held_words
+
+        def held_time(t):
+            return t is not None and any(a <= t <= b for a, b in held_spans)
 
         removed = set()
         for e in eds:
@@ -927,6 +1009,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                         anchor = find(anchor_t, word_id=anchor_id)
                         if anchor is None or anchor in removed:
                             return "опора вставки отсутствует, удаляется или неоднозначна"
+                        if held(anchor):
+                            return HELD_FOR_HUMAN
+                if held_time(e.get("s")):
+                    return HELD_FOR_HUMAN
                 continue
             if op == "place_text":
                 ks = place_indices(e)
@@ -937,14 +1023,20 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
                 if by != "human" and any(protected(flat[k]["w"]) for k in ks):
                     return "на отрезке есть подтверждённые человеком слова"
-                if current and _diff_words(current, e["text"], e.get("card", "?"))[1]:
-                    return "на отрезке есть конфликтующие прежние правки"
+                if any(held(k) for k in ks) or (not ks and any(
+                        a <= e["t2"] + 0.01 and e["t1"] - 0.01 <= b for a, b in held_spans)):
+                    return HELD_FOR_HUMAN
+                why = current and _diff_words(current, e["text"], e.get("card", "?"), refuse(e))[2]
+                if why:
+                    return "на отрезке есть конфликтующие прежние правки: " + "; ".join(why)
                 continue
             k = find(e["t"], e.get("w"), strict=True, word_id=e.get("word_id"))
             if k is None:
                 return f"слово «{e.get('w')}» ({e['t']} с) не найдено — стенограмма изменилась"
             if by != "human" and protected(flat[k]["w"]):
                 return "слово подтверждено человеком"
+            if held(k):
+                return HELD_FOR_HUMAN
             if op == "overlap_move" and (e.get("after_id") is not None or e.get("after_t") is not None):
                 anchor = find(e.get("after_t"), word_id=e.get("after_id"))
                 if anchor is None or anchor in removed or anchor == k:
@@ -993,7 +1085,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     after_words += toks
                     continue
                 old = [flat[k]["w"] for k in ks]
-                new_ws, _ = _diff_words(old, e["text"], card)
+                new_ws, _, _ = _diff_words(old, e["text"], card, refuse(e))
                 old_text = {w.get("word_id"): w["w"] for w in old if w.get("word_id")}
                 speaker_changed = bool(e.get("speaker") and any(flat[k]["spk"] != e["speaker"] for k in ks))
                 for w in new_ws:
@@ -1148,8 +1240,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             continue
         if card in rep["failed"]:
             it["status"] = "human"
-            it["note"] = (it.get("note") + "; " if it.get("note") else "") + \
-                f"ответ не применён: {rep['failed'][card]}" + (f": «{answers[card]}»" if answers.get(card) else "")
+            why = f"ответ не применён: {rep['failed'][card]}" + (f": «{answers[card]}»" if answers.get(card) else "")
+            if why not in (it.get("note") or ""):        # повтор той же неудачи заметку не удлиняет
+                it["note"] = (it.get("note") + "; " if it.get("note") else "") + why
         else:
             it["status"] = "resolved"
     for d in rep["proposed_delete"]:
@@ -1172,7 +1265,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 data.setdefault("vocab_suggestions", []).append({"to": c, "from": None, "card": e.get("card"),
                                                                  "add": {"terms": [c]}})
     data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
-    if not dry_run:
+    if not dry_run and data != original:     # без изменений — без новой ревизии и перезаписи файлов
         save(data, json_path, md_path)
     rep["open_left"] = sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")
     rep["conspects"] = None if dry_run else _refresh_conspects(json_path)
@@ -1185,6 +1278,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
     "note"?: str}]. Без speaker и text — место принято как есть. status "human" — оставить человеку.
     Возвращает (data, отчёт)."""
     data = load(json_path)
+    original = copy.deepcopy(data)
     items = {i["id"]: i for i in data.get("review") or []}
     name_to_label = {v: k for k, v in (data.get("speaker_names") or {}).items()}
     report = {"applied": 0, "kept": 0, "human": 0, "unknown": [], "successful_ids": []}
@@ -1196,8 +1290,25 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             report["unknown"].append(d.get("id"))
             continue
         if d.get("status") == "human":
+            # Слова не получают отметок человека. Место, уже оставленное человеку, не меняется.
+            # if_open («Оставить человеку» на карточке): решённое место тоже не меняется — повтор после
+            # того, как место закрыли, ничего не пишет. Без него (программа отправляет непонятый ответ
+            # человеку) решённое место снова уходит человеку, как раньше.
+            status = it.get("status", "open")
+            if status == "human":
+                # Комментарий человека из нового ответа дописывается; повтор того же ничего не пишет.
+                comment = d.get("comment")
+                if comment and d.get("note") and comment not in (it.get("note") or ""):
+                    it["note"] = (it["note"] + "; " if it.get("note") else "") + d["note"]
+                continue
+            if status != "open" and d.get("if_open"):
+                report.setdefault("already_decided", []).append(it["id"])
+                continue
             it["status"], it["note"] = "human", d.get("note") or it.get("note")
             report["human"] += 1
+            continue
+        if by != "human" and it.get("status") == "human":
+            report.setdefault("conflicts", []).append({"id": it["id"], "why": HELD_FOR_HUMAN})
             continue
         if it.get("asr_problem") and "listened" not in d:
             report.setdefault("conflicts", []).append({"id": it["id"], "why": "нужно отдельное подтверждение прослушивания"})
@@ -1262,9 +1373,11 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         new_text = d.get("text")
         if new_text and new_text != before["text"]:
             model = [w.get("raw", w["w"]) for w in ws[w1:w2]]
-            new_ws, conflicts = _diff_words(ws[w1:w2], new_text, it["id"])
+            new_ws, conflicts, why = _diff_words(
+                ws[w1:w2], new_text, it["id"], lambda w: overwrite_refusal(w, data, by, it["id"]))
             if conflicts:
-                report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts})
+                report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts,
+                                                           "why": "; ".join(why)})
                 continue
             original_text = {w.get("word_id"): w["w"] for w in ws[w1:w2] if w.get("word_id")}
             for w in new_ws:
@@ -1340,7 +1453,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             it["status"] = "open"
             it.pop("note", None)
     data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
-    save(data, json_path, md_path)
+    if data != original:                     # без изменений — без новой ревизии и перезаписи файлов
+        save(data, json_path, md_path)
     report["open_left"] = sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")
     report["vocab_suggestions"] = data.get("vocab_suggestions", [])
     report["conspects"] = _refresh_conspects(json_path)
