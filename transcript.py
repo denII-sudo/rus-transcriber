@@ -70,6 +70,23 @@ def doubt_marks(data):
     """{номер реплики: {номер слова: id места}} — слова нерешённых мест (по времени: индексы сдвигаются)."""
     out = {}
     for it in unresolved(data):
+        if is_gap_place(it):
+            # пропуск (ответ владельца, вариант А): слова паузы — начатые в ней; у пустой паузы помечены последнее
+            # слово до неё и первое после, чтобы цитата рядом с непрослушанной паузой не считалась проверенной
+            times = _place_time(it)
+            if times is None:
+                continue
+            inside = pause_words(data, *times)
+            if inside:
+                # при наложении речи — реплика того, кому место приписано (как у мест-слов)
+                best = min((data["segments"][si]["speaker"] != it.get("speaker"), si)
+                           for si in {x[0] for x in inside})[1]
+                found = [x for x in inside if x[0] == best]
+            else:
+                found = neighbors_of_pause(data, *times)
+            for si, k, _w in found:
+                out.setdefault(si, {})[k] = it["id"]
+            continue
         t1, t2 = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
         if t1 is None:
             continue
@@ -609,6 +626,18 @@ def pause_words(data, t1, t2):
     return out
 
 
+def neighbors_of_pause(data, t1, t2):
+    """[(номер реплики, номер слова, слово)]: последнее слово с началом до паузы [t1, t2) и первое после неё
+    (что есть; равные времена — по порядку стенограммы: «до» — позднее, «после» — раньше). Слова без конечного
+    начала пропускаются. Одна запись для place_words(pause_neighbors=True) и пометок ⟦…⟧ (doubt_marks)."""
+    timed = [(si, k, w) for si, seg in enumerate(data.get("segments") or [])
+             for k, w in enumerate(seg.get("words") or []) if _finite_number(w.get("s"))]
+    before = [x for x in timed if _cents(x[2]["s"]) < _cents(t1)]
+    after = [x for x in timed if _cents(x[2]["s"]) >= _cents(t2)]
+    key = lambda x: (x[2]["s"], x[0], x[1])
+    return ([max(before, key=key)] if before else []) + ([min(after, key=key)] if after else [])
+
+
 def word_in_place(start, end, t1, t2):
     """Правило пересечения слова [start, end] с местом-словом [t1, t2] (секунды): для цитат и пометок 7.3.
 
@@ -659,12 +688,11 @@ def place_words(data, item, *, pause_neighbors=False):
     chosen = inside
     if not inside and pause_neighbors:
         if gap_place:
-            before = [(w["s"], pos, w) for pos, w in timed if _cents(w["s"]) < _cents(t1)]
-            after = [(w["s"], pos, w) for pos, w in timed if _cents(w["s"]) >= _cents(t2)]
+            chosen = [w for _si, _k, w in neighbors_of_pause(data, t1, t2)]
         else:
             before = [(w["s"], pos, w) for pos, w in timed if w["s"] < t1 - WORD_PLACE_TOLERANCE]
             after = [(w["s"], pos, w) for pos, w in timed if w["s"] > t2 + WORD_PLACE_TOLERANCE]
-        chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else [])             + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
+            chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else [])                 + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
     if any(not isinstance(w.get("word_id"), str) or not w.get("word_id") for w in chosen):
         return None
     return [w["word_id"] for w in chosen], not inside

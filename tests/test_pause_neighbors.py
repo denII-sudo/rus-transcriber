@@ -877,6 +877,15 @@ class DoubtMarksPauseTests(unittest.TestCase):
         self.assertEqual(self.marks(gap(5.0, 6.0)), {0: {5: "r1"}})
         self.assertEqual(self.marks(gap(0.0, 0.4)), {0: {0: "r1"}})
 
+    def test_overlapping_speech_in_the_pause_marks_the_speakers_own_segment(self):
+        data = {"segments": [
+            {"speaker": "Борис", "start": 2.0, "end": 2.4, "text": "эх", "words": [word("w1", "эх", 2.0)]},
+            {"speaker": "Анна", "start": 2.2, "end": 2.6, "text": "ага", "words": [word("w2", "ага", 2.2)]}],
+            "review": [gap(1.5, 3.0, speaker="Анна")]}
+        self.assertEqual(transcript.doubt_marks(data), {1: {0: "r1"}})
+        data["review"] = [gap(1.5, 3.0, speaker="Борис")]
+        self.assertEqual(transcript.doubt_marks(data), {0: {0: "r1"}})
+
     def test_neighbors_render_as_one_doubt_span(self):
         data = self.make()
         marks = self.marks(gap(1.5, 3.0), data)
