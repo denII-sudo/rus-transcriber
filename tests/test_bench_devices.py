@@ -956,6 +956,25 @@ class RunFileFromMainTests(unittest.TestCase):
         rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
         self.assertEqual(rec["params"]["third_max_repeat"], 1)
 
+    def test_speed_is_to_audio_length_and_words_stay_out_of_run_file(self):
+        # РАР-4.2, шаг 4: куски с нахлёстом длиннее звука, но скорость — к длине отрывка, как в расшифровке;
+        # слова со временами нужны только голосованию отчёта и в файл прогона не попадают
+        words = [{"w": "раз", "s": 0.1, "e": 0.4, "c": 0.9}, {"w": "два", "s": 1.0, "e": 1.3, "c": 0.9}]
+        diag = [{"index": 0, "state": "ok", "attempts": [], "audio_span": [0.0, 3.0], "own_span": [0.0, 2.75]},
+                {"index": 1, "state": "ok", "attempts": [], "audio_span": [2.5, 5.0], "own_span": [2.75, 5.0]}]
+        for vid in ("onnx-cpu", "ctc-cpu"):
+            self.overrides[vid] = {"hyp_words": words, "diagnostics": diag, "text": "раз два", "chunks": 2}
+        st, _ = self.run_main("20260101-000300-b00004")
+        raw = Path(st["run_file"]).read_text(encoding="utf-8")
+        rec = json.loads(raw)
+        by_id = {r["id"]: r for r in rec["results"]}
+        self.assertEqual(by_id["onnx-cpu"]["rtfx"], 2.5)        # 5 с звука / 2 с работы, не 5,5 с кусков
+        self.assertEqual(by_id["ctc-cpu"]["rtfx"], 5.0)
+        for r in by_id.values():
+            self.assertNotIn("hyp_words", r)
+            self.assertNotIn("diagnostics", r)
+        self.assertNotIn("\"раз\"", raw)
+
     def test_every_run_leaves_its_own_file(self):
         import runinfo
         st1, report = self.run_main("20260101-000000-b00001")
