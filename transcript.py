@@ -400,9 +400,9 @@ def _save_locked(data, json_path, md_path):
                         document_revision=result["document_revision"],
                         document_sync=result["document_sync"])
             if result["document_sync"] != "synced":
+                import documents
                 completed = recordings.materialize_recording(store, recording_id)
-                if (recording_id, result["document_revision"]) not in completed:
-                    raise RuntimeError("SQLite commit succeeded but document materialization is pending")
+                documents.require_written(store, recording_id, result["document_revision"], completed)
             data["document_sync"] = "synced"
             return result
         finally:

@@ -1003,7 +1003,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     with self.assertRaises(storage.Conflict):
                         recordings.write_review_pack_state(json_path, stale)
                     with mock.patch.object(recordings, "materialize_recording", return_value=[]):
-                        with self.assertRaisesRegex(RuntimeError, "materialization is pending"):
+                        with self.assertRaisesRegex(documents.NotSynced, "обновление документа не завершено"):
                             transcript.rename(json_path, "unused", {"Тестовый": "Другое"})
                     self.assertEqual(store.get_current(draft_id)["transcript"]["revision"], 4)
                     recordings.materialize_recording(store, draft_id)
@@ -1479,7 +1479,7 @@ class BackendSelectionTests(unittest.TestCase):
             data["file"] = str(audio)
             with mock.patch.object(settings.paths, "STATE_DB", db_path):
                 with mock.patch.object(recordings, "materialize_recording", return_value=[]):
-                    with self.assertRaisesRegex(RuntimeError, "materialization is pending"):
+                    with self.assertRaisesRegex(documents.NotSynced, "обновление документа не завершено"):
                         worker._save_worker_result(
                             data, audio, status, {"root_id": root_id, "paths": paths, "context": context},
                             layout["root"] / paths["json"], layout["root"] / paths["md"])

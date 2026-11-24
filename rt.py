@@ -449,8 +449,12 @@ def main(argv=None):
         return 1
     except Exception as ex:
         import llm_provider
+        import storage
         if isinstance(ex, llm_provider.ProviderError):
             say(f"Ошибка модельного исполнителя [{ex.code}]: {ex}")
+            return 1
+        if isinstance(ex, storage.StorageError):     # «не записано», «записано, файл обновится позже», открытый конфликт
+            say(f"Ошибка: {core.explain_error(ex)}")
             return 1
         raise
 
