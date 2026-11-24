@@ -3,6 +3,7 @@
 import json
 import math
 import uuid
+from fractions import Fraction
 from pathlib import Path
 
 import model_tasks
@@ -1102,6 +1103,43 @@ def _quotes_one_by_one(task):
     return model_tasks.version(task) != 1
 
 
+# Исправление ненайденных цитат (РАР-7, 7.5в; решение владельца 24.11.2026 к В7 плана 7.5: «Да, как предложено»).
+REPAIR_MIN_UNLINKED = 3
+REPAIR_MIN_SHARE = Fraction(1, 5)       # 20 % всех цитат свёртки; дробь, чтобы граница не зависела от округления
+
+
+def quotes_need_repair(unlinked, total):
+    """Достаточно ли ненайденных цитат для исправления: не меньше 3 и не меньше 20 % всех цитат свёртки.
+
+    unlinked — цитаты «не найдено в стенограмме» и «в разделе несколько таких мест»; total — все цитаты свёртки,
+    в том числе связанные (задевшие место разбора цитаты в кавычки не берутся, но связаны и входят в total).
+    Единственная запись порога: экран и MCP спрашивают эту функцию.
+    """
+    for number in (unlinked, total):
+        if type(number) is not int or number < 0:
+            raise ValueError("число цитат — целое, не меньше нуля")
+    if total < unlinked:
+        raise ValueError("ненайденных цитат не может быть больше, чем всех")
+    return unlinked >= REPAIR_MIN_UNLINKED and unlinked >= REPAIR_MIN_SHARE * total
+
+
+def quote_counts(payload):
+    """(ненайденных цитат, всех цитат) свёртки «цитаты по одной»; None — у остальных свёрток.
+
+    Свёртка с перечнем `unlinked` считает по нему; собранная до 7.5в (перечня нет) — по сохранённому числу.
+    """
+    if payload.get("quote_policy") != 1:
+        return None
+    listed = payload.get("unlinked")
+    if isinstance(listed, list):
+        unlinked = len(listed)
+    else:
+        saved = payload.get("unlinked_count")
+        unlinked = saved if type(saved) is int and saved >= 0 else 0
+    quotes = payload.get("quotes")
+    return unlinked, (len(quotes) if isinstance(quotes, dict) else 0) + unlinked
+
+
 def _validate_model_part(store, request_id, part_index, result, before=None):
     """Чистая проверка ответа, пригодная для repair без изменения счётчиков состояния."""
     before = before or get(store, request_id)
@@ -1128,7 +1166,7 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
                 "source_revision": current["transcript"]["revision"]}
         open_review = any(_place_unresolved(item) for item in current["review"]["payload"].get("review", []))
         for section in accepted["sections"]:
-            if "{{q:" in section["text"]:
+            if any(mark in section["text"] for mark in conspect.SLOT_MARKS):
                 raise ValueError("служебные маркеры цитат в ответе не допускаются")
             if _quotes_one_by_one(task):
                 continue      # цитаты по одной: несвязанная или задевшая сомнение цитата ответ не отклоняет
@@ -1415,7 +1453,7 @@ def _accept_model_result_once(store, request_id, result):
     accepted = model_tasks.validate(request["model_task"], result,
                                     current_revision=request["model_task"]["source_revision"])
     text = "\n\n".join(section["text"] for section in accepted["sections"])
-    if "{{q:" in text:
+    if any(mark in text for mark in conspect.SLOT_MARKS):
         raise ValueError("служебные маркеры цитат в ответе не допускаются")
     labelled = _quotes_one_by_one(request["model_task"])     # одно правило: версия задания, не равная 1
     if labelled:
@@ -1436,21 +1474,23 @@ def _accept_model_result_once(store, request_id, result):
         # не найденная или неоднозначная печатается без кавычек с пометкой, а задевшая место разбора
         # получает пометку при каждой сборке (conspect.render). Разбор нужен сборке — он идёт в data.
         data["review"] = snapshots["review"]["payload"].get("review", [])
-        pieces, quotes, unlinked_count = [], {}, 0
-        for section, span in zip(accepted["sections"], spans):
+        pieces, quotes, unlinked = [], {}, []
+        for index, (section, span) in enumerate(zip(accepted["sections"], spans)):
             section_obj, _report = conspect.link(section["text"], data, within=set(section["evidence"]),
-                                                 unlinked="mark", labels=True)
-            offset = len(quotes)
-            template = conspect.PLACE.sub(lambda hit: "{{q:%d}}" % (int(hit.group(1)) + offset),
-                                          section_obj["template"])
-            quotes.update({str(int(key) + offset): quote for key, quote in section_obj["quotes"].items()})
-            unlinked_count += section_obj["unlinked_count"]
+                                                 unlinked="slot", labels=True)
+            shift = {"q": len(quotes), "u": len(unlinked)}          # номера цитат и слотов — сквозные
+            template = conspect.SLOT.sub(
+                lambda hit: "{{%s:%d}}" % (hit.group(1), int(hit.group(2)) + shift[hit.group(1)]),
+                section_obj["template"])
+            quotes.update({str(int(key) + shift["q"]): quote for key, quote in section_obj["quotes"].items()})
+            unlinked.extend({**item, "id": str(int(item["id"]) + shift["u"]), "section": index}
+                            for item in section_obj["unlinked"])
             pieces.append((f"[{_clock(span['t1'])}]\n" if span["t1"] is not None else "") + template
                           + _also_line(section, current["payload"]))
         obj = {"version": 2, "template": "\n\n".join(pieces), "quotes": quotes,
                "recording_id": data["recording_id"], "source_revision": data["source_revision"],
-               "analysis_revision": None, "quote_policy": 1, "unlinked_count": unlinked_count,
-               "assembly_review_revision": snapshots["review"]["revision"]}
+               "analysis_revision": None, "quote_policy": 1, "unlinked": unlinked,
+               "unlinked_count": len(unlinked), "assembly_review_revision": snapshots["review"]["revision"]}
     else:
         for section in accepted["sections"]:
             section_obj, section_report = conspect.link(section["text"], data)

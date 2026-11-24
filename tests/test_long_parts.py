@@ -425,7 +425,9 @@ class LongWorkflowTests(unittest.TestCase):
         self.assertTrue(set(second["evidence"]) <= part_words)
         conspect_json = self.store.list_conspects(saved["recording_id"])[0]["payload"]
         self.assertEqual(conspect_json["quotes"], {})
-        self.assertIn("Особая фраза изложения (не найдено в стенограмме)", conspect_json["template"])
+        self.assertIn("{{u:1}}", conspect_json["template"])             # слот; пометку печатает сборка файла
+        self.assertEqual([(item["quote"], item["why"], item["section"]) for item in conspect_json["unlinked"]],
+                         [("Особая фраза изложения", "none", 1)])
 
     def test_more_than_six_parts_is_refused_before_the_cloud(self):
         request = self.prepare_request(turn_words=(100,) * 61)        # 6 100 слов при пределе 1 000
