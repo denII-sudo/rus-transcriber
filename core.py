@@ -1110,7 +1110,33 @@ def apply_answers(job_id):
 
 
 def apply_answers_files(jp, md):
-    """Применить ответы к указанной паре файлов готовой задачи."""
+    """Применить ответы к указанной паре файлов готовой задачи.
+
+    После применения (и после фиксации в sqlite) карточки ответов с исходом applied_open получают новую
+    редакцию (PR 13б): ответ применён, место осталось открытым — следующий вопрос человеку. Замена идёт
+    снаружи `conspect.write_lock`: применение держит её и внутри берёт блокировку ответов пакета, а
+    `review_pack.upsert_cards` сам берёт операцию документа и ту же блокировку ответов — без вложения."""
+    report = _apply_answers_files_once(jp, md)
+    return _replace_open_cards(jp, report)
+
+
+def _replace_open_cards(jp, report):
+    """Новая редакция карточек с исходом applied_open. Сбой замены не отменяет применённые ответы: он в
+    отчёте (`cards_not_replaced`), и следующее «Применить» снова даёт этому ответу applied_open и замену."""
+    import review_pack
+    ids = [row["id"] for row in report.get("outcomes") or [] if row.get("outcome") == "applied_open"]
+    if not ids:
+        return report
+    try:
+        replaced = review_pack.open_after_answer_cards(jp, ids)
+    except (OSError, RuntimeError, ValueError) as ex:
+        report["cards_not_replaced"] = [{"id": aid, "why": str(ex)} for aid in ids]
+        return report
+    report["replaced_cards"] = replaced
+    return report
+
+
+def _apply_answers_files_once(jp, md):
     import conspect
     import recordings
     store, binding = recordings.open_for_document(jp)

@@ -203,6 +203,23 @@ ASR_STATE_RU = {"error": "сбой распознавания",
 ASR_STATE_UNKNOWN_RU = "результат неполон или неизвестен"
 
 
+# Вопрос новой редакции карточки, чей ответ применён, а место осталось открытым (PR 13б, applied_open).
+OPEN_AFTER_ANSWER = "Ответ применён, место осталось открытым. "
+
+
+def open_after_answer_cards(json_path, ids):
+    """Новая редакция карточек ids (механизм 13а, upsert_cards): вопрос прежний с OPEN_AFTER_ANSWER в начале.
+    Повтор ничего не пишет: вопрос с этим началом уже стоит. -> id заменённых карточек."""
+    items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
+    cards = [{**{k: items[aid].get(k) for k in ("question", "options", "recommended", "answer_mode", "note")
+                 if items[aid].get(k) is not None}, "id": aid, "open_after_answer": True}
+             for aid in ids if aid in items]
+    if not cards:
+        return []
+    rep = upsert_cards(json_path, cards, why="ответ применён, место осталось открытым")
+    return [row["id"] for row in rep.get("replaced") or []]
+
+
 def _card(T, data, it, q):
     """Карточка пакета для места it по вопросу q — без клипа; одна для build и upsert_cards.
     -> (карточка, (t1, t2)) или (None, причина пропуска)."""
@@ -241,6 +258,8 @@ def _card(T, data, it, q):
             question = (str(model) + ": " + ASR_STATE_RU.get(problem.get("state"), ASR_STATE_UNKNOWN_RU) +
                         ("; слова других проходов: " + ", ".join(names) if names else ""))
         question += ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали."
+    if q.get("open_after_answer") and not question.startswith(OPEN_AFTER_ANSWER):
+        question = OPEN_AFTER_ANSWER + question
     manifest_item = {
         "id": it["id"], "rev": 1, "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
         **target,
