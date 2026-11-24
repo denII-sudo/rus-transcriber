@@ -1,8 +1,8 @@
 ﻿# Хук Claude Code (UserPromptSubmit и Stop): предупреждает, что контекст сессии пора сжать.
 # Заполнение считается по транскрипту: токены входа последнего ответа модели, как в строке
-# состояния. С порога RT_CONTEXT_WARN_PCT (30%) хук показывает предупреждение человеку, а при
+# состояния. С порога RT_CONTEXT_WARN_PCT (35%) хук показывает предупреждение человеку, а при
 # отправке сообщения просит модель предложить /compact; повторяет один раз на 5% выше порога
-# (35%) и дальше молчит до сжатия.
+# (40%) и дальше молчит до сжатия.
 # Само сжатие хук не запускает: автосжатие задаёт CLAUDE_AUTOCOMPACT_PCT_OVERRIDE в
 # .claude/settings.json. Размер окна — RT_CONTEXT_WINDOW_TOKENS (по умолчанию 1 000 000).
 # Любая ошибка — тишина и код 0: хук не должен мешать работе.
@@ -70,7 +70,7 @@ try {
     if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { exit 0 }
 
     $window = Get-EnvInt "RT_CONTEXT_WINDOW_TOKENS" 1000000 100000 100000000
-    $warn = Get-EnvInt "RT_CONTEXT_WARN_PCT" 30 1 100
+    $warn = Get-EnvInt "RT_CONTEXT_WARN_PCT" 35 1 100
     $step = 5
     $tokens = Get-ContextTokens $path
 
