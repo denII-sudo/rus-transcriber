@@ -196,6 +196,13 @@ def answer_is_current(answer, item):
     return bool(answer) and answer.get("rev", 1) == card_rev(item)
 
 
+# Состояние сбойного прохода (asr_problem.state) в вопросе карточки — по-русски; служебное имя не выводится.
+ASR_STATE_RU = {"error": "сбой распознавания",
+                "empty_unknown": "модель не выдала слов, неизвестно, была ли здесь речь",
+                "filtered": "распознанный текст целиком удалён очисткой"}
+ASR_STATE_UNKNOWN_RU = "результат неполон или неизвестен"
+
+
 def _card(T, data, it, q):
     """Карточка пакета для места it по вопросу q — без клипа; одна для build и upsert_cards.
     -> (карточка, (t1, t2)) или (None, причина пропуска)."""
@@ -228,9 +235,12 @@ def _card(T, data, it, q):
         models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
         names = [(models.get(key) or {}).get("id") or key for key in problem.get("words_from") or []]
         model = (models.get(problem.get("model")) or {}).get("id") or problem.get("model") or "ASR"
-        question = (str(model) + ": " + str(problem.get("state")) +
-                    ("; слова других проходов: " + ", ".join(names) if names else "") +
-                    ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
+        if problem.get("state") == "disagreement":
+            question = "Модели распознали по-разному (" + ", ".join(dict.fromkeys([str(model), *names])) + ")"
+        else:
+            question = (str(model) + ": " + ASR_STATE_RU.get(problem.get("state"), ASR_STATE_UNKNOWN_RU) +
+                        ("; слова других проходов: " + ", ".join(names) if names else ""))
+        question += ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали."
     manifest_item = {
         "id": it["id"], "rev": 1, "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
         **target,
