@@ -493,7 +493,7 @@ class ApplyTests(RepairBase):
                     calls.append((path.name, node.func.attr, "allow_cloud_model" in keys,
                                   isinstance(keys.get("allow_cloud_model"), ast.Constant)
                                   and keys["allow_cloud_model"].value is True))
-        self.assertEqual(sorted(calls), [("core.py", "repair_quotes", True, False),
+        self.assertEqual(sorted(calls), [("core_screen.py", "repair_quotes", True, False),
                                          ("server.py", "workflow_repair_quotes", True, True),
                                          ("workflow_page.py", "workflow_repair_quotes", True, True)])
 
