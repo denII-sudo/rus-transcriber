@@ -80,6 +80,8 @@ PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом
                          "прослушайте паузу или место и подтвердите отдельно")
 # годность кнопки прослушивания паузы — по словам её интервала, а не по ревизии всей стенограммы
 LISTEN_STALE = "слова в интервале паузы изменились после создания карточек; пересоберите пакет"
+CONTRADICTION_STALE = ("слова места изменились после показа карточки противоречия; ответ не применён, "
+                       "карточка обновлена — выберите заново")
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -220,12 +222,79 @@ def open_after_answer_cards(json_path, ids):
     return [row["id"] for row in rep.get("replaced") or []]
 
 
+def _when(at):
+    """«2026-11-25T10:05:00Z» → «25.11 10:05» (UTC)."""
+    at = str(at or "")
+    return f"{at[8:10]}.{at[5:7]} {at[11:16]}" if len(at) >= 16 else ""
+
+
+def _who(T, row):
+    who = "человек" if row.get("by") == "human" else "агент"
+    via = T.CONTRADICTION_VIA_RU.get(row.get("via")) or ("оставлено человеку" if row.get("via") == "held" else "")
+    card = row.get("card") if row.get("via") in (None, "card") else None
+    return ", ".join(x for x in (who, via + (f" {card}" if card else ""), _when(row.get("at"))) if x)
+
+
+def _place_words(data, it):
+    """Слова места: у противоречия — те, о которых предложение (их видел человек), иначе word_ids."""
+    ids = (it.get("contradiction") or {}).get("words") or it.get("word_ids") or []
+    by_id = {w.get("word_id"): w for seg in data.get("segments") or [] for w in seg.get("words") or []}
+    return [by_id[wid] for wid in ids if wid in by_id]
+
+
+def _contradiction_options(T, data, it):
+    """Варианты карточки противоречия (PR 13б): «Оставить подтверждённое», «Принять новое» на каждое
+    предложение (последние), «Как распознано» — только если отличается от обоих. Не больше четырёх."""
+    record = it["contradiction"]
+    confirmed = record.get("confirmed") or {}
+    proposals = [p for p in record["proposals"] if (p.get("text") or "").strip()]
+    words = _place_words(data, it)
+    raw = " ".join(w.get("model") or w["w"] for w in words)
+    raw_needed = bool(raw) and raw != confirmed.get("text") and raw not in [p["text"] for p in proposals]
+    opts = [{"label": f"Оставить подтверждённое: «{confirmed.get('text', '')}» ({_who(T, confirmed)})",
+             "decision": {"contradiction": "keep"}}]
+    for p in proposals[-(2 if raw_needed else 3):]:
+        opts.append({"label": f"Принять новое: «{p['text']}» ({_who(T, p)})",
+                     "decision": {"text": p["text"], "contradiction": "accept", "proposal": p["key"],
+                                  **({"speaker": p["speaker"]} if p.get("speaker") else {})}})
+    if raw_needed:
+        opts.append({"label": f"Как распознано: «{raw}»", "decision": {"text": raw, "contradiction": "raw"}})
+    return opts
+
+
+def _contradiction_question(T, data, it):
+    record = it["contradiction"]
+    last = record["proposals"][-1]
+    current = " ".join(w["w"] for w in _place_words(data, it))
+    return (f"Вы подтвердили «{(record.get('confirmed') or {}).get('text', '')}». "
+            f"Предложено «{last.get('text', '')}» ({_who(T, last)}). Сейчас в стенограмме: «{current}». "
+            "Что верно?")
+
+
+def contradiction_cards(json_path, ids):
+    """Карточки мест с противоречием в открытом пакете (механизм 13а, upsert_cards).
+    -> {id: "added" | "updated" | "unchanged" | "pending"}; pending — пакета нет, карточка появится при сборке."""
+    if not ids:
+        return {}
+    if not manifest(json_path):
+        return {rid: "pending" for rid in ids}
+    rep = upsert_cards(json_path, [{"id": rid} for rid in ids], why="противоречие")
+    out = {rid: "unchanged" for rid in rep.get("unchanged") or []}
+    out.update({row["id"]: "added" for row in rep.get("added") or []})
+    out.update({row["id"]: "updated" for row in rep.get("replaced") or []})
+    out.update({row["id"]: "pending" for row in rep.get("skipped") or []})
+    return out
+
+
 def _card(T, data, it, q):
     """Карточка пакета для места it по вопросу q — без клипа; одна для build и upsert_cards.
     -> (карточка, (t1, t2)) или (None, причина пропуска)."""
     opts = q.get("options") or []
     gap = T.gap_interval(it) if T.is_gap_place(it) else None
-    if gap:
+    contradiction = T.contradiction_pending(it)
+    if contradiction:
+        opts = _contradiction_options(T, data, it)
+    elif gap:
         # Пропуск (В7): кнопки прослушивания вместо вариантов агента; «как есть» на паузе не показывается.
         opts = ([{"label": T.LISTEN_WORDS, "decision": {"listened": "words"}}] if T.pause_words(data, *gap)
                 else []) + [{"label": T.LISTEN_SILENCE, "decision": {"listened": "silence"}},
@@ -258,6 +327,8 @@ def _card(T, data, it, q):
             question = (str(model) + ": " + ASR_STATE_RU.get(problem.get("state"), ASR_STATE_UNKNOWN_RU) +
                         ("; слова других проходов: " + ", ".join(names) if names else ""))
         question += ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали."
+    if contradiction:
+        question = _contradiction_question(T, data, it)
     if q.get("open_after_answer") and not question.startswith(OPEN_AFTER_ANSWER):
         question = OPEN_AFTER_ANSWER + question
     manifest_item = {
@@ -269,7 +340,11 @@ def _card(T, data, it, q):
         "reasons": it.get("reasons"), "voices": it.get("voices"),
         "question": question,
         "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
-        "recommended": None if it.get("asr_problem") or gap else q.get("recommended"), "note": q.get("note")}
+        "recommended": None if it.get("asr_problem") or gap or contradiction else q.get("recommended"),
+        "note": q.get("note")}
+    if contradiction:
+        # варианты привязаны к словам, которые видел человек: ответ сверяется с ними при «Применить»
+        manifest_item["seen_fp"] = T._listening_fingerprint(target_words)
     if gap:
         # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
         manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
@@ -323,6 +398,9 @@ def build(json_path, items, base_url_note=None):
         clips_dir = clips_dir / uuid.uuid4().hex
     clips_dir.mkdir(parents=True, exist_ok=True)
     out, skipped = [], []
+    listed = {q.get("id") for q in items}
+    items = list(items) + [{"id": i["id"]} for i in data.get("review") or []
+                           if T.contradiction_pending(i) and i.get("id") not in listed]
     for q in items:
         it = review.get(q.get("id"))
         if not it:
@@ -952,6 +1030,12 @@ def decisions(json_path):
                 continue
             # Прежний ответ снимается структурно, а не по тексту отображения.
             out.append({"id": aid, "_undo_snapshot": snapshot})
+            continue
+        if "seen_fp" in it and T.contradiction_pending(places.get(aid) or {}) and \
+                T._listening_fingerprint(_place_words(data, places[aid])) != it["seen_fp"]:
+            rep.setdefault("source_conflict", CONTRADICTION_STALE)
+            rep["source_conflict_ids"].append(aid)
+            rep.setdefault("source_conflict_why", {})[aid] = CONTRADICTION_STALE
             continue
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})

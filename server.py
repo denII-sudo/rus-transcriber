@@ -586,7 +586,10 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
     карточек. Слова, начинающиеся в [t1, t2] (секунды записи), заменяются текстом text по словам (совпадающие
     сохраняют время); speaker — подписать отрезок этим участником (реплика делится); пустой text — удалить
     слова отрезка; на отрезке без слов text вставляется (speaker обязателен); на отрезке слов нескольких говорящих
-    speaker тоже обязателен. Места разбора внутри отрезка закрываются (в ответе resolved — только закрытые по
+    speaker тоже обязателен. Если правка меняет слово, решённое человеком (карточкой, «как есть» или его правкой
+    отрезка), ничего не записывается: первая строка ответа — «не записано: противоречие, карточка rN …», в JSON
+    written=false, contradiction и card (added/updated/unchanged/pending); выбор делает человек на карточке этого
+    места в открытом пакете. Места разбора внутри отрезка закрываются (в ответе resolved — только закрытые по
     сохранённой записи; seen_changed — слова, которые человек видел в своей правке отрезка и которые вы
     изменили). Пишется в журнал правок. by обязателен: "claude" — правка агента (в том числе по поручению
     человека); "human" через MCP не принимается; без by правка не принимается.
@@ -594,7 +597,10 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
     try:
         if by == "human":
             return "Правку с авторством человека вносите через локальную карточку с подтверждением"
-        return json.dumps(core.edit_span(job_id, t1, t2, text, speaker, note, by), ensure_ascii=False, indent=1)
+        rep = core.edit_span(job_id, t1, t2, text, speaker, note, by)
+        body = json.dumps(rep, ensure_ascii=False, indent=1)
+        # противоречие решению человека: первая строка прямо говорит, что ничего не записано (PR 13б)
+        return rep["text"] + "\n" + body if rep.get("written") is False else body
     except (core.CoreError, storage.StorageError, ValueError) as ex:
         return core.say_error(ex)
 
@@ -635,12 +641,14 @@ def apply_review(job_id: str, decisions: list[dict]) -> str:
     Место «пропущена речь» (пауза) владеет только словами, начатыми внутри неё: соседнее слово ему не принадлежит.
     «Как есть», подпись говорящего и текст для пустой паузы отклоняются с причиной в conflicts — впишите услышанное
     ответом «Имя: слова» (apply_answers).
+    Решение по словам или месту человека не применяется (conflicts) и становится предложением на карточке
+    противоречия этого места (contradictions, cards): выбирает человек.
     После разбора .md содержит список «Проверить человеку» и журнал правок."""
     import transcript
     s = _status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
         return "Расшифровка не найдена или ещё не готова"
-    _, report = transcript.apply_review(s["json"], s["markdown"], decisions)
+    report = core.apply_review_files(s["json"], s["markdown"], decisions)
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 

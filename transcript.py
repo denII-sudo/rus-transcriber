@@ -454,6 +454,10 @@ def _save_locked(data, json_path, md_path):
         if item.get("asr_problem") and not listening and item.get("status") == "resolved":
             item["status"] = "open"
             data["review_done"] = False
+        if contradiction_pending(item) and item.get("status") == "resolved":
+            # противоречие закрывает только выбор на его карточке (PR 13б)
+            item["status"] = "open"
+            data["review_done"] = False
         if not listening or not item.get("gap"):
             continue
         start, end = item["gap"]
@@ -992,6 +996,18 @@ def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None,
     if not has_words and not speaker:
         raise ValueError("на отрезке нет слов: для вставки укажите speaker")
     card = f"span@{t1:.2f}"
+    pairs = [(w, sg["speaker"]) for sg in data["segments"] for w in sg.get("words") or []
+             if t1 - 0.01 <= w["s"] <= t2 + 0.01]
+    confirmed = _span_contradiction(data, pairs, (text or "").strip(), speaker, by, card) if pairs else None
+    if confirmed is not None:
+        _ensure_ids(data)
+        rid, new = propose_contradiction(data, [w for w, _ in pairs], {
+            "text": (text or "").strip(), "speaker": speaker, "by": by, "via": "edit_span",
+            "speaker_now": pairs[0][1]}, confirmed)
+        if new:
+            save(data, json_path, md_path)
+        return data, {"written": False, "contradiction": rid, "new": new,
+                      "text": CONTRADICTION_NOT_WRITTEN.format(rid=rid)}
     e = {"op": "place_text", "t1": t1, "t2": t2, "text": (text or "").strip(), "card": card}
     if speaker:
         e["speaker"] = speaker
@@ -1173,6 +1189,8 @@ def overwrite_refusal(word, data, writer, card):
         return None
     if writer == "human" and prior["by"] != "human":
         return None
+    if writer == "human" and _contradiction_covers(data, card, word):
+        return None             # выбор человека на карточке противоречия этого слова (PR 13б)
     span = prior["via"] == "edit_span"
     if prior["by"] == "human":
         how = "правкой отрезка человека" if span else "ответом человека на карточку"
@@ -1181,6 +1199,142 @@ def overwrite_refusal(word, data, writer, card):
     else:
         how = "прежней правкой без автора"
     return f"слово «{word.get('w')}» уже исправлено {how} ({prior['id']})"
+
+
+CONTRADICTION = "contradiction"
+CONTRADICTION_NOT_WRITTEN = ("не записано: противоречие, карточка {rid} — слова не изменены; "
+                             "выберите вариант на карточке этого места")
+CONTRADICTION_VIA_RU = {"edit_span": "правкой отрезка", "apply_review": "решением агента", "card": "карточкой"}
+
+
+def contradiction_pending(item):
+    """У места противоречие, которое ждёт выбора человека на его карточке (PR 13б)."""
+    return bool((item.get("contradiction") or {}).get("proposals"))
+
+
+def _contradiction_covers(data, card, word):
+    """Карточка card — место с ожидающим противоречием, в слова которого входит word."""
+    item = next((i for i in data.get("review") or [] if i.get("id") == card), None)
+    return bool(item and contradiction_pending(item) and word.get("word_id")
+                and word["word_id"] in item["contradiction"].get("words", []))
+
+
+def human_confirmation(word, data=None):
+    """Как человек решил слово: правкой (карточкой или правкой отрезка) или «как есть» на карточке.
+    -> {"card", "via"} или None. «Как есть» — `provenance` человека без `edited` (prior_edit его не видит:
+    до PR 13б правка отрезка человека такое слово молча перезаписывала)."""
+    prior = prior_edit(word, data)
+    if prior is not None:
+        return {"card": prior["id"], "via": prior["via"]} if prior["by"] == "human" else None
+    for dimension in ("text", "speaker"):
+        mark = (word.get("provenance") or {}).get(dimension)
+        if isinstance(mark, dict) and mark.get("by") == "human" and mark.get("edit"):
+            return {"card": mark["edit"], "via": mark.get("via") or "card"}
+    return None
+
+
+def _next_place_id(data):
+    numbers = [int(m.group(1)) for i in data.get("review") or [] for m in [re.fullmatch(r"r(\d+)", str(i.get("id")))]
+               if m]
+    return f"r{max(numbers, default=0) + 1}"
+
+
+def propose_contradiction(data, words, proposal, confirmed=None):
+    """Записать предложение, противоречащее решению человека, на место этих слов (или на новое место).
+    words — слова стенограммы (с word_id), proposal — {text, speaker?, by, via}; confirmed — что решил
+    человек (по умолчанию текст слов сейчас). Слова не меняются; место открыто до выбора на карточке.
+    Повтор того же предложения (слова, текст, говорящий, автор) ничего не меняет. -> (id места, новое?)"""
+    ids = [w["word_id"] for w in words]
+    places = data.setdefault("review", [])
+    preferred = (confirmed or {}).get("card")       # место той карточки, которой человек решил слово
+    item = next((i for i in places if i.get("id") == preferred and set(ids) <= set(i.get("word_ids") or [])),
+                None) or next((i for i in places if set(ids) <= set(i.get("word_ids") or [])), None) or \
+        next((i for i in places if set(ids) & set(i.get("word_ids") or [])), None)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    current = " ".join(w["w"] for w in words)
+    if item is None:
+        item = {"id": _next_place_id(data), "status": "open", "t": words[0]["s"], "t1": words[0]["s"],
+                "t2": words[-1]["s"], "speaker": proposal.get("speaker_now"), "reasons": [CONTRADICTION],
+                "text": current, "word_ids": ids}
+        places.append(item)
+        places.sort(key=lambda i: i.get("t", 0))
+    record = item.setdefault(CONTRADICTION, {"words": ids, "proposals": [], "history": []})
+    key = hashlib.sha1(json.dumps([sorted(ids), proposal.get("text"), proposal.get("speaker"), proposal.get("by")],
+                                  ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    if any(p.get("key") == key for p in record["proposals"]):
+        return item["id"], False
+    if not record["proposals"]:
+        record["words"] = ids
+        record["confirmed"] = {"text": current, "by": "human", "at": now, **(confirmed or {})}
+    record["proposals"].append({"text": proposal.get("text", ""), "by": proposal.get("by"),
+                                "via": proposal.get("via"), "at": now, "key": key,
+                                **({"speaker": proposal["speaker"]} if proposal.get("speaker") else {})})
+    if CONTRADICTION not in (item.get("reasons") or []):
+        item["reasons"] = list(item.get("reasons") or []) + [CONTRADICTION]
+    if item.get("status", "open") == "resolved":
+        item["status"] = "open"
+    data["review_done"] = False
+    return item["id"], True
+
+
+def settle_contradiction(item, choice, by, proposal=None):
+    """Выбор человека на карточке противоречия: итог — в историю, предложений больше нет."""
+    record = item.get(CONTRADICTION) or {}
+    if not record.get("proposals"):
+        return
+    record.setdefault("history", []).append({
+        "choice": choice, "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "confirmed": record.get("confirmed"), "proposals": record["proposals"],
+        **({"proposal": proposal} if proposal else {})})
+    record["proposals"] = []
+
+
+def _propose_from_review(data, item, decision, by, report, confirmed=None):
+    """Решение агента (apply_review) по словам или месту человека: вместо одного отказа — предложение на
+    карточку противоречия этого места (PR 13б). Слова не меняются."""
+    if not (decision.get("text") or decision.get("speaker")):
+        return
+    loc = _find_span(data, {**item, **({"word_ids": decision["word_ids"]} if "word_ids" in decision else {})})
+    if loc is None:
+        return
+    seg = data["segments"][loc[0]]
+    words = seg["words"][loc[1]:loc[2]]
+    if not words:
+        return
+    _ensure_ids(data)
+    if confirmed is None:
+        confirmed = dict(next((m for m in map(lambda w: human_confirmation(w, data), words) if m), None) or {})
+    rid, _ = propose_contradiction(data, words, {
+        "text": decision.get("text") or " ".join(w["w"] for w in words), "speaker": decision.get("speaker"),
+        "by": by, "via": "apply_review", "speaker_now": seg["speaker"]}, confirmed)
+    report.setdefault("contradictions", []).append(rid)
+
+
+def _span_contradiction(data, pairs, text, speaker, by, card):
+    """Правка отрезка противоречит решению человека? pairs — (слово, говорящий) отрезка.
+    -> что решил человек ({card?, via?}) или None. Агент: на отрезке есть слово, тронутое человеком
+    (прежде — отказ). Человек: правка меняет текст или говорящего слова, которое он решил карточкой (правкой
+    или «как есть») или другой правкой отрезка (прежде — отказ или, у «как есть», молчаливая запись)."""
+    import difflib
+
+    def decided(w):
+        mark = human_confirmation(w, data)
+        return mark if mark and mark["card"] != card and not (by == "human" and mark["via"] == "edit_span") \
+            else None
+    words = [w for w, _ in pairs]
+    if by != "human":
+        touched = [w for w in words if human_touched(w)]
+        if not touched:
+            return None
+        mark = next((m for m in map(decided, touched) if m), None)
+        return dict(mark) if mark else {}
+    sm = difflib.SequenceMatcher(None, [_wkey(w["w"]) for w in words], [_wkey(x) for x in text.split()],
+                                 autojunk=False)
+    changed = [w for op, i1, i2, _, _ in sm.get_opcodes() if op != "equal" for w in words[i1:i2]]
+    if speaker:
+        changed += [w for w, spk in pairs if spk != speaker and w not in changed]
+    mark = next((m for m in map(decided, changed) if m), None)
+    return dict(mark) if mark else None
 
 
 def _held_places(data):
@@ -1724,6 +1878,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             it["status"] = "resolved"
             if card in listen and touched(card, it):
                 to_mark.append(it)
+            if by == "human" and not via:
+                settle_contradiction(it, "own", by)
     for d in rep["proposed_delete"]:
         it = items.get(d["card"])
         if it:
@@ -1793,6 +1949,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             continue
         if by != "human" and it.get("status") == "human":
             report.setdefault("conflicts", []).append({"id": it["id"], "why": HELD_FOR_HUMAN})
+            _propose_from_review(data, it, d, by, report, {"via": "held"})
             continue
         if it.get("asr_problem") and "listened" not in d:
             report.setdefault("conflicts", []).append({"id": it["id"], "why": "нужно отдельное подтверждение прослушивания"})
@@ -1865,6 +2022,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                               (d.get("speaker") and d["speaker"] != before["speaker"])):
             if any(human_touched(w) for w in ws[w1:w2]):
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": ["human"]})
+                _propose_from_review(data, it, d, by, report)
                 continue
         if (not d.get("text") or d["text"] == before["text"]) and d.get("speaker") in (None, seg["speaker"]):
             it["status"] = "resolved"
@@ -1887,7 +2045,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             original_text = {w.get("word_id"): w["w"] for w in ws[w1:w2] if w.get("word_id")}
             for w in new_ws:
                 if not w.get("word_id") or original_text.get(w["word_id"]) != w["w"]:
-                    _mark_provenance(w, "text", by, it["id"])
+                    _mark_provenance(w, "text", by, it["id"], CONTRADICTION if d.get(CONTRADICTION) else None)
             ws[w1:w2] = new_ws
             w2 = w1 + len(new_ws)
             # одиночная замена слова на имя собственное — подсказка для словаря
@@ -1952,6 +2110,11 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         else:
             merged.append(seg)
     data["segments"] = merged
+    # выбор человека на карточке противоречия (PR 13б): итог — в историю места
+    for d in decisions:
+        it = items.get(d.get("id"))
+        if by == "human" and it and d.get(CONTRADICTION) and it["id"] in report["successful_ids"]:
+            settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"))
     # решение применено, но место ещё раз показать человеку (например, ответы двух режимов разошлись)
     for d in decisions:
         it = items.get(d.get("id"))
