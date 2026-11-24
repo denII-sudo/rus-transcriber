@@ -112,6 +112,15 @@ class NeighboursAreIsolated(OutcomeCase):
         self.assertIn((second, 2), completed)
         self.assertEqual(env.versions(second), {kind: 2 for kind in KINDS})
 
+    def test_my_own_missing_file_that_cannot_be_restored_is_not_lost(self):
+        env = self.env
+        mine, other = env.create(), env.create()
+        env.materialize()
+        env.file(mine, "md").unlink()
+        with failing(self.names(mine), OSError("диск недоступен")):
+            with self.assertRaises(OSError):
+                env.materialize(recording_id=mine)
+
     def test_neighbour_in_conflict_does_not_break_my_write(self):
         first, second = self.two()
         self.env.file(first, "md").write_bytes(b"external")
@@ -205,6 +214,23 @@ class WrittenButFileChangedMeanwhile(unittest.TestCase):
                 self.assertEqual(binding["document_revision"], 2, "ревизия в базе записана")
             finally:
                 store.close()
+
+
+class CardsPageWriteOutcome(unittest.TestCase):
+    helper = test_recordings.WorkerSnapshotTests()
+
+    def test_card_answer_with_a_busy_file_is_recorded_and_says_the_file_follows_later(self):
+        import review_pack
+        question = {"id": "r1", "question": "Проверьте", "options": [
+            {"label": "Другое слово", "decision": {"text": "другое"}}]}
+        with self.helper.answer_files("sqlite", self.helper.answer_result(word_ids=True)) as (jp, md):
+            pack = review_pack.build(jp, [question])
+            row = {"id": "r1", "version": pack["version"], "text": "другое", "heard": False}
+            with busy({md.name}):
+                with self.assertRaises(documents.NotSynced) as caught:
+                    review_pack.add_answers(jp, [row], "local", trusted_actor="human")
+            self.assertEqual(caught.exception.status, "later")
+            self.assertEqual(review_page.safe_error(caught.exception), str(caught.exception))
 
 
 class RestoreAnswersHonestly(unittest.TestCase):
@@ -335,6 +361,7 @@ class OversizeConflictCloses(test_conflict_replace.ScreenCase):
         for scope in test_conflict_replace.SCOPES:
             with self.subTest(scope=scope):
                 case = self.over_limit_conflict(scope)
+                self.assertEqual((self.item(case)["can_replace"], self.item(case)["status"]), (False, "open"))
                 shown = self.preview(case)
                 self.assertEqual((shown["can_replace"], shown["snapshot"]), (False, None))
                 self.assertIn("8 МиБ", shown["reason"])
