@@ -25,7 +25,7 @@ import runinfo
 
 BENCH_DB_SCHEMA = 1                    # номер схемы базы; не то же, что runinfo.SCHEMA_VERSION (формат файла)
 KEY_VERSION = 1                        # версия правила ключа сопоставимости (раздел 7 задания)
-LOADER_VERSION = "benchdb-1"
+LOADER_VERSION = "benchdb-2"     # отклонённые прежним загрузчиком файлы проверяются заново
 DB_NAME = "bench_runs.sqlite3"
 RUN_FORMATS = (1,)                     # какие значения schema_version файла прогона загрузчик понимает
 HISTORICAL_FORMAT = "bench-historical-1"
@@ -47,6 +47,7 @@ NUM_FIELDS = ("load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "tot
               "peak_memory_mb")
 INT_FIELDS = ("chunks", "empty_chunks", "compile_cache_new_files")
 BOOL_FIELDS = ("model_downloaded", "device_mismatch")
+_RUN_NAME = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")      # имя, которое даёт runinfo.new_run_id
 _ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.-]{0,79}$")
 
 SCHEMA = """
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS run (
     error_type TEXT, method_version TEXT, run_schema_version INTEGER, db_schema_version INTEGER,
     loader_version TEXT, job_id TEXT, testbed_pk TEXT, env_pk TEXT, unit_pk TEXT, params_json TEXT,
     conditions_json TEXT, preflight_json TEXT, choice_json TEXT, valid TEXT, valid_reason TEXT,
-    is_historical INTEGER DEFAULT 0, completeness TEXT, source_note TEXT, source_file_sha256 TEXT);
+    is_historical INTEGER DEFAULT 0, completeness TEXT, source_note TEXT, source_file_sha256 TEXT,
+    texts_file TEXT);
 CREATE TABLE IF NOT EXISTS run_model (run_id TEXT, model_pk TEXT, PRIMARY KEY (run_id, model_pk));
 CREATE TABLE IF NOT EXISTS measurement (
     measurement_id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, variant_id TEXT NOT NULL,
@@ -97,8 +99,8 @@ CREATE TABLE IF NOT EXISTS decision (
 CREATE TABLE IF NOT EXISTS external_reference (
     ref_id INTEGER PRIMARY KEY, source TEXT, published TEXT, summary_json TEXT);
 CREATE TABLE IF NOT EXISTS import_log (
-    log_id INTEGER PRIMARY KEY, file_name TEXT, sha256 TEXT NOT NULL UNIQUE, size_bytes INTEGER, run_id TEXT,
-    loaded_utc TEXT, loader_version TEXT, outcome TEXT, reason TEXT);
+    log_id INTEGER PRIMARY KEY, file_name TEXT, sha256 TEXT NOT NULL, size_bytes INTEGER, run_id TEXT,
+    loaded_utc TEXT, loader_version TEXT, outcome TEXT, reason TEXT, UNIQUE (sha256, loader_version));
 CREATE INDEX IF NOT EXISTS measurement_key ON measurement (speed_key);
 CREATE INDEX IF NOT EXISTS measurement_run ON measurement (run_id, variant_id);
 """
@@ -117,6 +119,23 @@ class RunRejected(Exception):
 
 def db_path(bench_dir):
     return Path(bench_dir) / DB_NAME
+
+
+def _exists(bench_dir):
+    """Файл базы есть и не пуст: пустой файл — база, которую ещё не успели создать (или бросили на полпути)."""
+    p = db_path(bench_dir)
+    try:
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def plural(n, forms):
+    """Склонение по числу: forms = («прогон», «прогона», «прогонов»)."""
+    n = abs(int(n))
+    if 11 <= n % 100 <= 14:
+        return forms[2]
+    return forms[0] if n % 10 == 1 else forms[1] if 2 <= n % 10 <= 4 else forms[2]
 
 
 def canon(x):
@@ -143,14 +162,16 @@ def _get(d, *keys):
 
 def open_read(bench_dir):
     """Только чтение: запись через это соединение невозможна. Нет базы — BenchDbError."""
-    p = db_path(bench_dir)
-    if not p.is_file():
+    if not _exists(bench_dir):
         raise BenchDbError("базы прогонов нет")
+    con = None
     try:
-        con = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True)
+        con = sqlite3.connect(db_path(bench_dir).resolve().as_uri() + "?mode=ro", uri=True)
         con.execute("SELECT 1 FROM meta LIMIT 1")
     except sqlite3.DatabaseError as ex:
-        raise BenchDbError(f"файл не читается как база прогонов: {type(ex).__name__}")
+        if con is not None:
+            con.close()
+        raise BenchDbError(f"файл не читается как база прогонов: {type(ex).__name__}") from None
     return con
 
 
@@ -161,27 +182,55 @@ def _check_version(con):
                            f"{BENCH_DB_SCHEMA}: соберите базу заново в новый файл из runs/*.json")
 
 
-def _open_write(bench_dir):
-    p = db_path(bench_dir)
+def _has_meta(con):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE name='meta'").fetchone() is not None
+
+
+def _rollback(con):
     try:
-        con = sqlite3.connect(p, isolation_level=None, timeout=10)
+        con.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
+def _create_schema(con):
+    for stmt in SCHEMA.split(";"):
+        if stmt.strip():
+            con.execute(stmt)
+    for t in FACT_TABLES:
+        for op in ("UPDATE", "DELETE"):
+            con.execute(f"CREATE TRIGGER no_{op.lower()}_{t} BEFORE {op} ON {t} "
+                        f"BEGIN SELECT RAISE(ABORT, 'база прогонов только дописывается'); END")
+    for k, v in (("schema_version", str(BENCH_DB_SCHEMA)), ("key_version", str(KEY_VERSION)),
+                 ("created_utc", runinfo.utc_now()), ("loader_version", LOADER_VERSION)):
+        con.execute("INSERT INTO meta(key, value) VALUES (?, ?)", (k, v))
+
+
+def _open_write(bench_dir):
+    """Соединение на запись. Схема создаётся одной транзакцией под блокировкой: одновременный первый запуск
+    нескольких процессов не даёт полусозданной базы. При любом отказе соединение закрывается."""
+    con = None
+    try:
+        con = sqlite3.connect(db_path(bench_dir), isolation_level=None, timeout=10)
         con.execute("PRAGMA busy_timeout=5000")
-        has = con.execute("SELECT 1 FROM sqlite_master WHERE name='meta'").fetchone()
-        if has:
-            _check_version(con)
-        else:
-            if con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
-                raise BenchDbError("в файле базы чужие таблицы: он не создан этой программой")
-            con.executescript(SCHEMA)
-            for t in FACT_TABLES:
-                for op in ("UPDATE", "DELETE"):
-                    con.execute(f"CREATE TRIGGER no_{op.lower()}_{t} BEFORE {op} ON {t} "
-                                f"BEGIN SELECT RAISE(ABORT, 'база прогонов только дописывается'); END")
-            for k, v in (("schema_version", str(BENCH_DB_SCHEMA)), ("key_version", str(KEY_VERSION)),
-                         ("created_utc", runinfo.utc_now()), ("loader_version", LOADER_VERSION)):
-                con.execute("INSERT INTO meta(key, value) VALUES (?, ?)", (k, v))
-    except sqlite3.DatabaseError as ex:
-        raise BenchDbError(f"файл не открывается как база прогонов: {type(ex).__name__}")
+        if not _has_meta(con):
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                if not _has_meta(con):           # пока ждали блокировку, другой процесс мог создать схему
+                    if con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
+                        raise BenchDbError("в файле базы чужие таблицы: он не создан этой программой")
+                    _create_schema(con)
+                con.execute("COMMIT")
+            except BaseException:
+                _rollback(con)
+                raise
+        _check_version(con)
+    except BaseException as ex:
+        if con is not None:
+            con.close()
+        if isinstance(ex, sqlite3.DatabaseError):
+            raise BenchDbError(f"файл не открывается как база прогонов: {type(ex).__name__}") from None
+        raise
     return con
 
 
@@ -193,6 +242,8 @@ def _num(v, key, nm):
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
+    if isinstance(v, int) and abs(v) >= 2 ** 63:
+        raise OverflowError("число не помещается в целое SQLite")
     return v
 
 
@@ -249,12 +300,67 @@ def _valid(rec):
     return "with_reservations", ",".join(str(x) for x in pre.get("reasons") or []) or "preflight_not_ok"
 
 
+def _no_constant(name):
+    raise ValueError("NaN или Infinity в файле")
+
+
+def _check_structure(rec):
+    """Типы полей, от которых зависит разбор. Неверная структура — RunRejected с названием поля."""
+    def kind(path, v, types):
+        if v is None:
+            return
+        if isinstance(v, bool) or not isinstance(v, types):
+            raise RunRejected(f"неверный тип поля {path}")
+
+    for key in ("testbed", "environment", "audio", "params", "models", "conditions", "preflight", "choice", "saved"):
+        kind(key, rec.get(key), dict)
+    for key in ("started_utc", "finished_utc", "status", "error_type", "job_id", "method_version", "texts_file"):
+        kind(key, rec.get(key), str)
+    kind("duration_sec", rec.get("duration_sec"), (int, float))
+    kind("variants", rec.get("variants"), list)
+    kind("results", rec.get("results"), list)
+    hw = _get(rec, "testbed", "hardware")
+    kind("testbed.hardware", hw, dict)
+    if isinstance(hw, dict):
+        kind("testbed.hardware.devices", hw.get("devices"), list)
+        for d in hw.get("devices") or []:
+            if not isinstance(d, dict):
+                raise RunRejected("неверный тип поля testbed.hardware.devices[]")
+    env = rec.get("environment") or {}
+    for key in ("os", "python", "packages", "code"):
+        kind(f"environment.{key}", env.get(key), dict)
+    kind("environment.packages.key", _get(env, "packages", "key"), dict)
+    cond = rec.get("conditions") or {}
+    for key in ("start", "end"):
+        kind(f"conditions.{key}", cond.get(key), dict)
+    kind("conditions.start.power", _get(cond, "start", "power"), dict)
+    kind("preflight.reasons", _get(rec, "preflight", "reasons"), list)
+    mods = rec.get("models") or {}
+    for key in ("hf", "local"):
+        kind(f"models.{key}", mods.get(key), list)
+    kind("audio.excerpt", _get(rec, "audio", "excerpt"), dict)
+    for name in ("variants", "results"):
+        for item in rec.get(name) or []:
+            if not isinstance(item, dict):
+                raise RunRejected(f"неверный тип элемента {name}")
+    seen = set()
+    for r in rec.get("results") or []:
+        rid = r.get("id")
+        if rid is None:
+            continue
+        if not isinstance(rid, str) or not rid:
+            raise RunRejected("неверный id варианта в results")
+        if rid in seen:
+            raise RunRejected("повтор id варианта в results")
+        seen.add(rid)
+
+
 def parse_run(data, file_name=None):
     """Раскладывает файл прогона по таблицам. Чистая функция: базу не открывает. Плохой файл — RunRejected."""
     try:
-        rec = json.loads(data.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError):
-        raise RunRejected("файл не JSON")
+        rec = json.loads(data.decode("utf-8-sig"), parse_constant=_no_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError) as ex:
+        raise RunRejected("в файле NaN или Infinity" if "NaN" in str(ex) else "файл не JSON") from None
     if not isinstance(rec, dict):
         raise RunRejected("в файле не объект JSON")
     if rec.get("kind") != "bench":
@@ -266,7 +372,15 @@ def parse_run(data, file_name=None):
         raise RunRejected("нет допустимого run_id")
     if file_name is not None and file_name != f"{run_id}.json":
         raise RunRejected("имя файла не совпадает с run_id")
-    rec = runinfo.scrub(rec)
+    _check_structure(rec)
+    try:
+        return _build(runinfo.scrub(rec), run_id)
+    except (TypeError, ValueError, AttributeError, KeyError, OverflowError, RecursionError) as ex:
+        raise RunRejected(f"структура файла неверна ({type(ex).__name__})") from None
+
+
+def _build(rec, run_id):
+    """Раскладка проверенного файла по таблицам."""
     method = str(rec.get("method_version") or "unknown")
     out = {"run_id": run_id, "models": [], "configs": [], "measurements": [], "decisions": []}
 
@@ -377,7 +491,8 @@ def parse_run(data, file_name=None):
                   "env_pk": env_pk, "unit_pk": unit_pk, "params_json": _js(params),
                   "conditions_json": _js(rec.get("conditions")), "preflight_json": _js(rec.get("preflight")),
                   "choice_json": _js(rec.get("choice")), "valid": valid, "valid_reason": reason,
-                  "is_historical": 0, "completeness": None, "source_note": None}
+                  "is_historical": 0, "completeness": None, "source_note": None,
+                  "texts_file": rec.get("texts_file")}
     out["texts_file"] = rec.get("texts_file")
     return out
 
@@ -397,10 +512,13 @@ def _log(con, name, sha, size, run_id, outcome, reason):
 
 
 def _known(con, sha):
+    """Файл уже учтён: загружен или в конфликте (любым загрузчиком), отклонён — только этим же загрузчиком:
+    после обновления загрузчика отклонённый файл проверяется заново, журнал при этом только дописывается."""
     if con is None:
         return None
-    row = con.execute("SELECT outcome FROM import_log WHERE sha256=?", (sha,)).fetchone()
-    return row[0] if row else None
+    row = con.execute("SELECT outcome, run_id FROM import_log WHERE sha256=? AND (outcome != 'rejected' "
+                      "OR loader_version=?) ORDER BY log_id LIMIT 1", (sha, LOADER_VERSION)).fetchone()
+    return {"outcome": row[0], "run_id": row[1]} if row else None
 
 
 def _run_exists(con, run_id):
@@ -415,12 +533,14 @@ def _classify(con, path):
     item = {"file": p.name, "sha256": sha, "size_bytes": len(data), "run_id": None, "action": None, "reason": None}
     earlier = _known(con, sha)
     if earlier:
-        item.update(action="known", reason=f"уже учтён ({earlier})")
+        item.update(action="known", reason=f"уже учтён ({earlier['outcome']})", run_id=earlier["run_id"],
+                    known_outcome=earlier["outcome"])
         return item, None
     try:
         parsed = parse_run(data, p.name)
     except RunRejected as ex:
-        item.update(action="rejected", reason=str(ex))
+        stem = p.name[:-len(".json")]
+        item.update(action="rejected", reason=str(ex), run_id=stem if _RUN_NAME.match(stem) else None)
         return item, None
     item["run_id"] = parsed["run_id"]
     if _run_exists(con, parsed["run_id"]):
@@ -448,7 +568,7 @@ def _ro_or_none(bench_dir):
     try:
         return open_read(bench_dir)
     except BenchDbError:
-        if db_path(bench_dir).is_file():
+        if _exists(bench_dir):
             raise
         return None
 
@@ -505,32 +625,89 @@ def _store(con, bench_dir, parsed):
         _insert(con, "raw_output", ref)
 
 
+def _unreadable(p):
+    return {"file": p.name, "sha256": None, "size_bytes": None, "run_id": None, "action": "rejected",
+            "reason": "файл не читается"}
+
+
+def _late_texts(con, bench_dir, item):
+    """Файл текстов появился позже файла прогона: ссылку на него дописываем уже загруженному прогону."""
+    run_id = item.get("run_id")
+    if item.get("known_outcome") != "loaded" or not run_id:
+        return
+    row = con.execute("SELECT texts_file FROM run WHERE run_id=?", (run_id,)).fetchone()
+    if not row or row[0] != f"{run_id}.texts.json":
+        return
+    if con.execute("SELECT 1 FROM raw_output WHERE run_id=?", (run_id,)).fetchone():
+        return
+    ref = _texts_ref(bench_dir, {"run_id": run_id, "texts_file": row[0]})
+    if not ref:
+        return
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        if not con.execute("SELECT 1 FROM raw_output WHERE run_id=?", (run_id,)).fetchone():
+            _insert(con, "raw_output", ref)
+        con.execute("COMMIT")
+    except BaseException as ex:
+        _rollback(con)
+        if isinstance(ex, sqlite3.OperationalError):
+            raise BenchDbError(f"запись не удалась: {type(ex).__name__}") from None
+        raise
+
+
+def _apply_one(con, bench_dir, p, item):
+    """Один файл — одна транзакция: сбой разбора или вставки откатывает только его, файл записывается как
+    отклонённый, загрузка идёт дальше. Занятая база (OperationalError) — не вина файла: загрузка останавливается."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        item, parsed = _classify(con, p)           # заново внутри транзакции: пока ждали, мог загрузить другой
+        if item["action"] == "new":
+            parsed["run"]["source_file_sha256"] = item["sha256"]
+            _store(con, bench_dir, parsed)
+            item["action"] = "loaded"
+            _log(con, item["file"], item["sha256"], item["size_bytes"], item["run_id"], "loaded", None)
+        elif item["action"] in ("rejected", "conflict"):
+            _log(con, item["file"], item["sha256"], item["size_bytes"], item["run_id"], item["action"], item["reason"])
+        con.execute("COMMIT")
+        return item
+    except OSError:
+        _rollback(con)
+        return _unreadable(p)
+    except sqlite3.OperationalError as ex:
+        _rollback(con)
+        raise BenchDbError(f"запись не удалась: {type(ex).__name__}") from None
+    except (ValueError, TypeError, OverflowError, sqlite3.Error) as ex:
+        _rollback(con)
+        item.update(action="rejected", reason=f"сбой разбора или записи ({type(ex).__name__})")
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            _log(con, item["file"], item["sha256"], item["size_bytes"], item["run_id"], "rejected", item["reason"])
+            con.execute("COMMIT")
+        except BaseException:
+            _rollback(con)
+            raise
+        return item
+    except BaseException:
+        _rollback(con)
+        raise
+
+
 def apply_load(bench_dir):
     """Единственное место записи для файлов прогонов. Файл — своя транзакция; учтённые пропускаются."""
     con = _open_write(bench_dir)
     items = []
     try:
         for p in _run_files(bench_dir):
-            item, _ = _classify(con, p)
-            if item["action"] == "known":              # учтённый файл: ни транзакции, ни записи
+            try:
+                item, _ = _classify(con, p)
+            except OSError:
+                items.append(_unreadable(p))
+                continue
+            if item["action"] == "known":              # учтённый файл: транзакции нет, пишется только запоздавшая ссылка
+                _late_texts(con, bench_dir, item)
                 items.append(item)
                 continue
-            con.execute("BEGIN IMMEDIATE")
-            try:
-                item, parsed = _classify(con, p)       # заново внутри транзакции: пока ждали, мог загрузить другой
-                if item["action"] == "new":
-                    parsed["run"]["source_file_sha256"] = item["sha256"]
-                    _store(con, bench_dir, parsed)
-                    item["action"] = "loaded"
-                    _log(con, item["file"], item["sha256"], item["size_bytes"], item["run_id"], "loaded", None)
-                elif item["action"] in ("rejected", "conflict"):
-                    _log(con, item["file"], item["sha256"], item["size_bytes"], item["run_id"],
-                         item["action"], item["reason"])
-                con.execute("COMMIT")
-            except BaseException:
-                con.execute("ROLLBACK")
-                raise
-            items.append(item)
+            items.append(_apply_one(con, bench_dir, p, item))
     finally:
         con.close()
     return {"files": items, "counts": _counts(items)}
@@ -590,7 +767,7 @@ def load_historical(bench_dir, file_path, apply=False):
             _check_version(con)
         earlier = _known(con, sha)
         if earlier:
-            item.update(action="known", reason=f"уже учтён ({earlier})")
+            item.update(action="known", reason=f"уже учтён ({earlier['outcome']})")
             return {"files": [item], "counts": {"known": 1}}
         try:
             doc = json.loads(data.decode("utf-8-sig"))
@@ -598,8 +775,11 @@ def load_historical(bench_dir, file_path, apply=False):
                     or not isinstance(doc.get("entries"), list):
                 raise RunRejected(f"формат не {HISTORICAL_FORMAT}")
             built = [_historical_rows(e) for e in doc["entries"] if isinstance(e, dict)]
-        except (RunRejected, ValueError, UnicodeDecodeError) as ex:
-            item.update(action="rejected", reason=str(ex) if isinstance(ex, RunRejected) else "файл не JSON")
+        except (RunRejected, ValueError, UnicodeDecodeError, TypeError, AttributeError, KeyError,
+                OverflowError, RecursionError) as ex:
+            item.update(action="rejected", reason=str(ex) if isinstance(ex, RunRejected)
+                        else "файл не JSON" if isinstance(ex, (ValueError, UnicodeDecodeError, RecursionError))
+                        else f"структура файла неверна ({type(ex).__name__})")
             if apply:
                 con.execute("BEGIN IMMEDIATE")
                 _log(con, name, sha, len(data), None, "rejected", item["reason"])
@@ -639,7 +819,7 @@ def load_historical(bench_dir, file_path, apply=False):
 def status(bench_dir):
     """Сколько прогонов в базе по методикам и сколько файлов ещё не загружено. Только чтение."""
     plan = plan_load(bench_dir)
-    out = {"db_exists": db_path(bench_dir).is_file(), "by_method": {}, "runs": 0,
+    out = {"db_exists": _exists(bench_dir), "by_method": {}, "runs": 0,
            "not_loaded": plan["counts"].get("new", 0), "conflicts": 0, "rejected": 0}
     if out["db_exists"]:
         con = open_read(bench_dir)
@@ -719,7 +899,7 @@ def cli(a, bench_dir=None):
             st = status(bench_dir)
             print(f"База: {'есть' if st['db_exists'] else 'нет (создаётся командой load --apply)'}")
             for m, n in st["by_method"].items():
-                print(f"  методика {m}: {n} прогонов")
+                print(f"  методика {m}: {n} {plural(n, ('прогон', 'прогона', 'прогонов'))}")
             print(f"Не загружено файлов: {st['not_loaded']}; конфликтов: {st['conflicts']}; "
                   f"отклонено: {st['rejected']}")
             print(HELP_APPEND_ONLY)
@@ -732,10 +912,14 @@ def cli(a, bench_dir=None):
             print(HELP_APPEND_ONLY)
         elif a.bench_cmd == "compare":
             print(compare(bench_dir, a.first, a.second)["text"])
-        else:
+        else:       # rt.py не пропускает другие значения; ветка для прямого вызова benchdb.cli
             print("Подкоманды: status, load, compare")
             return 2
     except BenchDbError as ex:
         print(f"Ошибка: {ex}", file=sys.stderr)
+        return 1
+    except Exception as ex:         # noqa: BLE001 — человеку не показывается трейсбек, только вид сбоя
+        print(f"Ошибка: непредвиденный сбой ({type(ex).__name__}); база и файлы прогонов не изменены "
+              f"сверх завершённых транзакций", file=sys.stderr)
         return 1
     return 0

@@ -108,7 +108,8 @@ def record(run_id, method="bench-2", power="ac", device_actual="CPU", seed=b"a",
 
 
 def write(bench, rec, texts=True):
-    t = {r["id"]: f"{SECRET_WORD} раз два три" for r in rec["results"]} if texts else None
+    ok = texts and isinstance(rec.get("results"), list) and all(isinstance(r, dict) for r in rec["results"])
+    t = {r["id"]: f"{SECRET_WORD} раз два три" for r in rec["results"]} if ok else None
     return runinfo.write_run(bench, rec, t)
 
 
@@ -658,6 +659,7 @@ class BrokenStructureTests(unittest.TestCase):
     BREAKS = {
         "hardware_is_string": lambda r: r["testbed"].__setitem__("hardware", "oops"),
         "chunks_nan": lambda r: r["results"][0].__setitem__("chunks", float("nan")),
+        "asr_sec_nan": lambda r: r["results"][0].__setitem__("asr_sec", float("nan")),
         "chunks_infinity": lambda r: r["results"][0].__setitem__("chunks", float("inf")),
         "started_is_dict": lambda r: r.__setitem__("started_utc", {"a": 1}),
         "reasons_is_number": lambda r: r["preflight"].__setitem__("reasons", 5),

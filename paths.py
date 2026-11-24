@@ -51,7 +51,6 @@ DATA_DIR = _data_dir()
 GROUPS = DATA_DIR / "groups"
 JOBS = DATA_DIR / "jobs"
 BENCH = DATA_DIR / "bench"
-BENCH_DB = BENCH / "bench_runs.sqlite3"  # база прогонов (benchdb.py): создаётся только командой rt.py bench-db load --apply
 CONFIG_FILE = DATA_DIR / "config.json"
 STATE_DB = DATA_DIR / "state.sqlite3"  # создаётся только явной операцией initialize_store
 HYPOTHESES = DATA_DIR / "hypotheses"   # гипотезы моделей (hypstore); создаётся только при первой записи
