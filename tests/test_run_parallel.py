@@ -87,13 +87,18 @@ class DiscoveryAndPlanTests(unittest.TestCase):
         self.assertEqual(sum(loads), 26.0)
         self.assertLessEqual(loads[1] - loads[0], 2.0)                      # «самый тяжёлый — в самую лёгкую»: 14 и 12
 
-    def test_seed_replays_the_same_layout_and_other_seeds_differ(self):
+    def test_seed_shuffles_only_the_order_inside_groups_not_their_content(self):
         modules = [f"test_m{i}" for i in range(20)]
         seconds = {m: 1.0 + i for i, m in enumerate(modules)}
+        base = rp.plan_groups(modules, seconds, 4)
         a = rp.plan_groups(modules, seconds, 4, seed=5)
-        self.assertEqual(a, rp.plan_groups(modules, seconds, 4, seed=5))
-        layouts = {json.dumps(rp.plan_groups(modules, seconds, 4, seed=s)) for s in range(8)}
-        self.assertGreater(len(layouts), 4)
+        self.assertEqual(a, rp.plan_groups(modules, seconds, 4, seed=5))          # seed повторяет порядок
+        orders = set()
+        for s in range(8):
+            groups = rp.plan_groups(modules, seconds, 4, seed=s)
+            self.assertEqual([sorted(g) for g in groups], base, "seed изменил состав групп")
+            orders.add(json.dumps(groups))
+        self.assertGreater(len(orders), 4)                                        # а порядок внутри групп меняется
 
     def test_modules_marked_together_stay_in_one_group(self):
         modules = [f"test_m{i}" for i in range(10)]

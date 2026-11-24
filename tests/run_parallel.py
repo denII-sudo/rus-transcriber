@@ -4,8 +4,8 @@
 
     python -B tests/run_parallel.py            # N = min(4, число ядер) групп
     python -B tests/run_parallel.py -v         # подробный вывод, строки групп с метками [g1] … [g4]
-    python -B tests/run_parallel.py --shuffle  # случайная раскладка по группам; число (seed) печатается в итоге
-    python -B tests/run_parallel.py --shuffle 12345   # повторить ту же раскладку
+    python -B tests/run_parallel.py --shuffle  # случайный порядок модулей внутри групп (состав групп прежний); seed печатается
+    python -B tests/run_parallel.py --shuffle 12345   # повторить тот же порядок
     python -B tests/run_parallel.py --sequential      # прежний путь: один процесс, `unittest discover -s tests`
 
 Что гарантирует запуск (иначе итог — FAILED и код выхода 1):
@@ -99,10 +99,9 @@ def plan_groups(modules, seconds, jobs, together=(), seed=None, after=None):
 
     Два состояния набора: «сейчас» (`seconds`) и «после ухода legacy_files» (`after`, если дана). Кусок ставится в ту
     группу, где после него наибольшая нагрузка в любом из двух состояний меньше всего (при одном состоянии это
-    правило «в самую лёгкую группу»). Без seed куски идут от самого тяжёлого, а затем перестановками и переносами
-    убирается остаточный перекос в обоих состояниях — раскладка устойчива и повторяема. С seed куски перемешаны,
-    выбор между равными группами случаен, порядок внутри групп случаен; доводки нет (иначе все seed сошлись бы к одной
-    раскладке), баланс держится самим правилом."""
+    правило «в самую лёгкую группу»). Куски идут от самого тяжёлого, а затем перестановками и переносами убирается
+    остаточный перекос в обоих состояниях — состав групп детерминирован и не зависит от seed. Seed перемешивает только
+    порядок модулей внутри каждой группы (скрытая зависимость соседей по набору проявится, а нагрузка групп не меняется)."""
     known = [seconds[m] for m in modules if m in seconds]
     default = (sum(known) / len(known)) if known else 1.0
     now = {m: seconds.get(m, default) for m in modules}
@@ -116,26 +115,15 @@ def plan_groups(modules, seconds, jobs, together=(), seed=None, after=None):
     units += [[m] for m in sorted(left)]
     jobs = max(1, min(jobs, len(units)))
     weight = {tuple(u): (sum(now[m] for m in u), sum(then[m] for m in u)) for u in units}
-    rng = random.Random(seed) if seed is not None else None
-    if rng:
-        rng.shuffle(units)
-    else:
-        units.sort(key=lambda u: (-max(weight[tuple(u)]), u[0]))
+    units.sort(key=lambda u: (-max(weight[tuple(u)]), u[0]))
     groups, load = [[] for _ in range(jobs)], [[0.0, 0.0] for _ in range(jobs)]
     for unit in units:
         a, b = weight[tuple(unit)]
         score = [max(load[i][0] + a, load[i][1] + b) for i in range(jobs)]
-        best = min(score)
-        pick = [i for i, v in enumerate(score) if v == best]
-        i = rng.choice(pick) if rng else pick[0]
+        i = score.index(min(score))
         groups[i].append(unit)
         load[i][0] += a
         load[i][1] += b
-    if rng:
-        flat = [[m for unit in g for m in unit] for g in groups]
-        for g in flat:
-            rng.shuffle(g)
-        return [g for g in flat if g]
 
     def cost(loads):
         return (max(max(x[0] for x in loads), max(x[1] for x in loads)),
@@ -169,7 +157,12 @@ def plan_groups(modules, seconds, jobs, together=(), seed=None, after=None):
             groups[gj].append(groups[gi].pop(ui))
         else:
             groups[gi][ui], groups[gj][vi] = groups[gj][vi], groups[gi][ui]
-    return [g for g in (sorted(m for unit in grp for m in unit) for grp in groups) if g]
+    result = [g for g in (sorted(m for unit in grp for m in unit) for grp in groups) if g]
+    if seed is not None:
+        rng = random.Random(seed)
+        for g in result:
+            rng.shuffle(g)
+    return result
 
 
 def verify_plan(modules, groups):
@@ -421,7 +414,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
     ap.add_argument("-v", "--verbose", action="store_true", help="подробный вывод unittest с метками групп")
     ap.add_argument("--jobs", type=int, help=f"число групп (по умолчанию min({MAX_JOBS}, число ядер))")
     ap.add_argument("--shuffle", nargs="?", const="random", metavar="SEED",
-                    help="случайная раскладка по группам; без числа — seed выбирается и печатается")
+                    help="случайный порядок модулей внутри групп (состав групп не меняется); без числа — seed выбирается и печатается")
     ap.add_argument("--sequential", action="store_true", help="один процесс: unittest discover -s tests")
     ap.add_argument("--timeout", type=int, default=GROUP_TIMEOUT, help="секунд на группу (по умолчанию %(default)s)")
     ap.add_argument("--table", help="таблица длительностей модулей (по умолчанию tests/parallel_durations.json)")
@@ -502,7 +495,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
         counter = Run("count", [py, "-B", "-c", COUNT_CODE], repo, tests_dir, root, [], False, say)
     started = time.time()
     if seed is not None:
-        say(f"раскладка: seed={seed} (повтор: python -B tests/run_parallel.py --jobs {len(groups)} --shuffle {seed})")
+        say(f"порядок модулей в группах: seed={seed} (повтор: python -B tests/run_parallel.py --jobs {len(groups)} --shuffle {seed})")
     say(f"запуск: {'последовательно, один процесс' if args.sequential else f'{len(runs)} групп(ы) параллельно'}"
         f", модулей {len(modules)}")
     for r in runs:
