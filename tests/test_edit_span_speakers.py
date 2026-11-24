@@ -38,7 +38,7 @@ class SeveralSpeakersNeedSpeaker(unittest.TestCase):
                     self.assertIn("несколько говорящих", text)
                     self.assertIn("Вера", text)
                     self.assertIn("Глеб", text)
-                    self.assertIn("укажите speaker", text)
+                    self.assertIn("укажите, чей это текст — в карточке «Имя: текст», в edit_span — speaker", text)
                     self.assertEqual(state(jp), before)          # ревизия, файлы и журнал правок не тронуты
 
     def test_text_that_moves_the_other_speakers_word_is_refused_too(self):
@@ -85,6 +85,8 @@ class SeveralSpeakersNeedSpeaker(unittest.TestCase):
                 before = state(jp)
                 _, rep = transcript.apply_word_edits(jp, md, [edit], by="human")
                 self.assertIn("несколько говорящих", rep["failed"]["r1"])
+                self.assertIn("в карточке «Имя: текст»", rep["failed"]["r1"])
+                self.assertIn("в карточке «Имя: текст»", hc.item(jp, "r1")["note"])    # человек видит причину
                 self.assertEqual(speakers_of(jp), {"w1": "Глеб", "w2": "Глеб", "w3": "Глеб", "w4": "Вера"})
                 self.assertEqual(hc.item(jp, "r1")["status"], "human")          # место уходит человеку с причиной
                 self.assertNotEqual(state(jp), before)                          # статус места записан, слова — нет

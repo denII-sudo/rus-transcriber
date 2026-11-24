@@ -792,7 +792,8 @@ EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правк�
                              'человека) или "human" (текст продиктовал человек, только командной строкой); '
                              'без автора правка не принимается')
 SPAN_REOPEN_HINT = "; чтобы решить заново — reopen_review (rt.py reopen)"
-SEVERAL_SPEAKERS = "на отрезке несколько говорящих ({}): укажите speaker"
+SEVERAL_SPEAKERS = ("на отрезке несколько говорящих ({}): укажите, чей это текст — в карточке «Имя: текст», "
+                    "в edit_span — speaker")
 
 
 def check_edit_span_author(by):
