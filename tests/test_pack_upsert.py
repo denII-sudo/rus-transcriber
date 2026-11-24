@@ -190,21 +190,79 @@ class ReplaceTests(Case):
                 self.assertEqual([(d["id"], d.get("text")) for d in decisions], [("r1", "вам")])
                 self.assertEqual(rep["pending_new"], [])
 
+    def test_old_revision_answer_left_by_a_crash_is_never_applied(self):
+        """Условие архитектора (1): ответ старой редакции, оставшийся в ответах (сбой между записями), не
+        применяется молча и не показывается как ответ на новый вопрос; конфликты прежней редакции — в history."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                self.save(jp, version, "r1", option=1)
+                stale = copy.deepcopy(review_pack.answers_state(jp)["answers"]["r1"])
+                self.save(jp, version, "r3", option=0)
+                review_pack.add_answers(jp, [{"id": "r3", "version": version, "option": 1,
+                                              "ts": "2026-11-25T11:00:00"}], "cloud", trusted_actor="human")
+                self.assertEqual([c["id"] for c in review_pack.answers_state(jp)["conflicts"]], ["r3"])
+                review_pack.upsert_cards(jp, [question("r1", "вам"), question("r3", "тут")], why="тест")
+                state = review_pack.answers_state(jp)
+                self.assertEqual(state["conflicts"], [])
+                self.assertEqual([c["id"] for c in self.item(jp, "r3")["history"][0]["conflicts"]], ["r3"])
+                self.assertEqual(self.item(jp, "r1")["history"][0]["answer"]["option"], 1)
+                state["answers"]["r1"] = stale                    # как после обрыва между manifest и ответами
+                review_pack._write_answers(jp, state)
+                decisions, rep = review_pack.decisions(jp)
+                self.assertEqual(decisions, [])
+                self.assertIn("r1", rep["unanswered"])
+                self.assertNotIn("r1", review_pack.answer_states(jp))
+                self.assertNotIn("r1", json.loads((review_pack.pack_dir(jp) / review_pack.cloud_bundle(jp)["files"]
+                                                   ["manifest.json"]).read_text(encoding="utf-8"))["answers"])
+                core.apply_answers_files(jp, md)
+                self.assertEqual(self.texts(jp)["w1"], "вот", "ответ старой редакции применился")
+
     def test_late_card_is_checked_against_its_own_transcript_revision(self):
-        """sqlite: карточка, собранная позже пакета, сверяется при «Применить» с ревизией, по которой собрана."""
+        """Условие архитектора (б), (в): карточка, собранная позже пакета, сверяется при «Применить» с ревизией,
+        по которой собрана; настоящая правка её слов ловится; своя ревизия старше пакетной не подменяет её."""
         def payload(text):
             return {"segments": [{"speaker": "Анна", "words": [{"word_id": "w1", "w": text}]}]}
-        man = {"source_revision": 1, "items": [{"id": "r1", "rev": 2, "source_revision": 2, "word_ids": ["w1"]}]}
-        state = {"answers": {"r1": {"id": "r1", "rev": 2, "kind": "option", "option": 0}}}
-        current = payload("тэ")
-        self.assertEqual(core._answer_revision_conflicts(current, man, state, payload("та"), sqlite=True,
-                                                         sources={2: payload("тэ")}), {})
-        self.assertIn("r1", core._answer_revision_conflicts(current, man, state, payload("тэ"), sqlite=True,
-                                                            sources={2: payload("та")}))
-        self.assertIn("r1", core._answer_revision_conflicts(current, man, state, payload("тэ"), sqlite=True))
+
+        def conflicts(own, current, source, sources=None, answer_rev=2):
+            man = {"source_revision": 1, "items": [{"id": "r1", "rev": 2, "source_revision": own, "word_ids": ["w1"]}]}
+            answer = {"id": "r1", "kind": "option", "option": 0, **({"rev": answer_rev} if answer_rev else {})}
+            return core._answer_revision_conflicts(payload(current), man, {"answers": {"r1": answer}},
+                                                   payload(source), sqlite=True, sources=sources)
+        # 1. заменённая карточка новее пакета: без ложного «слова изменились»
+        self.assertEqual(conflicts(2, "тэ", "та", {2: payload("тэ")}), {})
+        # 2. настоящая правка слов после замены ловится
+        self.assertIn("r1", conflicts(2, "то", "та", {2: payload("тэ")}))
+        self.assertIn("r1", conflicts(2, "тэ", "тэ"), "нет ревизии карточки — сверять не с чем")
+        # 3. своя ревизия старше пакетной — ошибка данных: сверка по ревизии пакета, как раньше
+        self.assertIn("r1", conflicts(0, "тэ", "та", {0: payload("тэ")}))
+        self.assertEqual(conflicts(0, "та", "та", {0: payload("тэ")}), {})
         # ответ прежней редакции не сверяется вовсе: он не применяется
-        stale = {"answers": {"r1": {"id": "r1", "kind": "option", "option": 0}}}
-        self.assertEqual(core._answer_revision_conflicts(current, man, stale, payload("та"), sqlite=True), {})
+        self.assertEqual(conflicts(2, "тэ", "та", answer_rev=None), {})
+
+    def test_listened_button_is_checked_against_the_card_revision(self):
+        """Условие архитектора (б): «прослушал» на месте «модели расходятся» сверяется с ревизией карточки."""
+        data = result()
+        data["review"][1].update(reasons=["asr"], asr_problem={"model": "whisper", "state": "words_differ",
+                                                                "words_from": []})
+        with files("sqlite", data, [question("r1", "вон"), question("r2", "дальнейшем")]) as (jp, md, version):
+            self.save(jp, version, "r1", option=1)
+            core.apply_answers_files(jp, md)                  # ревизия стенограммы выросла
+            self.save(jp, version, "r2", option=0)            # «Я прослушал: слова в стенограмме верны»
+
+            def card_revision(revision):
+                state = review_pack.answers_state(jp)
+                next(i for i in state["manifest"]["items"] if i["id"] == "r2")["source_revision"] = revision
+                review_pack._write_answers(jp, state)
+                return review_pack.decisions(jp)
+            pack_revision = review_pack.manifest(jp)["source_revision"]
+            _out, rep = review_pack.decisions(jp)
+            self.assertIn("r2", rep["source_conflict_ids"])
+            current = transcript.load(jp)["source_revision"]
+            out, rep = card_revision(current)
+            self.assertNotIn("r2", rep["source_conflict_ids"])
+            self.assertEqual([d["id"] for d in out], ["r2"])
+            _out, rep = card_revision(pack_revision - 1)
+            self.assertIn("r2", rep["source_conflict_ids"], "старшая ревизия карточки подменила ревизию пакета")
 
     def test_repeat_of_the_same_card_writes_nothing(self):
         """Тест 5: тот же вопрос — ничего не пишется, pack_rev прежний, ревизия sqlite прежняя."""

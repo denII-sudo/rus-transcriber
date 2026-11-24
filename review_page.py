@@ -201,7 +201,8 @@ def main():
                     man = P.manifest(a.json_path) or {}
                     item = next((it for it in man.get("items", []) if isinstance(obj, dict)
                                  and it.get("id") == obj.get("id")), None)
-                    if not isinstance(obj, dict) or obj.get("version") != man.get("version") or item is None                             or not isinstance(obj.get("text"), str) or not obj["text"].strip():
+                    if not isinstance(obj, dict) or obj.get("version") != man.get("version") or item is None \
+                            or not isinstance(obj.get("text"), str) or not obj["text"].strip():
                         return self._send(400, {"error": "неверная карточка, версия или текст"})
                     stale = P.rev_refusal(obj.get("rev"), item)
                     if stale:

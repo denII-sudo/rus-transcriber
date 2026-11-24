@@ -2558,10 +2558,11 @@ def _answer_source_snapshot(store, recording_id, manifest):
 
 def _answer_item_sources(store, recording_id, manifest):
     """{ревизия: стенограмма} для карточек, заменённых или дописанных по другой ревизии (upsert_cards)."""
+    import review_pack
     out = {}
     for item in manifest.get("items") or []:
-        revision = item.get("source_revision")
-        if revision is not None and revision != manifest.get("source_revision") and revision not in out:
+        revision = review_pack.card_source_revision(item, manifest)
+        if revision != manifest.get("source_revision") and revision not in out:
             out[revision] = _answer_source_snapshot(store, recording_id, {"source_revision": revision})
     return out
 
@@ -2615,8 +2616,8 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite, sour
         if not review_pack.answer_is_current(answer, item) or aid in applied:
             continue
         # Карточка, заменённая или дописанная позже сборки пакета, сверяется с ревизией, по которой собрана.
-        revision = item.get("source_revision")
-        if sqlite and revision is not None and revision != manifest.get("source_revision"):
+        revision = review_pack.card_source_revision(item, manifest)
+        if sqlite and revision != manifest.get("source_revision"):
             source = (sources or {}).get(revision)
         else:
             source = base_source

@@ -176,6 +176,16 @@ def rev_refusal(rev, item):
     return REV_UNKNOWN if rev > current else None
 
 
+def card_source_revision(item, man):
+    """Ревизия стенограммы, по которой собрана карточка: своя, если карточка собрана позже пакета (upsert_cards),
+    иначе — ревизия пакета (и у карточек до PR 13а). Своя ревизия не новее пакетной — ошибка данных или та же
+    ревизия: проверяется по ревизии пакета, как раньше."""
+    own, base = (item or {}).get("source_revision"), (man or {}).get("source_revision")
+    if all(isinstance(x, int) and not isinstance(x, bool) for x in (own, base)) and own > base:
+        return own
+    return base
+
+
 def answer_is_current(answer, item):
     """Сохранённый ответ относится к текущей редакции карточки (ответ без rev — к первой)."""
     return bool(answer) and answer.get("rev", 1) == card_rev(item)
@@ -919,7 +929,7 @@ def decisions(json_path):
                     rep["source_conflict_ids"].append(aid)
                     rep.setdefault("source_conflict_why", {})[aid] = LISTEN_STALE
                     continue
-            elif d.get("listened") and it.get("source_revision", man.get("source_revision")) !=                     data.get("source_revision"):
+            elif d.get("listened") and card_source_revision(it, man) != data.get("source_revision"):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
                 continue
