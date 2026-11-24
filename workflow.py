@@ -1,7 +1,10 @@
 """Сохранённые запросы П3. Исполнение вызывается сервисом, не при импорте."""
 
+import copy
+import itertools
 import json
 import math
+import re
 import uuid
 from fractions import Fraction
 from pathlib import Path
@@ -1553,3 +1556,363 @@ def _accept_model_result_once(store, request_id, result):
     if (conspect_id, saved["conspect_revision"]) not in completed:
         raise storage.StorageError("конспект сохранён в БД; формирование файлов не завершено")
     return accepted
+
+
+# ---------- Исправление ненайденных цитат по просьбе человека (РАР-7, этап 7.5в, шаг 2) ----------
+# Один вызов облака на одно нажатие (экран) или одно обращение (MCP) с согласием человека. Сама программа его
+# не запускает: ни приём ответа, ни пересборка, ни разбор. Условия — quote_repair_problem (единственная запись),
+# порог — quotes_need_repair, задание — quote_repair_task, применение — _apply_quote_repair (по одной цитате).
+REPAIR_MAX_QUOTES = 60
+REPAIR_WHO = "opencode/openai/gpt-6-luna"
+REPAIR_OLD = ("свёртка собрана до этой возможности; исправление недоступно. Новая свёртка — "
+              "workflow_execute_model(restart=true): весь текст снова уйдёт в облако.")
+REPAIR_CHANGED = "что уйдёт в облако, изменилось: посмотрите снова"
+_LEADING_LABEL = re.compile(r"^(Участник\s+\d+|Говорящий не определён)\s*[:—–-]\s*")
+
+
+def _repair_conspect(store, request):
+    """Текущая запись свёртки запроса или None."""
+    for saved in store.list_conspects(request["recording_id"]):
+        if saved["name"] == "workflow-" + request["request_id"]:
+            return saved
+    return None
+
+
+def _repair_labels(payload, transcript):
+    """{номер реплики со словами: условная метка} по меткам свёртки. Имён здесь нет: говорящий без метки
+    (появился после приёма ответа) и без говорящего — UNKNOWN_SPEAKER."""
+    speaker_of = {word.get("word_id"): segment.get("speaker")
+                  for segment in transcript.get("segments", []) for word in segment.get("words", [])}
+    by_speaker = {}
+    for item in payload.get("speaker_labels") or []:
+        for word_id in item.get("word_ids") or []:
+            if word_id in speaker_of:
+                by_speaker.setdefault(speaker_of[word_id], item.get("label"))
+    labels, turn = {}, 0
+    for segment in transcript.get("segments", []):
+        if segment.get("words"):
+            turn += 1
+            label = by_speaker.get(segment["speaker"]) if segment.get("speaker") else None
+            ok = isinstance(label, str) and model_tasks.SPEAKER_LABEL.fullmatch(label)
+            labels[turn] = label if ok else model_tasks.UNKNOWN_SPEAKER
+    return labels
+
+
+def _repair_task_from(payload, snapshots):
+    """(задание или None, сведения) по свёртке и текущим снимкам. Только разделы со слотами; пункты — из текущей
+    стенограммы (с исправлениями и сомнениями ⟦…⟧), метки — условные. Имён, времени, ID слов, записи, цели
+    и номеров ревизий в задании нет. Не поместившееся и потерявшее слова — в left."""
+    import llm_provider
+    transcript = snapshots["transcript"]["payload"]
+    words = _task_words(transcript, snapshots["review"]["payload"])
+    labels = _repair_labels(payload, transcript)
+    by_section = {}
+    for item in payload.get("unlinked") or []:
+        by_section.setdefault(item["section"], []).append(item)
+    sections, indexes, sent, used, left, full = [], [], [], 0, 0, False
+    for index in sorted(by_section):
+        items = sorted(by_section[index], key=lambda item: item["at"][0])
+        evidence = set(payload["evidence"][index].get("evidence") or [])
+        chosen = [word for word in words if word["word_id"] in evidence]
+        if not chosen:
+            left += len(items)                      # места этих цитат удалены из стенограммы
+            continue
+        fits = len(sent) + len(items) <= REPAIR_MAX_QUOTES and used + len(chosen) <= llm_provider.MAX_WORDS
+        if full or (not fits and sections):
+            full = True
+            left += len(items)
+            continue
+        if not fits:                                # первый раздел сам не помещается: берутся первые цитаты
+            left += max(0, len(items) - REPAIR_MAX_QUOTES)
+            items = items[:REPAIR_MAX_QUOTES]
+        points = [[labels[turn], model_tasks._point_text(list(group))]
+                  for turn, group in itertools.groupby(chosen, key=lambda word: word["turn"])]
+        sections.append({"text": payload["evidence"][index]["text"], "quotes": [
+            {"id": item["id"], "quote": item["quote"], "why": item["why"]} for item in items], "points": points})
+        indexes.append(index)
+        sent += items
+        used += len(chosen)
+    meta = {"sections": indexes, "ids": [item["id"] for item in sent], "words": used, "left": left,
+            "slots": {item["id"]: {"quote": item["quote"], "section": item["section"], "at": list(item["at"])}
+                      for item in sent}}
+    if not sections:
+        return None, meta
+    return model_tasks.quote_repair({"kind": model_tasks.REPAIR_KIND, "version": 1, "sections": sections}), meta
+
+
+def quote_repair_task(store, request):
+    """(задание, сведения) исправления для запроса; Conflict, если отправлять нечего. Только чтение."""
+    saved = _repair_conspect(store, request)
+    if saved is None:
+        raise storage.Conflict(REPAIR_OLD)
+    snapshots = store.get_current(request["recording_id"])
+    task, meta = _repair_task_from(saved["payload"], snapshots)
+    if task is None:
+        raise storage.Conflict("места этих цитат удалены из стенограммы: отправлять нечего")
+    meta.update(conspect_id=saved["conspect_id"], conspect_revision=saved["current_revision"],
+                source_revision=snapshots["transcript"]["revision"], review_revision=snapshots["review"]["revision"])
+    return task, meta
+
+
+def quote_repair_problem(store, request):
+    """Почему исправление цитат недоступно, или None. Только чтение; единственная запись условий.
+
+    Экран, MCP и исполнение спрашивают эту функцию; ни одна проверка здесь облако не вызывает.
+    """
+    if (not request["policy"]["require_conspect"] or request["state"] != "completed"
+            or request["model_task"] is None or not request["recording_id"]):
+        return "готовой модельной свёртки у этого запроса нет"
+    if not _quotes_one_by_one(request["model_task"]):
+        return REPAIR_OLD
+    if not request["policy"]["allow_cloud_model"]:
+        return ("облако запрещено политикой этого запроса; для облачной обработки нужен новый запрос "
+                "с разрешением")
+    saved = _repair_conspect(store, request)
+    payload = saved["payload"] if saved else {}
+    if payload.get("quote_policy") != 1 or not isinstance(payload.get("unlinked"), list):
+        return REPAIR_OLD
+    unlinked, total = quote_counts(payload)
+    if not quotes_need_repair(unlinked, total):
+        return (f"не найдено {unlinked} из {total} цитат: исправление доступно от {REPAIR_MIN_UNLINKED} "
+                f"и от {int(REPAIR_MIN_SHARE * 100)} %")
+    problem = conspect_file_problem(store, request)
+    if problem:
+        return problem
+    try:
+        quote_repair_task(store, request)
+    except storage.Conflict as ex:
+        return str(ex)
+    return None
+
+
+def _repair_snapshot(request, saved, task, meta):
+    unlinked, total = quote_counts(saved["payload"])
+    return {"request_id": request["request_id"], "name": saved["name"], "unlinked": unlinked, "total": total,
+            "sections": len(meta["sections"]), "quotes": len(meta["ids"]), "words": meta["words"],
+            "left": meta["left"], "task_hash": storage._hash(task), "conspect_revision": meta["conspect_revision"],
+            "source_revision": meta["source_revision"], "review_revision": meta["review_revision"]}
+
+
+def quote_repair_prepare(store, request_id):
+    """Снимок того, что уйдёт в облако, для окна согласия на экране. Conflict с причиной, если недоступно."""
+    request = get(store, request_id)
+    problem = quote_repair_problem(store, request)
+    if problem:
+        raise storage.Conflict(problem)
+    task, meta = quote_repair_task(store, request)
+    return _repair_snapshot(request, _repair_conspect(store, request), task, meta)
+
+
+def quote_repair_info(store, request_id):
+    """Для MCP без согласия: доступно ли исправление, почему нет, сколько уйдёт. Облако не вызывается."""
+    request = get(store, request_id)
+    problem = quote_repair_problem(store, request)
+    info = {"request_id": request_id, "available": problem is None, "reason": problem}
+    saved = _repair_conspect(store, request) if request["recording_id"] else None
+    counts = quote_counts(saved["payload"]) if saved else None
+    if counts:
+        info.update(unlinked=counts[0], total=counts[1], quotes=[
+            {"id": item["id"], "quote": item["quote"], "why": item["why"], "section": item["section"]}
+            for item in saved["payload"].get("unlinked") or []])
+    if problem is None:
+        task, meta = quote_repair_task(store, request)
+        info.update(sections=len(meta["sections"]), words=meta["words"], left=meta["left"])
+    return info
+
+
+def _repair_clean(answer):
+    """Ответ модели -> цитата для связывания: без наших служебных знаков ⟦ ⟧, крайних «» и метки говорящего."""
+    text = " ".join(answer.replace("⟦", "").replace("⟧", "").split())
+    for _ in range(3):
+        text = text.strip("«»\" ")
+        text = _LEADING_LABEL.sub("", text, count=1)
+    return text
+
+
+def _repair_link(clean, data, within):
+    """Связанная цитата (объект свёртки) или None: отрывок должен однозначно найтись среди слов раздела."""
+    import conspect
+    if (not clean or len(clean) > model_tasks.MAX_REPAIR_QUOTE_CHARS
+            or any(mark in clean for mark in ("…", "...", "«", "»", "[", "]", *conspect.SLOT_MARKS))):
+        return None
+    try:
+        obj, report = conspect.link(f"«{clean}»", data, within=within, unlinked="reject", labels=True)
+    except ValueError:
+        return None
+    if report["unlinked"] or list(obj["quotes"]) != ["1"]:
+        return None
+    return obj["quotes"]["1"]
+
+
+def _apply_quote_repair(payload, data, ids, answers):
+    """Чистая функция: (новая свёртка, счёт). Каждая цитата — отдельно, одна негодная не мешает остальным.
+
+    Строка, найденная в своём разделе, — новая цитата: слот {{u:N}} становится {{q:K}}, в тексте раздела
+    «старая» заменена на «новая». null — кавычки сняты: цитата остаётся обычным текстом без пометки.
+    Замены идут с конца раздела, позиции оставшихся слотов сдвигаются на разницу длин.
+    """
+    import conspect
+    new = copy.deepcopy(payload)
+    by_id = {item["id"]: item for item in new["unlinked"]}
+    todo = [by_id[ident] for ident in ids if ident in by_id and ident in answers]
+    todo.sort(key=lambda item: (item["section"], item["at"][0]), reverse=True)
+    counts = {"fixed": 0, "unquoted": 0, "failed": 0}
+    last = max((int(key) for key in new["quotes"]), default=0)
+    for item in todo:
+        section = new["evidence"][item["section"]]
+        text, (start, end), answer = section["text"], item["at"], answers[item["id"]]
+        if text[start:end] != "«%s»" % item["quote"]:
+            counts["failed"] += 1                    # место цитаты в тексте не то, что записано: не трогаем
+            continue
+        if answer is None:
+            replacement, token = item["quote"], item["quote"]
+            counts["unquoted"] += 1
+        else:
+            clean = _repair_clean(answer)
+            quote = _repair_link(clean, data, set(section.get("evidence") or []))
+            if quote is None:
+                counts["failed"] += 1
+                continue
+            last += 1
+            found = conspect._LABEL_BEFORE.search(text[:start])
+            quote["written_label"] = " ".join(found.group(1).split()) if found else None
+            new["quotes"][str(last)] = quote
+            replacement, token = f"«{clean}»", "{{q:%d}}" % last
+            counts["fixed"] += 1
+        new["template"] = new["template"].replace("{{u:%s}}" % item["id"], token, 1)
+        section["text"] = text[:start] + replacement + text[end:]
+        delta = len(replacement) - (end - start)
+        for other in new["unlinked"]:
+            if other is not item and other["section"] == item["section"] and other["at"][0] >= end:
+                other["at"] = [other["at"][0] + delta, other["at"][1] + delta]
+        new["unlinked"] = [other for other in new["unlinked"] if other is not item]
+    new["unlinked_count"] = len(new["unlinked"])
+    return new, counts
+
+
+def _repair_rows(store, run_id, state, extra):
+    """Состояние запуска и шага исправления; в result_json дописываются поля extra. Вызывать в транзакции."""
+    row = store.db.execute("SELECT step_id, result_json FROM workflow_steps WHERE run_id=?", (run_id,)).fetchone()
+    details = storage._loads(row["result_json"]) if row["result_json"] else {}
+    details.update(extra)
+    now = storage._now()
+    store.db.execute("UPDATE workflow_steps SET state=?, result_json=?, updated_at=? WHERE step_id=?",
+                     (state, storage._json(details), now, row["step_id"]))
+    store.db.execute("UPDATE workflow_runs SET state=?, updated_at=? WHERE run_id=?", (state, now, run_id))
+
+
+def _repair_failed(store, run_id, code, message):
+    try:
+        with store._transaction():
+            store.current_identity()
+            _repair_rows(store, run_id, "failed", {"error_code": code, "message": message})
+    except Exception as ex:     # запись отказа не должна скрыть первую ошибку
+        import sys
+        print(f"workflow: отказ исправления цитат не записан: {type(ex).__name__}", file=sys.stderr)
+
+
+def _save_repair(store, request, run_id, meta, answers):
+    """Применить ответ к ТЕКУЩЕЙ свёртке и записать новую ревизию вместе с шагом. -> (счёт, ревизия, id, записано)."""
+    import conspect
+    now = get(store, request["request_id"])
+    if now["state"] != "completed" or now["model_task"] != request["model_task"]:
+        raise storage.Conflict("модельный шаг начат заново; исправление не записано")
+    snapshots = store.get_current(request["recording_id"])
+    current = snapshots["transcript"]
+    if current["revision"] != meta["source_revision"]:
+        raise storage.Conflict("стенограмма изменилась, пока модель отвечала; исправление не записано")
+    saved = _repair_conspect(store, request)
+    live = {item["id"]: item for item in (saved["payload"].get("unlinked") or [])} if saved else {}
+    if any(live.get(ident, {}).get(key) != value
+           for ident, slot in meta["slots"].items() for key, value in slot.items()):
+        raise storage.Conflict("свёртка изменилась, пока модель отвечала; исправление не записано")
+    data = {**current["payload"], "recording_id": request["recording_id"], "source_revision": current["revision"],
+            "review": snapshots["review"]["payload"].get("review", [])}
+    new, counts = _apply_quote_repair(saved["payload"], data, meta["ids"], answers)
+    counts["left"] = meta["left"]
+    if counts["fixed"] + counts["unquoted"] == 0:
+        with store._transaction():
+            store.current_identity()
+            _repair_rows(store, run_id, "completed", {**counts, "conspect_revision": saved["current_revision"]})
+        return counts, saved["current_revision"], saved["conspect_id"], False
+    new["source_revision"] = current["revision"]
+    new["assembly_review_revision"] = snapshots["review"]["revision"]
+    md, _ = conspect.render(new, data)
+    payload = json.dumps(new, ensure_ascii=False, indent=1).encode("utf-8")
+    binding = recordings.document_binding(store, request["recording_id"])
+    with store._transaction():
+        store.current_identity()
+        head = recordings.recording_head(store, request["recording_id"])
+        if head["source_revision"] != current["revision"]:
+            raise storage.Conflict("стенограмма изменилась, пока модель отвечала; исправление не записано")
+        result = store.save_conspect(
+            request["recording_id"], saved["conspect_id"], saved["name"], current["revision"],
+            saved["current_revision"], new, payload, (md + "\n").encode("utf-8"), saved["json_relative"],
+            saved["md_relative"], binding["root_id"], str(uuid.uuid5(uuid.UUID(run_id), "quote-repair")),
+            recordings.operation_context(store, "model"))
+        _repair_rows(store, run_id, "completed", {**counts, "conspect_revision": result["conspect_revision"]})
+    return counts, result["conspect_revision"], saved["conspect_id"], True
+
+
+def repair_quotes(store, request_id, *, via, snapshot=None):
+    """Один вызов облака: исправить ненайденные цитаты готовой свёртки. via — «screen» или «mcp».
+
+    Отказы до вызова (условия, устаревший снимок) облако не вызывают и запуска не пишут. Отказы после вызова
+    (формат ответа, смена стенограммы или свёртки) пишут шаг failed, свёртку не меняют; повтора нет.
+    """
+    import llm_provider
+    if via not in ("screen", "mcp") or (via == "screen" and snapshot is None):
+        raise ValueError("исправление запускает экран (со снимком) или MCP")
+    request = get(store, request_id)
+    problem = quote_repair_problem(store, request)
+    if problem:
+        raise storage.Conflict(problem)
+    task, meta = quote_repair_task(store, request)
+    if snapshot is not None and snapshot != _repair_snapshot(request, _repair_conspect(store, request), task, meta):
+        raise storage.Conflict(REPAIR_CHANGED)
+    run_id, now = str(uuid.uuid4()), storage._now()
+    with store._transaction():
+        store.current_identity()
+        row = store.db.execute("SELECT current_revision FROM conspects WHERE conspect_id=?",
+                               (meta["conspect_id"],)).fetchone()
+        if row is None or row["current_revision"] != meta["conspect_revision"]:
+            raise storage.Conflict(REPAIR_CHANGED)
+        # Запуск, оставшийся running от оборванного процесса, больше не ждётся: interrupted.
+        store.db.execute("UPDATE workflow_steps SET state='interrupted', updated_at=? WHERE state='running' AND "
+                         "run_id IN (SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='quote_repair')",
+                         (now, request_id))
+        store.db.execute("UPDATE workflow_runs SET state='interrupted', updated_at=? "
+                         "WHERE request_id=? AND kind='quote_repair' AND state='running'", (now, request_id))
+        store.db.execute("INSERT INTO workflow_runs VALUES (?, ?, 'quote_repair', 'running', ?, ?, ?)",
+                         (run_id, request_id, REPAIR_WHO, now, now))
+        store.db.execute("INSERT INTO workflow_steps VALUES (?, ?, 'quote_repair', 'running', ?, ?, ?)",
+                         (str(uuid.uuid4()), run_id,
+                          storage._json({"initiated_via": via, "context": recordings.operation_context(store, "model"),
+                                         "meta": meta, "task": task}), now, now))
+    cleanup = []
+    try:
+        with llm_provider.OpenCodeTextClient() as client:
+            cleanup = getattr(client, "cleanup_warnings", cleanup)
+            result, _raw = client.repair_quotes(task)
+        try:
+            answers = model_tasks.validate_quote_repair(task, result)
+        except ValueError as ex:
+            raise llm_provider.ProviderError(
+                "invalid_response", f"ответ модели не прошёл проверку формата ({ex}); свёртка не изменена") from ex
+        counts, revision, conspect_id, changed = _save_repair(store, request, run_id, meta, answers)
+    except llm_provider.ProviderError as ex:
+        _repair_failed(store, run_id, ex.code, str(ex))
+        raise
+    except storage.Conflict as ex:
+        _repair_failed(store, run_id, "revision_changed", str(ex))
+        raise llm_provider.ProviderError("revision_changed", str(ex)) from ex
+    except Exception as ex:
+        _repair_failed(store, run_id, "internal_error", f"исправление цитат остановлено: {type(ex).__name__}")
+        raise
+    finally:
+        _record_cleanup_warnings(store, run_id, cleanup)
+    if changed:
+        completed = recordings.materialize_conspects(store, request["recording_id"], conspect_id=conspect_id)
+        if (conspect_id, revision) not in completed:
+            raise storage.StorageError("сохранено в базе; файлы свёртки не записаны: решите конфликт на экране")
+    return {"request_id": request_id, **counts, "conspect_revision": revision}
