@@ -1141,8 +1141,12 @@ def _copy_problem(store, row):
     return None
 
 
-def _damaged_stops(store, row, rows, program):
-    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row."""
+def _damaged_stops(store, row, rows, program, row_state):
+    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row.
+
+    row_state — состояние файла row. Файлы документа сверяются все до первой замены в порядке `documents.WRITE_ORDER`:
+    копия раньше row в этом порядке останавливает запись всегда, позже — только если row не изменён после решения
+    (изменённый файл даёт новый конфликт раньше, чем сверка дойдёт до копии)."""
     import documents
     decided = {}
     for other in rows:
@@ -1155,12 +1159,10 @@ def _damaged_stops(store, row, rows, program):
         decided[(other["revision"], other["relative_path"])] = other
     table, column, revision = (("document_outbox", "recording_id", "document_revision") if row["scope"] == "document"
                                else ("conspect_outbox", "conspect_id", "revision"))
-    found, order = set(), None
+    found = set()
     for other in decided.values():
-        if row["scope"] == "document" and other["revision"] == row["revision"]:
-            if order is None:    # файлы документа пишутся по очереди: позднейший предыдущему не мешает
-                order = list(documents.current_paths_from_document(
-                    store.get_document(row["recording_id"], row["revision"]), row["recording_id"]))
+        if row["scope"] == "document" and other["revision"] == row["revision"] and row_state != "same":
+            order = documents.WRITE_ORDER
             if order.index(other["kind"]) > order.index(row["kind"]):
                 continue
         state, digest = _file_at(store, other, other["relative_path"])
@@ -1227,7 +1229,7 @@ def _conflict_facts(store, row):
     also = [] if reason else _also_replaced(store, row, program)
     rows = [] if reason else _conflict_rows(store, row["scope"])
     waits = [] if reason else _waits_for(row, rows)
-    stops = [] if reason else _damaged_stops(store, row, rows, program)
+    stops = [] if reason else _damaged_stops(store, row, rows, program, state)
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
             "also_replaces": also, "waits_for": waits, "stops_for": stops,
             "effect": None if reason else _effect(row, state, waits, stops), "can_replace": reason is None, "reason": reason,
@@ -1603,7 +1605,7 @@ def _next_step(store, row, rows, problem):
     found, digest = _file_at(store, row, row["relative_path"])
     state = found if found != "ok" else "same" if digest == row["observed_hash"] else "changed"
     waits = _waits_for(row, rows)
-    stops = _damaged_stops(store, row, rows, program)
+    stops = _damaged_stops(store, row, rows, program, state)
     effect = _effect(row, state, waits, stops)
     waiting = ""
     if waits:

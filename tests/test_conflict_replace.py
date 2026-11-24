@@ -691,15 +691,41 @@ class ConflictPreviewTests(ScreenCase):
         self.assertEqual(self.preview(second)["also_replaces"], [first.relative])
 
     def test_preview_names_returned_copy_that_goes_with_other_file(self):
-        first = self.conflict("document")
+        # PR 5а: файлы проверяются в порядке md, json, manifest, поэтому роли файлов здесь поменяны местами:
+        # решён json, а поправлен md (раньше первым проверялся json и роли были обратными)
+        first = self.conflict("document", kind="json")
         self.resolve_directly(first)
         self.materialize(first.rec, "document")
         # человек вернул скачанную копию на место и поправил второй файл той же записи
         first.path.write_bytes(first.saved)
-        first.rec.files["json"].write_bytes(b"{}\n")
+        first.rec.files["md"].write_bytes(b"my text\n")
         self.materialize(first.rec, "document")
-        second = self.open_case(first.rec, "document", "json")
+        second = self.open_case(first.rec, "document", "md")
         self.assertEqual(self.preview(second)["also_replaces"], [first.relative])
+
+    def test_damaged_copy_of_later_file_stops_unchanged_file(self):
+        # PR 5а: все три файла сверяются до первой замены. Если файл конфликта не изменён после сохранения копии,
+        # сверка дойдёт и до файла, который пишется позже (json после md); испорченная копия решения по нему
+        # остановит запись, и экран должен назвать этот файл, а не обещать замену
+        later = self.conflict("document", kind="json")
+        self.resolve_directly(later)
+        rec = later.rec
+        rec.files["md"].write_bytes(b"my text\n")
+        self.materialize(rec, "document")
+        case = self.open_case(rec, "document", "md")
+        for found in self.store.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='document_conflicts'").fetchall():
+            self.store.db.execute(f'DROP TRIGGER "{found[0]}"')
+        self.store.db.execute("UPDATE document_conflicts SET observed_bytes=? WHERE conflict_id=?",
+                              (b"damaged", later.id))
+        shown = self.preview(case)
+        self.assertEqual((shown["file_state"], shown["can_replace"]), ("same", True))
+        self.assertEqual(shown["stops_for"], [Path(later.relative).name])
+        self.assertEqual(shown["effect"], "stopped")
+        files = {kind: path.read_bytes() for kind, path in rec.files.items()}
+        self.request("POST", "api/conflict/resolve", {"snapshot": shown["snapshot"], "confirm": True})
+        self.assertEqual({kind: path.read_bytes() for kind, path in rec.files.items()}, files,
+                         "при испорченной копии позднего файла не должен заменяться ни один файл")
 
 
 class ConflictReplaceTests(ScreenCase):
@@ -1042,11 +1068,17 @@ class ConflictReplaceTests(ScreenCase):
         snapshot = self.snapshot(case)
         md = case.rec.files["md"]
         md.write_bytes(LATE_EDIT)
-        self.assertEqual(self.replace(snapshot)["outcome"], "replaced")
-        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "json"))
+        # PR 5а: три файла сверяются до первой замены, поэтому json не записывается раньше md (раньше — записывался)
+        result = self.replace(snapshot)
+        self.assertEqual((result["outcome"], result["new_conflict_id"]), ("not_written", None))
+        self.assertEqual(case.path.read_bytes(), case.saved)
         self.assertEqual(md.read_bytes(), LATE_EDIT)
+        self.assertEqual(self.item(case)["status"], "not_written")
+        second = self.open_case(case.rec, "document", "md")
+        self.assertEqual(self.item(second)["status"], "open")
+        self.assertEqual(self.replace(self.snapshot(second))["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "json"))
         self.assertEqual(self.item(case)["status"], "resolved")
-        self.assertEqual(self.item(self.open_case(case.rec, "document", "md"))["status"], "open")
 
     def test_document_waiting_for_second_file_is_not_called_replaced(self):
         case = self.conflict("document")
@@ -1429,7 +1461,8 @@ class ConflictMCPCompatibilityTests(ScreenCase):
         case = self.conflict("document", kind="json")
         case.rec.files["md"].write_bytes(LATE_EDIT)
         self.assertIs(json.loads(self.resolve(case))["materialized"], False)
-        self.assertEqual(case.path.read_bytes(), self.program(case.rec, "document", "json"))
+        # PR 5а: ревизия записывается целиком или не записывается вовсе; json ждёт решения по md (раньше — был записан)
+        self.assertEqual(case.path.read_bytes(), case.saved)
         self.assertEqual([row["kind"] for row in core.list_document_conflicts(case.rid)], ["md"])
 
     def test_failed_write_is_still_error_with_cause(self):

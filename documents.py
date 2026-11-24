@@ -15,6 +15,9 @@ import storage
 FORMAT_VERSION = 2
 RENDERER_VERSION = 1
 MAX_CONFLICT_BYTES = 8 * 1024 * 1024
+# Порядок записи трёх файлов одной версии (текущий комплект, архив и восстановление): manifest последним,
+# он описывает md и json. Порядок не берётся из паспорта: ключи путей в сохранённом JSON отсортированы.
+WRITE_ORDER = ("md", "json", "manifest")
 
 
 class _FileConflict(storage.Conflict):
@@ -216,6 +219,30 @@ def _authorized_root(store, root_id, root_path):
     return root
 
 
+def _check_current(store, root, rid, rev, kind, filename, desired, expected):
+    """Сверить один текущий файл записи; ничего не пишет. -> (путь, файл отличается от версии программы).
+
+    Допустимы: версия программы, предыдущая версия из очереди и байты, принятые человеком при замене конфликта.
+    Всё прочее — внешняя правка (`_FileConflict`); исчезнувший после подтверждения файл — `storage.Conflict`;
+    испорченная копия принятого решения — `DamagedCopy`. Правило одно: его вызывают и сверка набора до первой замены,
+    и повтор прямо перед заменой."""
+    path = _target(root, filename)
+    current = _file_hash(path)
+    override = store.db.execute(
+        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
+        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
+        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
+    if override is not None and current not in (desired, override["observed_hash"]):
+        if current is None:
+            raise storage.Conflict("external document disappeared after confirmation")
+        raise _FileConflict(kind, path)
+    if override is None and current not in (None, desired, expected):
+        raise _FileConflict(kind, path)
+    if current != desired:
+        _check_override_copy(override, current, desired, filename)
+    return path, current != desired
+
+
 def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=None):
     """Обработать очередь зарегистрированного, явно разрешённого корня по порядку.
 
@@ -248,7 +275,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
                 if row["generation"] != rev:
                     raise storage.StorageError("outbox generation mismatch")
                 archives = archive_paths(rid, rev)
-                for kind in ("md", "json", "manifest"):
+                for kind in WRITE_ORDER:
                     value = doc["archive_manifest"] if kind == "manifest" else doc[kind]
                     path = _target(root, archives[kind])
                     current = _file_hash(path)
@@ -257,23 +284,14 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
                     if current is None:
                         _write_atomic(path, value, immutable=True, conflict_kind="archive_" + kind)
                     fault("archive_" + kind, rid, rev)
-                for kind, filename in paths.items():
-                    path = _target(root, filename)
-                    current = _file_hash(path)
-                    desired = _digest(doc[kind])
-                    expected = expected_hashes[kind]
-                    override = store.db.execute(
-                        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
-                        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
-                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
-                    if override is not None and current not in (desired, override["observed_hash"]):
-                        if current is None:
-                            raise storage.Conflict("external document disappeared after confirmation")
-                        raise _FileConflict(kind, path)
-                    if override is None and current not in (None, desired, expected):
-                        raise _FileConflict(kind, path)
-                    if current != desired:
-                        _check_override_copy(override, current, desired, filename)
+                def check(kind):
+                    return _check_current(store, root, rid, rev, kind, paths[kind], _digest(doc[kind]),
+                                          expected_hashes[kind])
+                for kind in WRITE_ORDER:      # сначала сверить все три: отказ не оставит смешанного набора
+                    check(kind)
+                for kind in WRITE_ORDER:
+                    path, stale = check(kind)  # повтор прямо перед заменой: окно «сверка → замена» не шире прежнего
+                    if stale:
                         _write_atomic(path, doc[kind])
                     fault("replace_" + kind, rid, rev)
                 fault("before_ack", rid, rev)
@@ -320,16 +338,23 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
             rid, rev = row["recording_id"], row["document_revision"]
             try:
                 doc = store.get_document(rid, rev)
-                for kind, filename in current_paths_from_document(doc, rid).items():
-                    target = _target(root, filename)
+                names = current_paths_from_document(doc, rid)
+
+                def look(kind):
+                    target = _target(root, names[kind])
                     observed = _file_hash(target)
-                    if observed is None:
+                    if observed is not None and observed != doc["hashes"][kind]:
+                        raise _FileConflict(kind, target)
+                    return target, observed is None
+                for kind in WRITE_ORDER:      # сначала сверить все три: изменённый файл не даёт восстанавливать соседей
+                    look(kind)
+                for kind in WRITE_ORDER:
+                    target, absent = look(kind)
+                    if absent:
                         _write_atomic(target, doc[kind])
                         with store._transaction():
                             store.db.execute("INSERT INTO materialization_events VALUES (?, ?, ?, ?, ?, ?)",
                                              (str(uuid.uuid4()), rid, rev, kind, "missing_restored", storage._now()))
-                    elif observed != doc["hashes"][kind]:
-                        raise _FileConflict(kind, target)
             except _FileConflict as exc:
                 _record_conflict(store, root_id, rid, rev, exc)
             except Exception:
