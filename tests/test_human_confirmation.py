@@ -21,6 +21,7 @@ import test_answer_outcomes as base  # noqa: E402  (тот же sandbox и те 
 core, recordings, review_pack, settings, transcript = (base.core, base.recordings, base.review_pack,
                                                        base.settings, base.transcript)
 import voices  # noqa: E402
+import dbtemplate  # noqa: E402
 
 BACKENDS = base.BACKENDS
 
@@ -60,7 +61,7 @@ def files(backend, before=None):
                 mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
             try:
                 if backend == "sqlite":
-                    store = recordings.initialize_store(db, display_name="Тест")
+                    store = dbtemplate.initialize(db, "Тест")
                     root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
                     rid = str(uuid.uuid4())
                     recordings.commit_worker_result(

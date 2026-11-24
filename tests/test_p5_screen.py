@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
+import dbtemplate
 import documents
 import model_tasks
 import paths
@@ -47,7 +48,7 @@ class P5ServiceTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.base = sandbox(self)
-        self.store = storage.initialize(self.base / "state.sqlite3", initial_display_name="Тест")
+        self.store = dbtemplate.initialize(self.base / "state.sqlite3", "Тест")
         self.source = self.base / "synthetic.wav"
         self.source.write_bytes(b"synthetic")
         self.patcher = mock.patch.object(paths, "STATE_DB", self.base / "state.sqlite3")
@@ -268,7 +269,7 @@ class P5ScreenHTTPTests(unittest.TestCase):
         self.patcher = mock.patch.object(paths, "STATE_DB", self.base / "state.sqlite3")
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
-        recordings.initialize_store(self.base / "state.sqlite3", display_name="Тест")
+        dbtemplate.initialize(self.base / "state.sqlite3", "Тест")
         self.srv, self.url, _ = workflow_page.make_server(8790)
         self.prefix = urlsplit(self.url).path
         self.host = f"127.0.0.1:{self.srv.server_port}"
