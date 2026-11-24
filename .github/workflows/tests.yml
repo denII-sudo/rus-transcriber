@@ -108,9 +108,16 @@ jobs:
         with:
           path: ${{ runner.temp }}/test-venv
           key: ${{ steps.deps.outputs.cache-primary-key }}
-      # Набор идёт один раз, с подробным выводом (при падении в журнале виден полный разбор).
-      - name: Run unit tests
-        if: steps.scope.outputs.scope != 'docs'
+      # В PR набор идёт параллельно: tests/run_parallel.py делит модули на 4 группы (по процессу unittest, у
+      # каждой своя песочница), раскладка случайная, её seed печатается в журнале (повтор — --shuffle SEED).
+      # Число тестов и состав модулей запускатель сверяет с discover; при падении печатает полный вывод группы.
+      - name: Run unit tests (parallel groups)
+        if: steps.scope.outputs.scope != 'docs' && github.event_name == 'pull_request'
+        run: python -B tests/run_parallel.py -v --shuffle
+      # Контроль по расписанию и после изменения этого файла в main — прежний последовательный прогон одним
+      # процессом: «параллельно зелёно, последовательно красно» показало бы скрытую зависимость модулей.
+      - name: Run unit tests (sequential control)
+        if: steps.scope.outputs.scope != 'docs' && github.event_name != 'pull_request'
         run: python -B -m unittest discover -s tests -v
       - name: Run text tests for a documentation-only change
         if: steps.scope.outputs.scope == 'docs'
