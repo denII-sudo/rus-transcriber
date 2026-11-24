@@ -4,6 +4,7 @@
 во временной папке, опрос компьютера и условий подменён. Главное условие: включённая настройка результат
 расшифровки не меняет (отметка о записи — в статусе задачи), файл пишется только после сохранения результата.
 """
+import copy
 import json
 import os
 import shutil
@@ -30,6 +31,26 @@ HW = {"status": "ok", "cpu": {"model": "synthetic"}, "devices": []}
 COND = {"taken_utc": "synthetic", "cpu_load_percent": 1.0}
 
 
+def _computed_once(real):
+    """Настоящее вычисление сведений о сборке (запуски git, метаданные пакетов) — один раз на процесс.
+
+    Сведения не зависят от теста, а каждое сохранение гипотез звало их заново (~70 % времени класса).
+    Содержимое записи то же: значение считает настоящая функция, тесты получают его копию.
+    """
+    cache = {}
+
+    def call(*args, **kwargs):
+        key = repr((args, sorted(kwargs.items())))
+        if key not in cache:
+            cache[key] = real(*args, **kwargs)
+        return copy.deepcopy(cache[key])
+    return call
+
+
+_CODE_REVISION_ONCE = _computed_once(runinfo.code_revision)
+_PACKAGES_ONCE = _computed_once(runinfo.packages)
+
+
 class Sandbox(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rt-hyp-"))
@@ -39,7 +60,9 @@ class Sandbox(unittest.TestCase):
                       mock.patch.object(paths, "BENCH", self.root / "bench"),
                       mock.patch.object(paths, "CACHE", self.root / "cache"),
                       mock.patch.object(runinfo, "hardware", return_value=HW),
-                      mock.patch.object(runinfo, "conditions", return_value=COND)):
+                      mock.patch.object(runinfo, "conditions", return_value=COND),
+                      mock.patch.object(runinfo, "code_revision", side_effect=_CODE_REVISION_ONCE),
+                      mock.patch.object(runinfo, "packages", side_effect=_PACKAGES_ONCE)):
             patch.start()
             self.addCleanup(patch.stop)
 

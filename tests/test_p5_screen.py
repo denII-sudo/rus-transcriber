@@ -29,9 +29,12 @@ def sandbox(case):
     root = Path(tempfile.mkdtemp(prefix="p5-"))
 
     def remove():
-        # соединения SQLite, оставшиеся у обработчиков страницы, держат файл базы в Windows
-        gc.collect()
+        # соединения SQLite, оставшиеся у обработчиков страницы, могут держать файл базы в Windows:
+        # сборщик мусора нужен только если папка не удалилась сразу
         shutil.rmtree(root, ignore_errors=True)
+        if root.exists():
+            gc.collect()
+            shutil.rmtree(root, ignore_errors=True)
     case.addCleanup(remove)
     return root
 

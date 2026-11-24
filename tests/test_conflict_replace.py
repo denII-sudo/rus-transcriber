@@ -133,9 +133,12 @@ class ScreenCase(unittest.TestCase):
         self.base = Path(tempfile.mkdtemp(prefix="conflict-replace-")).resolve()
 
         def remove():
-            # соединения SQLite обработчиков экрана держат файл базы в Windows
-            gc.collect()
+            # соединения SQLite обработчиков экрана могут держать файл базы в Windows:
+            # сборщик мусора нужен только если папка не удалилась сразу
             shutil.rmtree(self.base, ignore_errors=True)
+            if self.base.exists():
+                gc.collect()
+                shutil.rmtree(self.base, ignore_errors=True)
         self.addCleanup(remove)
         self.database = self.base / "state.sqlite3"
         for patcher in (mock.patch.object(paths, "STATE_DB", self.database),
@@ -1775,12 +1778,18 @@ async function run(sc) {
     const data = replies[key] || {};
     return {ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(data)), headers: {get: () => ""}};
   }
-  const context = {document, fetch, setTimeout, clearTimeout, console, encodeURIComponent, decodeURIComponent,
-    requestAnimationFrame: f => setTimeout(f, 0), location: {pathname: "/t/"}, URL, confirm: () => false};
+  // Таймер Node в Windows срабатывает не раньше ~15 мс, поэтому нулевые таймеры страницы идут через
+  // setImmediate (порядок тот же, ожидание — доли миллисекунды); остальные таймеры — настоящие.
+  const pageTimeout = (f, delay, ...rest) => delay ? setTimeout(f, delay, ...rest) : setImmediate(f, ...rest);
+  const pageClear = handle => (handle && handle.constructor && handle.constructor.name === "Immediate"
+    ? clearImmediate(handle) : clearTimeout(handle));
+  const context = {document, fetch, setTimeout: pageTimeout, clearTimeout: pageClear, console, encodeURIComponent,
+    decodeURIComponent, requestAnimationFrame: f => setImmediate(f), location: {pathname: "/t/"}, URL,
+    confirm: () => false};
   context.window = context;
   vm.createContext(context);
   vm.runInContext(script, context);
-  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setTimeout(r, 0)); };
+  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   await settle();
   const out = {};
   const card = () => every().find(e => String(e.className).split(" ").includes("conflict"));
