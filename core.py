@@ -2480,7 +2480,9 @@ def apply_answers_files(jp, md):
                 context = recordings.operation_context(store, "human")
                 manifest = state.get("manifest") or {}
                 source = _answer_source_snapshot(store, binding["recording_id"], manifest)
-                guard = _answer_revision_conflicts(initial, manifest, state, source, sqlite=True)
+                sources = _answer_item_sources(store, binding["recording_id"], manifest)
+                guard = _answer_revision_conflicts(initial, manifest, state, source, sqlite=True,
+                                                   sources=sources)
                 with recordings.answer_draft(jp, initial, state, context) as draft:
                     draft["revision_conflicts"] = guard
                     report = _apply_answers_files_locked(jp, md)
@@ -2495,7 +2497,9 @@ def apply_answers_files(jp, md):
                     current = transaction_store.get_revision(
                         binding["recording_id"], "transcript", expected["source_revision"])["payload"]
                     original = _answer_source_snapshot(transaction_store, binding["recording_id"], manifest)
-                    if _answer_revision_conflicts(current, manifest, state, original, sqlite=True) != guard:
+                    originals = _answer_item_sources(transaction_store, binding["recording_id"], manifest)
+                    if _answer_revision_conflicts(current, manifest, state, original, sqlite=True,
+                                                  sources=originals) != guard:
                         raise storage.Conflict("answer source changed while applying answers")
 
                 result = recordings.commit_recording_data(
@@ -2552,11 +2556,22 @@ def _answer_source_snapshot(store, recording_id, manifest):
         return None
 
 
-def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
+def _answer_item_sources(store, recording_id, manifest):
+    """{ревизия: стенограмма} для карточек, заменённых или дописанных по другой ревизии (upsert_cards)."""
+    out = {}
+    for item in manifest.get("items") or []:
+        revision = item.get("source_revision")
+        if revision is not None and revision != manifest.get("source_revision") and revision not in out:
+            out[revision] = _answer_source_snapshot(store, recording_id, {"source_revision": revision})
+    return out
+
+
+def _answer_revision_conflicts(current, manifest, state, source, *, sqlite, sources=None):
     import review_pack
     import transcript
     applied = review_pack._applied_map(state)
     answers = state.get("answers") or {}
+    base_source = source
 
     def snapshot(word, speaker):
         return (word.get("word_id"), word.get("w"), word.get("edited"),
@@ -2597,8 +2612,14 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
         answer = answers.get(aid)
         gap = transcript.is_gap_place(item)
         ids = None if gap else item.get("word_ids")      # у пропуска word_ids пакета не читаются
-        if not answer or aid in applied:
+        if not review_pack.answer_is_current(answer, item) or aid in applied:
             continue
+        # Карточка, заменённая или дописанная позже сборки пакета, сверяется с ревизией, по которой собрана.
+        revision = item.get("source_revision")
+        if sqlite and revision is not None and revision != manifest.get("source_revision"):
+            source = (sources or {}).get(revision)
+        else:
+            source = base_source
         if sqlite and source is None:
             conflicts[aid] = "недоступна исходная ревизия карточки"
             continue
@@ -2774,6 +2795,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                              else "negative")
     # Исход есть у каждого сохранённого ответа пакета, а не только у тех, что применялись в этот раз.
     stored = P.answers_state(jp, {"answers": {}}).get("answers") or {}
+    # ответ прежней редакции карточки (остался после сбоя замены) не применялся и исхода не получает
+    current_items = {item.get("id"): item for item in (P.manifest(jp) or {}).get("items") or []}
+    stored = {aid: a for aid, a in stored.items() if P.answer_is_current(a, current_items.get(aid))}
     undo_conflict_ids = {row.get("id") for row in rep.get("undo_conflicts") or []}
     for aid in stored:
         if aid in rep.get("source_conflict_ids", []):

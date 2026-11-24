@@ -72,7 +72,8 @@ def main():
             ans = None
             for attempt in range(3):
                 V.speak(f"Место {n} из {len(todo)}. {it['question']}")
-                V.play(pd / it["clip"])
+                if it.get("clip"):
+                    V.play(pd / it["clip"])
                 parts = [f"{NUM[k] if k < 4 else k + 1}: {o['label']}" for k, o in enumerate(it["options"])]
                 rec = it.get("recommended")
                 V.speak("Варианты. " + ". ".join(parts) + "."
@@ -87,7 +88,8 @@ def main():
                 if not text and attempt == 0:
                     V.speak("Не расслышал. Ещё раз.")
                     continue
-                ans = {"id": it["id"], "version": man["version"], "text": text, "audio": str(wav), "heard": True,
+                ans = {"id": it["id"], "version": man["version"], "rev": P.card_rev(it), "text": text,
+                       "audio": str(wav), "heard": True,
                        **({"kind": m["kind"]} if m["kind"] != "option" else {"option": m["option"]})}
                 break
             if ans is None:

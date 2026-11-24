@@ -1149,7 +1149,7 @@ def review_pack_info(job_id: str, include_manifest: bool = False) -> str:
            "conflicts": len(ans.get("conflicts") or []), "rejected": len(ans.get("rejected") or []),
            "manifest_storage": "sqlite" if sqlite_mode else "file",
            "files": ["cards.html"] + ([] if sqlite_mode else ["manifest.json"]) +
-                    [it["clip"] for it in man["items"]]}
+                    [it["clip"] for it in man["items"] if it.get("clip")]}
     if include_manifest:
         out["manifest"] = man
     return json.dumps(out, ensure_ascii=False, indent=1)
@@ -1369,10 +1369,11 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
 
 @mcp.tool()
 def import_answers(job_id: str, answers: list[dict], source: str = "cloud") -> str:
-    """Сводит ответы в answers.json пакета. answers: [{"id", "version", "option" (с 0) | "kind"
-    (human/skip/recommended/free) | "text", "audio" (путь к голосовому ответу на этом компьютере), "ts"}].
-    Голосовые ответы распознаются GigaAM и сопоставляются с вариантами. Ответ на прежнюю version не
-    принимается; на одно место из двух режимов побеждает более поздний, расхождение — в conflicts."""
+    """Сводит ответы в answers.json пакета. answers: [{"id", "version", "rev" (редакция карточки; без него —
+    только к неизменённой карточке), "option" (с 0) | "kind" (human/skip/recommended/free) | "text", "audio"
+    (путь к голосовому ответу на этом компьютере), "ts"}]. Голосовые ответы распознаются GigaAM и сопоставляются
+    с вариантами. Ответ на прежнюю version или прежнюю редакцию карточки («вопрос обновлён») не принимается;
+    на одно место из двух режимов побеждает более поздний, расхождение — в conflicts."""
     import review_pack as P
     if any(isinstance(answer, dict) and answer.get("audio") for answer in answers):
         return "Импорт ответов не принимает пути к аудиофайлам; используйте локальный голосовой разбор"
@@ -1427,6 +1428,8 @@ def _play_clip(job_id, item_id):
     it = next((x for x in (man or {}).get("items", []) if x["id"] == item_id), None)
     if not it:
         return "Нет такого места в пакете"
+    if not it.get("clip"):
+        return "У этой карточки нет клипа: исходная запись недоступна или клип не нарезался"
     voice_io.play(P.pack_dir(jp) / it["clip"])
     return json.dumps({"played": it["clip"]}, ensure_ascii=False)
 
@@ -1454,8 +1457,10 @@ def _listen_reply(seconds, job_id, item_id):
     out = {"heard": text, "audio": str(wav)}
     if jp and item_id:
         man = P.manifest(jp)
-        out["answer"] = P.add_answers(jp, [{"id": item_id, "version": man["version"], "text": text,
-                                            "audio": str(wav), "heard": True}], "local", trusted_actor="human")
+        it = next((row for row in (man or {}).get("items", []) if row.get("id") == item_id), {})
+        out["answer"] = P.add_answers(jp, [{"id": item_id, "version": man["version"], "rev": P.card_rev(it),
+                                            "text": text, "audio": str(wav), "heard": True}],
+                                      "local", trusted_actor="human")
     return json.dumps(out, ensure_ascii=False, indent=1)
 
 

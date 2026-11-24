@@ -38,6 +38,8 @@ MAX_VOICE_BYTES = 16 * 1024 * 1024
 # чужих данных. Сообщение с таким началом и подробностями после «:» показывается без подробностей.
 SAFE_ERRORS = (
     "версия пакета изменилась",
+    P.REV_STALE,
+    P.REV_UNKNOWN,
     "карточка не найдена",
     "неизвестное событие карточки",
     "неверный идентификатор сессии страницы",
@@ -154,8 +156,11 @@ def main():
             if u == "api/answers":
                 store = P.answers_state(a.json_path, {"answers": {}})
                 store["applied_answers"] = store.get("applied_answers") or {}
+                man = P.manifest(a.json_path) or {}
                 # Состояние каждого ответа считает Python; страница его только показывает.
-                store["answer_states"] = P.answer_states_of(store, P.manifest(a.json_path) or {})
+                store["answer_states"] = P.answer_states_of(store, man)
+                # По ним страница узнаёт, что карточки заменены или дописаны, и перечитывает manifest.json.
+                store["pack_version"], store["pack_rev"] = man.get("version"), man.get("pack_rev", 0)
                 return self._send(200, store)
             if u == "manifest.json":
                 manifest = P.manifest(a.json_path)
@@ -194,9 +199,13 @@ def main():
                 if u == "api/preview":
                     obj = json.loads(body.decode("utf-8"))
                     man = P.manifest(a.json_path) or {}
-                    if not isinstance(obj, dict) or obj.get("version") != man.get("version") or not any(
-                            it.get("id") == obj.get("id") for it in man.get("items", [])) or not isinstance(obj.get("text"), str) or not obj["text"].strip():
+                    item = next((it for it in man.get("items", []) if isinstance(obj, dict)
+                                 and it.get("id") == obj.get("id")), None)
+                    if not isinstance(obj, dict) or obj.get("version") != man.get("version") or item is None                             or not isinstance(obj.get("text"), str) or not obj["text"].strip():
                         return self._send(400, {"error": "неверная карточка, версия или текст"})
+                    stale = P.rev_refusal(obj.get("rev"), item)
+                    if stale:
+                        return self._send(400, {"error": stale})
                     with lock:
                         aid = obj["id"]
                         free = P.free_answers(a.json_path)
@@ -236,7 +245,7 @@ def main():
                     with lock:
                         rep = P.add_interaction_event(
                             a.json_path, event.get("id"), event.get("version"),
-                            event.get("type"), event.get("session"))
+                            event.get("type"), event.get("session"), event.get("rev"))
                     return self._send(200, rep)
                 if u == "api/voice":
                     q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
@@ -244,6 +253,11 @@ def main():
                     item = next((it for it in man.get("items", []) if it.get("id") == q.get("id")), None)
                     if q.get("version") != man.get("version") or item is None:
                         return self._send(400, {"error": "неизвестная карточка или версия"})
+                    rev = q.get("rev")
+                    stale = P.rev_refusal(int(rev) if rev is not None and rev.isdecimal() and rev.isascii()
+                                          else rev, item)
+                    if stale:
+                        return self._send(400, {"error": stale})
                     f = pd / "voice" / f"page-{uuid.uuid4().hex}.{types[ctype]}"
                     f.parent.mkdir(exist_ok=True)
                     f.write_bytes(body)

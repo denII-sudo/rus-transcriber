@@ -2,21 +2,24 @@
 и answers.json — ответы из локального и облачного режимов.
 
 Папка пакета: <подпапка результатов>/<имя записи>[.tag].review/
-    manifest.json   {"version", "job_id", "audio", "speakers", "items": [...]}
-    clips/r5.mp3    клип места: 3,5 с до и 1,5 с после (mp3, моно, 64 кбит/с — играет везде, и на iPhone)
+    manifest.json   {"version", "pack_rev", "job_id", "audio", "speakers", "clips_dir", "items": [...]}
+    clips/r5.mp3    клип места: 3,5 с до и 1,5 с после (mp3, моно, 64 кбит/с — играет везде, и на iPhone);
+                    заменённая или дописанная карточка — clips/r5.r2.mp3 (upsert_cards)
     answers.json    {"version", "answers": {id: ответ}, "conflicts": [...], "rejected": [...]}
     voice/          голосовые ответы (локальная страница и перенесённые из облака)
     cards.html      страница карточек (та же, что публикуется в облако)
 
 Элемент manifest:
-    id, t (чч:мм:сс), t1/t2 (время места в записи), clip, clip_t1/clip_t2 (место внутри клипа),
+    id, rev (редакция карточки, с 1), t (чч:мм:сс), t1/t2 (время места в записи), clip (null — без звука),
+    clip_t1/clip_t2 (место внутри клипа), history (прежние редакции с их ответами),
     speaker, text, reply (реплика с ⟦…⟧), before/after, reasons, voices,
     question, options [{label, decision: {speaker | text | status, note}}], recommended (номер варианта).
 Ответ:
-    {id, version, source: local|cloud, ts, kind: option|recommended|human|skip|free|repeat,
+    {id, version, rev (у карточки с rev > 1), source: local|cloud, ts, kind: option|recommended|human|skip|free|repeat,
      option (номер), text (распознанный или набранный), audio (путь к голосовому ответу)}
 Ответ на одно место из двух режимов: побеждает более поздний, расхождение — в conflicts (для человека).
-Ответ с другой version (пакет пересобран) не принимается — в rejected.
+Ответ с другой version (пакет пересобран) не принимается — в rejected. version — имя пакета: upsert_cards его не
+меняет, а растит pack_rev; ответ на прежнюю редакцию карточки (rev) не принимается — «вопрос обновлён».
 
 Запуск отдельно (распознавание голосовых ответов, нужно отдельным процессом, чтобы сервер MCP не держал модель):
     python review_pack.py recognize <файл> [<файл> ...]   → JSON {файл: текст}
@@ -144,11 +147,124 @@ def cut_clip(src, t1, t2, out):
 
 
 # ---------- сборка пакета ----------
+# Ответ на редакцию карточки, которая уже заменена (upsert_cards): страница показывает новую, текст остаётся в поле.
+REV_STALE = "вопрос обновлён"
+REV_UNKNOWN = "нет такой редакции вопроса"
+# Поля карточки, по которым её замена считается тем же вопросом (повтор ничего не пишет). Контекст соседних
+# реплик (reply/before/after) сюда не входит: правка соседнего места не делает вопрос другим.
+_CARD_FP_FIELDS = ("question", "options", "recommended", "answer_mode", "word_ids", "listen_fp", "t1", "t2",
+                   "speaker", "text")
+# Копии для «Не отменять» нужны только живому ответу, не ответу в истории карточки.
+_ANSWER_PRIVATE = ("applied_answer", "keep_request")
+
+
+def card_rev(item):
+    """Номер редакции карточки; у карточек до PR 13а его нет — первая редакция."""
+    return (item or {}).get("rev", 1)
+
+
+def rev_refusal(rev, item):
+    """Почему ответ (событие, голос, предпросмотр) с номером редакции rev не относится к карточке item.
+    Без номера (старая страница, облако до обновления, import_answers) — только к неизменённой карточке."""
+    current = card_rev(item)
+    if rev is None:
+        return None if current == 1 else REV_STALE
+    if isinstance(rev, bool) or not isinstance(rev, int):
+        return REV_UNKNOWN
+    if rev < current:
+        return REV_STALE
+    return REV_UNKNOWN if rev > current else None
+
+
+def answer_is_current(answer, item):
+    """Сохранённый ответ относится к текущей редакции карточки (ответ без rev — к первой)."""
+    return bool(answer) and answer.get("rev", 1) == card_rev(item)
+
+
+def _card(T, data, it, q):
+    """Карточка пакета для места it по вопросу q — без клипа; одна для build и upsert_cards.
+    -> (карточка, (t1, t2)) или (None, причина пропуска)."""
+    opts = q.get("options") or []
+    gap = T.gap_interval(it) if T.is_gap_place(it) else None
+    if gap:
+        # Пропуск (В7): кнопки прослушивания вместо вариантов агента; «как есть» на паузе не показывается.
+        opts = ([{"label": T.LISTEN_WORDS, "decision": {"listened": "words"}}] if T.pause_words(data, *gap)
+                else []) + [{"label": T.LISTEN_SILENCE, "decision": {"listened": "silence"}},
+                            {"label": T.LISTEN_INTERJECTIONS, "decision": {"listened": "interjections"}}]
+    elif it.get("asr_problem"):
+        opts = [{"label": "Я прослушал: слова в стенограмме верны", "decision": {"listened": "words"}},
+                {"label": "Я прослушал: здесь тишина", "decision": {"listened": "silence"}}]
+    else:
+        opts = [{**o, "decision": {k: v for k, v in (o.get("decision") or {}).items() if k != "listened"}}
+                for o in opts]
+    if not 1 <= len(opts) <= 4:
+        return None, "нужно 1–4 варианта"
+    t1, t2 = float(it.get("t1", it["t"])), float(it.get("t2", it["t"]))
+    row = _context(T, data, it)
+    loc = T._find_span(data, it)
+    target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
+    ids = [w.get("word_id") for w in target_words]
+    # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
+    target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) \
+        and not T.is_gap_place(it) else {}
+    question = q.get("question") or "Как правильно?"
+    if it.get("asr_problem"):
+        problem = it["asr_problem"]
+        models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
+        names = [(models.get(key) or {}).get("id") or key for key in problem.get("words_from") or []]
+        model = (models.get(problem.get("model")) or {}).get("id") or problem.get("model") or "ASR"
+        question = (str(model) + ": " + str(problem.get("state")) +
+                    ("; слова других проходов: " + ", ".join(names) if names else "") +
+                    ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
+    manifest_item = {
+        "id": it["id"], "rev": 1, "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
+        **target,
+        "clip": None, "clip_t1": None, "clip_t2": None,
+        "speaker": it.get("speaker"), "text": it.get("text"),
+        "reply": row.get("reply"), "before": row.get("before"), "after": row.get("after"),
+        "reasons": it.get("reasons"), "voices": it.get("voices"),
+        "question": question,
+        "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
+        "recommended": None if it.get("asr_problem") or gap else q.get("recommended"), "note": q.get("note")}
+    if gap:
+        # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
+        manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
+    if q.get("answer_mode") == "speaker" and not it.get("asr_problem"):
+        # подтверждение говорящего: свободный ответ не становится текстом реплики (freeform.card_edits)
+        manifest_item["answer_mode"] = "speaker"
+    automation_diagnostic = _automation_diagnostic(data, it)
+    if automation_diagnostic:
+        manifest_item["diagnostic_id"] = automation_diagnostic["id"]
+        manifest_item["automation_diagnostic"] = automation_diagnostic
+    return manifest_item, (t1, t2)
+
+
+def _attach_clip(item, times, src, clip, pd, strict):
+    """Нарезать клип карточки. strict (build) — ошибка наружу, как раньше; иначе карточка остаётся без звука."""
+    t1, t2 = times
+    try:
+        if not src.is_file():
+            raise RuntimeError(f"исходная запись не найдена: {src}")
+        s0 = cut_clip(src, t1, t2, clip)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        if strict:
+            raise
+        Path(clip).unlink(missing_ok=True)
+        return item
+    item.update(clip=Path(clip).relative_to(pd).as_posix(), clip_t1=round(t1 - s0, 2), clip_t2=round(t2 - s0, 2))
+    return item
+
+
+def _card_fp(item):
+    return json.dumps({k: item.get(k) for k in _CARD_FP_FIELDS}, ensure_ascii=False, sort_keys=True)
+
+
 def build(json_path, items, base_url_note=None):
     """items: [{id, question, options: [{label, decision}], recommended, answer_mode?}] — вопросы Claude
     по местам review. answer_mode="speaker" — карточка подтверждения говорящего: свой ответ на ней
     применяется только как решение о говорящем (имя или «Имя: точные слова»), иначе — человеку.
-    -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся."""
+    -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся.
+    Заменить или дописать карточки, не меняя version и не теряя ответов, — upsert_cards."""
     import transcript as T
     data = T.load(json_path)
     import recordings
@@ -157,7 +273,6 @@ def build(json_path, items, base_url_note=None):
     if not src.exists():
         raise RuntimeError(f"исходная запись не найдена: {src}")
     review = {it["id"]: it for it in data.get("review") or []}
-    rows = {it["id"]: _context(T, data, it) for it in data.get("review") or []}
     pd = pack_dir(json_path)
     clips_dir = pd / "clips"
     if sqlite_mode:
@@ -169,67 +284,17 @@ def build(json_path, items, base_url_note=None):
         if not it:
             skipped.append({"id": q.get("id"), "why": "нет такого места"})
             continue
-        opts = q.get("options") or []
-        gap = T.gap_interval(it) if T.is_gap_place(it) else None
-        if gap:
-            # Пропуск (В7): кнопки прослушивания вместо вариантов агента; «как есть» на паузе не показывается.
-            opts = ([{"label": T.LISTEN_WORDS, "decision": {"listened": "words"}}] if T.pause_words(data, *gap)
-                    else []) + [{"label": T.LISTEN_SILENCE, "decision": {"listened": "silence"}},
-                                {"label": T.LISTEN_INTERJECTIONS, "decision": {"listened": "interjections"}}]
-        elif it.get("asr_problem"):
-            opts = [{"label": "Я прослушал: слова в стенограмме верны", "decision": {"listened": "words"}},
-                    {"label": "Я прослушал: здесь тишина", "decision": {"listened": "silence"}}]
-        else:
-            opts = [{**o, "decision": {k: v for k, v in (o.get("decision") or {}).items() if k != "listened"}}
-                    for o in opts]
-        if not 1 <= len(opts) <= 4:
-            skipped.append({"id": it["id"], "why": "нужно 1–4 варианта"})
+        manifest_item, times = _card(T, data, it, q)
+        if manifest_item is None:
+            skipped.append({"id": it["id"], "why": times})
             continue
-        t1, t2 = float(it.get("t1", it["t"])), float(it.get("t2", it["t"]))
         clip = clips_dir / (f"{len(out)}.mp3" if sqlite_mode else f"{it['id']}.mp3")
-        s0 = cut_clip(src, t1, t2, clip)
-        row = rows.get(it["id"], {})
-        loc = T._find_span(data, it)
-        target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
-        ids = [w.get("word_id") for w in target_words]
-        # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
-        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) \
-            and not T.is_gap_place(it) else {}
-        question = q.get("question") or "Как правильно?"
-        if it.get("asr_problem"):
-            problem = it["asr_problem"]
-            models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
-            names = [(models.get(key) or {}).get("id") or key for key in problem.get("words_from") or []]
-            model = (models.get(problem.get("model")) or {}).get("id") or problem.get("model") or "ASR"
-            question = (str(model) + ": " + str(problem.get("state")) +
-                        ("; слова других проходов: " + ", ".join(names) if names else "") +
-                        ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
-        manifest_item = {
-            "id": it["id"], "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
-            **target,
-            "clip": clip.relative_to(pd).as_posix(), "clip_t1": round(t1 - s0, 2), "clip_t2": round(t2 - s0, 2),
-            "speaker": it.get("speaker"), "text": it.get("text"),
-            "reply": row.get("reply"), "before": row.get("before"), "after": row.get("after"),
-            "reasons": it.get("reasons"), "voices": it.get("voices"),
-            "question": question,
-            "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
-            "recommended": None if it.get("asr_problem") or gap else q.get("recommended"), "note": q.get("note")}
-        if gap:
-            # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
-            manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
-        if q.get("answer_mode") == "speaker" and not it.get("asr_problem"):
-            # подтверждение говорящего: свободный ответ не становится текстом реплики (freeform.card_edits)
-            manifest_item["answer_mode"] = "speaker"
-        automation_diagnostic = _automation_diagnostic(data, it)
-        if automation_diagnostic:
-            manifest_item["diagnostic_id"] = automation_diagnostic["id"]
-            manifest_item["automation_diagnostic"] = automation_diagnostic
-        out.append(manifest_item)
+        out.append(_attach_clip(manifest_item, times, src, clip, pd, strict=True))
     body = json.dumps(out, ensure_ascii=False, sort_keys=True)
     version = time.strftime("%Y%m%d%H%M%S-") + hashlib.sha1(body.encode()).hexdigest()[:6]
     if not sqlite_mode:
         # прежние вопросы — часть истории ответов: manifest сохраняется рядом с архивом ответов,
-        # а фрагменты, на которые ссылаются сохранённые манифесты, не удаляются
+        # а фрагменты, на которые ссылаются сохранённые манифесты (и истории их карточек), не удаляются
         old = _read(pd / "manifest.json", None)
         if isinstance(old, dict) and old.get("version") and old.get("version") != version:
             archived = pd / f"manifest.{old['version']}.json"
@@ -238,14 +303,18 @@ def build(json_path, items, base_url_note=None):
         keep = {f"{r['id']}.mp3" for r in out}
         for kept in pd.glob("manifest.*.json"):
             for row in (_read(kept, {}) or {}).get("items") or []:
-                if isinstance(row, dict) and row.get("clip"):
-                    keep.add(Path(row["clip"]).name)
+                if not isinstance(row, dict):
+                    continue
+                for ref in [row] + [h for h in row.get("history") or [] if isinstance(h, dict)]:
+                    if ref.get("clip"):
+                        keep.add(Path(ref["clip"]).name)
         for f in clips_dir.glob("*.mp3"):
             if f.name not in keep:
                 f.unlink()
-    man = {"version": version, "job_json": str(json_path), "audio": src.name,
+    man = {"version": version, "pack_rev": 0, "job_json": str(json_path), "audio": src.name,
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
-           "speakers": data.get("speakers"), "created": _now(), "items": out}
+           "speakers": data.get("speakers"), "created": _now(),
+           "clips_dir": clips_dir.relative_to(pd).as_posix(), "items": out}
     ans = _read_answers(json_path, {})
     if sqlite_mode and ans.get("_expected_versions") != {
             "source_revision": data.get("source_revision"),
@@ -270,7 +339,128 @@ def build(json_path, items, base_url_note=None):
             "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
 
 
-CTX_BEFORE = 400      # символов соседних реплик до места
+def upsert_cards(json_path, cards, *, why, actor="system"):
+    """Заменить или дописать карточки в собранном пакете, не меняя version и не трогая ответы других карточек.
+    cards — вопросы в виде build. Новая карточка дописывается в конец (rev 1). Заменённая получает rev + 1;
+    прежняя редакция с её ответом уходит в history карточки, снимок отмены и отметка применения прежнего
+    ответа снимаются: новый вопрос отвечается заново. Тот же вопрос (те же поля _CARD_FP_FIELDS) ничего не
+    пишет. Клип — <id>.r<rev>.mp3, прежние не затираются; нет аудио или клип не нарезался — карточка без звука.
+    Одна запись состояния на вызов; pack_rev + 1, если что-то изменилось.
+    -> {"version", "pack_rev", "written", "added", "replaced", "unchanged", "skipped"}"""
+    import recordings
+    with recordings.operation_for_document(json_path, actor):
+        with _answers_lock(json_path):
+            return _upsert_cards_locked(json_path, cards, why)
+
+
+def _pack_clips_dir(man, sqlite_mode):
+    """Папка клипов пакета относительно папки пакета: из manifest, у пакетов до PR 13а — по клипам карточек."""
+    if man.get("clips_dir"):
+        return man["clips_dir"]
+    for it in man.get("items") or []:
+        if it.get("clip"):
+            return Path(it["clip"]).parent.as_posix()
+    return "clips/" + uuid.uuid4().hex if sqlite_mode else "clips"
+
+
+def _free_clip_name(folder, aid, rev):
+    """<id>.r<rev>.mp3; если такой файл уже есть (архивный manifest прежней версии), имя с уникальным хвостом."""
+    clip = folder / f"{aid}.r{rev}.mp3"
+    return clip if not clip.exists() else folder / f"{aid}.r{rev}.{uuid.uuid4().hex[:8]}.mp3"
+
+
+def _history_row(old, answer, applied, conflicts, why):
+    row = {"rev": card_rev(old), "question": old.get("question"), "options": copy.deepcopy(old.get("options")),
+           "recommended": old.get("recommended"), "clip": old.get("clip"), "at": _now(), "why": why}
+    if answer_is_current(answer, old):
+        row["answer"] = {k: copy.deepcopy(v) for k, v in answer.items() if k not in _ANSWER_PRIVATE}
+        row["applied"] = applied
+    if conflicts:
+        row["conflicts"] = conflicts
+    return row
+
+
+def _upsert_cards_locked(json_path, cards, why):
+    import transcript as T
+    man = manifest(json_path)
+    if not man:
+        raise RuntimeError("пакет разбора не собран: сначала build_review_pack")
+    data = T.load(json_path)
+    if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
+        raise RuntimeError("пакет относится к другой стенограмме")
+    store = _read_answers(json_path, {"version": man["version"], "answers": {}, "conflicts": [], "rejected": []})
+    sqlite_mode = "_expected_versions" in store
+    if sqlite_mode and store["_expected_versions"] != {"source_revision": data.get("source_revision"),
+                                                        "review_revision": data.get("review_revision")}:
+        import storage
+        raise storage.Conflict("recording changed while updating review pack")
+    pd = pack_dir(json_path)
+    clips_rel = _pack_clips_dir(man, sqlite_mode)
+    src = Path(data.get("file") or "")
+    review = {it["id"]: it for it in data.get("review") or []}
+    items = list(man.get("items") or [])
+    index = {it.get("id"): n for n, it in enumerate(items)}
+    applied = _applied_map(store)
+    rep = {"added": [], "replaced": [], "unchanged": [], "skipped": []}
+    seen = set()
+    for q in cards:
+        aid = q.get("id")
+        it = review.get(aid)
+        if not it:
+            rep["skipped"].append({"id": aid, "why": "нет такого места"})
+            continue
+        if aid in seen:
+            rep["skipped"].append({"id": aid, "why": "карточка повторяется в вызове"})
+            continue
+        seen.add(aid)
+        new, times = _card(T, data, it, q)
+        if new is None:
+            rep["skipped"].append({"id": aid, "why": times})
+            continue
+        old = items[index[aid]] if aid in index else None
+        if old is not None and _card_fp(old) == _card_fp(new):
+            rep["unchanged"].append(aid)
+            continue
+        new["rev"] = card_rev(old) + 1 if old is not None else 1
+        if data.get("source_revision") is not None:
+            # слова карточки сверяются при «Применить» с ревизией, по которой она собрана, а не с ревизией пакета
+            new["source_revision"] = data["source_revision"]
+        folder = pd / clips_rel
+        folder.mkdir(parents=True, exist_ok=True)
+        _attach_clip(new, times, src, _free_clip_name(folder, aid, new["rev"]), pd, strict=False)
+        if old is None:
+            index[aid] = len(items)
+            items.append(new)
+            rep["added"].append({"id": aid, "rev": 1, "clip": bool(new["clip"])})
+            continue
+        answers = store.setdefault("answers", {})
+        conflicts = [c for c in store.get("conflicts") or [] if c.get("id") == aid]
+        new["history"] = list(old.get("history") or []) + [
+            _history_row(old, answers.get(aid), aid in applied, conflicts, why)]
+        answers.pop(aid, None)
+        if conflicts:
+            store["conflicts"] = [c for c in store["conflicts"] if c.get("id") != aid]
+        if "applied_answers" in store:
+            store["applied_answers"].pop(aid, None)
+        (store.get("undo_snapshots") or {}).pop(aid, None)
+        items[index[aid]] = new
+        rep["replaced"].append({"id": aid, "rev": new["rev"], "clip": bool(new["clip"])})
+    pack_rev = man.get("pack_rev", 0)
+    if not rep["added"] and not rep["replaced"]:
+        return {"version": man["version"], "pack_rev": pack_rev, "written": False, **rep}
+    man = dict(man, items=items, pack_rev=pack_rev + 1, clips_dir=clips_rel, updated=_now())
+    store["manifest"] = man
+    if not sqlite_mode:
+        # manifest первым: при сбое между записями прежний ответ уже в истории карточки, а оставшийся
+        # в answers.json ответ прежней редакции не применяется (answer_is_current)
+        _write(pd / "manifest.json", man)
+        if not (pd / "cards.html").exists():
+            shutil.copyfile(HERE / "cards.html", pd / "cards.html")
+    _write_answers(json_path, store)
+    return {"version": man["version"], "pack_rev": man["pack_rev"], "written": True, **rep}
+
+
+CTX_BEFORE = 400     # символов соседних реплик до места
 CTX_AFTER = 400
 CTX_IN_REPLY = 700    # символов до и после места внутри его реплики; ⟦место⟧ всегда видно
 
@@ -375,8 +565,8 @@ def _write_answers(json_path, state):
     return _write(pack_dir(json_path) / "answers.json", state)
 
 
-def add_interaction_event(json_path, aid, version, event_type, session):
-    """Сохраняет локальный факт показа карточки или действия с её клипом."""
+def add_interaction_event(json_path, aid, version, event_type, session, rev=None):
+    """Сохраняет локальный факт показа карточки или действия с её клипом (rev — редакция карточки на странице)."""
     allowed = {"card_visible", "card_rendered", "audio_play", "audio_ended"}
     if event_type not in allowed:
         raise ValueError("неизвестное событие карточки")
@@ -389,15 +579,20 @@ def add_interaction_event(json_path, aid, version, event_type, session):
     item = next((it for it in man.get("items") or [] if it.get("id") == aid), None)
     if not item:
         raise ValueError("карточка не найдена")
+    stale = rev_refusal(rev, item)
+    if stale:
+        raise ValueError(stale)
     with _answers_lock(json_path):
         store = _read_answers(json_path, {"version": man["version"], "answers": {}})
         events = store.setdefault("interaction_events", [])
         if event_type == "card_visible" and any(
-                row.get("id") == aid and row.get("version") == version and
+                row.get("id") == aid and row.get("version") == version and row.get("rev", 1) == card_rev(item) and
                 row.get("type") == event_type and row.get("session") == session for row in events):
             return {"stored": False, "duplicate": True}
         event = {"id": aid, "version": version, "diagnostic_id": item.get("diagnostic_id"),
                  "type": event_type, "session": session, "source": "local", "ts": _now()}
+        if card_rev(item) != 1:
+            event["rev"] = card_rev(item)
         events.append(event)
         if len(events) > MAX_INTERACTION_EVENTS:
             removed = len(events) - MAX_INTERACTION_EVENTS
@@ -523,7 +718,16 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             rep["rejected"].append(rej)
             store.setdefault("rejected", []).append({**rej, "source": source, "ts": a.get("ts") or _now()})
             continue
+        stale = rev_refusal(a.get("rev"), it)
+        if stale:
+            # сверка по паре (id, rev): ответ на заменённую редакцию не ложится на новый вопрос
+            rej = {"id": aid, "why": stale, "version": a.get("version"), "rev": a.get("rev")}
+            rep["rejected"].append(rej)
+            store.setdefault("rejected", []).append({**rej, "source": source, "ts": a.get("ts") or _now()})
+            continue
         ans = {"id": aid, "version": a["version"], "source": source, "ts": a.get("ts") or _now()}
+        if card_rev(it) != 1:
+            ans["rev"] = card_rev(it)        # ответ без rev — к первой редакции (answer_is_current)
         if context is not None:
             ans.update(actor_kind=context["actor_kind"], author_ref=context["author_ref"],
                        initiated_by=context["initiated_by"])
@@ -586,6 +790,8 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
                                     "note": "пропуск не меняет применённый ответ — он остаётся"})
             continue
         old = store["answers"].get(aid)
+        if old and not answer_is_current(old, it):
+            old = None                     # ответ прежней редакции, оставшийся после сбоя замены, — не соперник
         if old and old.get("source") != source and not _same(old, ans):
             c = {"id": aid, "was": old, "now": ans}
             store.setdefault("conflicts", []).append(c)
@@ -675,7 +881,7 @@ def decisions(json_path):
         return out, rep
     for aid, it in by_id.items():
         a = store["answers"].get(aid)
-        if not a:
+        if not answer_is_current(a, it):       # ответ прежней редакции карточки к новому вопросу не применяется
             rep["unanswered"].append(aid)
             continue
         relation = over_applied(a, applied.get(aid))
@@ -713,7 +919,7 @@ def decisions(json_path):
                     rep["source_conflict_ids"].append(aid)
                     rep.setdefault("source_conflict_why", {})[aid] = LISTEN_STALE
                     continue
-            elif d.get("listened") and man.get("source_revision") != data.get("source_revision"):
+            elif d.get("listened") and it.get("source_revision", man.get("source_revision")) !=                     data.get("source_revision"):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
                 continue
@@ -759,10 +965,11 @@ def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}. Отрицание — и после применения (место
     остаётся с подсказкой, применённая правка не трогается)."""
     import freeform
-    pd = pack_dir(json_path)
     store = _read_answers(json_path, {"answers": {}})
+    items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
     applied = _applied_map(store)
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and
+            answer_is_current(a, items.get(aid)) and
             (aid not in applied or freeform.negative_answer(a.get("text")))}
 
 
@@ -958,14 +1165,17 @@ def cloud_bundle(json_path, artifact_url=None):
     meta = _read(pd / "cloud.json", {})
     if artifact_url:
         meta["artifact_url"] = artifact_url
-    clips = {it["clip"]: pd / it["clip"] for it in man["items"]}
+    clips = {it["clip"]: pd / it["clip"] for it in man["items"] if it.get("clip")}
     have = {k: v for k, v in clips.items() if v.exists()}
+    items = {it["id"]: it for it in man["items"]}
     # Копия применённого ответа (applied_answer) и отметка запроса (keep_request) нужны только ноутбуку:
     # странице хватает answer_states (keep: ts, source, accepted).
     # Отпечаток слов интервала паузы (listen_fp) нужен только сверке на ноутбуке (decisions): в облако не уходит.
-    out = dict(man, items=[{f: x for f, x in it.items() if f != "listen_fp"} for it in man["items"]],
-               answers={k: {f: x for f, x in v.items() if f not in ("applied_answer", "keep_request")}
-                             for k, v in store.get("answers", {}).items() if v.get("version") == man["version"]},
+    # Ответ прежней редакции карточки в облако не уходит: страница показывает его из истории карточки.
+    out = dict(man, items=[_cloud_item(it) for it in man["items"]],
+               answers={k: {f: x for f, x in v.items() if f not in _ANSWER_PRIVATE}
+                             for k, v in store.get("answers", {}).items()
+                             if v.get("version") == man["version"] and answer_is_current(v, items.get(k))},
                applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
@@ -987,6 +1197,15 @@ def cloud_bundle(json_path, artifact_url=None):
     return {"base": str(pd), "files": files, "remove": sorted(set(clips) - set(have)),
             "artifact_url": meta.get("artifact_url"),
             "applied": out["applied"], "answered": len(out["answers"]), "items": len(man["items"])}
+
+
+def _cloud_item(it):
+    """Карточка для облака: без отпечатка слов паузы и без служебных полей ответов в истории."""
+    out = {f: x for f, x in it.items() if f != "listen_fp"}
+    if it.get("history"):
+        out["history"] = [dict(h, answer={f: x for f, x in h["answer"].items() if f not in _ANSWER_PRIVATE})
+                          if isinstance(h.get("answer"), dict) else dict(h) for h in it["history"]]
+    return out
 
 
 def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
@@ -1092,10 +1311,13 @@ def answer_states_of(store, man):
     applied = _applied_map(store)
     events = store.get("application_events") or []
     snapshots = store.get("undo_snapshots") or {}
-    cards = {it.get("id"): n for n, it in enumerate((man or {}).get("items") or [], 1)}
+    items = {it.get("id"): it for it in (man or {}).get("items") or []}
+    cards = {aid: n for n, aid in enumerate(items, 1)}
     rejected_keeps = {r.get("id"): r for r in store.get("rejected") or [] if r.get("kind") == "keep"}
     out = {}
     for aid, answer in (store.get("answers") or {}).items():
+        if not answer_is_current(answer, items.get(aid)):
+            continue                      # ответ прежней редакции: страница показывает его в истории карточки
         state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer))
         out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
                     "ts": answer.get("ts"), "source": answer.get("source")}
