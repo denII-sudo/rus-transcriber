@@ -692,7 +692,20 @@ def places_overlap(x, y):
 
 # ---------- разбор сомнительных мест ----------
 def _find_span(data, it):
-    """Находит место по времени слов (индексы сдвигаются после правок)."""
+    """Находит место по времени слов (индексы сдвигаются после правок).
+
+    Пропуск — слова, начатые в его паузе [t1, t2); word_ids места не читаются (старые пакеты несли в них ID
+    соседнего слова). Пустая пауза — None."""
+    if is_gap_place(it):
+        times = _place_time(it)
+        if times is None:
+            return None
+        in_segment = {}
+        for si, k, _w in pause_words(data, *times):
+            in_segment.setdefault(si, []).append(k)
+        locs = [(si, ks[0], ks[-1] + 1) for si, ks in in_segment.items()]
+        return next((loc for loc in locs if data["segments"][loc[0]].get("speaker") == it.get("speaker")),
+                    locs[0] if locs else None)
     if "word_ids" in it:
         target = it["word_ids"]
         if not isinstance(target, list) or not target or not all(isinstance(x, str) and x for x in target) \
@@ -918,6 +931,19 @@ def _counts_text(changed, seen, seen_changed):
 
 
 HELD_FOR_HUMAN = "место оставлено человеку"
+# Отказы варианта карточки на пустой паузе (apply_review): слов нет — «как есть», подпись и замена не к чему.
+PAUSE_EMPTY_AS_IS = ("в паузе нет слов — подтверждать «как есть» нечего; "
+                     "впишите услышанное в поле ответа («Имя: слова»)")
+PAUSE_EMPTY_SPEAKER = ("в паузе нет слов — подписывать говорящего нечему; "
+                       "впишите услышанное в поле ответа («Имя: слова»)")
+PAUSE_EMPTY_TEXT = ("вариант с текстом в пустую паузу не вписывается; "
+                    "впишите услышанное в поле ответа («Имя: слова»)")
+
+
+def _empty_pause_refusal(decision):
+    if decision.get("text"):
+        return PAUSE_EMPTY_TEXT
+    return PAUSE_EMPTY_SPEAKER if decision.get("speaker") else PAUSE_EMPTY_AS_IS
 EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правки by — "claude" (правка агента, в том числе по поручению '
                              'человека) или "human" (текст продиктовал человек, только командной строкой); '
                              'без автора правка не принимается')
@@ -989,21 +1015,42 @@ def overwrite_refusal(word, data, writer, card):
 
 def _held_places(data):
     """Места, оставленные человеку (статус human): (id() их слов, их отрезки). Агент их не меняет и не
-    закрывает, пока нет правила о поручении такого места ИИ."""
+    закрывает, пока нет правила о поручении такого места ИИ.
+
+    Отрезок — (a, b, пропуск?): у места-слова закрытый [t1 − допуск; t2 + допуск], у пропуска — [t1, t2) в
+    сотых (_span_has_time, _span_overlaps). Слова пропуска — слова паузы; соседнее слово ему не принадлежит."""
     words, spans = set(), []
     all_words = [w for seg in data.get("segments") or [] for w in seg.get("words") or []]
     for it in data.get("review") or []:
         if it.get("status") != "human":
             continue
+        if is_gap_place(it):
+            times = _place_time(it)
+            if times is not None:
+                spans.append((times[0], times[1], True))
+                words.update(id(w) for _si, _k, w in pause_words(data, *times))
+            continue
         t1, t2 = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
         if t1 is not None and t2 is not None:
-            spans.append((t1 - 0.01, t2 + 0.01))
+            spans.append((t1 - WORD_PLACE_TOLERANCE, t2 + WORD_PLACE_TOLERANCE, False))
         ids = it.get("word_ids")
         if ids:
             words.update(id(w) for w in all_words if w.get("word_id") in ids)
         elif t1 is not None and t2 is not None:
-            words.update(id(w) for w in all_words if t1 - 0.01 <= w["s"] <= t2 + 0.01)
+            words.update(id(w) for w in all_words if t1 - WORD_PLACE_TOLERANCE <= w["s"] <= t2 + WORD_PLACE_TOLERANCE)
     return words, spans
+
+
+def _span_has_time(spans, t):
+    """Попадает ли время t (начало вставляемого слова) в один из отрезков _held_places."""
+    return t is not None and any(in_pause(t, a, b) if gap else a <= t <= b for a, b, gap in spans)
+
+
+def _span_overlaps(spans, t1, t2):
+    """Пересекает ли явный отрезок правки [t1, t2] один из отрезков _held_places."""
+    return any((_cents(t1) < _cents(b) and _cents(a) <= _cents(t2)) if gap
+               else (a <= t2 + WORD_PLACE_TOLERANCE and t1 - WORD_PLACE_TOLERANCE <= b)
+               for a, b, gap in spans)
 
 
 def _diff_words(old, new_text, item_id, refuse=None):
@@ -1192,7 +1239,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             return k is not None and id(flat[k]["w"]) in held_words
 
         def held_time(t):
-            return t is not None and any(a <= t <= b for a, b in held_spans)
+            return _span_has_time(held_spans, t)
 
         removed = set()
         for e in eds:
@@ -1230,8 +1277,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
                 if by != "human" and any(human_touched(flat[k]["w"]) for k in ks):
                     return "на отрезке есть подтверждённые человеком слова"
-                if any(held(k) for k in ks) or (not ks and any(
-                        a <= e["t2"] + 0.01 and e["t1"] - 0.01 <= b for a, b in held_spans)):
+                if any(held(k) for k in ks) or (not ks and _span_overlaps(held_spans, e["t1"], e["t2"])):
                     return HELD_FOR_HUMAN
                 names = list(dict.fromkeys(flat[k]["spk"] for k in ks))
                 if len(names) > 1 and not e.get("speaker") and (e.get("text") or "").strip():
@@ -1564,6 +1610,10 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             it["status"] = "resolved"
             report["kept"] += 1
             report["successful_ids"].append(it["id"])
+            continue
+        if is_gap_place(it) and _place_time(it) is not None and not pause_words(data, *_place_time(it)):
+            # В паузе нет слов: подтверждать, подписывать и заменять нечего. Соседнее слово ей не принадлежит.
+            report.setdefault("conflicts", []).append({"id": it["id"], "why": _empty_pause_refusal(d)})
             continue
         target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
         loc = _find_span(data, target)

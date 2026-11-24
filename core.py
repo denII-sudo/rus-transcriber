@@ -2641,11 +2641,20 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
         return [snapshot(word, segment.get("speaker"))
                 for word in (segment.get("words") or [])[w1:w2]]
 
+    def select_pause(data, item):
+        # Слова пропуска — начатые в его паузе (transcript.pause_words); пустая пауза — пустой снимок, не None.
+        times = transcript._place_time(item)
+        if times is None:
+            return None
+        return [snapshot(word, data["segments"][si].get("speaker"))
+                for si, _k, word in transcript.pause_words(data, *times)]
+
     conflicts = {}
     for item in manifest.get("items") or []:
         aid = item.get("id")
         answer = answers.get(aid)
-        ids = item.get("word_ids")
+        gap = transcript.is_gap_place(item)
+        ids = None if gap else item.get("word_ids")      # у пропуска word_ids пакета не читаются
         if not answer or aid in applied:
             continue
         if sqlite and source is None:
@@ -2654,9 +2663,10 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
         if not ids:
             # Старый вид карточки: ответ ищет место по времени. Сравниваем ровно те
             # слова, которые он перезапишет, включая говорящего и все измерения provenance.
-            if sqlite and "word_ids" not in item:
-                actual = select_by_time(current, item)
-                original = select_by_time(source, item)
+            if sqlite and (gap or "word_ids" not in item):
+                pick = select_pause if gap else select_by_time
+                actual = pick(current, item)
+                original = pick(source, item)
                 if actual is None or original is None or actual != original:
                     conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
             continue

@@ -177,7 +177,8 @@ def build(json_path, items, base_url_note=None):
         loc = T._find_span(data, it)
         target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
         ids = [w.get("word_id") for w in target_words]
-        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) else {}
+        # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
+        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids)             and not T.is_gap_place(it) else {}
         question = q.get("question") or "Как правильно?"
         if it.get("asr_problem"):
             problem = it["asr_problem"]
@@ -687,7 +688,7 @@ def decisions(json_path):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
                 continue
-            if "word_ids" in it:
+            if "word_ids" in it and not T.is_gap_place(it):     # у пропуска старый пакет нёс ID соседа
                 d["word_ids"] = it["word_ids"]
             note = f"{src}: {it['options'][a['option']]['label']}"
             if aid in conflicted:
@@ -758,7 +759,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         aid = item["id"]
         if aid not in valid_free:
             continue
-        if "word_ids" in item:
+        if "word_ids" in item and not T.is_gap_place(item):     # пропуск: слова — по времени паузы
             ids = item["word_ids"]
             all_words = [w for s in data["segments"] for w in s.get("words") or []]
             all_ids = Counter(w.get("word_id") for w in all_words)

@@ -518,14 +518,19 @@ def legacy_speaker_places(data):
         else:
             continue
         t1, t2 = item.get("t1", item.get("t")), item.get("t2", item.get("t"))
-        if not isinstance(t1, (int, float)) or not isinstance(t2, (int, float)):
+        if not all(isinstance(t, (int, float)) and math.isfinite(t) for t in (t1, t2)):
             skipped["no_words"] += 1
             continue
+        import transcript
         found = []
+        pause = transcript.is_gap_place(item)       # слова пропуска — начатые в паузе, соседнее слово не его
         for si, seg in enumerate(data.get("segments") or []):
             for wi, w in enumerate(seg.get("words") or []):
-                if (isinstance(w.get("s"), (int, float)) and t1 - 0.01 <= w["s"] <= t2 + 0.01
-                        and wanted(w)):
+                if not isinstance(w.get("s"), (int, float)):
+                    continue
+                inside = (transcript.in_pause(w["s"], t1, t2) if pause
+                          else t1 - transcript.WORD_PLACE_TOLERANCE <= w["s"] <= t2 + transcript.WORD_PLACE_TOLERANCE)
+                if inside and wanted(w):
                     found.append((si, wi))
         if not found:
             skipped["no_words"] += 1
