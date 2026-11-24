@@ -526,15 +526,18 @@ class PromiseTests(fixtures.ScreenCase):
     # разный: у документа важен порядок файлов (md раньше json) и состояние самого файла, у свёртки порядка нет
     # (внешние правки ищутся по всем файлам сразу), поэтому у неё один вид файла. Состояние «уже равен версии
     # программы» идёт общим путём (закрыть конфликт, сосед не важен) и покрыто матрицей выше.
-    NEIGHBOUR_CHANGED = (("document", "md", "same"), ("document", "md", "changed"), ("document", "json", "same"),
-                         ("document", "json", "changed"), ("conspect", "md", "same"), ("conspect", "md", "changed"))
+    # (область, файл, его состояние) -> обещание. Порядок записи документа md → json → manifest: изменённый md
+    # даёт новый конфликт по себе раньше соседа json, а сосед md останавливает json при любом его состоянии.
+    NEIGHBOUR_CHANGED = {("document", "md", "same"): "stopped", ("document", "md", "changed"): "recopy",
+                         ("document", "json", "same"): "stopped", ("document", "json", "changed"): "stopped",
+                         ("conspect", "md", "same"): "stopped", ("conspect", "md", "changed"): "recopy"}
 
     def new_conflicts_on(self, case):
         """Виды файлов, по которым запись открыла новые конфликты."""
         return sorted(row["kind"] for row in self.open_rows(case.rec, case.scope) if row["conflict_id"] != case.id)
 
     def test_neighbour_changed_after_decision_promise_is_what_happens(self):
-        for scope, kind, state in self.NEIGHBOUR_CHANGED:
+        for (scope, kind, state), expected in self.NEIGHBOUR_CHANGED.items():
             with self.subTest(scope=scope, kind=kind, state=state):
                 case = self.prepare(scope, kind, state, "decided changed")
                 other = "json" if kind == "md" else "md"
@@ -544,6 +547,7 @@ class PromiseTests(fixtures.ScreenCase):
                 action, _, lines = asked.call_args.args
                 shown = self.preview(case)
                 promised = shown["effect"]
+                self.assertEqual(promised, expected)
                 # экран и писатель решают одинаково: где экран называет остановку соседом, там писатель встаёт
                 # на соседе; где обещает новый конфликт по этому файлу — открывает его по этому файлу
                 if promised == "stopped":
@@ -587,6 +591,22 @@ class PromiseTests(fixtures.ScreenCase):
         self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
         self.assertEqual(case.path.read_bytes(), before)
         self.assertTrue(self.is_open(case))
+
+
+class OrderRuleTests(fixtures.unittest.TestCase):
+    """Порядок отказов набора документа — одна функция; запись встаёт на первом файле в порядке md → json → manifest."""
+
+    def test_refusals_follow_the_write_order(self):
+        verdicts = {"manifest": "external", "json": "damaged_copy", "md": "external"}
+        self.assertEqual(documents.refusals(verdicts), ["md", "json", "manifest"])
+        self.assertEqual(documents.refusals({"md": "ok", "json": "stale", "manifest": "missing"}), [])
+        self.assertEqual(documents.refusals({"md": "accepted", "json": "error"}), ["json"])
+
+    def test_what_stops_a_file_depends_on_its_place_and_its_own_state(self):
+        self.assertEqual(documents.stopped_by({"md": "accepted", "json": "external"}, "md"), ["json"])
+        self.assertEqual(documents.stopped_by({"md": "external", "json": "external"}, "md"), [])
+        self.assertEqual(documents.stopped_by({"md": "external", "json": "external"}, "json"), ["md"])
+        self.assertEqual(documents.stopped_by({"md": "external", "json": "accepted"}, "json"), ["md"])
 
 
 class OneFileRuleTests(fixtures.unittest.TestCase):
