@@ -1,4 +1,5 @@
 """О1, О2, О4: копия проверяется там, где действительно заменяется файл."""
+import ast
 import hashlib
 import json
 import uuid
@@ -422,10 +423,12 @@ class PromiseTests(fixtures.ScreenCase):
             other.kind = other_kind
             if neighbour == "open damaged":
                 self.damage(other)
-            elif neighbour in ("decided", "decided damaged"):
+            elif neighbour in ("decided", "decided damaged", "decided changed"):
                 self.resolve_directly(other)
                 if neighbour == "decided damaged":
                     self.damage(other)
+                if neighbour == "decided changed":    # решение принято, а файл потом снова изменили
+                    paths[other_kind].write_bytes(saved + b"later")
         if state == "changed":
             target.path.write_bytes(fixtures.LATE_EDIT)
         elif state == "program":
@@ -518,4 +521,88 @@ class PromiseTests(fixtures.ScreenCase):
                 for text in (self.item(case).get("next_step") or "нет пояснения", self.retry(case)["reason"]):
                     self.assertNotIn("Скачайте копию", text)
                     self.assertIn("повреждена", text)
+
+    # Т13: сосед «решение принято, файл изменён после решения». Новое состояние соседа — только там, где путь кода
+    # разный: у документа важен порядок файлов (md раньше json) и состояние самого файла, у свёртки порядка нет
+    # (внешние правки ищутся по всем файлам сразу), поэтому у неё один вид файла. Состояние «уже равен версии
+    # программы» идёт общим путём (закрыть конфликт, сосед не важен) и покрыто матрицей выше.
+    NEIGHBOUR_CHANGED = (("document", "md", "same"), ("document", "md", "changed"), ("document", "json", "same"),
+                         ("document", "json", "changed"), ("conspect", "md", "same"), ("conspect", "md", "changed"))
+
+    def new_conflicts_on(self, case):
+        """Виды файлов, по которым запись открыла новые конфликты."""
+        return sorted(row["kind"] for row in self.open_rows(case.rec, case.scope) if row["conflict_id"] != case.id)
+
+    def test_neighbour_changed_after_decision_promise_is_what_happens(self):
+        for scope, kind, state in self.NEIGHBOUR_CHANGED:
+            with self.subTest(scope=scope, kind=kind, state=state):
+                case = self.prepare(scope, kind, state, "decided changed")
+                other = "json" if kind == "md" else "md"
+                other_name = (case.rec.files if scope == "document" else case.rec.conspect_files)[other].name
+                _, asked = fixtures.ConflictMCPTests.mcp_resolve(
+                    self, case, side_effect=confirm.NotConfirmed("проба текста"))
+                action, _, lines = asked.call_args.args
+                shown = self.preview(case)
+                promised = shown["effect"]
+                # экран и писатель решают одинаково: где экран называет остановку соседом, там писатель встаёт
+                # на соседе; где обещает новый конфликт по этому файлу — открывает его по этому файлу
+                if promised == "stopped":
+                    self.assertEqual(shown["stops_for"], [other_name])
+                    self.assertEqual(shown["stops_changed"], [other_name])
+                    self.assertIn("изменили после", "\n".join(lines))
+                    self.assertIn(other_name, "\n".join(lines))
+                before = case.path.read_bytes()
+                done = self.happened(case, before, self.replace(shown["snapshot"])["outcome"])
+                self.assertEqual("unchanged" if promised in ("wait", "stopped") else promised, done)
+                self.assertIn(self.ACTION[promised], action.casefold())
+                self.assertNotEqual(promised, "replace")
+                self.assertNotIn("заменить файл на диске", "\n".join(lines).casefold())
+                fresh = self.new_conflicts_on(case)
+                if promised == "recopy":    # у свёртки новый конфликт и по соседу: правки ищутся по всем файлам
+                    self.assertIn(kind, fresh)
+                else:
+                    self.assertEqual(fresh, [other])
+
+    def test_card_promise_with_neighbour_changed_after_decision_is_what_retry_does(self):
+        for scope in fixtures.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.prepare(scope, "md", "same", "decided changed")
+                self.resolve_directly(case)
+                card = self.item(case)
+                self.assertEqual(card["next_effect"], "stopped")
+                self.assertIn("изменили после", card["next_step"])
+                self.assertNotIn("повреждённая копия", card["next_step"])
+                before = case.path.read_bytes()
+                self.assertEqual(self.happened(case, before, self.retry(case)["outcome"]), "unchanged")
+                self.assertEqual(self.new_conflicts_on(case), ["json"])
+
+    def test_snapshot_without_the_new_stop_reason_is_refused(self):
+        """Страница, открытая до обновления, держит снимок без новой причины остановки: заменять по нему нельзя."""
+        case = self.prepare("document", "md", "same", "decided changed")
+        snapshot = dict(self.snapshot(case))
+        snapshot.pop("stops_changed", None)
+        snapshot["stops_for"] = []    # прежний экран соседа не видел и обещал замену
+        before = case.path.read_bytes()
+        self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
+        self.assertEqual(case.path.read_bytes(), before)
+        self.assertTrue(self.is_open(case))
+
+
+class OneFileRuleTests(fixtures.unittest.TestCase):
+    """Т14: правило допустимости текущего файла записано один раз — в documents.file_verdict."""
+
+    def test_only_file_verdict_compares_the_current_file_with_allowed_versions(self):
+        found = []
+        for source in sorted(fixtures.PROJECT.glob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for function in ast.walk(tree):
+                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(function):
+                    if (isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.NotIn)
+                            and isinstance(node.left, ast.Name) and "current" in node.left.id
+                            and isinstance(node.comparators[0], ast.Tuple)):
+                        found.append(f"{source.name}:{function.name}")
+        # conspect.recover_pending — другое правило: откат прерванной записи по журналу (файл — старый или новый)
+        self.assertEqual(sorted(set(found)), ["conspect.py:recover_pending", "documents.py:file_verdict"])
 
