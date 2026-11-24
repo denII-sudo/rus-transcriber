@@ -160,7 +160,7 @@ class NoSelfApproveTests(unittest.TestCase):
         self.assertFalse([n for n in names if "approve" in n or "confirm" in n or "allow" in n], names)
 
     def test_core_and_confirm_do_not_import_mcp(self):
-        for fn in ("core.py", "core_voices.py", "core_screen.py", "confirm.py", "rt.py"):
+        for fn in ("core.py", "core_voices.py", "core_screen.py", "core_conflicts.py", "confirm.py", "rt.py"):
             tree = ast.parse((ROOT / fn).read_text(encoding="utf-8"))
             mods = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module] + \
                    [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
