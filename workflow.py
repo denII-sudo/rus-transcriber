@@ -376,53 +376,36 @@ def place_holds_quote(item):
     return not _place_unresolved(item) and not _closed_unheard(item)
 
 
-# Названное исключение этапа 7.5а: открытое место-пауза (слов внутри нет) пока задевает все цитаты записи,
-# так же строго, как раньше. В 7.5б, после PR 6а, слова места-паузы берутся функцией PR 6а с
-# pause_neighbors=True, и исключение убирается вместе с этим именем.
-PAUSE_UNTIL_6A = True
-
-
 def quote_blockers(data, word_ids):
     """Места разбора, из-за которых цитата из слов word_ids не держится в кавычках.
 
     data — стенограмма с ключом review (как у transcript.load): список мест. -> [{"id", "reason"}], reason:
     open — место не решено; unheard — закрыто без прослушивания; unlocated — место или слова цитаты
-    привязать к времени нельзя, и оно задевает все цитаты. Пусто — цитата чистая.
+    привязать к словам нельзя, и оно задевает все цитаты. Пусто — цитата чистая.
+
+    Место со ссылками на слова (и не пропуск) — эти слова. Остальные места — слова по transcript.place_words
+    (PR 6а) с pause_neighbors=True: у места-паузы (слов внутри нет) это последнее слово до неё и первое после,
+    так что пауза между словами цитаты или вплотную к её краю цитату задевает, а пауза в стороне — нет.
     """
     wanted = set(word_ids)
-    timed, quote_spans, quote_untimed = [], [], False
-    for segment in data.get("segments") or []:
-        for word in segment.get("words") or []:
-            start, end = word.get("s"), word.get("e")
-            span = None
-            if _seconds(start):
-                span = (start, end if _seconds(end) and end >= start else start)
-                timed.append(span)
-            if word.get("word_id") in wanted:
-                if span is None:
-                    quote_untimed = True
-                else:
-                    quote_spans.append(span)
+    quote_untimed = any(
+        word.get("word_id") in wanted and not _seconds(word.get("s"))
+        for segment in data.get("segments") or [] for word in segment.get("words") or [])
     blockers = []
     for item in data.get("review") or []:
         if place_holds_quote(item):
             continue
         reason = "open" if _place_unresolved(item) else "unheard"
-        if item.get("word_ids"):
+        if item.get("word_ids") and not transcript.is_gap_place(item):
             hit = bool(wanted & set(item["word_ids"]))
         else:
-            place = _place_time(item)
-            if place is None:
-                reason, hit = "unlocated", True
+            # Время места — только t1/t2, как до PR 6а (place_words читает и запасное «t»: цитат это не касается).
+            found = (transcript.place_words(data, item, pause_neighbors=True)
+                     if _place_time(item) is not None else None)
+            if found is None or quote_untimed:
+                reason, hit = "unlocated", True   # место или время слова цитаты неизвестны — не судим
             else:
-                t1, t2 = place
-                inside = any(_word_in_place(start, end, t1, t2) for start, end in timed)
-                if not inside:
-                    hit = PAUSE_UNTIL_6A                  # пауза: слов внутри нет
-                elif quote_untimed:
-                    reason, hit = "unlocated", True       # время слова цитаты неизвестно — не судим
-                else:
-                    hit = any(_word_in_place(start, end, t1, t2) for start, end in quote_spans)
+                hit = bool(wanted & set(found[0]))
         if hit:
             blockers.append({"id": item.get("id"), "reason": reason})
     return blockers

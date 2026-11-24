@@ -137,6 +137,12 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(workflow.quote_blockers(data, ["w2", "w3"]), [])
         self.assertEqual(workflow.quote_blockers(data, ["w8", "w9"]), [])
 
+    def test_a_gap_place_ignores_its_word_ids_like_the_place_words_function(self):
+        gap = dict(OPEN_PAUSE, reasons=["missed"], word_ids=["w2"])      # пропуск: слова — по времени паузы
+        data = make_data([gap])
+        self.assertEqual(workflow.quote_blockers(data, ["w2"]), [])
+        self.assertEqual(workflow.quote_blockers(data, ["w5"]), [{"id": "r3", "reason": "open"}])
+
     def test_a_pause_at_the_start_or_the_end_of_the_record_has_one_neighbour(self):
         before_all = {"id": "r8", "status": "open", "t1": -3.0, "t2": -2.0}
         after_all = {"id": "r9", "status": "open", "t1": 20.0, "t2": 21.0}
