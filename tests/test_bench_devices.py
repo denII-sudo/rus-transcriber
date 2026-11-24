@@ -984,6 +984,46 @@ class RunFileFromMainTests(unittest.TestCase):
             self.assertNotIn("diagnostics", r)
         self.assertNotIn("\"раз\"", raw)
 
+    def test_vote_in_report_uses_timed_words_and_roles_of_chunk_diagnostics(self):
+        # РАР-4.2, шаг 4, сквозной: основная, вторая и третья модели отдают слова со временами и сведения
+        # о кусках, у второй кусок 0 сбойный; голосование в отчёте — как words.combine_hypotheses с ролями
+        # primary/second/whisper, а эталон PyTorch (только текст) голосование не подменяет
+        import copy
+        import words as W
+
+        def wd(w, s):
+            return {"w": w, "s": float(s), "e": float(s) + 0.3, "c": 0.9}
+
+        def diag(*states):
+            spans = [[0.0, 2.75], [2.75, 5.0]]
+            return [{"index": i, "state": st, "attempts": [], "audio_span": spans[i], "own_span": spans[i]}
+                    for i, st in enumerate(states)]
+        main = [wd("раз", 0.1), wd("два", 1.0), wd("три", 3.0), wd("четыре", 4.0)]
+        ctc = [wd("раз", 0.1), wd("два", 1.0), wd("пять", 3.0), wd("четыре", 4.0)]     # кусок 0 — сбой
+        third = ["раз", "два", "пять", "четыре"]
+        d_main, d_ctc = diag("ok", "ok"), diag("error", "ok")
+        d_third = [{"index": 0, "state": "ok", "attempts": [], "audio_span": [0.0, 3.5], "own_span": [0.0, 3.5]},
+                   {"index": 1, "state": "error", "attempts": [], "audio_span": [3.5, 5.0],
+                    "own_span": [3.5, 5.0]}]                              # у третьей сбой в конце: свой отрезок
+        self.overrides["onnx-cpu"] = {"hyp_words": main, "diagnostics": d_main, "text": "раз два три четыре"}
+        self.overrides["ctc-cpu"] = {"hyp_words": ctc, "diagnostics": d_ctc, "text": "раз два пять четыре"}
+        self.overrides["ml-cpu"] = {"hyp_words": third, "diagnostics": d_third, "text": " ".join(third)}
+        self.overrides["torch-cpu"] = {"text": "раз два три четыре"}           # слов со временами нет
+        expected = W.combine_hypotheses({"primary": copy.deepcopy(main), "second": copy.deepcopy(ctc),
+                                         "whisper": list(third)},
+                                        {"primary": {"chunks": copy.deepcopy(d_main)},
+                                         "second": {"chunks": copy.deepcopy(d_ctc)},
+                                         "whisper": {"chunks": copy.deepcopy(d_third)}})["quality"]
+        st, _ = self.run_main("20260101-000400-b00005", only="onnx-cpu,ctc-cpu,ml-cpu,torch-cpu")
+        rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
+        vote = {r["id"]: r for r in rec["results"]}["ml-cpu"]["vote"]
+        ev = expected["vote"]
+        self.assertEqual((vote["for_ctc"], vote["unresolved"], vote["inserted"]),
+                         (ev["replaced"], ev["disputed"], ev["inserted"]))
+        self.assertEqual(vote["skipped_spans"], 2)              # путь по словам (не текстовый); отрезки второй и третьей
+        self.assertEqual(vote["skipped_spans"], expected["vote3_partial"]["spans"])
+        self.assertNotIn("vote", {r["id"]: r for r in rec["results"]}["torch-cpu"])
+
     def test_every_run_leaves_its_own_file(self):
         import runinfo
         st1, report = self.run_main("20260101-000000-b00001")
