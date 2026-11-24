@@ -1490,7 +1490,11 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         for card in groups:
             ids = set(disagreement_words(data, places_before[card])) if card in places_before else set()
             if ids:
-                listen[card] = {f["w"]["word_id"]: f["w"]["w"] for f in flat if f["w"].get("word_id") in ids}
+                # слова, которые человек вписал своим ответом (в том числе тем же текстом): он их слышал
+                aimed = {wid for e in groups[card] if e["op"] in ("place_text", "replace", "delete")
+                         for wid in list(e.get("word_ids") or []) + [e.get("word_id")] if wid}
+                listen[card] = ({f["w"]["word_id"]: f["w"]["w"] for f in flat if f["w"].get("word_id") in ids},
+                                bool(aimed & ids))
     for card, eds in groups.items():
         why = check(eds)
         if why:
@@ -1688,8 +1692,11 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     to_mark = []
 
     def touched(card, item):
-        """Правка карточки задела слово расхождения: заменила, удалила, слила или вставила слово внутри места."""
-        before = listen[card]
+        """Правка карточки задела слово расхождения: вписала его (и тем же текстом), заменила, удалила, слила
+        или вставила слово внутри места."""
+        before, aimed = listen[card]
+        if aimed:
+            return True
         now = {w.get("word_id"): w["w"] for sg in segs for w in sg["words"] if w.get("word_id") in before}
         if any(now.get(wid) != text for wid, text in before.items()):
             return True

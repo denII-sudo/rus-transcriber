@@ -1087,6 +1087,8 @@ def _answer_state(answer, applied_sig, event):
     if relation == "revert":
         # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
         return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
+    if relation == "applied" and (event or {}).get("outcome") == "applied_open":
+        return "applied_open"          # применён, место открыто (PR 7): подпись та же, исход последнего применения
     if relation is not None:
         return relation
     if event is not None and event.get("outcome") in OUTCOME_REASONS and event.get("outcome") != "applied":
