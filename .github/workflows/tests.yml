@@ -111,9 +111,11 @@ jobs:
       # В PR набор идёт параллельно: tests/run_parallel.py делит модули на 4 группы (по процессу unittest, у
       # каждой своя песочница), раскладка случайная, её seed печатается в журнале (повтор — --shuffle SEED).
       # Число тестов и состав модулей запускатель сверяет с discover; при падении печатает полный вывод группы.
+      # --durations: секунды по тестам остаются в журнале, из него таблица раскладки пересчитывается одной командой:
+      # python tests/run_parallel.py --table-from журнал.log
       - name: Run unit tests (parallel groups)
         if: steps.scope.outputs.scope != 'docs' && github.event_name == 'pull_request'
-        run: python -B tests/run_parallel.py -v --shuffle
+        run: python -B tests/run_parallel.py -v --shuffle --durations
       # Контроль по расписанию и после изменения этого файла в main — прежний последовательный прогон одним
       # процессом: «параллельно зелёно, последовательно красно» показало бы скрытую зависимость модулей.
       - name: Run unit tests (sequential control)

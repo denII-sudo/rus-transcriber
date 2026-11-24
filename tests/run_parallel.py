@@ -21,9 +21,17 @@
 
 Имя файла не подходит под `test*.py`, поэтому `discover` его не подхватывает. Таблица длительностей модулей —
 `tests/parallel_durations.json` (только для баланса: устаревшая таблица портит скорость, не результат);
-обновить: `--update-table`.
+обновить: `--update-table` (после прогона) или `--table-from ЖУРНАЛ` (из сохранённого вывода с `--durations`).
+
+Запись в файловом режиме (`legacy_files`) будет убрана. В таблице два столбца: `modules` — секунды сейчас,
+`after_legacy_removal` — оценка после ухода этого режима; раскладка строится по их среднему, поэтому ровна и до, и
+после. Оценка считается при пересчёте таблицы по тексту тестов (`classify_tests`): тест, гоняющий оба режима, даёт
+после ухода долю SQLITE_COST/(1+SQLITE_COST) своего времени; тест только для файлового режима — 0; остальные — как были.
+Когда `legacy_files` из тестов исчезнет, пересчёт сам даст «после» = «сейчас» (одна команда, без ручной правки).
+`--plan` печатает раскладку и ожидаемую нагрузку групп в обоих состояниях, ничего не запуская.
 """
 import argparse
+import ast
 import fnmatch
 import json
 import os
@@ -46,7 +54,8 @@ MAX_JOBS = 4
 GROUP_TIMEOUT = 900                   # секунд на группу; предел CI — 20 минут на всё задание
 SUMMARY_RAN = re.compile(r"^Ran (\d+) tests? in ([\d.]+)s\s*$", re.M)
 SUMMARY_STATUS = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
-DURATION_LINE = re.compile(r"^\s*([\d.]+)s\s+\S+ \(([\w.]+)\)\s*$", re.M)
+DURATION_LINE = re.compile(r"(?:^|\s)(\d+\.\d+)s\s+\S+ \(([\w.]+)\)\s*$", re.M)
+SQLITE_COST = 4.5                     # цена варианта в режиме sqlite к варианту legacy_files (К-2 плана: 0,42 против 0,09 с)
 
 
 # ---------- модули и раскладка ----------
@@ -61,24 +70,42 @@ def list_modules(tests_dir):
                   if p.is_file() and p.suffix == ".py" and fnmatch.fnmatch(p.name, PATTERN))
 
 
-def load_table(path):
-    """-> (секунды по модулям, списки модулей, которые держать в одной группе)."""
+def _read_table(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}, []
-    modules = {k: float(v) for k, v in (data.get("modules") or {}).items() if isinstance(v, (int, float))}
-    return modules, [list(g) for g in (data.get("together") or []) if isinstance(g, list)]
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def plan_groups(modules, seconds, jobs, together=(), seed=None):
+def _seconds(section):
+    return {k: float(v) for k, v in (section or {}).items() if isinstance(v, (int, float))}
+
+
+def load_table(path):
+    """-> (секунды по модулям, списки модулей, которые держать в одной группе)."""
+    data = _read_table(path)
+    return _seconds(data.get("modules")), [list(g) for g in (data.get("together") or []) if isinstance(g, list)]
+
+
+def load_after(path):
+    """Оценка секунд по модулям после ухода режима legacy_files (пусто, если в таблице её нет)."""
+    return _seconds(_read_table(path).get("after_legacy_removal"))
+
+
+def plan_groups(modules, seconds, jobs, together=(), seed=None, after=None):
     """Делит модули на группы по ожидаемому времени. -> список списков имён (пустых групп нет).
 
-    Без seed: самый тяжёлый «кусок» — в самую лёгкую группу (устойчивая раскладка). С seed: куски перемешаны,
-    раскладка и порядок внутри групп случайны, но по тому же правилу «в самую лёгкую» — баланс сохраняется."""
+    Два состояния набора: «сейчас» (`seconds`) и «после ухода legacy_files» (`after`, если дана). Кусок ставится в ту
+    группу, где после него наибольшая нагрузка в любом из двух состояний меньше всего (при одном состоянии это
+    правило «в самую лёгкую группу»). Без seed куски идут от самого тяжёлого, а затем перестановками и переносами
+    убирается остаточный перекос в обоих состояниях — раскладка устойчива и повторяема. С seed куски перемешаны,
+    выбор между равными группами случаен, порядок внутри групп случаен; доводки нет (иначе все seed сошлись бы к одной
+    раскладке), баланс держится самим правилом."""
     known = [seconds[m] for m in modules if m in seconds]
     default = (sum(known) / len(known)) if known else 1.0
-    weight = {m: seconds.get(m, default) for m in modules}
+    now = {m: seconds.get(m, default) for m in modules}
+    then = {m: (after or {}).get(m, now[m]) for m in modules}
     left, units = set(modules), []
     for glue in together:
         part = [m for m in glue if m in left]
@@ -87,24 +114,61 @@ def plan_groups(modules, seconds, jobs, together=(), seed=None):
             left -= set(part)
     units += [[m] for m in sorted(left)]
     jobs = max(1, min(jobs, len(units)))
-    groups, load = [[] for _ in range(jobs)], [0.0] * jobs
+    weight = {tuple(u): (sum(now[m] for m in u), sum(then[m] for m in u)) for u in units}
     rng = random.Random(seed) if seed is not None else None
     if rng:
         rng.shuffle(units)
     else:
-        units.sort(key=lambda u: (-sum(weight[m] for m in u), u[0]))
+        units.sort(key=lambda u: (-max(weight[tuple(u)]), u[0]))
+    groups, load = [[] for _ in range(jobs)], [[0.0, 0.0] for _ in range(jobs)]
     for unit in units:
-        lightest = min(load)
-        pick = [i for i, v in enumerate(load) if v == lightest]
+        a, b = weight[tuple(unit)]
+        score = [max(load[i][0] + a, load[i][1] + b) for i in range(jobs)]
+        best = min(score)
+        pick = [i for i, v in enumerate(score) if v == best]
         i = rng.choice(pick) if rng else pick[0]
-        groups[i] += unit
-        load[i] += sum(weight[m] for m in unit)
+        groups[i].append(unit)
+        load[i][0] += a
+        load[i][1] += b
     if rng:
-        for g in groups:
+        flat = [[m for unit in g for m in unit] for g in groups]
+        for g in flat:
             rng.shuffle(g)
-    else:
-        groups = [sorted(g) for g in groups]
-    return [g for g in groups if g]
+        return [g for g in flat if g]
+
+    def cost(loads):
+        return (max(max(x[0] for x in loads), max(x[1] for x in loads)),
+                sum(x[0] ** 2 + x[1] ** 2 for x in loads))
+
+    for _ in range(200):                         # доводка: перенос или обмен кусков, пока что-то улучшается
+        loads = [[sum(weight[tuple(u)][0] for u in g), sum(weight[tuple(u)][1] for u in g)] for g in groups]
+        best, move = cost(loads), None
+        for gi in range(jobs):
+            for ui, u in enumerate(groups[gi]):
+                wu = weight[tuple(u)]
+                for gj in range(jobs):
+                    if gj == gi:
+                        continue
+                    trial = [x[:] for x in loads]
+                    trial[gi] = [trial[gi][0] - wu[0], trial[gi][1] - wu[1]]
+                    trial[gj] = [trial[gj][0] + wu[0], trial[gj][1] + wu[1]]
+                    if len(groups[gi]) > 1 and cost(trial) < best:
+                        best, move = cost(trial), ("move", gi, ui, gj, None)
+                    for vi, v in enumerate(groups[gj]):
+                        wv = weight[tuple(v)]
+                        swap = [x[:] for x in loads]
+                        swap[gi] = [swap[gi][0] - wu[0] + wv[0], swap[gi][1] - wu[1] + wv[1]]
+                        swap[gj] = [swap[gj][0] + wu[0] - wv[0], swap[gj][1] + wu[1] - wv[1]]
+                        if cost(swap) < best:
+                            best, move = cost(swap), ("swap", gi, ui, gj, vi)
+        if not move:
+            break
+        kind, gi, ui, gj, vi = move
+        if kind == "move":
+            groups[gj].append(groups[gi].pop(ui))
+        else:
+            groups[gi][ui], groups[gj][vi] = groups[gj][vi], groups[gi][ui]
+    return [g for g in (sorted(m for unit in grp for m in unit) for grp in groups) if g]
 
 
 def verify_plan(modules, groups):
@@ -145,13 +209,75 @@ def parse_summary(text):
             "unexpected": items.get("unexpected successes", 0)}
 
 
+def test_durations(text):
+    """Секунды по тестам {модуль.Класс.тест: с} из блоков `--durations 0` (метки групп и времени перед строкой — не помеха)."""
+    out = {}
+    for secs, test_id in DURATION_LINE.findall(text.split("Slowest test durations", 1)[-1]):
+        out[test_id] = out.get(test_id, 0.0) + float(secs)
+    return out
+
+
 def module_durations(text):
     """Секунды по модулям из блока `--durations 0`."""
     out = {}
-    for secs, test_id in DURATION_LINE.findall(text.split("Slowest test durations", 1)[-1]):
+    for test_id, secs in test_durations(text).items():
         mod = test_id.split(".")[0]
-        out[mod] = out.get(mod, 0.0) + float(secs)
+        out[mod] = out.get(mod, 0.0) + secs
     return out
+
+
+def classify_tests(tests_dir):
+    """Тесты, связанные с режимом legacy_files, по тексту тестов. -> {модуль.Класс.тест: "both" | "legacy"}.
+
+    "both" — тест гоняет оба режима (`BACKENDS` или оба названия режимов в теле, в том числе через помощник
+    класса или модуля); "legacy" — только файловый режим (название в теле или `backend = "legacy_files"` у класса)."""
+    result = {}
+    for path in sorted(Path(tests_dir).glob(PATTERN)):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+
+        def facts(fn):
+            strings = {n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            calls = {n.func.attr for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+            calls |= {n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            both = "BACKENDS" in names or ("legacy_files" in strings and "sqlite" in strings)
+            return both, "legacy_files" in strings, calls
+
+        module_funcs = {n.name: facts(n) for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            pinned = any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "backend" for t in n.targets)
+                         and isinstance(n.value, ast.Constant) and n.value.value == "legacy_files" for n in cls.body)
+            funcs = {n.name: facts(n) for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            both_by_helper = {name for name, (b, _l, _c) in {**module_funcs, **funcs}.items() if b}
+            for name, (b, legacy, calls) in funcs.items():
+                if not name.startswith("test"):
+                    continue
+                if b or (calls & both_by_helper):
+                    result[f"{path.stem}.{cls.name}.{name}"] = "both"
+                elif legacy or pinned:
+                    result[f"{path.stem}.{cls.name}.{name}"] = "legacy"
+    return result
+
+
+def build_table(test_times, tests_dir, together=()):
+    """Таблица длительностей из секунд по тестам: `modules` (сейчас) и `after_legacy_removal` (оценка)."""
+    kinds = classify_tests(tests_dir)
+    now, after = {}, {}
+    for test_id, secs in test_times.items():
+        mod = test_id.split(".")[0]
+        keep = {"both": SQLITE_COST / (1 + SQLITE_COST), "legacy": 0.0}.get(kinds.get(test_id), 1.0)
+        now[mod] = now.get(mod, 0.0) + secs
+        after[mod] = after.get(mod, 0.0) + secs * keep
+    return {"modules": {m: round(v, 1) for m, v in sorted(now.items())},
+            "after_legacy_removal": {m: round(after[m], 1) for m in sorted(after)},
+            "together": [list(g) for g in together]}
+
+
+def write_table(path, table):
+    Path(path).write_text(json.dumps(table, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
 
 
 # ---------- процессы ----------
@@ -298,6 +424,10 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
     ap.add_argument("--timeout", type=int, default=GROUP_TIMEOUT, help="секунд на группу (по умолчанию %(default)s)")
     ap.add_argument("--table", help="таблица длительностей модулей (по умолчанию tests/parallel_durations.json)")
     ap.add_argument("--update-table", action="store_true", help="записать длительности модулей этого запуска в таблицу")
+    ap.add_argument("--table-from", metavar="ЖУРНАЛ", help="пересчитать таблицу из сохранённого вывода запуска с "
+                                                            "--durations (в том числе журнал CI) и выйти")
+    ap.add_argument("--durations", action="store_true", help="группы печатают секунды по тестам (для --table-from)")
+    ap.add_argument("--plan", action="store_true", help="напечатать раскладку и нагрузку групп, ничего не запуская")
     ap.add_argument("--no-count", action="store_true", help="не сверять число тестов с discover")
     ap.add_argument("--strict-tmp", action="store_true", help="остаток во временной папке группы — отказ")
     args = ap.parse_args(argv)
@@ -314,10 +444,35 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
     py = sys.executable
 
     seconds, together = load_table(table_path)
+    after = load_after(table_path)
+    if args.table_from:
+        times = test_durations(Path(args.table_from).read_text(encoding="utf-8", errors="replace"))
+        if not times:
+            print("в журнале нет блока «Slowest test durations»: запустите с --durations", file=out)
+            return 2
+        table = build_table(times, tests_dir, together)
+        for m in set(seconds) - set(table["modules"]):         # модуля не было в журнале — прежние числа
+            table["modules"][m] = round(seconds[m], 1)
+            table["after_legacy_removal"][m] = round(after.get(m, seconds[m]), 1)
+        write_table(table_path, table)
+        print(f"таблица пересчитана из журнала: {len(table['modules'])} модулей, {sum(table['modules'].values()):.0f} с "
+              f"сейчас, {sum(table['after_legacy_removal'].values()):.0f} с после ухода legacy_files (оценка)", file=out)
+        return 0
+    if args.plan:
+        plan = plan_groups(modules, seconds, jobs, together, seed, after)
+
+        def load(g, table):
+            return sum(table.get(m, seconds.get(m, 0.0)) for m in g)
+        for i, g in enumerate(plan, 1):
+            print(f"g{i}: модулей {len(g)}, сейчас {load(g, seconds):.0f} с, после ухода legacy_files "
+                  f"{load(g, after):.0f} с (оценка)", file=out)
+        print(f"самая длинная группа: сейчас {max(load(g, seconds) for g in plan):.0f} с, "
+              f"после {max(load(g, after) for g in plan):.0f} с", file=out)
+        return 0
     if args.sequential:
         groups = []
     else:
-        groups = plan_groups(modules, seconds, jobs, together, seed)
+        groups = plan_groups(modules, seconds, jobs, together, seed, after)
         if mutate:
             groups = mutate(groups)
         plan_problems = verify_plan(modules, groups)
@@ -331,7 +486,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
 
     root = Path(tempfile.mkdtemp(prefix="rt-par-"))
     before = tree_state(repo)
-    extra = (["-v"] if args.verbose else []) + (["--durations", "0"] if args.update_table else [])
+    extra = (["-v"] if args.verbose else []) + (["--durations", "0"] if args.update_table or args.durations else [])
     runs = []
     if args.sequential:
         runs.append(Run("seq", [py, "-B", "-m", "unittest", "discover", "-s", "tests", *extra], repo, tests_dir, root,
@@ -401,12 +556,14 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
 
     bad = [r for r in runs if r.timed_out or not r.summary or not r.summary["ok"]]
     if args.update_table and not bad and not problems:
-        merged = dict(seconds)
+        times = {}
         for r in runs:
-            for m, v in module_durations(r.output).items():
-                merged[m] = round(v, 1)
-        table_path.write_text(json.dumps({"modules": dict(sorted(merged.items())), "together": together},
-                                         ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
+            times.update(test_durations(r.output))
+        table = build_table(times, tests_dir, together)
+        for m in set(seconds) - set(table["modules"]):         # нет в этом запуске — оставить прежнее число
+            table["modules"][m] = round(seconds[m], 1)
+            table["after_legacy_removal"][m] = round(after.get(m, seconds[m]), 1)
+        write_table(table_path, table)
         say(f"таблица длительностей записана: {table_path.name}")
     for r in bad:
         say(f"===== {r.label}: полный вывод упавшей группы =====")

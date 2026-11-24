@@ -127,6 +127,123 @@ class DiscoveryAndPlanTests(unittest.TestCase):
         self.assertEqual(rp.module_durations(text), {"test_one": 2.0, "test_two": 2.0})
 
 
+CLASSIFIED = '''import unittest
+
+BACKENDS = ("legacy_files", "sqlite")
+
+
+def helper_both():
+    for backend in BACKENDS:
+        pass
+
+
+class A(unittest.TestCase):
+    def loop_both(self):
+        for backend in ("legacy_files", "sqlite"):
+            pass
+
+    def test_loop(self):
+        for backend in BACKENDS:
+            pass
+
+    def test_through_class_helper(self):
+        self.loop_both()
+
+    def test_through_module_helper(self):
+        helper_both()
+
+    def test_only_files(self):
+        mode = "legacy_files"
+
+    def test_plain(self):
+        pass
+
+
+class Pinned(unittest.TestCase):
+    backend = "legacy_files"
+
+    def test_pinned(self):
+        pass
+'''
+
+
+class LegacyEstimateTests(Synthetic):
+    """Время режима legacy_files отделено в таблице, раскладка ровна и до, и после его ухода."""
+
+    def test_tests_are_classified_by_their_text(self):
+        self.module("test_m", CLASSIFIED)
+        self.assertEqual(rp.classify_tests(self.repo / "tests"), {
+            "test_m.A.test_loop": "both", "test_m.A.test_through_class_helper": "both",
+            "test_m.A.test_through_module_helper": "both", "test_m.A.test_only_files": "legacy",
+            "test_m.Pinned.test_pinned": "legacy"})
+
+    def test_estimate_after_removal_keeps_sqlite_share_of_both_mode_tests_only(self):
+        self.module("test_m", CLASSIFIED)
+        times = {"test_m.A.test_loop": 11.0, "test_m.A.test_only_files": 2.0, "test_m.A.test_plain": 3.0,
+                 "test_other.B.test_x": 5.0}
+        table = rp.build_table(times, self.repo / "tests")
+        self.assertEqual(table["modules"], {"test_m": 16.0, "test_other": 5.0})
+        # 11 с гоняют оба режима: после ухода остаётся доля sqlite 4,5/5,5 = 9 с; «только файлы» исчезает; прочее как было
+        self.assertEqual(table["after_legacy_removal"], {"test_m": 12.0, "test_other": 5.0})
+
+    def test_without_legacy_files_in_tests_the_estimate_equals_the_current_time(self):
+        self.module("test_m", OK_MODULE)
+        table = rp.build_table({"test_m.T.test_a": 3.0}, self.repo / "tests")
+        self.assertEqual(table["modules"], table["after_legacy_removal"])
+
+    def test_table_is_rebuilt_from_a_saved_log_with_prefixes_and_timestamps(self):
+        self.module("test_m", CLASSIFIED)
+        self.module("test_keep")
+        self.table(test_keep=7.0)
+        log = self.repo / "run.log"
+        log.write_text("tests\tRun\t2026-11-25T01:00:00.1Z .....\n"
+                       "tests\tRun\t2026-11-25T01:00:01.0Z [g1] Slowest test durations\n"
+                       "tests\tRun\t2026-11-25T01:00:01.1Z [g1] 11.000s     test_loop (test_m.A.test_loop)\n"
+                       "tests\tRun\t2026-11-25T01:00:01.2Z [g2] 1.500s     test_plain (test_m.A.test_plain)\n"
+                       "tests\tRun\t2026-11-25T01:00:01.3Z [g1] test_plain (test_m.A.test_plain) ... ok\n",
+                       encoding="utf-8")
+        code, text = self.run_launcher("--table-from", str(log))
+        self.assertEqual(code, 0, text)
+        data = json.loads((self.repo / "tests" / "parallel_durations.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["modules"], {"test_keep": 7.0, "test_m": 12.5})     # неупомянутый модуль сохранён
+        self.assertEqual(data["after_legacy_removal"]["test_m"], 10.5)
+        code, text = self.run_launcher("--table-from", str(self.repo / "tests" / "test_m.py"))
+        self.assertEqual(code, 2, text)                                              # в файле нет блока длительностей
+
+    def test_plan_prints_loads_in_both_states_without_running_anything(self):
+        for name in ("test_a", "test_b", "test_c", "test_d"):
+            self.module(name, "raise SystemExit('не должен запускаться')\n")
+        (self.repo / "tests" / "parallel_durations.json").write_text(json.dumps({
+            "modules": {"test_a": 10, "test_b": 0, "test_c": 5, "test_d": 5},
+            "after_legacy_removal": {"test_a": 0, "test_b": 10, "test_c": 5, "test_d": 5}}), encoding="utf-8")
+        code, text = self.run_launcher("--plan", "--jobs", "2")
+        self.assertEqual(code, 0, text)
+        self.assertRegex(text, r"g1: .*сейчас 10 с, после ухода legacy_files 10 с")
+        self.assertRegex(text, r"g2: .*сейчас 10 с, после ухода legacy_files 10 с")
+        self.assertIn("самая длинная группа: сейчас 10 с, после 10 с", text)
+
+    def test_layout_is_even_in_both_states_where_averaging_would_not_be(self):
+        modules = ["a", "b", "c", "d"]
+        now = {"a": 10, "b": 0, "c": 5, "d": 5}
+        after = {"a": 0, "b": 10, "c": 5, "d": 5}
+        groups = rp.plan_groups(modules, now, 2, after=after)
+        self.assertEqual(rp.verify_plan(modules, groups), [])
+        self.assertEqual([sum(now[m] for m in g) for g in groups], [10, 10])
+        self.assertEqual([sum(after[m] for m in g) for g in groups], [10, 10])
+
+    def test_shipped_table_has_the_estimate_for_every_module_and_layout_is_even(self):
+        data = json.loads((REAL_TESTS / "parallel_durations.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(data["modules"]), sorted(data["after_legacy_removal"]))
+        modules = rp.list_modules(REAL_TESTS)
+        seconds, _ = rp.load_table(REAL_TESTS / "parallel_durations.json")
+        after = rp.load_after(REAL_TESTS / "parallel_durations.json")
+        groups = rp.plan_groups(modules, seconds, 4, after=after)
+        self.assertEqual(rp.verify_plan(modules, groups), [])
+        for table in (seconds, after):
+            loads = [sum(table.get(m, 0.0) for m in g) for g in groups]
+            self.assertLess(max(loads) - min(loads), 0.1 * max(loads) + 15, loads)
+
+
 class RunTests(Synthetic):
     def test_all_modules_run_once_and_numbers_equal_discover(self):
         for name in ("test_a", "test_b", "test_c"):
