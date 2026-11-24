@@ -234,7 +234,8 @@ class DocumentTests(unittest.TestCase):
 
     def test_incomplete_asr_and_missed_speech_remain_visible(self):
         source = dict(self.source, quality={"asr_incomplete_chunks": 2, "vote3_skipped": True})
-        review = {"review": [{"id": "r", "status": "open", "word_ids": ["w"],
+        # возможный пропуск — у места-пропуска («missed»), PR 7
+        review = {"review": [{"id": "r", "status": "open", "word_ids": ["w"], "reasons": ["missed"],
                                "gap": [1.0, 3.0]}], "answers": {}}
         prepared = documents.prepare(self.recording, 1, 1, 1, source, review,
                                      self.ctx, self.ctx, "now")
