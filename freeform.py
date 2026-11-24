@@ -30,6 +30,8 @@ import itertools
 from pathlib import Path
 import re
 
+import transcript as T
+
 PAD_BEFORE, PAD_AFTER, SLACK = 3.5, 1.5, 1.0
 GROW, MAX_GROW = 4.0, 2          # расширение окна, если ответ шире него (с), и сколько раз
 DUP_SEC = 2.0                    # повтор: то же слово модели не дальше этого от вставки
@@ -429,14 +431,76 @@ def _place_span(place, ans_raw):
     return span
 
 
+def _pause_answer(item, rep, flat, words, inside):
+    """Ответ текстом на место-пропуск. flat — [(говорящий, слово)], inside — слова паузы (начатые в ней).
+
+    Слова ответа, равные последним словам стенограммы до паузы (с начала ответа) и первым после неё (с конца),
+    при том же говорящем и не дальше DUP_SEC от края паузы, — это соседние слова, а не речь из паузы:
+    они не вставляются и не подписываются. Один токен ответа — одно слово стенограммы."""
+    t_a, t_b = float(item["t1"]), float(item["t2"])
+    cents, limit = T._cents, round(DUP_SEC * 100)
+    before = [w for w in words if cents(w["s"]) < cents(t_a)]
+    after = [w for w in words if cents(w["s"]) >= cents(t_b)]
+
+    def same(token, w):
+        return bool(norm(token[1])) and norm(token[1]) == norm(w["w"]) and token[0] == w["_spk"]
+
+    k = m = 0
+    for n in range(min(len(flat), len(before)), 0, -1):
+        if cents(t_a) - cents(before[-n]["s"]) <= limit and all(same(t, w) for t, w in zip(flat[:n], before[-n:])):
+            k = n
+            break
+    for n in range(min(len(flat) - k, len(after)), 0, -1):
+        if cents(after[n - 1]["s"]) - cents(t_b) <= limit and all(same(t, w) for t, w in zip(flat[len(flat) - n:], after[:n])):
+            m = n
+            break
+    middle = flat[k:len(flat) - m]
+    known = flat[:k] + flat[len(flat) - m:]
+    rep["kind"] = "missed"
+    if not inside:
+        if not middle:
+            rep["human"] = ("ответ совпадает со словами стенограммы рядом с паузой («" +
+                            " ".join(x for _, x in known) + "»): в паузу ничего не вписано")
+            return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+        step = (t_b - t_a) / (len(middle) + 1)
+        eds = []
+        for q, (spk, x) in enumerate(middle, 1):
+            s = round(t_a + step * q, 3)
+            eds.append({"op": "insert", "s": s, "e": round(s + step * 0.9, 3), "text": x, "speaker": spk,
+                        "card": item["id"], "in_place": True})
+        rep["applied"] = [f"«{x}» — уже в стенограмме рядом с паузой, не вставлено" for _, x in known]
+        rep["inserted"] = [f"{spk}: {' '.join(x for s2, x in grp)}"
+                           for spk, grp in itertools.groupby(middle, key=lambda t: t[0])]
+        return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
+    here = " ".join(w["w"] for w in inside)
+    if len(middle) == len(inside) and all(same(t, w) for t, w in zip(middle, inside)):
+        # те же слова уже стоят в паузе: вставлять нечего; открытое место закроется как «как есть» (confirm_pause)
+        rep["applied"] = [f"уже вписано: «{here}»"]
+        rep["confirm_pause"] = True
+        return {"kind": "missed", "edits": [], "covered": (t_a, t_b), "report": rep}
+    rep["human"] = (f"в паузе уже есть слова («{here}»), ответ с ними не совпадает; исправьте их правкой "
+                    "отрезка или ответом на карточку этих слов")
+    return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+
+
 def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=frozenset()):
     """item — элемент manifest (id, t1, t2, text, speaker); answer — ответ (text, ts).
     -> {"kind", "edits": [...], "covered": (t_from, t_to), "anchors", "report": {...}}"""
     text = answer.get("text") or ""
     cid = item["id"]
-    target_ids = set(item.get("word_ids") or [])
-    place = ([w for w in words if w.get("word_id") in target_ids] if target_ids else
-             [w for w in words if item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01])
+    is_gap = T.is_gap_place(item)             # пропуск: слова места — только начатые в паузе, word_ids не читаются
+    times = T._place_time(item) if is_gap else None
+    if is_gap and times is None:
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": {
+            "id": cid, "answer": text, "kind": "unmatched", "applied": [], "inserted": [], "typos": [],
+            "proposed_delete": [], "deleted": [], "overlap": [],
+            "human": "у места нет годного времени: ответ не применён"}}
+    target_ids = set() if is_gap else set(item.get("word_ids") or [])
+    if is_gap:
+        place = [w for w in words if T.in_pause(w["s"], *times)]
+    else:
+        place = ([w for w in words if w.get("word_id") in target_ids] if target_ids else
+                 [w for w in words if item["t1"] - 0.01 <= w["s"] <= item["t2"] + 0.01])
     target_times = {round(w["s"], 2) for w in place} if target_ids else set()
 
     def card_window(a, b):
@@ -462,6 +526,10 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":
         rep["human"] = "указано только отрицание имени; выберите говорящего"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+    if c["kind"] == "name" and is_gap and not place:
+        rep["human"] = ("в паузе нет слов: одно имя ничего не подписывает; "
+                        "напишите «Имя: услышанные слова»")
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "name":
         eds = [{"op": "relabel", "t": w["s"], "w": w["w"], "word_id": w.get("word_id"), "speaker": c["speaker"], "card": cid, "in_place": True}
@@ -495,23 +563,14 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
             rep["human"] = ("на карточке подтверждения говорящего свой ответ не понят как решение "
                             "о говорящем (нужно имя или «Имя: точные слова»)")
             return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
-    if "missed" in (item.get("reasons") or []) and replies:
-        # пропущенная речь: слов модели нет — весь ответ вставляется в этот промежуток
-        t_a, t_b = float(item["t1"]), float(item["t2"])
+    if is_gap and replies:
+        # пропущенная речь: слова паузы — только начатые в ней; слова ответа, уже стоящие рядом с паузой, не дублируются
         flat = [(spk or item.get("speaker"), x) for spk, ws in replies for x in ws]
         if any(not who for who, _ in flat):
             rep["kind"] = "missed"
             rep["human"] = "не удалось определить говорящего пропущенной речи (в ответе нет «Имя:»)"
             return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
-        step = (t_b - t_a) / (len(flat) + 1)
-        eds = []
-        for q, (spk, x) in enumerate(flat, 1):
-            s = round(t_a + step * q, 3)
-            eds.append({"op": "insert", "s": s, "e": round(s + step * 0.9, 3), "text": x, "speaker": spk,
-                        "card": cid, "in_place": True})
-        rep["kind"] = "missed"
-        rep["inserted"] = [f"{spk}: {' '.join(ws)}" for spk, ws in replies]
-        return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
+        return _pause_answer(item, rep, flat, words, place)
     ans_raw, ans_spk = [], []
     last = None
     for spk, ws in replies:
@@ -766,16 +825,22 @@ def plan(manifest, answers, data, vocab_words=()):
     # места других карточек и сомнительные места стенограммы, покрытые ответом, — закрыты человеком
     closed = {}
     for cid, r in results.items():
-        if any(it.get("id") == cid and it.get("word_ids") for it in items):
+        if any(it.get("id") == cid and it.get("word_ids") and not T.is_gap_place(it) for it in items):
             continue  # Временное покрытие не доказывает покрытие другой карточки по ID.
         if not r.get("covered"):
             continue
         t_a, t_b = r["covered"]
+        pause_answer = r["kind"] == "missed"      # ответ на паузу покрывает слова, начатые в ней, и только их
         for rv in data.get("review") or []:
             if rv["id"] == cid or rv["id"] in answers:
                 continue
-            ws = [w for w in words if rv.get("t1", rv["t"]) - 0.01 <= w["s"] <= rv.get("t2", rv["t"]) + 0.01]
-            inside = [w for w in ws if t_a - 0.01 <= w["s"] <= t_b + 0.01]
+            if T.is_gap_place(rv):
+                rv_times = T._place_time(rv)
+                ws = [w for w in words if rv_times and T.in_pause(w["s"], *rv_times)]
+            else:
+                ws = [w for w in words if rv.get("t1", rv["t"]) - 0.01 <= w["s"] <= rv.get("t2", rv["t"]) + 0.01]
+            inside = [w for w in ws if (T.in_pause(w["s"], t_a, t_b) if pause_answer
+                                        else t_a - 0.01 <= w["s"] <= t_b + 0.01)]
             if ws and len(inside) * 2 >= len(ws):
                 closed.setdefault(rv["id"], cid)
     return edits, reports, closed, conflicts

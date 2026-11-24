@@ -810,6 +810,15 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
                "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
+    confirmed = []
+    if not dry_run:
+        # ответ совпал со словами, уже стоящими в паузе: открытое место закрывается тем же путём, что «как есть»
+        still_open = {r["id"] for r in T.load(json_path).get("review") or []
+                      if r.get("status", "open") in ("open", "human")}
+        confirmed = [r["id"] for r in reports if r.get("confirm_pause") and r["id"] not in blocked
+                     and r["id"] in still_open]
+        if confirmed:
+            T.apply_review(json_path, md_path, [{"id": cid} for cid in confirmed], by="human")
     human = [{"id": aid, "why": reason, "answer": free[aid].get("text")}
              for aid, reason in missing_reasons.items()]
     for r in reports:
@@ -832,7 +841,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
             "closed_via": closed, "conflicts": conflicts, "left_to_human": human,
-            "successful_ids": [r["id"] for r in reports if r["id"] in rep["cards"]
+            "successful_ids": [r["id"] for r in reports if (r["id"] in rep["cards"] or r["id"] in confirmed)
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
                                and not r.get("human")
                                and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
@@ -861,23 +870,30 @@ def preflight_answers(json_path, md_path, decisions_, free):
     claims = {}
     for aid in ids:
         it = items.get(aid) or {}
-        target = set(it.get("word_ids") or []) | set(planned.get(aid) or [])
+        gap_card = T.is_gap_place(it)       # пропуск: цель — слова паузы; word_ids пакета не читаются
+        own = set(T.place_words(data, it)[0] if T.place_words(data, it) else []) if gap_card \
+            else set(it.get("word_ids") or [])
+        target = own | set(planned.get(aid) or [])
         t1, t2 = it.get("t1"), it.get("t2")
-        if not target and t1 is not None and t2 is not None:
+        if not target and not gap_card and t1 is not None and t2 is not None:
             # Старые карточки адресуются временем: берём все слова в диапазоне,
             # а не выбранный эвристикой первый сегмент.
             target = {w.get("word_id") for s in data.get("segments") or [] for w in s.get("words") or []
                       if t1 - 0.01 <= w["s"] <= t2 + 0.01 and w.get("word_id")}
-        claims[aid] = {"ids": target, "legacy": not bool(it.get("word_ids")), "t1": t1, "t2": t2}
+        claims[aid] = {"ids": target, "legacy": gap_card or not bool(it.get("word_ids")), "t1": t1, "t2": t2,
+                       "gap": gap_card}
     conflicts = []
     ordered = sorted(ids)
     for i, a in enumerate(ordered):
         for b in ordered[i + 1:]:
             x, y = claims[a], claims[b]
             shared = x["ids"] & y["ids"]
-            legacy_overlap = (x["legacy"] or y["legacy"]) and all(
-                v is not None for v in (x["t1"], x["t2"], y["t1"], y["t2"])) and \
-                x["t1"] <= y["t2"] + 0.01 and y["t1"] <= x["t2"] + 0.01
+            if x["gap"] or y["gap"]:
+                legacy_overlap = T.places_overlap(items.get(a) or {}, items.get(b) or {})
+            else:
+                legacy_overlap = (x["legacy"] or y["legacy"]) and all(
+                    v is not None for v in (x["t1"], x["t2"], y["t1"], y["t2"])) and \
+                    x["t1"] <= y["t2"] + 0.01 and y["t1"] <= x["t2"] + 0.01
             if shared or legacy_overlap:
                 conflicts.append({"cards": [a, b], "why": "ответы затрагивают общие слова или неоднозначный старый диапазон"})
     return conflicts

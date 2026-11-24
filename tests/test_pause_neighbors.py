@@ -662,6 +662,13 @@ class NeighborRecognitionTests(FreeAnswerCase):
                 _, texts, _ = self.run_answer(backend, far, "Анна: Вот. Ну")
                 self.assertEqual(texts, ["начало", "Вот.", "Ну", "Ну"])
 
+    def test_neighbor_before_the_pause_farther_than_the_limit_is_not_recognized(self):
+        data = custom_result([("w1", "Ну", 0.5, "Анна"), ("w3", "дальше", 4.5, "Анна")], [gap(3.0, 4.0, id="r1")])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                _, texts, _ = self.run_answer(backend, data, "Анна: Ну вот")
+                self.assertEqual(texts, ["Ну", "Ну", "вот", "дальше"])
+
     def test_answer_equal_to_the_neighbor_goes_to_human_with_reason(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend):
@@ -670,7 +677,7 @@ class NeighborRecognitionTests(FreeAnswerCase):
                 place_ = next(i for i in data["review"] if i["id"] == "r1")
                 self.assertEqual(place_["status"], "human")
                 self.assertIn("совпадает со словами стенограммы рядом с паузой", place_.get("note", ""))
-                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "left_for_human")
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "not_applied")
 
     def test_rebuilt_pack_with_the_same_answer_does_not_duplicate(self):
         for backend in BACKENDS:
@@ -720,7 +727,7 @@ class NeighborRecognitionTests(FreeAnswerCase):
                 item = self.place_of(jp, "r1")
                 self.assertEqual(item["status"], "human")
                 self.assertIn("в паузе уже есть слова", item.get("note", ""))
-                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "left_for_human")
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "not_applied")
 
 
 class PauseOverlapAnswersTests(FreeAnswerCase):
@@ -808,7 +815,7 @@ class OldPackFreeAnswersTests(FreeAnswerCase):
         data = custom_result([("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 2.0, "Анна"), ("w3", "дальше", 2.5, "Анна")],
                              [gap(1.0, 2.0, id="r1")])
         cases = (("как есть", {"option": 0}, ["начало", "Ну", "дальше"], "apply_conflict"),
-                 ("имя", {"text": "Анна"}, ["начало", "Ну", "дальше"], "left_for_human"),
+                 ("имя", {"text": "Анна"}, ["начало", "Ну", "дальше"], "not_applied"),
                  ("слова", {"text": "Анна: Вот. Ну"}, ["начало", "Вот.", "Ну", "дальше"], "applied"))
         for backend in BACKENDS:
             for name, answer, want_texts, want_outcome in cases:
