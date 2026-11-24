@@ -710,7 +710,11 @@ def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None,
         reason = rep["failed"][card]
         raise ValueError(reason + (SPAN_REOPEN_HINT if "ответом человека на карточку" in reason else ""))
     c = rep["cards"].get(card, {})
-    return data2, {"card": card, "before": c.get("before"), "after": c.get("after"), "resolved": sorted(closed),
+    # закрытыми называются места по сохранённым статусам: место со сбоем распознавания без прослушивания
+    # при сохранении возвращается в open
+    places = {i["id"]: i for i in data2.get("review") or []}
+    resolved = sorted(rid for rid in closed if (places.get(rid) or {}).get("status") == "resolved")
+    return data2, {"card": card, "before": c.get("before"), "after": c.get("after"), "resolved": resolved,
                    "seen_changed": rep.get("seen_changed", []), "conspects": rep.get("conspects")}
 
 
@@ -788,6 +792,7 @@ EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правк�
                              'человека) или "human" (текст продиктовал человек, только командной строкой); '
                              'без автора правка не принимается')
 SPAN_REOPEN_HINT = "; чтобы решить заново — reopen_review (rt.py reopen)"
+SEVERAL_SPEAKERS = "на отрезке несколько говорящих ({}): укажите speaker"
 
 
 def check_edit_span_author(by):
@@ -1097,6 +1102,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 if any(held(k) for k in ks) or (not ks and any(
                         a <= e["t2"] + 0.01 and e["t1"] - 0.01 <= b for a, b in held_spans)):
                     return HELD_FOR_HUMAN
+                names = list(dict.fromkeys(flat[k]["spk"] for k in ks))
+                if len(names) > 1 and not e.get("speaker") and (e.get("text") or "").strip():
+                    return SEVERAL_SPEAKERS.format(", ".join(names))   # иначе всё ушло бы первому говорящему
                 why = current and _diff_words(current, e["text"], e.get("card", "?"), refuse(e))[2]
                 if why:
                     return "на отрезке есть конфликтующие прежние правки: " + "; ".join(why)
