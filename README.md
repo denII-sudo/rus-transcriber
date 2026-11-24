@@ -209,13 +209,13 @@ $env:HF_TOKEN = "hf_ваш_токен"
 `<папка>` — это `%LOCALAPPDATA%\rus-transcriber` или путь из `-Target`. Если переменная `HF_HOME` уже задана в системе, модели Hugging Face будут храниться там.
 
 ## Как пользоваться
-**Сохранённый процесс П3/П4 (режим SQLite):** нужна явно созданная база
+**Сохранённый процесс (режим SQLite):** нужна явно созданная база
 (`initialize_recording_store`) и выбранный режим `recording_backend = "sqlite"`
 (`set_recording_backend`). Тогда `start_workflow` (или `rt.py workflow-start`)
 сохраняет процесс и запускает обработку без голосовых профилей; при `require_conspect=true` OpenCode автоматически вызывает
 OpenAI `gpt-6-luna` без открытого чата, **только при явном согласии**: по умолчанию
 `allow_cloud_model=false`, текст никуда не уходит. Согласие — `allow_cloud_model=true` в MCP,
-`rt.py workflow-start --conspect --cloud-model` или отметка «нужен конспект» на экране П5
+`rt.py workflow-start --conspect --cloud-model` или отметка «нужен конспект» на локальном экране
 (на экране заказ конспекта и есть согласие). В облако
 уходят только текст слов, деление на реплики с условными метками говорящих («Участник 1»,
 «Участник 2»…) и ограниченные поля задания, не имена говорящих, аудио, пути, биометрия
@@ -225,18 +225,18 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
 свёртки идут «по одной»: чистая — в «», с автором, которого пишет программа; задевшая
 неразобранное место — без кавычек с пометкой «по распознаванию, не проверено» и временем
 (после разбора кавычки возвращаются при пересборке, без облака); не найденная в стенограмме —
-без кавычек с пометкой «не найдено» (на экране П5 у такой свёртки — строка «Не найдено в
+без кавычек с пометкой «не найдено» (на локальном экране у такой свёртки — строка «Не найдено в
 стенограмме цитат: N из M»; если таких цитат не меньше 3 и не меньше 20 %, а запрос разрешает
 облако, человек может по кнопке или через `workflow_repair_quotes` попросить модель исправить их:
 в облако уйдут только разделы с такими цитатами, один вызов на нажатие, ничего без согласия). Подробности и временные ограничения — в
 `docs/2026-11-17-p4-opencode-openai-handoff.md`. Старые записи в базу автоматически не
-переносятся: это отдельный перенос П7
+переносятся: это отдельный перенос старых данных
 ([`docs/legacy-migration.md`](docs/legacy-migration.md); итог на установке владельца —
 [`docs/2026-11-21-p7-migration-handoff.md`](docs/2026-11-21-p7-migration-handoff.md)).
 Запрет облака у сохранённого запроса нельзя снять изменением его политики;
 после отказа для облачной обработки создайте новый запрос с явным разрешением.
 
-**П5 — локальный экран без терминала:** `python rt.py screen` открывает в браузере
+**Локальный экран без терминала:** `python rt.py screen` открывает в браузере
 секретный локальный адрес: запуск обработки, состояние и готовность, стенограмма
 и конспекты с путями к файлам, добровольные уточнения, история версий с просмотром
 и возвратом «как текущую», общий список файлов, изменённых вне программы (для записей в базе:
@@ -282,7 +282,7 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
 - `list_jobs` — последние задачи.
 
 Остальные инструменты сервера (полный список — в описаниях инструментов, которые видит клиент):
-- процесс П3/П4: `start_workflow`, `workflow_status`, `workflow_list`, `workflow_questions`, `workflow_change_policy`,
+- сохранённый процесс: `start_workflow`, `workflow_status`, `workflow_list`, `workflow_questions`, `workflow_change_policy`,
   `workflow_mark_reviewed`, `workflow_abandon_request`, модельные задания `workflow_model_task`,
   `workflow_model_part`, `workflow_model_part_result`, `workflow_model_result`, `workflow_execute_model`, `workflow_repair_quotes`;
 - записи в SQLite: `initialize_recording_store`, `set_recording_backend`, `set_recording_display_name`,
@@ -688,7 +688,7 @@ gigaam 0.2.0 requires onnxruntime, which is not installed
   - конспект: `conspect-confirm`, `conspect-candidates`, `conspect-select`;
   - голоса: `profiles`, `voice-preview`, `voice-update`, `voice-revoke`, `voice-refresh-plan`, `voice-quality`,
     `voice-quality-policy`, `voice-auto-learn`, `voice-backup` (изменяющие команды спрашивают согласие в терминале);
-  - процесс П3/П4 и экран П5: `workflow-start`, `workflow-status`, `workflow-list`, `workflow-questions`,
+  - сохранённый процесс и локальный экран: `workflow-start`, `workflow-status`, `workflow-list`, `workflow-questions`,
     `workflow-policy`, `workflow-confirm`, `workflow-abandon`, `workflow-task`, `workflow-part`, `workflow-part-result`,
     `workflow-result`, `workflow-execute`, `screen [--port 8766] [--hours 6]`, `db-backup`, `db-restore`;
   - данные: `export`, `import`, `delete-group`, `cleanup`, `migrate`, `audit`, `approve`.

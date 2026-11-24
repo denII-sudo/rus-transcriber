@@ -649,222 +649,7 @@ def workflow_abandon(snapshot):
         store.close()
 
 
-# ---------- П5: локальный экран и эксплуатация ----------
-def workflow_list(limit=20):
-    """Последние сохранённые запросы для локального экрана; без тяжёлых чтений."""
-    import recordings
-    import workflow
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        return workflow.list_recent(store, limit)
-    finally:
-        store.close()
-
-
-def recording_revisions(recording_id, kind):
-    """История ревизий записи (transcript/review) с происхождением; хэши снимков проверяются."""
-    import recordings
-    if kind not in ("transcript", "review"):
-        raise CoreError("некорректный тип ревизии")
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        result = []
-        for revision in store.list_revisions(recording_id, kind):
-            data = store.get_revision(recording_id, kind, revision)
-            context = data["context"]
-            item = {"kind": kind, "revision": revision, "restored_from": data["restored_from"],
-                    "actor_kind": context.get("actor_kind"),
-                    "initiated_by": (context.get("initiated_by") or {}).get("user_name_snapshot")}
-            row = store.db.execute("SELECT created_at FROM operations WHERE operation_id=?",
-                                   (data["operation_id"],)).fetchone()
-            item["created_at"] = row["created_at"] if row else None
-            if kind == "review":
-                item["source_revision"] = data["source_revision"]
-            else:
-                paired = store.db.execute(
-                    "SELECT revision FROM review_revisions WHERE recording_id=? AND source_revision=? "
-                    "ORDER BY revision DESC LIMIT 1", (recording_id, revision)).fetchone()
-                item["restore_review_revision"] = paired["revision"] if paired else None
-            result.append(item)
-        return result
-    finally:
-        store.close()
-
-
-def read_recording_revision(recording_id, kind, revision):
-    """Прочитать сохранённую ревизию для просмотра истории; текущая ревизия не меняется."""
-    import recordings
-    if kind not in ("transcript", "review"):
-        raise CoreError("некорректный тип ревизии")
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        data = store.get_revision(recording_id, kind, int(revision))
-        context = data["context"]
-        return {"kind": kind, "revision": data["revision"], "restored_from": data["restored_from"],
-                "payload": data["payload"], "actor_kind": context.get("actor_kind"),
-                "initiated_by": (context.get("initiated_by") or {}).get("user_name_snapshot")}
-    finally:
-        store.close()
-
-
-def _conspect_screen_sections(payload):
-    """Разделы конспекта для экрана. Прежнее поле `sections` отдаётся как есть; если его нет,
-    берутся тексты из `evidence` (так исполнитель свёртки сохраняет разделы), без номеров слов."""
-    sections = payload.get("sections")
-    if isinstance(sections, list):
-        return sections
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, list):
-        return []
-    return [{"text": item["text"]} for item in evidence
-            if isinstance(item, dict) and isinstance(item.get("text"), str)]
-
-
-def quote_repair_view(payload):
-    """Цитаты свёртки «по одной» для строки экрана: сколько не найдено в стенограмме и достигнут ли порог
-    исправления (порог и счёт — workflow.quotes_need_repair, workflow.quote_counts). None — у остальных свёрток."""
-    import workflow
-    counts = workflow.quote_counts(payload)
-    if counts is None:
-        return None
-    return {"unlinked": counts[0], "total": counts[1], "needed": workflow.quotes_need_repair(*counts)}
-
-
-def quote_repair_state(store, name):
-    """Для кнопки на экране: запрос свёртки, доступно ли исправление цитат и почему нет. Только чтение."""
-    import storage
-    import workflow
-    if not name.startswith("workflow-"):
-        return {"request_id": None, "available": False,
-                "reason": "это не свёртка запроса; исправление цитат недоступно"}
-    request_id = name[len("workflow-"):]
-    try:
-        problem = workflow.quote_repair_problem(store, workflow.get(store, request_id), screen=True)
-    except (KeyError, ValueError, storage.StorageError):
-        return {"request_id": request_id, "available": False, "reason": "запрос этой свёртки не найден"}
-    return {"request_id": request_id, "available": problem is None, "reason": problem}
-
-
-def workflow_repair_quotes_prepare(request_id):
-    """Снимок для окна согласия на экране: что уйдёт в облако. Ничего не отправляет."""
-    import recordings
-    import workflow
-    store = recordings.open_store()
-    try:
-        return workflow.quote_repair_prepare(store, request_id)
-    finally:
-        store.close()
-
-
-def workflow_repair_quotes_info(request_id):
-    """MCP без согласия: доступно ли исправление, почему нет, сколько уйдёт. Ничего не отправляет."""
-    import recordings
-    import workflow
-    store = recordings.open_store()
-    try:
-        return workflow.quote_repair_info(store, request_id)
-    finally:
-        store.close()
-
-
-def workflow_repair_quotes(request_id, *, via, snapshot=None, allow_cloud_model=False):
-    """Один вызов облака по явному согласию человека (экран: со снимком; MCP: с allow_cloud_model=true)."""
-    import recordings
-    import workflow
-    store = recordings.open_store()
-    try:
-        return workflow.repair_quotes(store, request_id, via=via, snapshot=snapshot,
-                                      allow_cloud_model=allow_cloud_model)
-    finally:
-        store.close()
-
-
-def recording_conspects(recording_id):
-    """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
-    import recordings
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        result = []
-        for item in store.list_conspects(recording_id):
-            root = store.db.execute("SELECT path FROM allowed_roots WHERE root_id=?",
-                                    (item["root_id"],)).fetchone()
-            locations = store.db.execute(
-                "SELECT kind, relative_path FROM conspect_file_locations WHERE conspect_id=?",
-                (item["conspect_id"],)).fetchall()
-            files = {loc["kind"]: str(Path(root["path"]) / loc["relative_path"])
-                     for loc in locations} if root else {}
-            result.append({"conspect_id": item["conspect_id"], "name": item["name"],
-                           "current_revision": item["current_revision"],
-                           "source_revision": item["source_revision"],
-                           "sections": _conspect_screen_sections(item["payload"]),
-                           "quote_repair": (None if quote_repair_view(item["payload"]) is None else
-                                            {**quote_repair_view(item["payload"]),
-                                             **quote_repair_state(store, item["name"])}),
-                           "files": files})
-        return result
-    finally:
-        store.close()
-
-
-def prepare_restore_snapshot(recording_id, source_revision, review_revision):
-    """Снимок для возврата прежней ревизии парой; подтверждение человека привязано к снимку."""
-    import recordings
-    import storage
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        head = recordings.recording_head(store, recording_id)
-        if head is None:
-            raise KeyError(recording_id)
-        expected = {"source_revision": head["source_revision"], "review_revision": head["review_revision"]}
-        restored_review = store.get_revision(recording_id, "review", int(review_revision))
-        if restored_review["source_revision"] != int(source_revision):
-            raise storage.Conflict("пара ревизий несовместима")
-        store.get_revision(recording_id, "transcript", int(source_revision))
-        binding = recordings.document_binding(store, recording_id)
-        return {"recording_id": recording_id, "source_revision": int(source_revision),
-                "review_revision": int(review_revision), "expected_versions": expected,
-                "document_revision": binding["document_revision"], "root_id": binding["root_id"],
-                "document": str(binding["root"] / binding["paths"]["md"]),
-                "context": recordings.operation_context(store, "human")}
-    finally:
-        store.close()
-
-
-def restore_recording_revision(snapshot):
-    """Вернуть прежнюю ревизию как новую текущую; история сохраняется, файлы формируются заново."""
-    import documents
-    import recordings
-    if not isinstance(snapshot, dict) or "recording_id" not in snapshot:
-        raise CoreError("неверный снимок возврата")
-    current = prepare_restore_snapshot(snapshot["recording_id"], snapshot["source_revision"],
-                                       snapshot["review_revision"])
-    if current != snapshot:
-        raise CoreError("состояние записи изменилось после запроса возврата")
-    store = recordings.open_store()
-    try:
-        store.current_identity()
-        documents.guard_before_write(store, snapshot["recording_id"])
-        result = store.restore_with_document(
-            snapshot["recording_id"], snapshot["source_revision"], snapshot["review_revision"],
-            snapshot["expected_versions"], str(uuid.uuid4()), snapshot["context"],
-            root_id=snapshot["root_id"],
-            generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        completed = recordings.materialize_recording(store, snapshot["recording_id"])
-        failure = documents.unsynced(store, snapshot["recording_id"], result["document_revision"], completed)
-        result["materialized"] = failure is None
-        result["outcome"] = "written" if failure is None else failure.status
-        if failure is not None:
-            result["reason"] = str(failure)
-        return result
-    except (OSError, ValueError, KeyError) as ex:
-        raise CoreError(f"возврат не выполнен или формирование не завершено: {ex}") from ex
-    finally:
-        store.close()
+# ---------- экран: перенесён в core_screen.py (имена прежние, переотдача — в конце файла) ----------
 
 
 # ---------- конфликты внешней правки: копия человека и явная замена файла ----------
@@ -1216,12 +1001,14 @@ def _copy_problem(store, row):
     return None
 
 
-def _damaged_stops(store, row, rows, program, row_state):
-    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row.
+def _set_stops(store, row, rows, program, row_state):
+    """Файлы с принятым решением, на которых запись встанет, не дойдя до файла row: (все такие, из них изменённые).
 
-    row_state — состояние файла row. Файлы документа сверяются все до первой замены в порядке `documents.WRITE_ORDER`:
-    копия раньше row в этом порядке останавливает запись всегда, позже — только если row не изменён после решения
-    (изменённый файл даёт новый конфликт раньше, чем сверка дойдёт до копии)."""
+    Каждый сверяется тем же правилом, что и при записи (`documents.file_verdict`): изменён после решения — запись
+    откроет по нему новый конфликт; повреждена копия решения — встанет без конфликта. row_state — состояние файла row.
+    Порядок отказов документа — `documents.stopped_by`: файл раньше row останавливает запись всегда, позже — только
+    если row не изменён после решения (изменённый row даёт новый конфликт раньше). У свёртки правки ищутся по всем
+    файлам сразу, порядка нет. Файл, исчезнувший после решения, здесь не назван (как и раньше)."""
     import documents
     decided = {}
     for other in rows:
@@ -1234,19 +1021,44 @@ def _damaged_stops(store, row, rows, program, row_state):
         decided[(other["revision"], other["relative_path"])] = other
     table, column, revision = (("document_outbox", "recording_id", "document_revision") if row["scope"] == "document"
                                else ("conspect_outbox", "conspect_id", "revision"))
-    found = set()
+    found = []    # (решение, изменён ли файл после решения)
+    own = (row["revision"], row["relative_path"])
     for other in decided.values():
-        if row["scope"] == "document" and other["revision"] == row["revision"] and row_state != "same":
-            order = documents.WRITE_ORDER
-            if order.index(other["kind"]) > order.index(row["kind"]):
-                continue
         state, digest = _file_at(store, other, other["relative_path"])
-        if state != "ok" or digest != other["observed_hash"] or digest == documents._digest(program[other["kind"]]):
+        program_hash = documents._digest(program[other["kind"]])
+        if state != "ok" or digest == program_hash:
             continue
-        if store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
-                            (row["object"][1], other["revision"])).fetchone() and _copy_problem(store, other):
-            found.add(Path(other["relative_path"]).name)
-    return sorted(found)
+        if not store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
+                                (row["object"][1], other["revision"])).fetchone():
+            continue
+        if digest == other["observed_hash"]:    # принятые байты: встанет, только если копия решения повреждена
+            if _copy_problem(store, other):
+                found.append((other, False))
+        elif ((other["revision"], other["relative_path"]) != own    # свой файл: его состояние — row_state
+              and documents.file_verdict(digest, program_hash, None, other) == "external"):
+            found.append((other, True))
+    if row["scope"] == "document":
+        verdicts = {other["kind"]: "external" if changed else "damaged_copy" for other, changed in found
+                    if other["revision"] == row["revision"] and (other["revision"], other["relative_path"]) != own}
+        verdicts[row["kind"]] = "accepted" if row_state == "same" else "refused"
+        allowed = set(documents.stopped_by(verdicts, row["kind"]))
+        found = [(other, changed) for other, changed in found
+                 if other["revision"] != row["revision"] or (other["revision"], other["relative_path"]) == own
+                 or other["kind"] in allowed]
+    return (sorted({Path(other["relative_path"]).name for other, _ in found}),
+            sorted({Path(other["relative_path"]).name for other, changed in found if changed}))
+
+
+def _stops_words(stops, changed):
+    """Чем остановится запись, словами: повреждённые копии и файлы, изменённые после решения."""
+    damaged = [name for name in stops if name not in changed]
+    parts = []
+    if damaged:
+        parts.append("повреждённая копия файла " + ", ".join(f"«{name}»" for name in damaged))
+    if changed:
+        parts.append("файл " + ", ".join(f"«{name}»" for name in changed) + ": его изменили после принятого решения, "
+                     "и программа покажет по нему новый конфликт")
+    return "; ".join(parts)
 
 
 def _effect(row, state, waits, stops):
@@ -1281,6 +1093,7 @@ def replacement_effect(recording_id, conflict_id, kind):
             raise CoreError(facts["reason"])
         blocked = bool(_unresolvable_wait(store, row, _conflict_rows(store, kind)))
         return {"effect": facts["effect"], "waits": facts["waits_for"], "stops": facts["stops_for"],
+                "stops_changed": facts["stops_changed"],
                 "changed": facts["file_state"] == "changed", "blocked": blocked}
     finally:
         store.close()
@@ -1304,15 +1117,15 @@ def _conflict_facts(store, row):
     also = [] if reason else _also_replaced(store, row, program)
     rows = [] if reason else _conflict_rows(store, row["scope"])
     waits = [] if reason else _waits_for(row, rows)
-    stops = [] if reason else _damaged_stops(store, row, rows, program, state)
+    stops, changed = ([], []) if reason else _set_stops(store, row, rows, program, state)
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
-            "also_replaces": also, "waits_for": waits, "stops_for": stops,
+            "also_replaces": also, "waits_for": waits, "stops_for": stops, "stops_changed": changed,
             "effect": None if reason else _effect(row, state, waits, stops), "can_replace": reason is None, "reason": reason,
             "snapshot": None if reason else {
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
                 "program_hash": program_hash, "also_replaces": also, "waits_for": waits,
-                "stops_for": stops}}
+                "stops_for": stops}}    # причины остановки в снимок не входят: состав снимка прежний
 
 
 def _lines(text):
@@ -1539,6 +1352,7 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "also_replaces": facts["also_replaces"] if can_replace else [],
                 "waits_for": facts["waits_for"] if can_replace else [], "waits_blocked": bool(waits),
                 "stops_for": facts["stops_for"] if can_replace else [],
+                "stops_changed": facts["stops_changed"] if can_replace else [],
                 "effect": facts["effect"] if can_replace else None,
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
@@ -1680,7 +1494,7 @@ def _next_step(store, row, rows, problem):
     found, digest = _file_at(store, row, row["relative_path"])
     state = found if found != "ok" else "same" if digest == row["observed_hash"] else "changed"
     waits = _waits_for(row, rows)
-    stops = _damaged_stops(store, row, rows, program, state)
+    stops, changed = _set_stops(store, row, rows, program, state)
     effect = _effect(row, state, waits, stops)
     waiting = ""
     if waits:
@@ -1709,6 +1523,9 @@ def _next_step(store, row, rows, problem):
     if effect == "recopy":
         return effect, ("Файл изменён после принятого решения, поэтому заменён не будет: при повторе программа "
                         "покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+    if effect == "stopped" and changed:
+        return effect, ("Этот файл сейчас не будет записан: запись встанет раньше — " + _stops_words(stops, changed)
+                        + ". Выход указан в карточке того файла.")
     if effect == "stopped":
         return effect, ("Этот файл не будет записан, пока не разобрана повреждённая копия: "
                         + ", ".join(f"«{name}»" for name in stops) + ". Выход указан в карточке того файла.")
@@ -3241,4 +3058,21 @@ from core_voices import (  # noqa: E402,F401
     voice_profiles,
     voice_quality,
     voice_refresh_plan,
+)
+
+
+# ---------- экран: перенесён в core_screen.py, имена прежние ----------
+from core_screen import (  # noqa: E402,F401
+    _conspect_screen_sections,
+    prepare_restore_snapshot,
+    quote_repair_state,
+    quote_repair_view,
+    read_recording_revision,
+    recording_conspects,
+    recording_revisions,
+    restore_recording_revision,
+    workflow_list,
+    workflow_repair_quotes,
+    workflow_repair_quotes_info,
+    workflow_repair_quotes_prepare,
 )

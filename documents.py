@@ -264,6 +264,25 @@ def file_verdict(current, desired, expected, override):
     return "stale"
 
 
+ACCEPTABLE = frozenset({"ok", "stale", "accepted", "missing"})    # итоги file_verdict, с которыми запись идёт дальше
+
+
+def refusals(verdicts):
+    """Виды файлов набора, на которых встанет запись, в порядке записи `WRITE_ORDER`.
+
+    verdicts — {вид: итог `file_verdict` или иная метка отказа, например 'error' — файл не сверить}. Запись встаёт
+    на первом из списка. Единственная копия правила порядка: её берут писатель документов (сверка до первой замены)
+    и экран конфликтов (`stopped_by`)."""
+    return [kind for kind in WRITE_ORDER if kind in verdicts and verdicts[kind] not in ACCEPTABLE]
+
+
+def stopped_by(verdicts, kind):
+    """Другие файлы набора, на которых запись встанет, не дойдя до файла kind: всё, что раньше него в списке
+    отказов; если сам kind допустим — весь список (отказ позже kind всё равно встретится до первой замены)."""
+    order = refusals(verdicts)
+    return [other for other in (order[:order.index(kind)] if kind in order else order) if other != kind]
+
+
 def _override_row(store, rid, rev, kind, filename):
     return store.db.execute(
         "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
@@ -282,22 +301,32 @@ def _authorized_root(store, root_id, root_path):
     return root
 
 
-def _check_current(store, root, rid, rev, kind, filename, desired, expected):
-    """Сверить один текущий файл записи; ничего не пишет. -> (путь, файл отличается от версии программы).
-
-    Допустимы: версия программы, предыдущая версия из очереди и байты, принятые человеком при замене конфликта.
-    Всё прочее — внешняя правка (`_FileConflict`); исчезнувший после подтверждения файл — `storage.Conflict`;
-    испорченная копия принятого решения — `DamagedCopy`. Правило одно: его вызывают и сверка набора до первой замены,
-    и повтор прямо перед заменой."""
+def _verdict_current(store, root, rid, rev, kind, filename, desired, expected):
+    """Итог `file_verdict` для одного текущего файла записи; ничего не пишет. -> (путь, хэш, итог)."""
     path = _target(root, filename)
     current = _file_hash(path)
-    verdict = file_verdict(current, desired, expected, _override_row(store, rid, rev, kind, filename))
+    return path, current, file_verdict(current, desired, expected, _override_row(store, rid, rev, kind, filename))
+
+
+def _refuse(kind, filename, path, verdict):
+    """Отказ записи по итогу `file_verdict`: внешняя правка — `_FileConflict`; исчезнувший после подтверждения
+    файл — `storage.Conflict`; испорченная копия принятого решения — `DamagedCopy`. Допустимый итог — без отказа."""
     if verdict == "gone_after_confirmation":
         raise storage.Conflict("external document disappeared after confirmation")
     if verdict == "external":
         raise _FileConflict(kind, path)
     if verdict == "damaged_copy":
         raise DamagedCopy(_damaged_message(filename))
+
+
+def _check_current(store, root, rid, rev, kind, filename, desired, expected):
+    """Сверить один текущий файл записи; ничего не пишет. -> (путь, файл отличается от версии программы).
+
+    Допустимы: версия программы, предыдущая версия из очереди и байты, принятые человеком при замене конфликта;
+    иначе отказ (`_refuse`). Вызывается повтором прямо перед заменой; сверка набора до первой замены берёт тот же
+    итог через `refusals`."""
+    path, current, verdict = _verdict_current(store, root, rid, rev, kind, filename, desired, expected)
+    _refuse(kind, filename, path, verdict)
     return path, current != desired
 
 
@@ -459,8 +488,20 @@ def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=N
                 def check(kind):
                     return _check_current(store, root, rid, rev, kind, paths[kind], _digest(doc[kind]),
                                           expected_hashes[kind])
-                for kind in WRITE_ORDER:      # сначала сверить все три: отказ не оставит смешанного набора
-                    check(kind)
+
+                def verdict(kind):
+                    try:
+                        return _verdict_current(store, root, rid, rev, kind, paths[kind], _digest(doc[kind]),
+                                                expected_hashes[kind])
+                    except Exception as exc:    # файл не сверить: отказ на своём месте в порядке записи
+                        return exc
+                # сначала сверить все три: отказ не оставит смешанного набора; встаёт на первом отказе (`refusals`)
+                found = {kind: verdict(kind) for kind in WRITE_ORDER}
+                for kind in refusals({kind: "error" if isinstance(item, Exception) else item[2]
+                                      for kind, item in found.items()})[:1]:
+                    if isinstance(found[kind], Exception):
+                        raise found[kind]
+                    _refuse(kind, paths[kind], found[kind][0], found[kind][2])
                 for kind in WRITE_ORDER:
                     path, stale = check(kind)  # повтор прямо перед заменой: окно «сверка → замена» не шире прежнего
                     if stale:

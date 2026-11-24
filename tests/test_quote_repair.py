@@ -60,7 +60,7 @@ APPROVED_MCP = (
     "локально, не найденная остаётся с пометкой. Повторяйте только по новой просьбе человека.")
 APPROVED_INSTRUCTIONS = (
     "Ненайденные цитаты готовой свёртки модель исправляет только по просьбе человека: workflow_repair_quotes "
-    "(allow_cloud_model=true — лишь при его прямом согласии на эту отправку) или кнопка на экране П5.")
+    "(allow_cloud_model=true — лишь при его прямом согласии на эту отправку) или кнопка на локальном экране.")
 APPROVED_WINDOW = [      # {name}, {unlinked}, … подставляет программа; в странице это ${s.name}, ${s.unlinked}, …
     "Исправление цитат облачной моделью",
     "В свёртке «{name}» не найдено в стенограмме {unlinked} из {total} цитат. Программа может попросить облачную "
@@ -493,7 +493,7 @@ class ApplyTests(RepairBase):
                     calls.append((path.name, node.func.attr, "allow_cloud_model" in keys,
                                   isinstance(keys.get("allow_cloud_model"), ast.Constant)
                                   and keys["allow_cloud_model"].value is True))
-        self.assertEqual(sorted(calls), [("core.py", "repair_quotes", True, False),
+        self.assertEqual(sorted(calls), [("core_screen.py", "repair_quotes", True, False),
                                          ("server.py", "workflow_repair_quotes", True, True),
                                          ("workflow_page.py", "workflow_repair_quotes", True, True)])
 
