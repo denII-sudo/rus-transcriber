@@ -193,6 +193,18 @@ class PartTaskTests(unittest.TestCase):
         self.assertNotIn("Открыли встречу", view_text)
         self.assertNotIn("Изложение предыдущих частей", prompt_of(model_tasks.part_task(self.task, 1)))
 
+    def test_part_request_forbids_quoting_the_summary(self):
+        prompt = prompt_of(model_tasks.part_task(self.task, 2), summary=[["Открыли встречу."]])
+        self.assertIn("не бери из него цитаты и не опирайся на него в разделах этой части", prompt)
+
+    def test_summary_for_a_task_without_part_is_refused_before_sending(self):
+        client = llm_provider.OpenCodeTextClient()
+        with mock.patch.object(client, "_generate_text") as call:
+            for task in (self.task, GOLDEN_TASK):
+                with self.assertRaises(ValueError):
+                    client.generate(task, summary=[["Открыли встречу."]])
+        call.assert_not_called()
+
 
 class SummaryTests(unittest.TestCase):
     @staticmethod
@@ -418,6 +430,38 @@ class LongWorkflowTests(unittest.TestCase):
         self.assertEqual((error.exception.code, len(self.sent)), ("limit", 0))
         self.assertIn("6000 слов", str(error.exception))
         self.assertEqual(workflow.get(self.store, request)["state"], "processed")
+
+    # Запись 2 990 слов из пунктов по 120 слов (и одного в 110) при пределе 1 000 и 3 частях не делится:
+    # первая часть — не больше 960 слов, остаток 2 030 в две части по 1 000 не входит, 4 части — сверх предела.
+    UNSPLIT = (120,) * 24 + (110,)
+
+    def test_record_that_cannot_be_split_is_refused_before_the_cloud(self):
+        request = self.prepare_request(turn_words=self.UNSPLIT)
+        with mock.patch("llm_provider.MAX_PARTS", 3):
+            for kwargs in ({}, {"restart": True}):
+                with self.subTest(**kwargs), self.assertRaises(llm_provider.ProviderError) as error:
+                    self.execute(request, **kwargs)
+                self.assertEqual((error.exception.code, len(self.sent)), ("limit", 0))
+                self.assertIn("не делится", str(error.exception))
+                self.assertEqual(workflow.get(self.store, request)["state"], "processed")
+
+    def test_record_that_cannot_be_split_gets_a_task_without_parts_for_the_agent(self):
+        request = self.prepare_request(turn_words=self.UNSPLIT)
+        with mock.patch("llm_provider.MAX_PARTS", 3):
+            task = workflow.prepare_model_task(self.store, request)
+        self.assertNotIn("parts", task)
+        self.assertEqual(len(task["words"]), 2990)
+        self.assertEqual(len(workflow._part_bounds(task)), 1)
+
+    def test_saved_part_longer_than_the_limit_is_refused_before_the_cloud(self):
+        request = self.prepare_request()
+        task = workflow.prepare_model_task(self.store, request)          # части по 800, 900 и 800 слов
+        self.assertEqual(task["parts"], [[1, 8], [9, 17], [18, 25]])
+        with mock.patch("llm_provider.MAX_WORDS", 850), self.assertRaises(llm_provider.ProviderError) as error:
+            self.execute(request)
+        self.assertEqual((error.exception.code, len(self.sent)), ("limit", 0))
+        self.assertIn("(850 слов)", str(error.exception))
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
 
     def test_old_waiting_task_without_parts_keeps_the_old_limit(self):
         request = self.prepare_request()
