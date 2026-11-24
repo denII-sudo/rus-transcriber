@@ -87,7 +87,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.24.10"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.24.11"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -1013,7 +1013,7 @@ async def self_check(tests: bool = True) -> str:
     процессе, с отдельной временной папкой данных — настоящие данные не трогаются), проверка файлов программы на
     личные данные (tools/check_repo.py: только где нарушение, сами слова не показываются) и морфология
     (pymorphy3 для подсказок словаря). Только проверки, ничего не меняет. tests=False — без тестов (быстро).
-    Тесты идут 15–60 с. Итог: ok, summary и подробности по каждой части."""
+    Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части."""
     import selfcheck
     r = await asyncio.to_thread(selfcheck.run, VERSION, bool(tests), True, True)
     return json.dumps(r, ensure_ascii=False, indent=1)

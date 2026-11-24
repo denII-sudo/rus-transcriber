@@ -187,6 +187,19 @@ class RunWordsWithSavingTests(Sandbox):
         self.assertNotIn("synthetic.wav", path.read_text(encoding="utf-8"))   # имён файлов и путей нет
         self.assertTrue(runinfo.scrub(rec) == rec)
 
+    def test_file_names_the_program_version_and_the_code(self):
+        """Блок program не подменяется пометкой «не передано/не измерено»: версия и сумма файлов кода есть."""
+        self.scenario("three_models")
+        (path,) = self.files()
+        program = json.loads(path.read_text(encoding="utf-8"))["program"]
+        version = program.get("version")
+        self.assertTrue(isinstance(version, str) and version.strip(), program)
+        self.assertEqual(version, runinfo.program_version(worker.HERE))
+        code = program.get("code")
+        self.assertNotIn("status", code or {}, program)      # {"status": "not_measured"|"not_available", ...}
+        self.assertTrue(isinstance(code.get("files_sha256"), str) and code["files_sha256"], program)
+        self.assertGreater(code.get("files", 0), 0, program)
+
     def test_doubt_mode_marks_chunks_the_third_model_did_not_hear(self):
         self.scenario("whisper_doubt")
         (path,) = self.files()
