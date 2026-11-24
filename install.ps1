@@ -777,6 +777,7 @@ if ($Source -ne $Target) {
         "data_io.py"
         "core.py"
         "core_voices.py"
+        "core_screen.py"
         "core_conflicts.py"
         "confirm.py"
         "tmpfiles.py"
