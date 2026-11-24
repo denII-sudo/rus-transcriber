@@ -279,6 +279,25 @@ class DoubtsSectionTests(Base):
             self.assertIn("открыто", line)
 
 
+class CardQuestionTests(Base):
+    """Т9: вопрос карточки места asr_problem по-русски; название состояния (латиница) не выводится."""
+
+    STATES = (("disagreement", "Модели распознали по-разному"), ("error", "сбой распознавания"),
+              ("empty_unknown", "модель не выдала слов"), ("filtered", "удалён очисткой"),
+              ("future_state", "результат неполон или неизвестен"))
+
+    def test_question_is_russian(self):
+        for state, words in self.STATES:
+            with self.subTest(state=state), files("sqlite", result(state=state)) as (jp, _md, _v):
+                question = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r3")["question"]
+                self.assertIn(words, question)
+                self.assertNotIn(state, question)
+                self.assertNotRegex(question, r"disagreement|empty_unknown|error|filtered|_")
+                self.assertIn("Прослушайте весь интервал", question)
+                if state == "disagreement":
+                    self.assertTrue(question.startswith("Модели распознали по-разному"), question)
+
+
 class OnePlaceRuleTests(unittest.TestCase):
     """Т10: правило «место открыто» записано один раз — transcript.place_open / place_unresolved."""
 
