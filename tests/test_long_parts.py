@@ -73,10 +73,11 @@ def times_with_gaps(total, gaps):
 
 
 def part_answer(task, text="Раздел части."):
-    """Верный ответ части (или всего задания): один раздел от первого до последнего пункта."""
+    """Верный ответ части (или всего задания): разделы подряд по 12 пунктов (не длиннее 1 500 слов)."""
     first, final = model_tasks.part_range(task)
-    return {"source_revision": task["source_revision"],
-            "sections": [{"from": first, "to": final, "text": f"{text} Пункты {first}–{final}."}]}
+    sections = [{"from": start, "to": min(start + 11, final), "text": f"{text} Пункты {start}–{min(start + 11, final)}."}
+                for start in range(first, final + 1, 12)]
+    return {"source_revision": task["source_revision"], "sections": sections}
 
 
 class GoldenTests(unittest.TestCase):

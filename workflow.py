@@ -433,6 +433,72 @@ def _task_words(transcript, review, *, task_version=model_tasks.CURRENT_VERSION)
     return words
 
 
+def _word_times(transcript):
+    """Время слов в порядке _task_words: (начало, конец) в секундах или None. В задание не попадает."""
+    result = []
+    for segment in transcript.get("segments", []):
+        for word in segment.get("words", []):
+            start, end = word.get("s"), word.get("e")
+            timed = all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (start, end))
+            result.append((float(start), float(end)) if timed else None)
+    return result
+
+
+def _pause_after(points, times, number):
+    """Пауза в секундах между пунктом number (с 1) и следующим; None — у слов нет времени."""
+    before, after = times[points[number - 1]["end"] - 1], times[points[number]["start"]]
+    return None if before is None or after is None else after[0] - before[1]
+
+
+def _try_parts(points, times, total, count, limit):
+    """Деление на count частей не длиннее limit слов или None, если так разделить нельзя."""
+    size = total / count
+    cuts, previous = [], 0
+    for k in range(1, count):
+        target = k * size
+        options = [number for number in range(1, len(points))
+                   if previous < points[number - 1]["end"] <= previous + limit
+                   and total - points[number - 1]["end"] <= (count - k) * limit]
+        if not options:
+            return None
+
+        def distance(number):
+            return abs(points[number - 1]["end"] - target), points[number - 1]["end"]
+        near = [number for number in options if abs(points[number - 1]["end"] - target) <= size / 10]
+        timed = [(_pause_after(points, times, number), number) for number in near]
+        timed = [(pause, number) for pause, number in timed if pause is not None]
+        if timed:
+            longest = max(pause for pause, _number in timed)
+            cut = min((number for pause, number in timed if pause == longest), key=distance)
+        else:
+            cut = min(options, key=distance)
+        cuts.append(cut)
+        previous = points[cut - 1]["end"]
+    return [[first, final] for first, final in zip([1] + [cut + 1 for cut in cuts], cuts + [len(points)])]
+
+
+def _plan_parts(points, times):
+    """Части записи длиннее предела одного запроса: [[первый пункт, последний пункт], ...] или None.
+
+    W — число слов, N = ceil(W / MAX_WORDS). Граница k ищется у цели k·W/N среди границ пунктов:
+    самая длинная пауза между пунктами в окне ±10 % размера части (W/N), но так, чтобы ни одна
+    часть не превысила MAX_WORDS слов; при равных паузах — ближе к цели. Если в окне нет пауз
+    (у слов нет времени), берётся граница пункта, ближайшая к цели, при том же условии. Пункт —
+    реплика или её кусок не длиннее 120 слов, поэтому делится и монолог. Если при N частях
+    условие не выполнить, пробуется N + 1. Больше MAX_PARTS частей — ValueError. Детерминировано.
+    """
+    import llm_provider
+    limit, most = llm_provider.MAX_WORDS, llm_provider.MAX_PARTS
+    total = points[-1]["end"] if points else 0
+    if total <= limit:
+        return None
+    for count in range(math.ceil(total / limit), most + 1):
+        parts = _try_parts(points, times, total, count, limit)
+        if parts is not None:
+            return parts
+    raise ValueError(f"запись в {total} слов не делится на {most} частей не длиннее {limit} слов")
+
+
 def _task_doubts(transcript, review, task_version):
     """Что модель видит о сомнениях в задании версии task_version: пометки слов и (версия 3) число."""
     words = [(word["word_id"], word["uncertain"])
@@ -440,10 +506,16 @@ def _task_doubts(transcript, review, task_version):
     return words, (_precise_doubts(transcript, review)[1] if task_version >= 3 else None)
 
 
-def _build_task(request, snapshots, *, task_version=None):
+_PLAN = object()
+
+
+def _build_task(request, snapshots, *, task_version=None, parts=_PLAN):
     """Задание из текущих снимков и цели запроса по правилам версии task_version (1–4).
 
-    Без task_version — текущей версии (model_tasks.CURRENT_VERSION на момент вызова).
+    Без task_version — текущей версии (model_tasks.CURRENT_VERSION на момент вызова). У версии 4
+    без parts деление на части вычисляется (_plan_parts); запись до предела одного запроса и
+    запись, которую не разделить, получают задание без частей. parts=None — без частей, список —
+    эти части (сверка содержания с сохранённым заданием).
     """
     task_version = model_tasks.CURRENT_VERSION if task_version is None else task_version
     current, review = snapshots["transcript"], snapshots["review"]
@@ -453,9 +525,21 @@ def _build_task(request, snapshots, *, task_version=None):
                                  [{key: value for key, value in word.items() if key != "turn"} for word in words],
                                  request["policy"]["goal"], review["revision"])
     unlocated = _precise_doubts(current["payload"], review["payload"])[1] if task_version >= 3 else None
-    return model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
-                             review["revision"], turns=_task_turns(current["payload"]), unlocated_doubts=unlocated,
-                             points=task_version >= 4)
+
+    def build(parts=None):
+        return model_tasks.build(request["recording_id"], current["revision"], words, request["policy"]["goal"],
+                                 review["revision"], turns=_task_turns(current["payload"]),
+                                 unlocated_doubts=unlocated, points=task_version >= 4, parts=parts)
+    task = build()
+    if task_version >= 4:
+        if parts is _PLAN:
+            try:
+                parts = _plan_parts(task["points"], _word_times(current["payload"]))
+            except ValueError:
+                parts = None            # длиннее предела облака: одно задание для ИИ-агента, облако откажет
+        if parts is not None:
+            task = build(parts)
+    return task
 
 
 _REVISION_FIELDS = ("source_revision", "review_revision")
@@ -479,7 +563,8 @@ def content_matches(request, task, snapshots):
     ответ меняют только номер ревизии разбора. Ничего не пишет.
     """
     try:
-        fresh = _build_task(request, snapshots, task_version=model_tasks.version(task))
+        # Деление на части — то же, что у сохранённого задания: границы зависят от пауз, а не от текста.
+        fresh = _build_task(request, snapshots, task_version=model_tasks.version(task), parts=task.get("parts"))
         return content_fingerprint(fresh) == content_fingerprint(task)
     except ValueError:
         return False
@@ -661,10 +746,14 @@ def _part_bounds(task):
     Версия 1 — ровно по MODEL_PART_WORDS слов, как раньше. Версии 2 и 3 — блок не длиннее предела
     и кончается на границе реплики; реплика длиннее предела делится по последнему в пределах
     блока концу предложения, а если такого нет — по пределу. Блоки идут подряд без пропусков.
-    Версия 4 — один блок на всю запись: модель отвечает границами разделов, а не перечнем слов.
+    Версия 4 — один блок на всю запись: модель отвечает границами разделов, а не перечнем слов;
+    у задания с частями (запись длиннее предела одного запроса) — блок на каждую часть.
     """
     words, limit = task["words"], MODEL_PART_WORDS
     if model_tasks.version(task) == 4:
+        if "parts" in task:
+            points = task["points"]
+            return [(points[first - 1]["start"], points[final - 1]["end"]) for first, final in task["parts"]]
         return [(0, len(words))] if words else []
     if model_tasks.version(task) == 1:
         return [(start, min(start + limit, len(words))) for start in range(0, len(words), limit)]
@@ -692,9 +781,12 @@ def _part_bounds(task):
 
 
 def _part_task(task, bounds):
-    """Задание одного блока той же версии, что и целое. У версии 4 блок один — само задание."""
+    """Задание одного блока той же версии, что и целое. У версии 4 без частей блок один — само задание,
+    с частями — задание части (model_tasks.part_task): модель видит только её пункты."""
     if model_tasks.version(task) == 4:
-        return task
+        if "parts" not in task:
+            return task
+        return model_tasks.part_task(task, _part_bounds(task).index(tuple(bounds)) + 1)
     words = task["words"][bounds[0]:bounds[1]]
     turns = None
     if model_tasks.version(task) != 1:
@@ -1022,19 +1114,26 @@ def _completed_result(store, request):
             "part_count": total, "completed_parts": total}
 
 
-def _limit_problem(request, words):
+def _limit_problem(request, words, *, limit=None, unsplit=False):
+    """Отказ по размеру до вызова облака или None. limit — предел задания (по умолчанию — записи
+    частями, MAX_WORDS × MAX_PARTS; у задания без частей, сохранённого раньше, — MAX_WORDS).
+    unsplit — запись в пределе, но не делится на части не длиннее MAX_WORDS слов."""
     import llm_provider
     if words == 0:
         return "в стенограмме нет слов: свёртку делать не из чего. В облако ничего не отправлено."
-    if words <= llm_provider.MAX_WORDS:
+    limit = llm_provider.MAX_WORDS * llm_provider.MAX_PARTS if limit is None else limit
+    if words <= llm_provider.MAX_WORDS or (words <= limit and not unsplit):
         return None
     exits = ("свёртку без облака может сделать ИИ-агент (workflow_model_task — задание по страницам, "
              "затем workflow_model_result); или снимите заказ конспекта (workflow_change_policy с "
              "require_conspect=false), стенограмма останется.")
     if request["state"] == "failed":
         exits = "сначала начните шаг заново для ИИ-агента: workflow_model_task(restart=true); затем " + exits
-    return (f"задание длиннее предела облачного исполнителя ({llm_provider.MAX_WORDS} слов): {words} слов. "
-            "В облако ничего не отправлено, состояние запроса не изменилось. Выходы: " + exits)
+    reason = (f"задание длиннее предела облачного исполнителя ({limit} слов): {words} слов"
+              if words > limit else
+              f"запись в {words} слов не делится на {llm_provider.MAX_PARTS} частей не длиннее "
+              f"{llm_provider.MAX_WORDS} слов по границам пунктов")
+    return reason + ". В облако ничего не отправлено, состояние запроса не изменилось. Выходы: " + exits
 
 
 def execute_model(store, request_id, *, retry_failed=False, restart=False):
@@ -1058,16 +1157,31 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
     if restart or state == "processed":
         if not request["recording_id"] or (state == "failed" and request["model_task"] is None):
             raise storage.Conflict("модельное задание ещё не готово к исполнению")
-        words = sum(len(segment.get("words", [])) for segment in
-                    store.get_current(request["recording_id"])["transcript"]["payload"].get("segments", []))
+        snapshots = store.get_current(request["recording_id"])
+        transcript = snapshots["transcript"]["payload"]
+        words = sum(len(segment.get("words", [])) for segment in transcript.get("segments", []))
+        limit = None
+        unsplit = False
+        if llm_provider.MAX_WORDS < words <= llm_provider.MAX_WORDS * llm_provider.MAX_PARTS:
+            points = model_tasks._points(_task_words(transcript, snapshots["review"]["payload"]))
+            try:
+                _plan_parts(points, _word_times(transcript))
+            except ValueError:
+                unsplit = True
     elif state == "waiting_model" or (state == "failed" and retry_failed):
-        words = len(request["model_task"]["words"])
+        task = request["model_task"]
+        words = len(task["words"])
+        unsplit = False
+        # Задание без частей (версии 1–4, сохранённое раньше) — прежний предел одного задания.
+        limit = None if model_tasks.version(task) == 4 and "parts" in task else llm_provider.MAX_WORDS
+        if limit is None and any(end - start > llm_provider.MAX_WORDS for start, end in _part_bounds(task)):
+            limit = llm_provider.MAX_WORDS
     elif state == "failed" and request["model_task"] is not None:
         raise storage.Conflict("модельный шаг завершился с ошибкой: продолжите его (retry_failed=true) или "
                                "начните заново. " + RESTART_HINT)
     else:
         raise storage.Conflict("модельное задание ещё не готово к исполнению")
-    problem = _limit_problem(request, words)
+    problem = _limit_problem(request, words, limit=limit, unsplit=unsplit)
     if problem:
         raise llm_provider.ProviderError("limit", problem)
     problem = conspect_file_problem(store, request)
@@ -1106,9 +1220,17 @@ def execute_model(store, request_id, *, retry_failed=False, restart=False):
                     if get(store, request_id)["model_task"] != task:
                         raise storage.Conflict("задание переписано: содержание стенограммы изменилось")
                     repair_error = invalid_output = None
+                    extra = {}
+                    if part_index and "part" in part["task"]:
+                        # Изложение — тексты разделов уже принятых частей (проверенный ответ модели).
+                        extra["summary"] = [
+                            [section["text"] for section in storage._loads(row["result_json"])["sections"]]
+                            for row in store.db.execute(
+                                "SELECT result_json FROM workflow_model_parts WHERE request_id=? AND task_hash=? "
+                                "AND part_index<? ORDER BY part_index", (request_id, task_hash, part_index))]
                     for attempt in range(2):
                         result, raw = client.generate(part["task"], repair_error=repair_error,
-                                                      invalid_output=invalid_output)
+                                                      invalid_output=invalid_output, **extra)
                         try:
                             _validate_model_part(store, request_id, part_index, result)
                         except ValueError as ex:

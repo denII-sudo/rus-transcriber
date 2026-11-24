@@ -10,6 +10,11 @@
 длиннее MAX_POINT_WORDS слов делится по концу предложения). Модель видит запись целиком как
 пункты (`model_view`) и отвечает границами разделов «с пункта N по пункт M» вместо перечня
 слов; программа сама раскладывает границы в прежнее поле `evidence` (список word_id).
+Запись длиннее предела одного запроса (этап 7.4в) делится на части: служебное поле `parts` —
+список пар [первый пункт, последний пункт] со сквозной нумерацией, не меньше двух частей. Поле
+есть только у таких заданий; у записи до предела его нет, и задание побайтно прежнее. Задание
+части — то же задание с полем `part` (номер части с 1): модель видит только пункты своей части,
+разделы ответа не выходят за её границы. Поля `parts` и `part` модели не показываются.
 Имена говорящих в задание не попадают: метка — только «Участник N» или UNKNOWN_SPEAKER.
 """
 import re
@@ -85,13 +90,13 @@ def _points(words):
 
 
 def build(recording_id, source_revision, words, goal="", review_revision=1, *, turns=None,
-          unlocated_doubts=None, points=False):
+          unlocated_doubts=None, points=False, parts=None):
     """Сформировать задание из слов и их устойчивых идентификаторов.
 
     Без `turns` — версия 1 (только слова). С `turns` — версия 2: каждое слово несёт номер
     своей реплики, реплики идут по порядку, пустых и неизвестных реплик нет. С `turns` и
     `unlocated_doubts` (целое ≥ 0) — версия 3. С ними же и points=True — версия 4: задание
-    дополнительно несёт пункты, вычисленные из слов (см. _points).
+    дополнительно несёт пункты, вычисленные из слов (см. _points); с parts — и деление на части.
     """
     if not isinstance(recording_id, str) or not recording_id:
         raise ValueError("требуется идентификатор записи")
@@ -103,6 +108,8 @@ def build(recording_id, source_revision, words, goal="", review_revision=1, *, t
         raise ValueError("слова должны быть списком")
     if not isinstance(goal, str) or len(goal) > 2000:
         raise ValueError("некорректная цель")
+    if parts is not None and not points:
+        raise ValueError("части есть только в задании с пунктами")
     if points and unlocated_doubts is None:
         raise ValueError("пункты есть только в задании с репликами и числом непривязанных мест")
     if unlocated_doubts is not None:
@@ -148,11 +155,49 @@ def build(recording_id, source_revision, words, goal="", review_revision=1, *, t
         task["unlocated_doubts"] = unlocated_doubts
     if points:
         task["points"] = _points(result)
+    if parts is not None:
+        task["parts"] = _parts(parts, len(task["points"]))
     return task
+
+
+def _parts(parts, last):
+    """Части версии 4: пары [первый, последний] пункт подряд от 1 до last, не меньше двух."""
+    if not isinstance(parts, list) or len(parts) < 2:
+        raise ValueError("части задания — список не менее чем из двух пар номеров пунктов")
+    result, following = [], 1
+    for part in parts:
+        if (not isinstance(part, list) or len(part) != 2 or any(type(x) is not int for x in part)
+                or part[0] != following or part[1] < part[0]):
+            raise ValueError("части задания должны идти подряд по пунктам без пропусков и пересечений")
+        result.append([part[0], part[1]])
+        following = part[1] + 1
+    if following != last + 1:
+        raise ValueError("части задания должны покрывать все пункты")
+    return result
+
+
+def part_task(task, number):
+    """Задание части number (с 1) задания версии 4 с частями: то же задание с полем `part`."""
+    checked = canonical(task)
+    if "parts" not in checked or "part" in task:
+        raise ValueError("задание не делится на части")
+    if type(number) is not int or not 1 <= number <= len(checked["parts"]):
+        raise ValueError("неверный номер части")
+    return {**checked, "part": number}
+
+
+def part_range(task):
+    """Первый и последний пункт, которые видит модель: своей части или всего задания версии 4."""
+    if "part" in task:
+        first, final = task["parts"][task["part"] - 1]
+        return first, final
+    return 1, len(task["points"])
 
 
 def canonical(task):
     """Пересобрать задание своей версии; расхождение означает неизвестные поля."""
+    if isinstance(task, dict) and "part" in task:
+        return part_task({key: value for key, value in task.items() if key != "part"}, task["part"])
     if version(task) == 1:
         checked = build(task.get("recording_id"), task.get("source_revision"), task.get("words"),
                         task.get("goal"), task.get("review_revision"))
@@ -165,7 +210,7 @@ def canonical(task):
         checked = build(task.get("recording_id"), task.get("source_revision"), task.get("words"),
                         task.get("goal"), task.get("review_revision"), turns=task["turns"],
                         unlocated_doubts=task["unlocated_doubts"] if number >= 3 else None,
-                        points=number == 4)
+                        points=number == 4, parts=task.get("parts") if number == 4 else None)
     if task != checked:
         raise ValueError("неизвестные поля задания")
     return checked
@@ -188,42 +233,48 @@ def _point_text(words):
 def model_view(task):
     """Что видит модель в задании версии 4: пункты [номер, условная метка, текст] и общие поля.
 
-    Идентификаторы слов, запись, номер ревизии разбора и время сюда не входят.
+    Идентификаторы слов, запись, номер ревизии разбора, время и деление на части сюда не входят;
+    у задания части — только её пункты (номера сквозные).
     """
     checked = canonical(task)
     if version(checked) != 4:
         raise ValueError("вид с пунктами есть только у задания версии 4")
     speakers = {turn["turn"]: turn["speaker"] for turn in checked["turns"]}
     words = checked["words"]
+    first, final = part_range(checked)
     return {"kind": checked["kind"], "version": 4, "source_revision": checked["source_revision"],
             "goal": checked["goal"], "unlocated_doubts": checked["unlocated_doubts"],
             "points": [[point["point"], speakers[point["turn"]], _point_text(words[point["start"]:point["end"]])]
-                       for point in checked["points"]]}
+                       for point in checked["points"][first - 1:final]]}
 
 
 def _validate_sections(checked, response, current_revision):
-    """Ответ версии 4: разделы с границами пунктов «from»–«to», подряд и без пересечений."""
+    """Ответ версии 4: разделы с границами пунктов «from»–«to», подряд и без пересечений.
+
+    У задания части разделы и отсылки also — только внутри её пунктов: раздел не переходит границу части.
+    """
     points, words = checked["points"], checked["words"]
-    last = len(points)
+    start, last = part_range(checked)
     if not isinstance(response, dict) or set(response) != {"source_revision", "sections"}:
         raise ValueError("неверный формат ответа: нужны ровно поля source_revision и sections")
     if (type(response["source_revision"]) is not int or response["source_revision"] != current_revision
             or not isinstance(response["sections"], list)):
         raise ValueError("неверная ревизия или разделы")
-    if not response["sections"] or not last:
+    if not response["sections"] or not points:
         raise ValueError("ответ не содержит разделов")
 
     def ids(first, final):
         return [word["word_id"] for point in points[first - 1:final] for word in words[point["start"]:point["end"]]]
 
-    sections, following = [], 1
+    sections, following = [], start
     for number, section in enumerate(response["sections"], 1):
         if (not isinstance(section, dict) or not {"from", "to", "text"} <= set(section)
                 or set(section) - {"from", "to", "text", "also"}):
             raise ValueError(f"раздел {number}: нужны поля from, to, text и необязательное also")
         first, final, text = section["from"], section["to"], section["text"]
-        if type(first) is not int or type(final) is not int or not 1 <= first <= final <= last:
-            raise ValueError(f"раздел {number}: границы — целые номера пунктов от 1 до {last}, from не больше to")
+        if type(first) is not int or type(final) is not int or not start <= first <= final <= last:
+            raise ValueError(f"раздел {number}: границы — целые номера пунктов от {start} до {last}, "
+                             "from не больше to")
         if first != following:
             raise ValueError(f"раздел {number} начинается с пункта {first}, а должен — с пункта {following}, "
                              "сразу за концом предыдущего раздела (без пропусков и пересечений)")
@@ -239,8 +290,9 @@ def _validate_sections(checked, response, current_revision):
         refs = []
         for ref in also:
             if (not isinstance(ref, list) or len(ref) != 2 or any(type(x) is not int for x in ref)
-                    or not 1 <= ref[0] <= ref[1] <= last or ref[1] - ref[0] + 1 > MAX_ALSO_POINTS):
-                raise ValueError(f"раздел {number}: отсылка also — пара [from, to] номеров пунктов, "
+                    or not start <= ref[0] <= ref[1] <= last or ref[1] - ref[0] + 1 > MAX_ALSO_POINTS):
+                within = "" if "part" not in checked else f" от {start} до {last} (внутри своей части)"
+                raise ValueError(f"раздел {number}: отсылка also — пара [from, to] номеров пунктов{within}, "
                                  f"не длиннее {MAX_ALSO_POINTS} пунктов")
             if ref[0] <= final and ref[1] >= first:
                 raise ValueError(f"раздел {number}: отсылка also должна вести вне своего раздела")
