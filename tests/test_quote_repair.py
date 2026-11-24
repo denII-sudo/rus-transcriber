@@ -157,7 +157,8 @@ class RepairBase(unittest.TestCase):
         client = fake_cloud(answer, **kwargs)
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
             try:
-                self.result = workflow.repair_quotes(self.store, request, via=via)
+                snapshot = workflow.quote_repair_prepare(self.store, request) if via == "screen" else None
+                self.result = workflow.repair_quotes(self.store, request, via=via, snapshot=snapshot)
             finally:
                 self.client = client
         return self.result
@@ -226,7 +227,7 @@ class ThresholdAndProblemTests(RepairBase):
         old = mock.patch.object(model_tasks, "CURRENT_VERSION", 1)
         old.start()
         self.addCleanup(old.stop)
-        two = self.ready()[0]                 # задание версии 1: цитаты по одной не применялись
+        two = self.ready(texts=["Итог без цитат.", "Потом тоже без цитат."])[0]   # версия 1
         self.assertIn("до этой возможности", workflow.quote_repair_problem(self.store, workflow.get(self.store, two)))
 
     def test_a_conspect_without_slots_is_not_repairable(self):
@@ -542,9 +543,9 @@ class ApplyTests(RepairBase):
 
 class NeverAutomaticTests(RepairBase):
     def test_nothing_but_the_explicit_call_reaches_the_repair_client(self):
+        request, recording = self.ready()
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
-            request, recording = self.ready()
             def resolve(review):
                 for item in review["review"]:
                     item["status"] = "resolved"

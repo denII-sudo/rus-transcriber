@@ -182,6 +182,54 @@ function renderResult(d) {
 const fmtDur = sec => (sec === null || sec === undefined) ? "" :
   `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
 
+const REPAIR_TITLE = `Исправление цитат облачной моделью`;
+const repairLines = s => [
+  `В свёртке «${s.name}» не найдено в стенограмме ${s.unlinked} из ${s.total} цитат. Программа может попросить облачную модель OpenAI GPT-6 Luna (через OpenCode) заменить каждую такую цитату точным отрывком стенограммы или снять с неё кавычки.`,
+  `Если нажать «Отправить», в облако уйдут только ${s.sections} раздел(а) свёртки, где есть такие цитаты (${s.quotes} цитат):`,
+  `— текст каждого из этих разделов, как его написала модель;`,
+  `— сами ненайденные цитаты;`,
+  `— текст стенограммы, на который опирается каждый раздел (около ${s.words} слов): с внесёнными исправлениями, в том числе сделанными после конспекта, с делением на реплики, условными метками говорящих («Участник 1», «Участник 2»…) и пометками сомнительных мест ⟦…⟧.`,
+  `Имена и сведения, произнесённые в этих местах записи или написанные в разделах, уходят вместе с текстом.`,
+  `Не уходят: остальные разделы и остальной текст стенограммы, подписи говорящих именами, аудио, время слов, путь к файлу, голосовые профили, журналы, цель запроса и номера версий.`,
+  ...(s.left > 0 ? [`Ещё ${s.left} цитат в этот раз не поместятся — их можно отправить следующим нажатием.`] : []),
+  `Ответ модели — предложение, а не проверка человеком. Программа сама проверит каждую новую цитату: найденная в своём разделе получит кавычки и автора, которого ставит программа; не найденная останется с пометкой. Цитата, с которой модель сняла кавычки, станет обычным текстом пересказа. Прежняя версия свёртки останется в базе программы.`,
+  `Одно нажатие — один вызов модели; сама программа его не повторяет и не запускает. Если стенограмма или свёртка изменится, пока модель отвечает, исправление не запишется, а вызов уже будет сделан.`];
+
+// Окно согласия: облако вызывается только нажатием «Отправить» и только по снимку того, что человек видел.
+async function repairQuotes(c, host, opener) {
+  host.innerHTML = "";
+  let s;
+  try { s = await post("api/quotes/repair/prepare", {request_id: c.quote_repair.request_id}); }
+  catch (ex) { say(ex.message, true); return; }
+  const box = document.createElement("div");
+  const title = document.createElement("h3");
+  title.textContent = REPAIR_TITLE;
+  box.appendChild(title);
+  for (const line of repairLines(s)) {
+    const p = document.createElement("p");
+    p.textContent = line;
+    box.appendChild(p);
+  }
+  const send = document.createElement("button");
+  send.textContent = "Отправить";
+  const cancel = document.createElement("button");
+  cancel.textContent = "Отмена";
+  const state = document.createElement("p");
+  state.className = "muted";
+  cancel.onclick = () => { host.innerHTML = ""; };
+  send.onclick = async () => {
+    send.disabled = cancel.disabled = opener.disabled = true;
+    state.textContent = "Модель отвечает, это может занять до 5 минут…";
+    try {
+      const r = await post("api/quotes/repair/confirm", {snapshot: s, allow_cloud_model: true});
+      say(`Исправлено: ${r.fixed}, кавычки сняты: ${r.unquoted}, не исправлено: ${r.failed}.`);
+    } catch (ex) { say(ex.message, true); }
+    loadConspects();
+  };
+  box.append(send, cancel, state);
+  host.appendChild(box);
+}
+
 async function loadConspects() {
   const root = $("conspects");
   try {
@@ -196,6 +244,18 @@ async function loadConspects() {
         const note = document.createElement("p");
         note.textContent = `Не найдено в стенограмме цитат: ${c.quote_repair.unlinked} из ${c.quote_repair.total}.`;
         div.appendChild(note);
+        const host = document.createElement("div");
+        if (c.quote_repair.available) {
+          const opener = document.createElement("button");
+          opener.textContent = "Попросить модель исправить цитаты…";
+          opener.onclick = () => repairQuotes(c, host, opener);
+          div.append(opener, host);
+        } else if (c.quote_repair.reason) {
+          const why = document.createElement("p");
+          why.className = "muted";
+          why.textContent = c.quote_repair.reason;
+          div.appendChild(why);
+        }
       }
       for (const s of c.sections || []) {
         const p = document.createElement("p");
