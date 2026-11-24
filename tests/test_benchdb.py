@@ -833,6 +833,30 @@ class RejectedIsNotForeverTests(unittest.TestCase):
         benchdb.apply_load(bench)
         self.assertEqual(benchdb.db_path(bench).read_bytes(), before)             # второй раз — без записи
 
+    def test_late_texts_written_by_another_loader_meanwhile_is_not_an_error(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        texts = bench / "runs" / "20261101-100000-aaaaaa.texts.json"
+        saved = texts.read_bytes()
+        texts.unlink()
+        benchdb.apply_load(bench)
+        texts.write_bytes(saved)
+        real = benchdb._texts_ref
+
+        def other_loader_first(bench_dir, parsed):                  # пока ждали блокировку, ссылку дописал другой
+            ref = real(bench_dir, parsed)
+            con = sqlite3.connect(benchdb.db_path(bench))
+            con.execute("INSERT INTO raw_output(run_id, file_name, sha256, size_bytes) VALUES (?, ?, ?, ?)",
+                        (ref["run_id"], ref["file_name"], ref["sha256"], ref["size_bytes"]))
+            con.commit()
+            con.close()
+            return ref
+
+        with mock.patch.object(benchdb, "_texts_ref", other_loader_first):
+            rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"known": 1})
+        self.assertEqual(rows(bench, "SELECT count(*) FROM raw_output"), [(1,)])
+
 
 class ConnectionAndSchemaTests(unittest.TestCase):
 
