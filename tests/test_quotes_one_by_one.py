@@ -94,6 +94,12 @@ class RuleTests(unittest.TestCase):
         for ids in (["w2"], ["w7", "w8"]):
             self.assertEqual(workflow.quote_blockers(data, ids), [{"id": "r4", "reason": "unlocated"}])
 
+    def test_quote_word_without_time_cannot_be_judged_against_a_timed_place(self):
+        data = make_data([OPEN_BY_TIME])
+        del data["segments"][0]["words"][1]["s"]                  # у w2 нет времени
+        self.assertEqual(workflow.quote_blockers(data, ["w2"]), [{"id": "r2", "reason": "unlocated"}])
+        self.assertEqual(workflow.quote_blockers(data, ["w7"]), [])
+
     def test_pause_until_6a_blocks_every_quote_as_strictly_as_before(self):
         # PAUSE_UNTIL_6A: до PR 6а открытое место-пауза (слов внутри нет) задевает все цитаты записи
         self.assertTrue(workflow.PAUSE_UNTIL_6A)
