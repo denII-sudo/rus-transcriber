@@ -467,9 +467,13 @@ class WorkerSnapshotTests(unittest.TestCase):
                  ("не Анна, а Вера", "Вера"), ("нет, не Анна, а Вера", "Вера")]
         to_human = ["это не Анна", "нет, не Анна", "не Анна и не Борис", "ни Анна, ни Борис",
                     "не Анна: тест", "нет, Анна: тест", "Спикер 3: тест"]
+        # Файловый режим (legacy_files) уходит: в нём остаются два представителя — имя и «оставить человеку»; sqlite — все.
+        files_named, files_to_human = {"Анна"}, {"это не Анна"}
         for backend in ("legacy_files", "sqlite"):
             for ids in (False, True):
                 for text, speaker in named:
+                    if backend == "legacy_files" and text not in files_named:
+                        continue
                     with self.subTest(backend=backend, word_ids=ids, answer=text), \
                             self.answer_files(backend, self.answer_result(ids), with_pack=True) as (jp, md):
                         self.answer_card(jp, md, [(text, False)], pack=self.stage_result)
@@ -478,6 +482,8 @@ class WorkerSnapshotTests(unittest.TestCase):
                             edits = transcript.load(jp).get("edits") or []
                             self.assertNotIn("Анна", json.dumps(edits, ensure_ascii=False).replace(text, ""))
                 for text in to_human:
+                    if backend == "legacy_files" and text not in files_to_human:
+                        continue
                     with self.subTest(backend=backend, word_ids=ids, answer=text), \
                             self.answer_files(backend, self.answer_result(ids), with_pack=True) as (jp, md):
                         result = self.answer_card(jp, md, [(text, False)], pack=self.stage_result)
@@ -549,11 +555,15 @@ class WorkerSnapshotTests(unittest.TestCase):
 
         data = self.worker_result()
         data["review"][0].pop("word_ids", None)
+        # Файловый режим (legacy_files) уходит: в нём остаются две формулировки (оба способа ввода); sqlite — все.
+        files_texts = ("неверно", "неверно: слово")
         for backend in ("legacy_files", "sqlite"):
             for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
                                                          "это неверно", "нет, неверно", "не согласен с этим",
                                                          "неверно: слово")
                                for mode in ("typed", "voice")):
+                if backend == "legacy_files" and text not in files_texts:
+                    continue
                 with self.subTest(backend=backend, answer=text, mode=mode), \
                         self.answer_files(backend, data, stage=applied_option, stage_name="option applied") as (jp, md):
                     pack = self.stage_result
@@ -578,8 +588,12 @@ class WorkerSnapshotTests(unittest.TestCase):
                  "не согласен: слово", "НЕВЕРНО", "Неверно!")
 
     def test_negative_answers_keep_place_open_in_both_modes(self):
+        # Файловый режим (legacy_files) уходит: в нём остаются три формулировки (обычная, с «:», регистр и «!»); sqlite — все.
+        files_texts = ("неверно", "не согласен: слово", "Неверно!")
         for backend in ("legacy_files", "sqlite"):
             for text in self.NEGATIVES:
+                if backend == "legacy_files" and text not in files_texts:
+                    continue
                 for heard in (False, True):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
                             self.answer_files(backend, with_pack=True) as (jp, md):
@@ -588,8 +602,11 @@ class WorkerSnapshotTests(unittest.TestCase):
                         self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
 
     def test_negative_then_correct_answer_in_both_modes(self):
+        # Файловый режим (legacy_files) уходит: в нём остаётся одна формулировка (текстом и вариантом); sqlite — все.
         for backend in ("legacy_files", "sqlite"):
             for negative in ("неверно", "совсем не верно", "неверно: слово"):
+                if backend == "legacy_files" and negative != "неверно":
+                    continue
                 for heard in (False, True):
                     with self.subTest(backend=backend, answer=negative, voice=heard, then="text"), \
                             self.answer_files(backend, with_pack=True) as (jp, md):
@@ -648,8 +665,13 @@ class WorkerSnapshotTests(unittest.TestCase):
     )
 
     def test_other_answers_behave_as_before_in_both_modes(self):
+        # Файловый режим (legacy_files) уходит: в нём остаются пять представителей — подсказка, свой текст, подтверждение,
+        # человеку, выбор варианта (печать и голос расходятся); sqlite — все 41.
+        files_texts = ("согласен", "принимаю", "верно", "Борис Иванович", "вариант 2: да")
         for backend in ("legacy_files", "sqlite"):
             for text, typed, voice in self.AS_BEFORE:
+                if backend == "legacy_files" and text not in files_texts:
+                    continue
                 for heard, (word, status) in ((False, typed), (True, voice)):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
                             self.answer_files(backend, with_pack=True) as (jp, md):
