@@ -703,6 +703,30 @@ class ConflictPreviewTests(ScreenCase):
         second = self.open_case(first.rec, "document", "md")
         self.assertEqual(self.preview(second)["also_replaces"], [first.relative])
 
+    def test_damaged_copy_of_later_file_stops_unchanged_file(self):
+        # PR 5а: все три файла сверяются до первой замены. Если файл конфликта не изменён после сохранения копии,
+        # сверка дойдёт и до файла, который пишется позже (json после md); испорченная копия решения по нему
+        # остановит запись, и экран должен назвать этот файл, а не обещать замену
+        later = self.conflict("document", kind="json")
+        self.resolve_directly(later)
+        rec = later.rec
+        rec.files["md"].write_bytes(b"my text\n")
+        self.materialize(rec, "document")
+        case = self.open_case(rec, "document", "md")
+        for found in self.store.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='document_conflicts'").fetchall():
+            self.store.db.execute(f'DROP TRIGGER "{found[0]}"')
+        self.store.db.execute("UPDATE document_conflicts SET observed_bytes=? WHERE conflict_id=?",
+                              (b"damaged", later.id))
+        shown = self.preview(case)
+        self.assertEqual((shown["file_state"], shown["can_replace"]), ("same", True))
+        self.assertEqual(shown["stops_for"], [Path(later.relative).name])
+        self.assertEqual(shown["effect"], "stopped")
+        files = {kind: path.read_bytes() for kind, path in rec.files.items()}
+        self.request("POST", "api/conflict/resolve", {"snapshot": shown["snapshot"], "confirm": True})
+        self.assertEqual({kind: path.read_bytes() for kind, path in rec.files.items()}, files,
+                         "при испорченной копии позднего файла не должен заменяться ни один файл")
+
 
 class ConflictReplaceTests(ScreenCase):
     def test_replace_writes_program_version_and_keeps_copy(self):
