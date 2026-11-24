@@ -2,18 +2,27 @@
 
 Что проверяется (режим `sqlite`, данные синтетические, всё во временной папке TEMP песочницы):
 - ошибка записи чужой записи того же корня не ломает свою; своя ошибка не теряется (изоляция соседей);
-- файл, занятый другой программой, не обрывает запись: исход «записано в базу, файл обновится позже»;
+- файл, который не удалось заменить (занят другой программой или защищён от записи), не обрывает запись:
+  исход «записано в базу, файл обновится позже», занятая ревизия держит следующие ревизии той же записи;
+- восстановление из резерва называет ревизии, файлы которых ещё не записаны;
 - правка файла между сверкой и записью: исход «записано, но файл не обновлён: его изменили во время записи»;
 - один русский текст исхода во всех местах показа (`rt.py`, MCP, обе страницы), английских нет;
 - файл больше 8 МиБ: когда он снова равен версии программы, конфликт закрывается без копии.
 """
 import asyncio
 import contextlib
+import http.client
 import io
+import json
 import os
 import re
+import stat
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -24,9 +33,11 @@ import review_page
 import rt
 import storage
 import test_conflict_replace
+import test_p5_screen
 import test_recordings
 import transcript
 from test_document_write_order import Env, KINDS
+from urllib.parse import urlsplit
 
 REPO = Path(__file__).resolve().parent.parent
 CYRILLIC = re.compile("[А-Яа-яЁё]")
@@ -185,6 +196,48 @@ class BusyFile(OutcomeCase):
         env.materialize()
         documents.require_written(env.store, rid, 2, [])      # уже записано другим вызовом: исхода нет
 
+    def test_a_busy_revision_holds_back_the_next_revision_of_the_same_recording(self):
+        env, rid = self.env, self.rid
+        env.change(rid, "три")                                 # в очереди ревизии 2 и 3
+        json_name = env.file(rid, "json").name
+        real, refused = os.replace, []
+
+        def replace(source, target, *args, **kwargs):
+            if Path(target).name == json_name and not refused:   # занят один раз, на ревизии 2
+                refused.append(target)
+                raise PermissionError(13, "файл занят другой программой")
+            return real(source, target, *args, **kwargs)
+        with mock.patch.object(documents.os, "replace", replace):
+            self.assertEqual(env.materialize(recording_id=rid), [])
+        self.assertEqual(env.outbox(rid, 2), ("pending", "busy"))
+        self.assertEqual(env.outbox(rid, 3), ("pending", None), "ревизия 3 не обгоняет занятую ревизию 2")
+        self.assertEqual(env.versions(rid), {"md": 2, "json": 1, "manifest": 1})
+        self.assertEqual(env.materialize(recording_id=rid), [(rid, 2), (rid, 3)])
+        self.assertEqual(env.versions(rid), {kind: 3 for kind in KINDS})
+
+    def test_the_text_names_both_causes_and_both_ways_out(self):
+        # PermissionError при замене — файл занят другой программой или защищён от записи («только чтение», права)
+        env, rid = self.env, self.rid
+        with busy({env.file(rid, "json").name}):
+            completed = env.materialize(recording_id=rid)
+        text = str(documents.unsynced(env.store, rid, 2, completed))
+        for words in ("занят другой программой", "защищён от записи", "Закройте файл", "снимите защиту от записи"):
+            self.assertIn(words, text)
+        self.assertNotIn("не дошла", text, "общая фраза — для очереди без кода busy")
+
+    @unittest.skipUnless(os.name == "nt", "атрибут «только чтение» мешает замене файла только в Windows")
+    def test_a_read_only_file_is_not_called_only_busy(self):
+        env, rid = self.env, self.rid
+        target = env.file(rid, "json")
+        os.chmod(target, stat.S_IREAD)                          # настоящий атрибут, без подмены os.replace
+        self.addCleanup(os.chmod, target, stat.S_IREAD | stat.S_IWRITE)
+        completed = env.materialize(recording_id=rid)
+        self.assertEqual(env.outbox(rid, 2), ("pending", "busy"))
+        self.assertIn("защищён от записи", str(documents.unsynced(env.store, rid, 2, completed)))
+        os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+        self.assertEqual(env.materialize(recording_id=rid), [(rid, 2)])
+        self.assertEqual(env.versions(rid), {kind: 2 for kind in KINDS})
+
 
 class WrittenButFileChangedMeanwhile(unittest.TestCase):
     helper = test_recordings.WorkerSnapshotTests()
@@ -265,6 +318,40 @@ class RestoreAnswersHonestly(unittest.TestCase):
             self.assertEqual(result["outcome"], "written")
 
 
+class RestoreFromBackupNamesWhatIsNotWritten(unittest.TestCase):
+    """Без recording_id занятый файл больше не обрывает восстановление: человек должен узнать, что не записано."""
+    setUp = test_p5_screen.P5ServiceTests.setUp
+    tearDown = test_p5_screen.P5ServiceTests.tearDown
+    make_recording = test_p5_screen.P5ServiceTests.make_recording
+
+    def restore(self, names=()):
+        ident, root_id, doc_paths = self.make_recording()
+        backup = self.base / "backup.sqlite3"
+        core.backup_store(backup)
+        user_id = self.store.current_identity()["user_id"]
+        new_root = self.base / "restored-docs"
+        new_root.mkdir()
+        with busy({Path(doc_paths[kind]).name for kind in names}):
+            report = core.restore_from_backup(backup, self.base / "restored.sqlite3", {root_id: new_root}, user_id)
+        return ident, report
+
+    def test_restore_with_a_busy_file_names_the_revision_left_unwritten(self):
+        ident, report = self.restore(["json"])
+        self.assertEqual(report["materialized"], [])
+        self.assertEqual([(row["recording_id"], row["error_code"]) for row in report["not_written"]],
+                         [(ident, "busy")])
+        first = report["warning"][0]
+        self.assertIn("не все файлы", first)
+        self.assertIn("защищён от записи", first)
+        self.assertIn("sync_recording_documents", first)
+        self.assertTrue(any(ident in line for line in report["warning"][1:]))
+
+    def test_restore_that_wrote_everything_has_no_such_warning(self):
+        ident, report = self.restore()
+        self.assertEqual(report["not_written"], [])
+        self.assertNotIn("warning", report)
+
+
 class OneRussianTextEverywhere(unittest.TestCase):
     NOT_WRITTEN = documents.NotWritten("Не записано: файл «а.transcript.md» изменён вне программы. Ничего не сохранено.",
                                        "md", "external")
@@ -309,6 +396,61 @@ class OneRussianTextEverywhere(unittest.TestCase):
         self.assertEqual(review_page.safe_error(self.OPEN_CONFLICT), core.say_error(self.OPEN_CONFLICT))
         self.assertIn("изменилась", review_page.safe_error(storage.Conflict("stale revisions")))
 
+    def test_cards_page_apply_shows_the_outcome_and_not_the_code(self):
+        # путь «Применить ответы»: core.apply_answers_files отдаёт исход как CoreError (тип прежнего отказа)
+        message = str(self.NOT_SYNCED)
+        with tempfile.TemporaryDirectory(prefix="p5b2-page-", dir=os.environ["TEMP"]) as temp:
+            root = Path(temp)
+            pack = root / "demo.review"
+            (pack / "clips").mkdir(parents=True)
+            (pack / "manifest.json").write_text(json.dumps({"version": "v1", "audio": "demo.wav", "items": [
+                {"id": "r1", "t": "00:00:01", "clip": "clips/r1.mp3", "text": "да", "speaker": "Участник",
+                 "t1": 0.0, "t2": 0.0, "question": "Как?", "options": [{"label": "да", "decision": {}}]}]}),
+                encoding="utf-8")
+            status, data, tmp = root / "status.json", root / "data", root / "temp"
+            data.mkdir()
+            tmp.mkdir()
+            env = dict(os.environ, RUS_TRANSCRIBER_DATA=str(data), TEMP=str(tmp), TMP=str(tmp),
+                       PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
+            code = ("import sys, core, review_page\n"
+                    "message = sys.argv[4]\n"
+                    "def refused(*a, **k):\n"
+                    "    raise core.CoreError(message)\n"
+                    "core.apply_answers_files = refused\n"
+                    "sys.argv = ['review_page.py', sys.argv[1], '--status', sys.argv[2], '--markdown', sys.argv[3],"
+                    " '--port', '19380']\n"
+                    "review_page.main()\n")
+            proc = subprocess.Popen([sys.executable, "-B", "-c", code, str(root / "demo.transcript.json"),
+                                     str(status), str(root / "demo.transcript.md"), message], cwd=str(REPO), env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                url = None
+                for _ in range(100):
+                    try:
+                        url = json.loads(status.read_text(encoding="utf-8")).get("url")
+                    except (OSError, ValueError):
+                        url = None
+                    if url or proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(url, "тестовая страница не запустилась")
+                address = urlsplit(url)
+                conn = http.client.HTTPConnection("127.0.0.1", address.port, timeout=10)
+                try:
+                    conn.request("POST", address.path + "api/apply", body=json.dumps({"version": "v1"}).encode(),
+                                 headers={"Origin": f"http://127.0.0.1:{address.port}",
+                                          "Content-Type": "application/json"})
+                    response = conn.getresponse()
+                    error = json.loads(response.read().decode("utf-8"))["error"]
+                finally:
+                    conn.close()
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(error, message)
+        self.assertNotIn("код:", error)
+
     def test_no_english_outcome_texts_are_left_in_the_code(self):
         for path in sorted(REPO.glob("*.py")):
             text = path.read_text(encoding="utf-8")
@@ -323,6 +465,49 @@ class OneRussianTextEverywhere(unittest.TestCase):
         self.assertNotIn(".value", before_request, "поле очищается только после успеха")
         self.assertNotIn("reset()", before_request)
         self.assertIn("Не сохранилось: ", send)
+
+
+class McpWritingToolsSpeakRussian(unittest.TestCase):
+    """Инструменты MCP, которые меняют запись: отказ хранилища — строкой ответа по-русски, не исключением."""
+    helper = test_recordings.WorkerSnapshotTests()
+
+    @contextlib.contextmanager
+    def changed_file(self):
+        with self.helper.answer_files("sqlite", self.helper.answer_result(word_ids=True)) as (jp, md):
+            word = transcript.load(jp)["segments"][0]["words"][0]
+            md.write_bytes(b"human edit")                          # правка человека рядом с аудио
+            with mock.patch.object(core, "_done_json", return_value={"json": str(jp), "markdown": str(md)}):
+                yield word, md
+
+    def test_edit_span_with_an_open_conflict_answers_in_russian(self):
+        import server
+        with self.changed_file() as (word, md):
+            first = server.edit_span("job", word["s"], word["e"], "правка", "", "", "claude")
+            second = server.edit_span("job", word["s"], word["e"], "правка два", "", "", "claude")
+        self.assertTrue(first.startswith("Не записано"), first)
+        self.assertEqual(second, "Сначала решите конфликт внешней правки документа.")
+
+    def test_reopen_review_returns_the_outcome_instead_of_raising(self):
+        import server
+        with self.changed_file() as (word, md):
+            server.edit_span("job", word["s"], word["e"], "правка", "", "", "claude")    # конфликт открыт
+            answer = server.reopen_review("job", "r1")
+        self.assertTrue(answer.startswith("Записано в базу, но"), answer)
+        self.assertIn(md.name, answer)
+
+    def test_other_writing_tools_answer_storage_refusals_in_words(self):
+        import server
+        calls = {"legacy_speaker_review": lambda: server.legacy_speaker_review("job", True),
+                 "build_review_pack": lambda: server.build_review_pack("job"),
+                 "reopen_review": lambda: server.reopen_review("job", "r1"),
+                 "edit_span": lambda: server.edit_span("job", 0.0, 1.0, "слово", "", "", "claude")}
+        for name, call in calls.items():
+            for error in (OneRussianTextEverywhere.NOT_SYNCED, OneRussianTextEverywhere.OPEN_CONFLICT):
+                with self.subTest(tool=name, error=str(error)):
+                    with mock.patch.object(core, name, side_effect=error):
+                        answer = call()
+                    self.assertEqual(answer, core.say_error(error))
+                    self.assertRegex(answer, CYRILLIC)
 
 
 class OversizeConflictCloses(test_conflict_replace.ScreenCase):
@@ -377,6 +562,18 @@ class OversizeConflictCloses(test_conflict_replace.ScreenCase):
         case.path.write_bytes(self.program(case.rec, "document", "md"))
         self.assertTrue(core.resolve_document_conflict(case.rid, case.id)["materialized"])
         self.assertEqual(self.open_rows(case.rec, "document"), [])
+
+    def test_the_store_refuses_a_conflict_without_a_copy_unless_asked(self):
+        # охрана не только в core: само хранилище без without_copy не закрывает конфликт без копии
+        for scope in test_conflict_replace.SCOPES:
+            with self.subTest(scope=scope):
+                case = self.over_limit_conflict(scope)
+                case.path.write_bytes(self.program(case.rec, scope, "md"))     # даже когда файл уже равен версии
+                resolve = getattr(self.store, f"resolve_{scope}_conflict")
+                with self.assertRaises(storage.Conflict) as caught:
+                    resolve(case.id, str(uuid.uuid4()), recordings.operation_context(self.store, "human"))
+                self.assertEqual(str(caught.exception), "external file too large to preserve; manual resolution required")
+                self.assertEqual(self.item(case)["status"], "open")
 
     def test_a_closed_conflict_never_lets_the_writer_replace_the_humans_file_later(self):
         # решение «закрыть» принято, а файл потом снова стал большим чужим: копии нет, писатель не затирает его
