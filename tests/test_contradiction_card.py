@@ -226,29 +226,30 @@ class ProposalInsteadOfRefusalTests(Base):
     def test_card_failure_after_writing_the_proposal_is_in_the_result(self):
         """Р3: сбой постановки карточки после записи предложения — в результате (`cards_not_replaced`), а не
         исключением мимо MCP; повтор той же правки ставит карточку."""
-        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
-        for error in (RuntimeError("занято"), OSError("диск занят"), storage.Conflict("запись изменилась")):
-            with self.subTest(error=type(error).__name__, how="edit_span"), files("sqlite") as (jp, md, version):
-                self.answer_r4(jp, md, version)
-                with mock.patch.object(review_pack, "upsert_cards", side_effect=error):
-                    rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
-                self.not_written(rep, "r4")
-                self.assertEqual(rep["card"], "not_replaced")
-                self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
-                self.assertEqual(self.card(jp, "r4")["rev"], 1)
-                self.contradiction(jp, "r4")
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах). По одному виду
+        # сбоя на место: RuntimeError MCP-обёртка не ловит; storage.Conflict — не RuntimeError и не OSError
+        with self.subTest(how="edit_span"), files("sqlite") as (jp, md, version):
+            self.answer_r4(jp, md, version)
+            with mock.patch.object(review_pack, "upsert_cards", side_effect=RuntimeError("занято")):
                 rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
-                self.assertEqual(rep["card"], "updated")
-                self.assertNotIn("cards_not_replaced", rep)
-            with self.subTest(error=type(error).__name__, how="apply_review"), files("sqlite") as (jp, md, version):
-                self.answer_r4(jp, md, version)
-                with mock.patch.object(review_pack, "upsert_cards", side_effect=error):
-                    rep = core.apply_review_files(jp, md, [{"id": "r4", "text": "тут"}], by="claude")
-                self.assertEqual(rep.get("contradictions"), ["r4"])
-                self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
-                self.assertEqual(rep["cards"], {"r4": "not_replaced"})
-                self.assertEqual(self.word(jp, "w5")["w"], "тот")
-                self.contradiction(jp, "r4")
+            self.not_written(rep, "r4")
+            self.assertEqual(rep["card"], "not_replaced")
+            self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
+            self.assertEqual(self.card(jp, "r4")["rev"], 1)
+            self.contradiction(jp, "r4")
+            rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
+            self.assertEqual(rep["card"], "updated")
+            self.assertNotIn("cards_not_replaced", rep)
+        with self.subTest(how="apply_review"), files("sqlite") as (jp, md, version):
+            self.answer_r4(jp, md, version)
+            with mock.patch.object(review_pack, "upsert_cards",
+                                   side_effect=storage.Conflict("запись изменилась")):
+                rep = core.apply_review_files(jp, md, [{"id": "r4", "text": "тут"}], by="claude")
+            self.assertEqual(rep.get("contradictions"), ["r4"])
+            self.assertEqual([row["id"] for row in rep["cards_not_replaced"]], ["r4"])
+            self.assertEqual(rep["cards"], {"r4": "not_replaced"})
+            self.assertEqual(self.word(jp, "w5")["w"], "тот")
+            self.contradiction(jp, "r4")
 
 
 class ChoiceTests(Base):
@@ -385,7 +386,8 @@ class ChoiceTests(Base):
         r4 = next(i for i in data["review"] if i["id"] == "r4")
         r4.update(t=2.5, t1=2.5, text="дальше та", word_ids=["w3", "w5"])
         qs = [q for q in six.questions() if q["id"] != "r3"]
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (выбор в обоих режимах — test_each_choice)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend, data, qs) as (jp, md, version):
                 self.press(jp, version, "Оставить как есть", "r4")
                 core.apply_answers_files(jp, md)
