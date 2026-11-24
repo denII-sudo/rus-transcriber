@@ -786,6 +786,7 @@ def prepare_restore_snapshot(recording_id, source_revision, review_revision):
 
 def restore_recording_revision(snapshot):
     """Вернуть прежнюю ревизию как новую текущую; история сохраняется, файлы формируются заново."""
+    import documents
     import recordings
     if not isinstance(snapshot, dict) or "recording_id" not in snapshot:
         raise CoreError("неверный снимок возврата")
@@ -796,6 +797,7 @@ def restore_recording_revision(snapshot):
     store = recordings.open_store()
     try:
         store.current_identity()
+        documents.guard_before_write(store, snapshot["recording_id"])
         result = store.restore_with_document(
             snapshot["recording_id"], snapshot["source_revision"], snapshot["review_revision"],
             snapshot["expected_versions"], str(uuid.uuid4()), snapshot["context"],

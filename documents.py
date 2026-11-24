@@ -49,6 +49,18 @@ class DamagedCopy(storage.StorageError):
     """Копия, разрешающая перезапись, непригодна: останавливается только её объект, не соседи."""
 
 
+class NotWritten(storage.Conflict):
+    """Ничего не записано: перед записью файл записи оказался изменён вне программы или недоступен.
+
+    Сообщение по-русски, с именем файла и следующим шагом. Ревизии и очередь не менялись.
+    kind — какой из трёх файлов, status — что с ним (external, unreadable, invalid_target, gone, damaged_copy)."""
+
+    def __init__(self, message, kind=None, status=None):
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+
+
 def _not_reparse(path):
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
@@ -192,6 +204,18 @@ def _record_conflict(store, root_id, rid, revision, exc):
                          "WHERE recording_id=? AND document_revision=?", (rid, revision))
 
 
+def _copy_damaged(override):
+    """Сохранённая копия принятого решения непригодна: нет, не тех байтов или не той длины."""
+    content = override["observed_bytes"]
+    return (not isinstance(content, (bytes, bytearray, memoryview)) or len(content) != override["observed_size"]
+            or _digest(content) != override["observed_hash"])
+
+
+def _damaged_message(relative):
+    return (f"Сохранённая копия правки файла «{relative}» повреждена или отсутствует, поэтому файл не заменён. "
+            + DAMAGED_EXIT)
+
+
 def _check_override_copy(override, current, desired, relative):
     """Под блокировкой писателя проверить копию, разрешающую именно эту перезапись.
 
@@ -200,12 +224,37 @@ def _check_override_copy(override, current, desired, relative):
     """
     if override is None or current == desired or current != override["observed_hash"]:
         return
-    content = override["observed_bytes"]
-    if (not isinstance(content, (bytes, bytearray, memoryview)) or len(content) != override["observed_size"]
-            or _digest(content) != override["observed_hash"]):
-        raise DamagedCopy(
-            f"Сохранённая копия правки файла «{relative}» повреждена или отсутствует, поэтому файл не заменён. "
-            + DAMAGED_EXIT)
+    if _copy_damaged(override):
+        raise DamagedCopy(_damaged_message(relative))
+
+
+def file_verdict(current, desired, expected, override):
+    """Правило допустимости одного текущего файла записи. Чистая функция: диск и базу не читает.
+
+    current — хэш файла (None, если файла нет); desired — хэш версии программы; expected — хэш предыдущей версии,
+    допустимой при недописанной очереди; override — решённый конфликт (observed_hash/size/bytes) или None.
+    -> "ok" (версия программы), "stale" (предыдущая версия), "accepted" (байты, принятые человеком при замене),
+    "missing" (файла нет, его допишет запись), "external" (внешняя правка), "gone_after_confirmation" (файл исчез
+    после подтверждения), "damaged_copy" (копия принятого решения испорчена). Это единственная копия правила:
+    её берут писатель документов и проверка до записи."""
+    if override is not None and current not in (desired, override["observed_hash"]):
+        return "gone_after_confirmation" if current is None else "external"
+    if override is None and current not in (None, desired, expected):
+        return "external"
+    if current == desired:
+        return "ok"
+    if current is None:
+        return "missing"
+    if override is not None:
+        return "damaged_copy" if _copy_damaged(override) else "accepted"
+    return "stale"
+
+
+def _override_row(store, rid, rev, kind, filename):
+    return store.db.execute(
+        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
+        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
+        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
 
 
 def _authorized_root(store, root_id, root_path):
@@ -228,19 +277,121 @@ def _check_current(store, root, rid, rev, kind, filename, desired, expected):
     и повтор прямо перед заменой."""
     path = _target(root, filename)
     current = _file_hash(path)
-    override = store.db.execute(
-        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
-        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
-        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
-    if override is not None and current not in (desired, override["observed_hash"]):
-        if current is None:
-            raise storage.Conflict("external document disappeared after confirmation")
+    verdict = file_verdict(current, desired, expected, _override_row(store, rid, rev, kind, filename))
+    if verdict == "gone_after_confirmation":
+        raise storage.Conflict("external document disappeared after confirmation")
+    if verdict == "external":
         raise _FileConflict(kind, path)
-    if override is None and current not in (None, desired, expected):
-        raise _FileConflict(kind, path)
-    if current != desired:
-        _check_override_copy(override, current, desired, filename)
+    if verdict == "damaged_copy":
+        raise DamagedCopy(_damaged_message(filename))
     return path, current != desired
+
+
+def _head(store, recording_id):
+    """Последняя ревизия документа записи: строка очереди (с корнем), сама ревизия и текущие пути файлов."""
+    row = store.db.execute(
+        "SELECT o.root_id, r.path AS root_path, o.document_revision, o.state, o.expected_previous_hashes "
+        "FROM document_outbox o JOIN allowed_roots r USING(root_id) "
+        "WHERE o.recording_id=? ORDER BY o.document_revision DESC LIMIT 1", (recording_id,)).fetchone()
+    if row is None:
+        raise KeyError(recording_id)
+    document = store.get_document(recording_id, row["document_revision"])
+    return row, document, current_paths_from_document(document, recording_id)
+
+
+_VERDICT_STATUS = {"ok": "ok", "stale": "ok", "accepted": "ok", "missing": "missing", "external": "external",
+                   "gone_after_confirmation": "gone", "damaged_copy": "damaged_copy"}
+
+
+def check_recording_files(store, recording_id):
+    """Сверить три текущих файла последней ревизии записи с тем, что допустимо при следующей записи. Ничего не пишет.
+
+    Не создаёт папок и не следует по ссылкам. -> {md|json|manifest: статус}: ok (допустим, в том числе предыдущая
+    версия при недописанной очереди и байты, принятые человеком), missing (файла нет, запись его допишет),
+    external (изменён вне программы), gone (исчез после подтверждения конфликта), damaged_copy (копия принятого
+    решения испорчена), unreadable (не читается), invalid_target (на месте файла папка, ссылка или корень не годится)."""
+    row, document, paths = _head(store, recording_id)
+    try:
+        root = _authorized_root(store, row["root_id"], row["root_path"])
+    except (OSError, ValueError):
+        return {kind: "invalid_target" for kind in WRITE_ORDER}
+    pending = row["state"] != "synced"
+    previous = storage._loads(row["expected_previous_hashes"]) if pending else None
+    found = {}
+    for kind in WRITE_ORDER:
+        desired = _digest(document[kind])
+        try:
+            target, exists = _read_only_target(root, paths[kind])
+            current = _file_hash(target) if exists else None
+        except OSError:
+            found[kind] = "unreadable"
+            continue
+        except ValueError:
+            found[kind] = "invalid_target"
+            continue
+        override = _override_row(store, recording_id, row["document_revision"], kind, paths[kind]) if pending else None
+        found[kind] = _VERDICT_STATUS[file_verdict(current, desired, previous[kind] if pending else desired,
+                                                   override)]
+    return found
+
+
+_NOT_WRITTEN_WHY = {
+    "external": "изменён вне программы",
+    "unreadable": "сейчас не читается (занят другой программой или недоступен)",
+    "invalid_target": "заменён папкой или ссылкой (на его месте не обычный файл)",
+    "gone": "исчез после вашего подтверждения конфликта",
+}
+
+
+def _not_written(kind, status, name):
+    if status == "damaged_copy":
+        return NotWritten("Не записано: " + _damaged_message(name), kind, status)
+    step = {"external": "Откройте экран конфликтов (rt.py screen), решите, что делать с этим файлом, "
+                        "и повторите действие.",
+            "gone": "Откройте экран конфликтов (rt.py screen) и решите, что делать с этим файлом.",
+            "unreadable": "Закройте файл в других программах и повторите действие.",
+            "invalid_target": "Уберите папку или ссылку, верните файл на место и повторите действие."}[status]
+    return NotWritten(f"Не записано: файл «{name}» {_NOT_WRITTEN_WHY[status]}. Ничего не сохранено, "
+                      f"файлы записи не тронуты. {step}", kind, status)
+
+
+def guard_before_write(store, recording_id):
+    """Перед записью новой ревизии сверить файлы записи; при отказе ничего не записывать. Вызывать вне транзакции.
+
+    Ручная правка файла: под блокировкой корня файлы читаются заново (сосед-процесс мог дописать свою версию),
+    и только подтвердившаяся правка регистрируется конфликтом на текущую ревизию — как при записи файла. Недоступный
+    файл и испорченная копия решения отказ без конфликта. Нет файла — запись его допишет. Открытый конфликт
+    записи оставлен хранилищу: оно откажет само."""
+    row, _, _ = _head(store, recording_id)
+    if row["state"] == "conflict":
+        return
+    found = check_recording_files(store, recording_id)
+    if all(found[kind] in ("ok", "missing") for kind in WRITE_ORDER):
+        return
+    try:
+        root = _authorized_root(store, row["root_id"], row["root_path"])
+    except (OSError, ValueError) as exc:
+        raise NotWritten("Не записано: папка с файлами записи недоступна или не подтверждена. "
+                         "Ничего не сохранено. Откройте экран программы и проверьте папку.", None,
+                         "invalid_target") from exc
+    with _file_lock(root):
+        row, document, paths = _head(store, recording_id)
+        if row["state"] == "conflict":
+            return
+        found = check_recording_files(store, recording_id)
+        blocked = [kind for kind in WRITE_ORDER if found[kind] not in ("ok", "missing", "external")]
+        if blocked:
+            kind = blocked[0]
+            raise _not_written(kind, found[kind], Path(paths[kind]).name)
+        for kind in WRITE_ORDER:
+            if found[kind] == "external":
+                name = Path(paths[kind]).name
+                try:
+                    exc = _FileConflict(kind, root / paths[kind])
+                except (OSError, ValueError) as err:
+                    raise _not_written(kind, "unreadable", name) from err
+                _record_conflict(store, row["root_id"], recording_id, row["document_revision"], exc)
+                raise _not_written(kind, "external", name)
 
 
 def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=None):

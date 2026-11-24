@@ -332,6 +332,7 @@ def write_review_pack_state(document_path, state):
             result = store.commit_change(
                 binding["recording_id"], expected, str(uuid.uuid4()), context, review=review)
             return result
+        documents.guard_before_write(store, binding["recording_id"])
         result = store.commit_change_with_document(
             binding["recording_id"], expected, str(uuid.uuid4()), context, review=review,
             root_id=binding["root_id"], generated_at=datetime.now(timezone.utc).isoformat())
@@ -695,6 +696,7 @@ def commit_recording_data(store, recording_id, data, expected_versions, operatio
     context = context or current_operation_context(store)
     root_id = root_id or binding["root_id"]
     generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+    documents.guard_before_write(store, recording_id)     # ручная правка файла: до записи в базу, вне транзакции
     # Изменение source всегда получает новый согласованный review-снимок.
     with store._transaction():
         if precommit is not None:
