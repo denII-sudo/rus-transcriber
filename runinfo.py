@@ -28,10 +28,13 @@ from importlib import metadata
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-# Методика замера bench.py на момент введения паспорта: один проход по отрывку, первый кусок —
-# прогрев, load_sec включает прогрев. Меняется методика — меняется номер; числа разных версий
-# между собой не сравниваются.
-METHOD_VERSION = "bench-1"
+# Методика замера bench.py. Меняется методика — меняется номер; числа разных версий между собой не
+# сравниваются. bench-1 — один проход по отрывку, куски worker.split_at_pauses без нахлёста, у модели —
+# только текст, голосование words.vote3 по текстам; первый кусок — прогрев, load_sec включает прогрев.
+# bench-2 (РАР-4.2, шаг 4) — те же функции, что в расшифровке: куски words.make_chunks (у третьей модели —
+# worker.whisper_plan), слова со временами (worker.timestamped_pass), голосование words.combine_hypotheses
+# со сведениями о кусках; прогрев и скорость (к длине отрывка) — как раньше.
+METHOD_VERSION = "bench-2"
 
 KEY_PACKAGES = ("onnx-asr", "onnxruntime", "onnxruntime-openvino", "onnxruntime-directml", "openvino",
                 "torch", "torchaudio", "ctranslate2", "faster-whisper", "pyannote-audio", "gigaam",
