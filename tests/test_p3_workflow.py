@@ -87,7 +87,10 @@ class WorkflowTests(unittest.TestCase):
         runs = workflow.get(self.store, request)["runs"]
         self.assertEqual(len([run for run in runs if run["kind"] == "model"]), 2)
 
-    def test_unlinked_quote_does_not_commit(self):
+    def test_unlinked_quote_is_accepted_with_a_mark(self):
+        # Цитаты по одной (РАР-7, 7.5): не найденная цитата не отклоняет ответ — она печатается без кавычек
+        # с пометкой. До 7.5 такой ответ отклонялся (для заданий версии 1 это осталось: см.
+        # tests/test_quotes_one_by_one.py).
         request = workflow.create(self.store, self.source, {"require_conspect": True})
         workflow.claim_start(self.store, request)
         recording = self.make_recording()
@@ -96,14 +99,12 @@ class WorkflowTests(unittest.TestCase):
         task = workflow.prepare_model_task(self.store, request)
         answer = {"source_revision": task["source_revision"],
                   "sections": [{"text": "«совершенно другое»", "evidence": [task["words"][0]["word_id"]]}]}
-        with self.assertRaises(ValueError):
-            workflow.accept_model_result(self.store, request, answer)
-        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
-        self.assertEqual(self.store.list_conspects(recording), [])
-        with self.assertRaises(ValueError):
-            workflow.accept_model_result(self.store, request, answer)
-        self.assertEqual(workflow.get(self.store, request)["state"], "failed")
-        self.assertEqual(workflow.get(self.store, request)["model_attempts"], 2)
+        workflow.accept_model_result(self.store, request, answer)
+        self.assertEqual(workflow.get(self.store, request)["state"], "completed")
+        payload, md = self.conspect_files(recording)
+        self.assertEqual(payload["quotes"], {})
+        self.assertIn("совершенно другое (не найдено в стенограмме)", md)
+        self.assertNotIn("«", md)
 
     def test_committed_worker_output_recovers_without_rerunning_worker(self):
         request = workflow.create(self.store, self.source)

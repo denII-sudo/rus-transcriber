@@ -263,8 +263,22 @@ def _legacy_span(data, t1, t2):
     return _span_text(data, t1, t2)
 
 
-def link(conspect_md, data, min_score=0.75, selections=None):
-    """Связывает только однозначные точные цитаты. min_score оставлен для совместимости вызовов."""
+# Метка говорящего, написанная вплотную перед цитатой («Участник 2: «…»»): часть цитаты, не текста раздела.
+_LABEL_BEFORE = re.compile(r"(Участник\s+\d+|Говорящий не определён)\s*[:—–-]\s*$")
+UNLINKED_MARKS = {"none": "не найдено в стенограмме", "several": "в разделе несколько таких мест"}
+
+
+def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unlinked="reject", labels=False):
+    """Связывает только однозначные точные цитаты. min_score оставлен для совместимости вызовов.
+
+    Параметры правила «цитаты по одной» (РАР-7, 7.5; без них поведение прежнее):
+    within — слова раздела (ID): цитата ищется только среди них;
+    unlinked="mark" — несвязанная цитата остаётся в тексте без кавычек с пометкой (UNLINKED_MARKS),
+    число таких цитат — в unlinked_count; по умолчанию "reject": текст не меняется;
+    labels — метка говорящего вплотную перед цитатой считается частью цитаты: убирается из текста,
+    в цитате остаётся written_label, автора пишет сборка.
+    """
+    unlinked_mode = unlinked                # ниже имя unlinked занимает список несвязанных цитат
     toks = _tokens(data)
     seq = [t[0] for t in toks]
     first = {}
@@ -276,10 +290,33 @@ def link(conspect_md, data, min_score=0.75, selections=None):
     selections = selections or {}
     consumed = set()
     out, pos, n = [], 0, 0
+
+    def mark_unlinked(m, q, why):
+        nonlocal pos
+        unlinked.append(q)
+        if unlinked_mode == "mark":
+            cut = label_cut(m)[0]
+            out.append(conspect_md[pos:cut])
+            out.append(f"{q} ({UNLINKED_MARKS[why]})")
+            pos = m.end()
+
+    def label_cut(m):
+        """(откуда вырезать, написанная метка): имя перед цитатой или метка в конце текста перед ней."""
+        if not labels:
+            return (m.start(1) if m.group(1) else m.start(2) - 1), m.group(1)
+        if m.group(1) in names:                 # имя говорящего перед цитатой; «Итог:» и т. п. — обычный текст
+            return m.start(1), m.group(1)
+        start = m.start(2) - 1
+        found = _LABEL_BEFORE.search(conspect_md[pos:start])
+        if found:
+            return pos + found.start(), " ".join(found.group(1).split())
+        return start, None
+
     for quote_index, m in enumerate(Q.QUOTE.finditer(conspect_md), 1):
         spk, q = m.group(1), m.group(2)
-        if spk and spk not in names:
-            unlinked.append(q)
+        why = "none"
+        if spk and spk not in names and not labels:
+            mark_unlinked(m, q, why)
             continue
         clean = re.sub(r"\[[^\]]*\]", "…", q)
         raw_parts = [p for p in re.split(r"…|\.\.\.", clean)]
@@ -287,14 +324,16 @@ def link(conspect_md, data, min_score=0.75, selections=None):
         # До отдельной реализации согласованного выбора частей не связывать
         # разорванную цитату с независимо найденными разными местами.
         if len(raw_parts) != 1 or not data.get("recording_id"):
-            unlinked.append(q)
+            mark_unlinked(m, q, why)
             continue
         for p in raw_parts:
             toks_p = [Q._n(w) for w in Q.WORD.findall(p)]
             if not toks_p:
                 continue
             # Приближённое совпадение показывается проверяющему, но не становится ссылкой автоматически.
-            matches = Q.candidates(toks_p, toks, speaker=spk, min_score=1.0)
+            matches = Q.candidates(toks_p, toks, speaker=None if labels else spk, min_score=1.0)
+            if within is not None:
+                matches = [hit for hit in matches if all(t[3] in within for t in toks[hit[1]:hit[1] + hit[2]])]
             options = []
             for _, ci, cl in matches[:21]:
                 selected_ids = list(dict.fromkeys(t[3] for t in toks[ci:ci + cl]))
@@ -316,6 +355,7 @@ def link(conspect_md, data, min_score=0.75, selections=None):
                 consumed.add(str(quote_index))
             if len(matches) != 1:
                 ok = False
+                why = "several" if len(matches) > 1 else "none"
                 break
             r, i, L = matches[0]
             ids = list(dict.fromkeys(t[3] for t in toks[i:i + L]))
@@ -325,17 +365,19 @@ def link(conspect_md, data, min_score=0.75, selections=None):
             t1, t2 = _part_times(toks[i:i + L])
             parts.append({"t1": t1, "t2": t2, "word_ids": ids})
         if not ok or not parts:
-            unlinked.append(q)
+            mark_unlinked(m, q, why)
             continue
         n += 1
         key = str(n)
         t1, t2 = parts[0]["t1"], parts[-1]["t2"]
         base, base_spk = _id_text(data, parts[0]["word_ids"])
         joined = " … ".join(filter(None, (_id_text(data, p["word_ids"])[0] for p in parts)))
-        quotes[key] = {"parts": parts, "author": q, "speaker": spk, "base": joined, "base_speaker": base_spk,
-                       "last": joined, "last_speaker": base_spk}
+        quotes[key] = {"parts": parts, "author": q, "speaker": None if labels else spk, "base": joined,
+                       "base_speaker": base_spk, "last": joined, "last_speaker": base_spk}
         # «Имя: «…»» — имя тоже часть ссылки, чтобы обновлялось вместе с говорящим
-        start = m.start(1) if spk else m.start(2) - 1
+        start, written = label_cut(m)
+        if labels:
+            quotes[key]["written_label"] = written
         out.append(conspect_md[pos:start])
         out.append(f"{{{{q:{key}}}}}")
         pos = m.end()
@@ -345,6 +387,8 @@ def link(conspect_md, data, min_score=0.75, selections=None):
     obj = {"version": 2, "template": "".join(out), "quotes": quotes,
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "analysis_revision": None}
+    if unlinked_mode == "mark":
+        obj["unlinked_count"] = len(unlinked)
     return obj, {"linked": n, "unlinked": unlinked, "candidates": candidates_report,
                  "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision")}
 
@@ -392,8 +436,39 @@ def _labels_header(obj, data, needs_review):
     return head
 
 
+def _clock(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _author_of(obj, data):
+    """Функция «говорящий в стенограмме → как назвать автора цитаты» для свёртки «цитаты по одной».
+
+    Условная метка («Участник N») — по словам метки в текущей стенограмме, как в шапке; говорящий без метки
+    (появился после приёма) — по правилу шапки _speaker_display.
+    """
+    names = data.get("speaker_names")
+    names = names if isinstance(names, dict) else {}
+    current = {word.get("word_id"): seg.get("speaker")
+               for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    by_speaker = {}
+    for item in obj.get("speaker_labels") or []:
+        for wid in item.get("word_ids") or []:
+            if wid in current:
+                by_speaker.setdefault(current[wid], item.get("label"))
+
+    def author(speaker):
+        return by_speaker.get(speaker) or _speaker_display(speaker, names)
+    return author
+
+
 def render(obj, data, update_last=True):
-    """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания."""
+    """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания.
+
+    Свёртка с quote_policy 1 («цитаты по одной», РАР-7, 7.5): автора пишет программа, цитата в «» только
+    если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
+    с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
+    """
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
     rep["rendered_source_revision"] = data.get("source_revision")
     rep["analysis_revision"] = obj.get("analysis_revision")
@@ -407,6 +482,15 @@ def render(obj, data, update_last=True):
     if not obj.get("recording_id"):
         rep["legacy_unverified"] = True
 
+    policy = obj.get("quote_policy") == 1
+    stats = {"quoted": 0, "marked": obj.get("unlinked_count", 0) if policy else 0, "unheard": 0}
+    if policy:
+        import workflow
+        rep["author_corrected"] = []
+        author_of = _author_of(obj, data)
+        starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
+                  for word in seg.get("words") or [] if _start(word) is not None}
+
     def sub(m):
         key = m.group(1)
         q = obj["quotes"].get(key)
@@ -416,6 +500,9 @@ def render(obj, data, update_last=True):
                  else _legacy_span(data, p["t1"], p["t2"]) for p in q["parts"]]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
+            if policy:
+                stats["marked"] += 1
+                return f"{q['author']} (место в стенограмме не найдено)"
             body = q["author"] + " [место в стенограмме не найдено]"
             return (f"{q['speaker']}: " if q.get("speaker") else "") + f"«{body}»"
         cur = " … ".join(t for t, _ in texts)
@@ -434,9 +521,34 @@ def render(obj, data, update_last=True):
             spk = cur_spk
         if update_last:
             q["last"], q["last_speaker"] = cur, cur_spk
+        if policy:
+            return one_by_one(key, q, body, cur_spk)
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
-    md = _labels_header(obj, data, rep["analysis_needs_review"]) + PLACE.sub(sub, obj["template"])
+    def one_by_one(key, q, body, speaker):
+        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают."""
+        author = author_of(speaker)
+        written = q.get("written_label")
+        if written and written != author:
+            rep["author_corrected"].append({"id": key, "written": written, "now": author})
+        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
+        blockers = workflow.quote_blockers(data, ids)
+        if not blockers:
+            stats["quoted"] += 1
+            return f"{author}: «{body}»"
+        stats["marked"] += 1
+        unheard = all(blocker["reason"] == "unheard" for blocker in blockers)
+        stats["unheard"] += unheard
+        found = [starts[wid] for wid in ids if wid in starts]
+        when = f", {_clock(min(found))}" if found else ""
+        return f"{author}: {body} (по распознаванию, {'не прослушано' if unheard else 'не проверено'}{when})"
+
+    body_md = PLACE.sub(sub, obj["template"])
+    header = _labels_header(obj, data, rep["analysis_needs_review"])
+    if policy and (stats["quoted"] or stats["marked"]):
+        header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
+                   + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
+    md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
     rep["assembly_revision"] = obj.get("assembly_revision")

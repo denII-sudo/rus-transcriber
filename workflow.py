@@ -325,9 +325,18 @@ def _task_turns(transcript):
                 (segment for segment in transcript.get("segments", []) if segment.get("words")), 1)]
 
 
+def _place_unresolved(item):
+    """Место разбора ещё не закрыто человеком: статус open (или не задан) или human.
+
+    Единственная запись этого правила для цитат и признаков сомнения в workflow.py. Копии его остались в
+    core.py и transcript.py (до PR 7 линии 1): там их не трогаем.
+    """
+    return item.get("status", "open") in ("open", "human")
+
+
 def _open_places(review):
-    """Открытые места разбора: статус open (или не задан) и human — их ещё не закрыл человек."""
-    return [item for item in review.get("review", []) if item.get("status", "open") in ("open", "human")]
+    """Открытые места разбора: их ещё не закрыл человек (см. _place_unresolved)."""
+    return [item for item in review.get("review", []) if _place_unresolved(item)]
 
 
 # Допуск на округление времени: то же правило, по которому transcript._find_span находит
@@ -355,6 +364,75 @@ def _word_in_place(start, end, t1, t2):
     """
     return (t1 - PLACE_TIME_TOLERANCE <= start <= t2 + PLACE_TIME_TOLERANCE
             or (start < t2 and end > t1))
+
+
+def _closed_unheard(item):
+    """Место закрыто без прослушивания (ИИ по поручению): цитату оно не держит, в шапке видно «не прослушано».
+
+    Поле появится с PR 14 (его имя задаёт линия 1): до него функция всегда возвращает False.
+    """
+    return False
+
+
+def place_holds_quote(item):
+    """Может ли место разбора держать цитату в кавычках. Единственная запись этого правила (РАР-7, 7.5).
+
+    Не держит открытое место и место, закрытое без прослушивания. Отметки слов (`word["seen"]` — человек
+    видел слово, это не подтверждение) правило не читает.
+    """
+    return not _place_unresolved(item) and not _closed_unheard(item)
+
+
+# Названное исключение этапа 7.5а: открытое место-пауза (слов внутри нет) пока задевает все цитаты записи,
+# так же строго, как раньше. В 7.5б, после PR 6а, слова места-паузы берутся функцией PR 6а с
+# pause_neighbors=True, и исключение убирается вместе с этим именем.
+PAUSE_UNTIL_6A = True
+
+
+def quote_blockers(data, word_ids):
+    """Места разбора, из-за которых цитата из слов word_ids не держится в кавычках.
+
+    data — стенограмма с ключом review (как у transcript.load): список мест. -> [{"id", "reason"}], reason:
+    open — место не решено; unheard — закрыто без прослушивания; unlocated — место или слова цитаты
+    привязать к времени нельзя, и оно задевает все цитаты. Пусто — цитата чистая.
+    """
+    wanted = set(word_ids)
+    timed, quote_spans, quote_untimed = [], [], False
+    for segment in data.get("segments") or []:
+        for word in segment.get("words") or []:
+            start, end = word.get("s"), word.get("e")
+            span = None
+            if _seconds(start):
+                span = (start, end if _seconds(end) and end >= start else start)
+                timed.append(span)
+            if word.get("word_id") in wanted:
+                if span is None:
+                    quote_untimed = True
+                else:
+                    quote_spans.append(span)
+    blockers = []
+    for item in data.get("review") or []:
+        if place_holds_quote(item):
+            continue
+        reason = "open" if _place_unresolved(item) else "unheard"
+        if item.get("word_ids"):
+            hit = bool(wanted & set(item["word_ids"]))
+        else:
+            place = _place_time(item)
+            if place is None:
+                reason, hit = "unlocated", True
+            else:
+                t1, t2 = place
+                inside = any(_word_in_place(start, end, t1, t2) for start, end in timed)
+                if not inside:
+                    hit = PAUSE_UNTIL_6A                  # пауза: слов внутри нет
+                elif quote_untimed:
+                    reason, hit = "unlocated", True       # время слова цитаты неизвестно — не судим
+                else:
+                    hit = any(_word_in_place(start, end, t1, t2) for start, end in quote_spans)
+        if hit:
+            blockers.append({"id": item.get("id"), "reason": reason})
+    return blockers
 
 
 def _precise_doubts(transcript, review):
@@ -1018,6 +1096,12 @@ def _assemble_parts(store, request_id, task, task_hash, *, expected_run_id=None)
                                                     "sections": sections})
 
 
+def _quotes_one_by_one(task):
+    """Новые модельные свёртки (задание с метками говорящих, версии 2 и выше) собираются «цитаты по одной»
+    (РАР-7, 7.5): заданные до этого версии 1 — по-прежнему с запретом на всю запись."""
+    return model_tasks.version(task) != 1
+
+
 def _validate_model_part(store, request_id, part_index, result, before=None):
     """Чистая проверка ответа, пригодная для repair без изменения счётчиков состояния."""
     before = before or get(store, request_id)
@@ -1042,11 +1126,12 @@ def _validate_model_part(store, request_id, part_index, result, before=None):
         import conspect
         data = {**current["transcript"]["payload"], "recording_id": before["recording_id"],
                 "source_revision": current["transcript"]["revision"]}
-        open_review = any(item.get("status", "open") in ("open", "human")
-                          for item in current["review"]["payload"].get("review", []))
+        open_review = any(_place_unresolved(item) for item in current["review"]["payload"].get("review", []))
         for section in accepted["sections"]:
             if "{{q:" in section["text"]:
                 raise ValueError("служебные маркеры цитат в ответе не допускаются")
+            if _quotes_one_by_one(task):
+                continue      # цитаты по одной: несвязанная или задевшая сомнение цитата ответ не отклоняет
             obj, report = conspect.link(section["text"], data)
             if report["unlinked"] or (obj["quotes"] and open_review):
                 raise ValueError("цитата неоднозначна или есть неразрешённые сомнения")
@@ -1346,20 +1431,41 @@ def _accept_model_result_once(store, request_id, result):
             for section, span in zip(accepted["sections"], spans))
     data = {**current["payload"], "recording_id": request["recording_id"],
             "source_revision": current["revision"]}
-    for section in accepted["sections"]:
-        section_obj, section_report = conspect.link(section["text"], data)
-        if section_report["unlinked"]:
+    if _quotes_one_by_one(request["model_task"]):
+        # Цитаты по одной: ответ не отклоняется из-за цитаты. Каждая ищется среди слов своего раздела;
+        # не найденная или неоднозначная печатается без кавычек с пометкой, а задевшая место разбора
+        # получает пометку при каждой сборке (conspect.render). Разбор нужен сборке — он идёт в data.
+        data["review"] = snapshots["review"]["payload"].get("review", [])
+        pieces, quotes, unlinked_count = [], {}, 0
+        for section, span in zip(accepted["sections"], spans):
+            section_obj, _report = conspect.link(section["text"], data, within=set(section["evidence"]),
+                                                 unlinked="mark", labels=True)
+            offset = len(quotes)
+            template = conspect.PLACE.sub(lambda hit: "{{q:%d}}" % (int(hit.group(1)) + offset),
+                                          section_obj["template"])
+            quotes.update({str(int(key) + offset): quote for key, quote in section_obj["quotes"].items()})
+            unlinked_count += section_obj["unlinked_count"]
+            pieces.append((f"[{_clock(span['t1'])}]\n" if span["t1"] is not None else "") + template
+                          + _also_line(section, current["payload"]))
+        obj = {"version": 2, "template": "\n\n".join(pieces), "quotes": quotes,
+               "recording_id": data["recording_id"], "source_revision": data["source_revision"],
+               "analysis_revision": None, "quote_policy": 1, "unlinked_count": unlinked_count,
+               "assembly_review_revision": snapshots["review"]["revision"]}
+    else:
+        for section in accepted["sections"]:
+            section_obj, section_report = conspect.link(section["text"], data)
+            if section_report["unlinked"]:
+                raise ValueError("цитаты неоднозначны или не найдены в стенограмме")
+            evidence = set(section["evidence"])
+            if any(not set(part["word_ids"]) <= evidence
+                   for quote in section_obj["quotes"].values() for part in quote["parts"]):
+                raise ValueError("цитата не входит в свидетельства раздела")
+        obj, report = conspect.link(text, data)
+        if report["unlinked"]:
             raise ValueError("цитаты неоднозначны или не найдены в стенограмме")
-        evidence = set(section["evidence"])
-        if any(not set(part["word_ids"]) <= evidence
-               for quote in section_obj["quotes"].values() for part in quote["parts"]):
-            raise ValueError("цитата не входит в свидетельства раздела")
-    obj, report = conspect.link(text, data)
-    if report["unlinked"]:
-        raise ValueError("цитаты неоднозначны или не найдены в стенограмме")
-    if obj["quotes"] and any(item.get("status", "open") in ("open", "human")
-                             for item in snapshots["review"]["payload"].get("review", [])):
-        raise ValueError("цитаты недоступны, пока остаются неразрешённые сомнения")
+        if obj["quotes"] and any(_place_unresolved(item)
+                                 for item in snapshots["review"]["payload"].get("review", [])):
+            raise ValueError("цитаты недоступны, пока остаются неразрешённые сомнения")
     name = "workflow-" + request_id
     binding = recordings.document_binding(store, request["recording_id"])
     json_path, md_path = conspect.path_for(binding["root"] / binding["paths"]["json"], name)

@@ -413,7 +413,9 @@ class LongWorkflowTests(unittest.TestCase):
             return result
         self.assertEqual(self.execute(request, answer=answer)["state"], "completed")
         self.assertIn("Особая фраза изложения", json.dumps(self.sent[1][1]["summary"], ensure_ascii=False))
-        self.assertIn("repair_error", self.sent[2][1])                # цитата из изложения отклонена
+        # цитаты по одной (7.5): ответ не отклоняется, но цитата из изложения в стенограмме части не найдена —
+        # она печатается без кавычек с пометкой, а не как цитата
+        self.assertTrue(all(sent[1].get("repair_error") is None for sent in self.sent))
         saved = workflow.get(self.store, request)
         task = saved["model_task"]
         first, final = task["parts"][1]
@@ -421,7 +423,9 @@ class LongWorkflowTests(unittest.TestCase):
                       for word in task["words"][point["start"]:point["end"]]}
         second = saved["model_result"]["sections"][1]
         self.assertTrue(set(second["evidence"]) <= part_words)
-        self.assertNotIn("«", second["text"])
+        conspect_json = self.store.list_conspects(saved["recording_id"])[0]["payload"]
+        self.assertEqual(conspect_json["quotes"], {})
+        self.assertIn("Особая фраза изложения (не найдено в стенограмме)", conspect_json["template"])
 
     def test_more_than_six_parts_is_refused_before_the_cloud(self):
         request = self.prepare_request(turn_words=(100,) * 61)        # 6 100 слов при пределе 1 000

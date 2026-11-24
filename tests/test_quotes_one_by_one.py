@@ -121,9 +121,9 @@ class RuleTests(unittest.TestCase):
 class LinkTests(unittest.TestCase):
     def test_within_picks_the_single_place_in_the_section(self):
         data = make_data()
-        obj, report = conspect.link("Решили: «срок релиза» переносится.", data)
+        obj, report = conspect.link("Решили, что «срок релиза» переносится.", data)
         self.assertEqual((len(report["unlinked"]), len(obj["quotes"])), (1, 0))      # без within — два места
-        obj, report = conspect.link("Решили: «срок релиза» переносится.", data, within=set(A))
+        obj, report = conspect.link("Решили, что «срок релиза» переносится.", data, within=set(A))
         self.assertEqual((report["unlinked"], obj["quotes"]["1"]["parts"][0]["word_ids"]), ([], ["w4", "w5"]))
 
     def test_unlinked_quote_is_printed_plainly_with_a_mark(self):
@@ -313,6 +313,25 @@ class SqliteModeTests(unittest.TestCase):
         before = workflow.get(self.store, request)
         workflow._validate_model_part(self.store, request, 0, {
             "source_revision": task["source_revision"], "sections": [{"text": self.TEXT, "evidence": ids}]}, before)
+
+    def test_saved_version_1_task_keeps_the_whole_record_ban(self):
+        # задание версии 1 (без реплик и меток) доделывается по-прежнему: цитата при открытом сомнении — отказ
+        request, recording, task = self.prepared([self.OPEN])
+        legacy = model_tasks.build(
+            task["recording_id"], task["source_revision"],
+            [{**{key: value for key, value in word.items() if key != "turn"}, "uncertain": True}
+             for word in task["words"]],     # версия 1: открытое место без ссылок — сомнительны все слова
+            task["goal"], task["review_revision"])
+        with self.store._transaction():
+            self.store.db.execute("UPDATE workflow_requests SET model_task_json=? WHERE request_id=?",
+                                  (storage._json(legacy), request))
+        ids = [word["word_id"] for word in legacy["words"]]
+        answer = {"source_revision": legacy["source_revision"],
+                  "sections": [{"text": "Итог: «согласен с этим».", "evidence": ids}]}
+        with self.assertRaises(ValueError):
+            workflow.accept_model_result(self.store, request, answer)
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        self.assertEqual(self.store.list_conspects(recording), [])
 
     def test_quotes_return_after_the_place_is_resolved_without_the_cloud(self):
         request, recording, task = self.prepared([self.OPEN])
