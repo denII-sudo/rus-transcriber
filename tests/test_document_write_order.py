@@ -191,9 +191,10 @@ class AllThreeFilesAreCheckedBeforeTheFirstReplacement(WriteOrderCase):
         self.assertEqual(env.outbox(rid, 2), ("error", "io_or_interrupted"))
 
     def test_other_record_of_the_root_is_written_in_full(self):
-        env, first = self.synced("two-records")
+        env, first = self.synced("two-records", revised=False)
         second = env.create("tag2")
         env.materialize()
+        env.change(first, "два")
         env.change(second, "два")
         env.file(first, "md").write_bytes(b"external")
         env.materialize()
@@ -239,7 +240,7 @@ class MissingFilesAreRestoredAfterTheCheck(WriteOrderCase):
         self.assertEqual(env.store.db.execute("SELECT count(*) FROM materialization_events").fetchone()[0], 0)
         env.resolve(rid)
         self.assertEqual(env.materialize(), [(rid, 1)])
-        self.assertEqual(env.versions(rid), {"md": 0, "json": 1, "manifest": 1})
+        self.assertEqual(env.versions(rid), {"md": 1, "json": 1, "manifest": 1})   # «заменить» вернуло версию программы
 
     def test_all_missing_are_restored_in_order(self):
         env, rid = self.synced(revised=False)
@@ -288,7 +289,7 @@ class CrashOnEveryBoundary(WriteOrderCase):
                 found = env.versions(rid)
                 self.assertTrue(set(found.values()) <= {1, 2}, found)         # только версии, которые принимает прежний код
                 order = [found[kind] for kind in KINDS]
-                self.assertEqual(order, sorted(order), f"manifest не может быть новее md и json: {found}")
+                self.assertEqual(order, sorted(order, reverse=True), f"manifest не может быть новее md и json: {found}")
                 self.assertEqual(env.outbox(rid, 2)[0], "synced" if boundary == "after_ack" else "writing")
                 expected = env.store.db.execute("SELECT expected_previous_hashes FROM document_outbox WHERE "
                                                 "recording_id=? AND document_revision=2", (rid,)).fetchone()[0]
