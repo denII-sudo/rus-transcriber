@@ -6,10 +6,12 @@ from pathlib import Path
 import freeform
 
 
-EXPECTED_AGREE = {
-    "да", "верно", "так", "правильно", "все верно", "всё верно", "да верно",
-    "ага", "угу", "так и есть", "как есть", "да так",
+# PR 6б (В8): прежние строки agree разделены на короткие слова и подтверждения; ID и тексты прежние.
+EXPECTED_SHORT_WORDS = {"да", "так", "ага", "угу", "нет"}
+EXPECTED_CONFIRMS = {
+    "верно", "правильно", "все верно", "всё верно", "да верно", "так и есть", "как есть", "да так",
 }
+EXPECTED_EVALUATION_STEMS = ("согла", "рекоменд", "предлож", "верно", "правильн")
 EXPECTED_NEGATIVE_PREFIXES = ("нет", "это", "я", "нет-нет")
 EXPECTED_NEGATIVE_INTENSIFIERS = ("совершенно", "совсем", "абсолютно")
 EXPECTED_NEGATIVE_CORES = (
@@ -26,16 +28,20 @@ EXPECTED_NEGATIVES = frozenset(
 
 
 class AnswerPhraseSnapshotTests(unittest.TestCase):
-    def test_current_agree_and_negative_sets_are_preserved(self):
-        self.assertEqual(freeform.AGREE, EXPECTED_AGREE)
+    def test_current_short_answer_and_negative_sets_are_preserved(self):
+        self.assertEqual(freeform.SHORT_WORDS, EXPECTED_SHORT_WORDS)
+        self.assertEqual(freeform.CONFIRMS, {x.replace("ё", "е") for x in EXPECTED_CONFIRMS})
+        self.assertEqual(freeform.EVALUATION_STEMS, EXPECTED_EVALUATION_STEMS)
         self.assertEqual(freeform.NEGATIVES, EXPECTED_NEGATIVES)
 
     def test_installed_table_is_parsed_with_all_supported_kinds(self):
         phrases = freeform._read_answer_phrases()
         self.assertEqual(set(phrases), {
-            "agree", "negative_prefix", "negative_intensifier", "negative_core",
+            "short_word", "confirm", "evaluation_stem", "negative_prefix", "negative_intensifier", "negative_core",
         })
-        self.assertEqual(set(phrases["agree"]), EXPECTED_AGREE)
+        self.assertEqual(set(phrases["short_word"]), EXPECTED_SHORT_WORDS)
+        self.assertEqual(set(phrases["confirm"]), EXPECTED_CONFIRMS)
+        self.assertEqual(tuple(phrases["evaluation_stem"]), EXPECTED_EVALUATION_STEMS)
         self.assertEqual(tuple(phrases["negative_prefix"]), EXPECTED_NEGATIVE_PREFIXES)
         self.assertEqual(tuple(phrases["negative_intensifier"]), EXPECTED_NEGATIVE_INTENSIFIERS)
         self.assertEqual(tuple(phrases["negative_core"]), EXPECTED_NEGATIVE_CORES)
@@ -56,18 +62,21 @@ class AnswerPhraseSnapshotTests(unittest.TestCase):
     def test_header_only_table_is_rejected_for_missing_categories(self):
         self.assert_table_error(
             "header-only.tsv", "id\tkind\ttext\tnote\n".encode("utf-8"),
-            "обязательные категории: agree, negative_prefix, negative_intensifier, negative_core", 2,
+            "обязательные категории: short_word, confirm, evaluation_stem, negative_prefix, "
+            "negative_intensifier, negative_core", 2,
         )
 
     def test_each_required_category_must_be_present(self):
         rows = (
-            ("A001", "agree", "да", ""),
+            ("A001", "short_word", "да", ""),
+            ("A002", "confirm", "верно", ""),
+            ("E001", "evaluation_stem", "согла", ""),
             ("N001", "negative_prefix", "нет", ""),
             ("N002", "negative_intensifier", "совсем", ""),
             ("N003", "negative_core", "неверно", ""),
         )
         for missing_kind in (
-            "agree", "negative_prefix", "negative_intensifier", "negative_core",
+            "short_word", "confirm", "evaluation_stem", "negative_prefix", "negative_intensifier", "negative_core",
         ):
             with self.subTest(kind=missing_kind):
                 table = "id\tkind\ttext\tnote\n" + "".join(
@@ -75,7 +84,7 @@ class AnswerPhraseSnapshotTests(unittest.TestCase):
                 )
                 self.assert_table_error(
                     f"missing-{missing_kind}.tsv", table.encode("utf-8"),
-                    f"обязательные категории: {missing_kind}", 5,
+                    f"обязательные категории: {missing_kind}", 7,
                 )
 
     def test_bom_is_rejected(self):
@@ -92,21 +101,21 @@ class AnswerPhraseSnapshotTests(unittest.TestCase):
 
     def test_empty_text_is_rejected(self):
         self.assert_table_error(
-            "empty.tsv", "id\tkind\ttext\tnote\nA001\tagree\t \t\n".encode("utf-8"),
+            "empty.tsv", "id\tkind\ttext\tnote\nA001\tshort_word\t \t\n".encode("utf-8"),
             "пустой text", 2,
         )
 
     def test_repeated_id_is_rejected(self):
         self.assert_table_error(
             "duplicate-id.tsv",
-            "id\tkind\ttext\tnote\nA001\tagree\tда\t\nA001\tagree\tага\t\n".encode("utf-8"),
+            "id\tkind\ttext\tnote\nA001\tshort_word\tда\t\nA001\tshort_word\tага\t\n".encode("utf-8"),
             "повторный id", 3,
         )
 
     def test_repeated_phrase_is_rejected(self):
         self.assert_table_error(
             "duplicate-text.tsv",
-            "id\tkind\ttext\tnote\nA001\tagree\tда\t\nA002\tagree\tда\t\n".encode("utf-8"),
+            "id\tkind\ttext\tnote\nA001\tshort_word\tда\t\nA002\tshort_word\tда\t\n".encode("utf-8"),
             "повторная фраза", 3,
         )
 

@@ -342,7 +342,7 @@ class PauseAsIsTests(PauseCase):
                     self.save(jp, version, option=0)
                     rep = self.apply(jp, md)
                     row = self.outcomes(rep)["r1"]
-                    self.assertEqual(row["outcome"], "apply_conflict")
+                    self.assertEqual(row["outcome"], "pause_refused")
                     self.assertIn(why, row.get("detail", ""))
                     self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
                     self.assertUntouchedNeighbors(jp)
@@ -412,7 +412,7 @@ class PauseAsIsTests(PauseCase):
                 decisions, _ = review_pack.decisions(jp)
                 self.assertTrue(all("word_ids" not in d for d in decisions if d["id"] == "r1"))
                 rep = self.apply(jp, md)
-                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "apply_conflict")
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "pause_refused")
                 self.assertUntouchedNeighbors(jp)
                 self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
 
@@ -794,7 +794,7 @@ class PauseOverlapAnswersTests(FreeAnswerCase):
                 self.save(jp, version, aid="r5", text="Анна: эээ")
                 rep = self.apply(jp, md)
                 rows = {k: v["outcome"] for k, v in self.outcomes(rep).items()}
-                self.assertEqual(rows, {"r1": "apply_conflict", "r2": "applied", "r5": "applied"})
+                self.assertEqual(rows, {"r1": "pause_refused", "r2": "applied", "r5": "applied"})
                 self.assertEqual(self.texts(jp), ["начало", "ну", "эээ", "дальше"])
                 self.assertEqual(self.place_of(jp, "r1")["status"], "open")
 
@@ -832,7 +832,7 @@ class OldPackFreeAnswersTests(FreeAnswerCase):
     def test_old_pack_is_read_by_the_new_rule_and_not_rewritten(self):
         data = custom_result([("w1", "начало", 0.5, "Анна"), ("w2", "Ну", 2.0, "Анна"), ("w3", "дальше", 2.5, "Анна")],
                              [gap(1.0, 2.0, id="r1")])
-        cases = (("как есть", {"option": 0}, ["начало", "Ну", "дальше"], "apply_conflict"),
+        cases = (("как есть", {"option": 0}, ["начало", "Ну", "дальше"], "pause_refused"),
                  ("имя", {"text": "Анна"}, ["начало", "Ну", "дальше"], "not_applied"),
                  ("слова", {"text": "Анна: Вот. Ну"}, ["начало", "Вот.", "Ну", "дальше"], "applied"))
         for backend in BACKENDS:

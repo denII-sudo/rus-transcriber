@@ -63,12 +63,18 @@ OUTCOME_REASONS = {
     "source_conflict": "не применён: стенограмма изменилась после создания карточек или пакет от другой записи",
     "not_found": "не применён: место карточки не найдено в стенограмме",
     "not_applied": "не применён: автоматическое изменение не получилось",
+    "pause_refused": ("не применён: паузу так не закрыть — нажмите кнопку прослушивания паузы "
+                      "или впишите услышанное"),
+    "hint": "не применён: короткий ответ не понят как слова, место осталось открытым — подсказка ниже",
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
-# ответ совпал со словами паузы, но вложенное «как есть» человека отказало (например, нужно прослушивание)
-PAUSE_CONFIRM_REFUSAL = ("слова паузы совпали с ответом, но место не закрылось: {why}; "
-                         "прослушайте паузу и подтвердите её отдельно")
+# ответ совпал со словами места (паузы) или подтвердил их, но вложенное «как есть» человека отказало
+# (например, нужно прослушивание)
+PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом, но место не закрылось: {why}; "
+                         "прослушайте паузу или место и подтвердите отдельно")
+# годность кнопки прослушивания паузы — по словам её интервала, а не по ревизии всей стенограммы
+LISTEN_STALE = "слова в интервале паузы изменились после создания карточек; пересоберите пакет"
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -164,7 +170,13 @@ def build(json_path, items, base_url_note=None):
             skipped.append({"id": q.get("id"), "why": "нет такого места"})
             continue
         opts = q.get("options") or []
-        if it.get("asr_problem"):
+        gap = T.gap_interval(it) if T.is_gap_place(it) else None
+        if gap:
+            # Пропуск (В7): кнопки прослушивания вместо вариантов агента; «как есть» на паузе не показывается.
+            opts = ([{"label": T.LISTEN_WORDS, "decision": {"listened": "words"}}] if T.pause_words(data, *gap)
+                    else []) + [{"label": T.LISTEN_SILENCE, "decision": {"listened": "silence"}},
+                                {"label": T.LISTEN_INTERJECTIONS, "decision": {"listened": "interjections"}}]
+        elif it.get("asr_problem"):
             opts = [{"label": "Я прослушал: слова в стенограмме верны", "decision": {"listened": "words"}},
                     {"label": "Я прослушал: здесь тишина", "decision": {"listened": "silence"}}]
         else:
@@ -201,7 +213,10 @@ def build(json_path, items, base_url_note=None):
             "reasons": it.get("reasons"), "voices": it.get("voices"),
             "question": question,
             "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
-            "recommended": None if it.get("asr_problem") else q.get("recommended"), "note": q.get("note")}
+            "recommended": None if it.get("asr_problem") or gap else q.get("recommended"), "note": q.get("note")}
+        if gap:
+            # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
+            manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
         if q.get("answer_mode") == "speaker" and not it.get("asr_problem"):
             # подтверждение говорящего: свободный ответ не становится текстом реплики (freeform.card_edits)
             manifest_item["answer_mode"] = "speaker"
@@ -416,6 +431,9 @@ def match(text, item):
         return {"kind": "human"}
     if re.search(r"пропус|дальше|следующ", j) and len(w) <= 3:
         return {"kind": "skip"}
+    if freeform.classify(text, [])["kind"] in freeform.SHORT_KINDS:
+        # голос = текст (В8): «да», «верно», «согласен» разбирает таблица слов, рекомендацию они не выбирают
+        return {"kind": "free"}
     opts = item.get("options") or []
     if len(w) <= 4:
         for x in w:
@@ -425,9 +443,6 @@ def match(text, item):
             for stem, n in _ORD:
                 if x.startswith(stem) and n < len(opts):
                     return {"kind": "option", "option": n}
-        if re.search(r"рекоменд|как предлож|согла|(?<!на)верно|правильно|^да$|^ага$|^угу$", j) and \
-                item.get("recommended") is not None:
-            return {"kind": "recommended", "option": item["recommended"]}
     # совпадение по словам варианта (имена, слова текста): берём вариант с наибольшим числом
     # отличительных слов — тех, что есть только в нём
     sets = [set(_norm(o["label"])) for o in opts]
@@ -648,6 +663,7 @@ def decisions(json_path):
     data = T.load(json_path)
     applied = _applied_map(store)
     by_id = {it["id"]: it for it in man["items"]}
+    places = {r.get("id"): r for r in data.get("review") or []}
     conflicted = {c["id"] for c in store.get("conflicts") or []}
     out, rep = [], {"applied_from_answers": 0, "human": [], "free": [], "skipped": [], "unanswered": [],
                     "unchanged": [], "changed": [], "reverted": [], "kept_previous": [], "pending_new": [],
@@ -688,7 +704,15 @@ def decisions(json_path):
             continue
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})
-            if d.get("listened") and man.get("source_revision") != data.get("source_revision"):
+            if d.get("listened") and "listen_fp" in it:
+                # кнопка паузы (6б): годна, пока слова её интервала те же, что при сборке пакета
+                gap = T.gap_interval(places.get(aid) or {})
+                if not gap or T._listening_fingerprint(T._interval_words(data, *gap)) != it["listen_fp"]:
+                    rep.setdefault("source_conflict", LISTEN_STALE)
+                    rep["source_conflict_ids"].append(aid)
+                    rep.setdefault("source_conflict_why", {})[aid] = LISTEN_STALE
+                    continue
+            elif d.get("listened") and man.get("source_revision") != data.get("source_revision"):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
                 continue
@@ -819,10 +843,15 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         # ответ совпал со словами, уже стоящими в паузе: открытое место закрывается тем же путём, что «как есть»
         still_open = {r["id"] for r in T.load(json_path).get("review") or []
                       if r.get("status", "open") in ("open", "human")}
-        confirmed = [r["id"] for r in reports if r.get("confirm_pause") and r["id"] not in blocked
+        confirmed = [r["id"] for r in reports if r.get("confirm_as_is") and r["id"] not in blocked
                      and r["id"] in still_open]
         if confirmed:
-            _, nested = T.apply_review(json_path, md_path, [{"id": cid} for cid in confirmed], by="human")
+            # «как есть» человека; у места-слова — по его ID слов из пакета, как у варианта (decisions)
+            man_items = {it["id"]: it for it in man["items"]}
+            asked = [{"id": cid, **({"word_ids": man_items[cid]["word_ids"]}
+                                    if "word_ids" in man_items.get(cid, {})
+                                    and not T.is_gap_place(man_items[cid]) else {})} for cid in confirmed]
+            _, nested = T.apply_review(json_path, md_path, asked, by="human")
             refused = {c.get("id"): c.get("why") for c in nested.get("conflicts") or []}
             done = set(nested.get("successful_ids") or [])
             not_closed = [cid for cid in confirmed if cid not in done]
@@ -842,8 +871,10 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         if r.get("human"):
             human.append({"id": r["id"], "why": r["human"], "answer": r["answer"]})
     negative_ids = {r["id"] for r in reports if r.get("kind") == "negative"}
-    mark_human = [h for h in human if h["id"] not in negative_ids]
-    if mark_human and not dry_run:                # не понятые ответы — человеку; отрицание оставляет место как было
+    hint_ids = {r["id"] for r in reports if r.get("kind") == "hint"}
+    mark_human = [h for h in human if h["id"] not in negative_ids | hint_ids]
+    # не понятые ответы — человеку; отрицание и подсказка на короткий ответ оставляют место открытым
+    if mark_human and not dry_run:
         T.apply_review(json_path, md_path, [{"id": h["id"], "status": "human",
                                              "note": f"{h['why']}: «{h['answer']}»"} for h in mark_human], by="human")
     return {**({"target_ids": {aid: sorted(ids) for aid, ids in targets.items()}} if dry_run else {}),
@@ -851,7 +882,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
-            "closed_via": closed, "conflicts": conflicts, "left_to_human": human,
+            "closed_via": closed, "conflicts": conflicts, "left_to_human": human, "hints": sorted(hint_ids),
             "successful_ids": [r["id"] for r in reports if (r["id"] in rep["cards"] or r["id"] in confirmed)
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
                                and not r.get("human")

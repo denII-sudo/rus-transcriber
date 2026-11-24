@@ -2350,7 +2350,7 @@ def _merge_free_reports(parts):
         return {}
     merged = dict(parts[0])
     for key in ("successful_ids", "not_found", "cards", "conflicts", "left_to_human",
-                "proposed_delete", "vocab_suggestions"):
+                "proposed_delete", "vocab_suggestions", "hints"):
         merged[key] = [x for part in parts for x in part.get(key) or []]
     for key in ("closed_via", "failed", "conspects"):
         merged[key] = {k: v for part in parts for k, v in (part.get(key) or {}).items()}
@@ -2866,6 +2866,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     free_report = rep.get("free_text") or {}
     free_conflicts = {aid for row in free_report.get("conflicts") or [] for aid in row.get("cards") or []}
     free_not_found = set(free_report.get("not_found") or [])
+    pause_refused = set(report.get("pause_refused") or [])      # пропуск без кнопки паузы (6б)
+    free_hints = set(free_report.get("hints") or [])             # короткий ответ — подсказка, место открыто
     outcomes = {}
     for aid in requested_ids:
         if aid in successful:
@@ -2880,6 +2882,10 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "already_decided"
         elif aid in rep.get("human", []):
             outcomes[aid] = "left_for_human"
+        elif aid in pause_refused:
+            outcomes[aid] = "pause_refused"
+        elif aid in free_hints:
+            outcomes[aid] = "hint"
         elif aid in apply_conflicts or aid in free_conflicts:
             outcomes[aid] = "apply_conflict"
         elif aid in free_not_found or aid in (report.get("not_found") or []):
@@ -2938,7 +2944,7 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         add_detail(row.get("id"), row.get("why") or ("слово уже исправлено прежней правкой"
                                                       if row.get("kept_edits") else None))
     for aid in rep.get("source_conflict_ids") or []:
-        add_detail(aid, rep.get("source_conflict"))
+        add_detail(aid, (rep.get("source_conflict_why") or {}).get(aid) or rep.get("source_conflict"))
 
     def row(aid):
         out = {"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],

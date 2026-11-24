@@ -117,6 +117,18 @@ def files(backend, data=None, qs=None):
                     store.close()
 
 
+def old_pack(jp, change):
+    """Пакет, собранный до 6б: change(элемент r1) правит его и в состоянии ответов, и в manifest.json файлов."""
+    state = review_pack.answers_state(jp)
+    change(next(i for i in state["manifest"]["items"] if i["id"] == "r1"))
+    review_pack._write_answers(jp, state)
+    path = review_pack.pack_dir(jp) / "manifest.json"
+    if recordings.read_review_pack_state(jp) is None and path.exists():
+        man = review_pack._read(path, {})
+        change(next(i for i in man["items"] if i["id"] == "r1"))
+        review_pack._write(path, man)
+
+
 class Case(unittest.TestCase):
     _ts = 0
 
@@ -263,9 +275,7 @@ class PauseButtonsApplyTests(Case):
                 with self.subTest(backend=backend, where=where, new_pack=new_pack), \
                         files(backend) as (jp, md, version):
                     if not new_pack:            # пакет до 6б: отпечатка интервала нет
-                        state = review_pack.answers_state(jp)
-                        next(i for i in state["manifest"]["items"] if i["id"] == "r1").pop("listen_fp")
-                        review_pack._write_answers(jp, state)
+                        old_pack(jp, lambda item: item.pop("listen_fp"))
                     self.press(jp, version, SILENCE)
                     if where == "elsewhere":
                         transcript.edit_span(jp, md, 3.0, 3.2, "тот", by="human")
@@ -334,11 +344,7 @@ class PauseButtonsApplyTests(Case):
         """Тест 17 (оба): вариант агента старого пакета на пустой паузе — исход «нужна кнопка паузы»."""
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
-                state = review_pack.answers_state(jp)
-                item = next(i for i in state["manifest"]["items"] if i["id"] == "r1")
-                item["options"] = [AS_IS]
-                item.pop("listen_fp")
-                review_pack._write_answers(jp, state)
+                old_pack(jp, lambda item: (item.update(options=[AS_IS]), item.pop("listen_fp")))
                 self.save(jp, version, option=0)
                 rep = self.apply(jp, md)
                 row = self.outcomes(rep)["r1"]
@@ -539,8 +545,7 @@ class ShortAnswersApplyTests(Case):
                 self.save(jp, version, "r2", text="да")
                 self.save(jp, version, "r4", text="да")
                 self.save(jp, version, "r3", text="верно")
-                rev = transcript.load(jp).get("source_revision")
-                rep = self.apply(jp, md)
+                rep = self.apply(jp, md)            # повтор с подсказками ничего не пишет (тест 16)
                 rows = self.outcomes(rep)
                 self.assertEqual(rows["r2"]["outcome"], "applied", rep.get("outcomes"))
                 self.assertEqual(self.place_of(jp, "r2")["status"], "resolved")
@@ -552,8 +557,6 @@ class ShortAnswersApplyTests(Case):
                 self.assertIn("«Оставить как есть»", rows["r3"].get("detail", ""))
                 self.assertEqual(self.texts(jp), ["начало", "да", "дальше", "та"])
                 self.assertNotIn("by", self.word(jp, "w5"))
-                if backend == "legacy_files":
-                    self.assertEqual(transcript.load(jp).get("source_revision"), rev)
 
     def test_confirm_keeps_the_words_and_ignores_the_recommendation(self):
         """Тест 14 (оба): «верно» на месте-слове с рекомендацией — как есть, рекомендация не применена."""
