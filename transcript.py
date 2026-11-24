@@ -288,6 +288,7 @@ def render_md(data, text_only=False):
                     who = e.get("by", "?")
                     if e.get("via") == "edit_span":
                         who = ("человек" if who == "human" else "агент") + ", правка отрезка"
+                    who += _counts_text(e.get("changed"), e.get("seen"), len(e.get("seen_changed") or []))
                     lines.append(f"- {hms(e['t'])} ({who}): " + "; ".join(ch)
                                  + (f" — {e['note']}" if e.get("note") else ""))
                 lines.append("")
@@ -704,13 +705,13 @@ def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None,
     who = "человек" if by == "human" else "агент"
     data2, rep = apply_word_edits(json_path, md_path, [e], by=by, closed=closed, via="edit_span",
                                   log_note="правка отрезка" + (f": {note}" if note else ""),
-                                  close_note=f"решено правкой отрезка {card} ({who})", close_held=by == "human")
+                                  close_note=f"решено правкой отрезка {card} ({who}{{counts}})", close_held=by == "human")
     if card in rep["failed"]:
         reason = rep["failed"][card]
         raise ValueError(reason + (SPAN_REOPEN_HINT if "ответом человека на карточку" in reason else ""))
     c = rep["cards"].get(card, {})
     return data2, {"card": card, "before": c.get("before"), "after": c.get("after"), "resolved": sorted(closed),
-                   "conspects": rep.get("conspects")}
+                   "seen_changed": rep.get("seen_changed", []), "conspects": rep.get("conspects")}
 
 
 @recording_locked
@@ -742,6 +743,44 @@ def _mark_provenance(word, dimension, by, edit, via=None):
     provenance = copy.deepcopy(word.get("provenance") or {})
     provenance[dimension] = {"by": by, "edit": edit, **({"via": via} if via else {})}
     word["provenance"] = provenance
+
+
+def _seen_key(word):
+    return word.get("word_id") or f"t{round(word['s'], 2)}"
+
+
+def _seen_snapshot(pairs):
+    """Слова с отметкой «видел» до правки. pairs — (слово, говорящий). Отметка `word["seen"]` лежит вне
+    `provenance`: она не делает слово «тронутым человеком» (`human_touched`) и в публичный документ sqlite не идёт."""
+    return {_seen_key(w): {"word_id": w.get("word_id"), "t": w["s"], "w": w["w"], "spk": spk,
+                           "seen_edit": w["seen"].get("edit")}
+            for w, spk in pairs if isinstance(w.get("seen"), dict)}
+
+
+def _seen_settle(snapshot, pairs):
+    """После правки: у слова, чей текст или говорящий изменились (или которое исчезло), отметка снимается.
+    -> список таких слов [{"word_id", "t", "w" (прежний текст), "seen_edit"}] — «видевшиеся» слова, изменённые правкой."""
+    now = {_seen_key(w): (w, spk) for w, spk in pairs}
+    changed = []
+    for key, old in snapshot.items():
+        cur = now.get(key)
+        if cur and cur[0]["w"] == old["w"] and cur[1] == old["spk"]:
+            continue
+        if cur:
+            cur[0].pop("seen", None)
+        changed.append({"word_id": old["word_id"], "t": old["t"], "w": old["w"], "seen_edit": old["seen_edit"]})
+    return changed
+
+
+def _counts_text(changed, seen, seen_changed):
+    """Числа правки отрезка для строки .md и заметки места: у человека «изменено N, видел M», у агента —
+    сколько из изменённых слов человек видел. Пусто, если отметок «видел» не было."""
+    if seen:
+        return f"; изменено {changed}, видел {seen}"
+    if seen_changed:
+        return f"; изменено {changed}, из них видел человек {seen_changed}" if changed else \
+            f"; видел человек: {seen_changed}"
+    return ""
 
 
 HELD_FOR_HUMAN = "место оставлено человеку"
@@ -949,8 +988,11 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     Реплика делится там, где внутри неё меняется говорящий. closed — {id места: карточка}, которые
     ответ человека покрыл (решено через другую карточку). answers — {карточка: текст ответа} для журнала.
     via — способ правки ("edit_span"): пишется в журнал и в отметки слов, и тогда помечаются только изменённые
-    слова. close_note — заметка закрытых мест (по умолчанию «решено человеком (через карточку)»); close_held —
-    закрывать и места, оставленные человеку. -> (data, отчёт)"""
+    слова. Человек (by="human") в правке с via ставит неизменённым словам отметку «видел» (`word["seen"]`, вне
+    `provenance`): слово не становится подтверждённым. Правка, изменившая слово, отметку снимает; у агента такие
+    слова идут в `seen_changed` отчёта и журнала.
+    close_note — заметка закрытых мест (по умолчанию «решено человеком (через карточку)»; «{counts}» заменяется
+    числами правки отрезка); close_held — закрывать и места, оставленные человеку. -> (data, отчёт)"""
     data = load(json_path)
     original = copy.deepcopy(data)
     answers = answers or {}
@@ -960,6 +1002,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         for w in seg.get("words") or []:
             flat.append({"w": w, "spk": seg["speaker"], "seg": si})
     by_t = {}
+    seen_before = _seen_snapshot((f["w"], f["spk"]) for f in flat)
+    counts, counts_text = {}, {}
 
     def reindex():
         by_t.clear()
@@ -1115,10 +1159,15 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 new_ws, _, _ = _diff_words(old, e["text"], card, refuse(e))
                 old_text = {w.get("word_id"): w["w"] for w in old if w.get("word_id")}
                 speaker_changed = bool(e.get("speaker") and any(flat[k]["spk"] != e["speaker"] for k in ks))
+                changed_new, kept = 0, set()
                 for w in new_ws:
                     text_changed = not w.get("word_id") or old_text.get(w["word_id"]) != w["w"]
                     if via and not (text_changed or speaker_changed):
-                        continue                  # правка отрезка: неизменённое слово сохраняет прежние отметки
+                        kept.add(_seen_key(w))
+                        if by == "human":         # правка отрезка человека: неизменённое слово — только «видел»
+                            w["seen"] = {"by": by, "edit": card, "via": via}
+                        continue                  # прежние отметки слова не меняются
+                    changed_new += 1
                     w["edited"], w["by"] = card, by
                     if text_changed:
                         _mark_provenance(w, "text", by, card, via)
@@ -1133,6 +1182,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 for q, w in enumerate(new_ws):
                     flat.insert(pos + q, {"w": w, "spk": spk, "seg": si})
                 reindex()
+                if via:
+                    c = counts.setdefault(card, {"changed": 0, "seen": 0})
+                    c["changed"] += max(changed_new, sum(1 for w in old if _seen_key(w) not in kept))
+                    c["seen"] += len(kept) if by == "human" else 0
                 before_words += [w["w"] for w in old]
                 after_words += [w["w"] for w in new_ws]
                 rep["replace"] += 1
@@ -1234,6 +1287,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             ns["inserts"] = old[si]["inserts"]
             used_ins.add(si)
     data["segments"] = segs
+    seen_changed = _seen_settle(seen_before, [(w, sg["speaker"]) for sg in segs for w in sg["words"]])
+    if seen_changed and by != "human":
+        rep["seen_changed"] = seen_changed
 
     def txt(rows):
         out, last = [], None
@@ -1251,7 +1307,12 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         brows = [r for r in snap if a_ <= r[0] <= b_]
         arows = [r for r in final if a_ <= r[0] <= b_ + 0.05]
         bt, at = txt(brows), txt(arows)
+        card_seen = [x for x in rep.get("seen_changed", []) if a_ <= x["t"] <= b_]
+        c = counts.get(card)
+        counts_text[card] = _counts_text(c["changed"], c["seen"], len(card_seen)) if c else ""
         log.append({"id": card, "t": rg["t1"], "by": by, "kind": "words", **({"via": via} if via else {}),
+                    **({"changed": c["changed"], "seen": c["seen"]} if c and (c["seen"] or card_seen) else {}),
+                    **({"seen_changed": card_seen} if card_seen else {}),
                     "before": {"text": bt, "speaker": who(brows)}, "after": {"text": at, "speaker": who(arows)},
                     "answer": answers.get(card), "note": log_note or "ответ человека в карточке",
                     "pairs": sorted({tuple(p) for p in pairs.get(card, [])})})
@@ -1263,7 +1324,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             continue
         it = items.get(rid)
         if it and (close_held or it.get("status", "open") != "human"):
-            it["status"], it["note"] = "resolved", close_note or f"решено человеком (через {card_via})"
+            it["status"], it["note"] = "resolved", (close_note or f"решено человеком (через {card_via})").replace(
+                "{counts}", counts_text.get(card_via, ""))
     for card in groups:
         it = items.get(card)
         if not it:
@@ -1384,6 +1446,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         seg = data["segments"][si]
         ws = seg["words"]
         before = {"text": " ".join(w["w"] for w in ws[w1:w2]), "speaker": seg["speaker"]}
+        seen_before = _seen_snapshot((w, seg["speaker"]) for w in ws[w1:w2])
         if by != "human" and ((d.get("text") and d["text"] != before["text"]) or
                               (d.get("speaker") and d["speaker"] != before["speaker"])):
             if any(human_touched(w) for w in ws[w1:w2]):
@@ -1450,10 +1513,14 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             data["segments"][si:si + 1] = new_segs
         else:
             seg["text"] = " ".join(w["w"] for w in ws)
+        seen_changed = _seen_settle(seen_before, [(w, new_spk) for w in ws[w1:w2]]) if seen_before else []
+        if seen_changed and by != "human":
+            report.setdefault("seen_changed", []).extend(seen_changed)
         edits.append({"id": it["id"], "t": it["t"], "by": by, "before": before,
                       "after": {"text": " ".join(w["w"] for w in (data["segments"][si]["words"] if new_spk == seg["speaker"]
                                                                    else ws)[w1:w2]) if new_text else before["text"],
-                                "speaker": new_spk}, "note": d.get("note")})
+                                "speaker": new_spk}, "note": d.get("note"),
+                      **({"seen_changed": seen_changed} if seen_changed and by != "human" else {})})
         it["status"] = "resolved"
         report["applied"] += 1
         report["successful_ids"].append(it["id"])
