@@ -921,7 +921,8 @@ def _replace_window(what, plan):
                 ["Заменить файл на диске версией программы: правка в нём пропадёт.", *kept])
     names = ", ".join(f"«{name}»" for name in (plan["waits"] if effect == "wait" else plan["stops"]))
     cause = (f"Он ждёт решения по другому файлу: {names}. " if effect == "wait"
-             else f"Запись остановит повреждённая копия файла {names}. ")
+             else f"Запись остановит {core._stops_words(plan['stops'], plan['stops_changed'])}. "
+             if plan.get("stops_changed") else f"Запись остановит повреждённая копия файла {names}. ")
     if plan["blocked"]:
         cause += "Тот файл здесь и на экране решить нельзя: нужен ручной разбор. "
     later = ("этот изменённый файл не заменит, а покажет новый конфликт." if plan["changed"]

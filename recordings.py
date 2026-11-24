@@ -490,11 +490,10 @@ def _materialize_conspects_locked(store, recording_id):
                 "SELECT observed_hash, observed_size, observed_bytes FROM conspect_conflicts WHERE conspect_id=? AND revision=? "
                 "AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL ORDER BY rowid DESC LIMIT 1",
                 (row["conspect_id"], row["revision"], kind, relative)).fetchone()
-            if resolved is not None and current_hash not in (desired_hash, resolved["observed_hash"]):
-                if not exists:
-                    raise storage.Conflict("external conspect file disappeared after confirmation")
-                conflicts.append(documents._FileConflict(kind, target))
-            elif resolved is None and current_hash not in (None, desired_hash, expected.get(kind)):
+            verdict = documents.file_verdict(current_hash, desired_hash, expected.get(kind), resolved)
+            if verdict == "gone_after_confirmation":
+                raise storage.Conflict("external conspect file disappeared after confirmation")
+            if verdict == "external":    # правки ищутся по всем файлам свёртки сразу, копии решений — после них
                 conflicts.append(documents._FileConflict(kind, target))
             overrides.append((resolved, current_hash, desired_hash, relative))
         if conflicts:
