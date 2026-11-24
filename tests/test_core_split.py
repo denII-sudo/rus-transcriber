@@ -1,4 +1,4 @@
-"""Разрезка `core.py` на модули: имена, порядок загрузки, свободные имена (первый перенос — раздел «голоса»).
+"""Разрезка `core.py` на модули: имена, порядок загрузки, свободные имена (переносы: «голоса», «конфликты»).
 
 `core.py` остаётся прослойкой: все прежние имена `core.X` работают, но каждое определено в одном месте — в новом
 модуле (`core_voices.X.__module__ == "core_voices"`, `core.X is core_voices.X`). Всё, что новый модуль берёт из
@@ -25,6 +25,23 @@ SPLIT = {
         "backup_voice_profile", "backup_voice_profiles", "preview_voice_learning", "prepare_voice_action",
         "revoke_voice_source", "set_voice_auto_learn", "set_voice_quality_policy", "start_voice_update",
         "voice_action_lines", "voice_profiles", "voice_quality", "voice_refresh_plan",
+    ),
+    "core_conflicts": (
+        "CONFLICT_DIFF_CELLS", "CONFLICT_DIFF_WORK", "CONFLICT_PREVIEW_CHARS", "CONFLICT_SCOPES",
+        "CONFLICT_SHOWN_CHARS", "CONFLICT_SHOWN_LINES", "_CONFLICT_COLUMNS", "_CONFLICT_SQL", "_KNOWN_CONFLICTS",
+        "_WIDE_SPACES", "_ZERO_WIDTH", "_also_replaced", "_anchors", "_answer_confirmation_hash", "_conflict_facts",
+        "_conflict_item", "_conflict_row", "_conflict_rows", "_copy_name", "_copy_problem",
+        "_damaged_copies_warning", "_decode_copy", "_diff_lines", "_effect", "_eol_names", "_failure_reason",
+        "_file_at", "_file_notes", "_file_outcome", "_file_words", "_invisible_note", "_is_journal_stop",
+        "_journal_blockers", "_journal_reason", "_lines", "_listed_program_version", "_missing_text", "_next_step",
+        "_not_written_warning", "_observed_bytes", "_present", "_program_version", "_queue_unfinished", "_real_case",
+        "_recording_reference", "_refusal", "_replace_file", "_resolve_for_agent", "_same_object", "_set_stops",
+        "_show_text", "_shown_file", "_stops_words", "_unresolvable_wait", "_view", "_waits_for",
+        "_write_and_report", "backup_store", "confirm_review_answers", "conflict_copy", "explain_error",
+        "find_recording_results", "inspect_backup", "list_all_conflicts", "list_conspect_conflicts",
+        "list_document_conflicts", "prepare_answer_confirmation", "preview_conflict", "read_recording_result",
+        "replace_conflict_file", "replacement_effect", "resolve_conspect_conflict", "resolve_document_conflict",
+        "restore_from_backup", "retry_conflict_file", "say_error", "sync_recording_documents",
     ),
 }
 
