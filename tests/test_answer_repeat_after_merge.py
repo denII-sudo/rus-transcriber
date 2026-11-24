@@ -5,6 +5,7 @@
 на слова убраны из карточек документа, а в пакете ответов (manifest) остаются.
 """
 import copy
+import json
 import unittest
 from unittest import mock
 
@@ -95,6 +96,61 @@ class RepeatAfterMerge(base.AnswerOutcomeCase):
             self.check_outcomes(jp, rep)
             self.assertEqual(self.pack_state(jp), before)
             self.assertEqual(rep["document_sync"], "synced")
+
+    def test_repeat_takes_the_unchanged_branch_without_commit(self):
+        # Правка А: повтор после слияния слов идёт веткой «ничего не изменилось», commit не вызывается.
+        with mock.patch.object(base, "result_data", two_word_card),                 mock.patch.object(base, "QUESTIONS", copy.deepcopy(QUESTIONS)),                 base.answer_files("sqlite") as (jp, md, version):
+            self.save(jp, version, option=0)
+            core.apply_answers_files(jp, md)
+            with mock.patch.object(recordings, "commit_recording_data",
+                                   wraps=recordings.commit_recording_data) as commit:
+                core.apply_answers_files(jp, md)
+            commit.assert_not_called()
+
+    @staticmethod
+    def disk_words(jp):
+        data = json.loads(jp.read_text(encoding="utf-8"))["transcript"]      # документ на диске
+        return [w["w"] for s in data["segments"] for w in s["words"]]
+
+    def failed_first_then_repeat(self, merge=None):
+        """Первое применение: документ не записан на диск (ошибка). Повтор должен дописать его."""
+        with mock.patch.object(base, "result_data", two_word_card),                 mock.patch.object(base, "QUESTIONS", copy.deepcopy(QUESTIONS)),                 base.answer_files("sqlite") as (jp, md, version):
+            self.save(jp, version, option=0)
+            with mock.patch.object(recordings, "materialize_recording", return_value=[]):
+                with self.assertRaises(core.CoreError) as ctx:
+                    core.apply_answers_files(jp, md)
+            self.assertIn("обновление документа не завершено", str(ctx.exception))
+            self.assertEqual(self.disk_words(jp), ["тест", "слово"])     # на диске ещё старый документ
+            if merge is None:
+                rep = core.apply_answers_files(jp, md)
+            else:
+                with mock.patch.object(recordings, "merge_answer_draft", merge):
+                    rep = core.apply_answers_files(jp, md)
+            self.assertEqual(rep["document_sync"], "synced")
+            self.assertEqual(self.disk_words(jp), ["другое"])            # документ дописан
+            store, binding = recordings.open_for_document(jp)
+            try:
+                latest = recordings.document_binding(store, binding["recording_id"])
+                self.assertEqual(recordings.document_sync_state(
+                    store, binding["recording_id"], latest["document_revision"]), "synced")
+            finally:
+                store.close()
+
+    def test_repeat_writes_unsynced_document_on_unchanged_candidate(self):
+        self.failed_first_then_repeat()
+
+    def test_repeat_writes_unsynced_document_on_unchanged_commit(self):
+        real = recordings.merge_answer_draft
+
+        def old_merge(data, state):
+            result = real(data, state)
+            items = {i["id"]: i for i in (state.get("manifest") or {}).get("items") or []}
+            for q in result["questions"]:
+                if "word_ids" in items.get(q["id"], {}):
+                    q["word_ids"] = list(items[q["id"]]["word_ids"])
+            return result
+
+        self.failed_first_then_repeat(old_merge)
 
 
 if __name__ == "__main__":
