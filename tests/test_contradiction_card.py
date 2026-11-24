@@ -317,6 +317,43 @@ class ChoiceTests(Base):
                 self.assertEqual(self.word(jp, "w5")["w"], "тот")
 
 
+class HumanNoteTests(Base):
+    """Тест 21. В-3, владелец: «Только на противоречии (Recommended)». Примечание человека — отдельно от
+    ответа: в ответе, истории противоречия и журнале правок; не в стенограмме, не в .md, не в публичном
+    документе и не в облачном пакете; ответом не разбирается."""
+
+    NOTE = "да, уточнил у Анны после встречи"
+
+    def test_note_is_kept_locally_and_goes_nowhere_else(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                self.answer_r4(jp, md, version)
+                core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="claude")
+                item = self.card(jp, "r4")
+                option = next(n for n, o in enumerate(item["options"]) if o["label"].startswith(ACCEPT))
+                self.save(jp, version, "r4", rev=item["rev"], option=option, human_note=self.NOTE)
+                rep = core.apply_answers_files(jp, md)
+                self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
+                self.assertEqual(self.word(jp, "w5")["w"], "тут")       # «да» в примечании — не ответ
+                self.assertEqual(review_pack.answers_state(jp)["answers"]["r4"]["human_note"], self.NOTE)
+                data = transcript.load(jp)
+                place = next(i for i in data["review"] if i["id"] == "r4")
+                self.assertEqual(place["contradiction"]["history"][-1]["human_note"], self.NOTE)
+                self.assertEqual(data["edits"][-1].get("human_note"), self.NOTE)
+                self.assertNotIn(self.NOTE, " ".join(w["w"] for s in data["segments"] for w in s["words"]))
+                self.assertNotIn(self.NOTE, md.read_text(encoding="utf-8"))
+                self.assertNotIn(self.NOTE, json.dumps(six.documents._public_review(data), ensure_ascii=False))
+                bundle = review_pack.cloud_bundle(jp)
+                cloud = (six.Path(bundle["base"]) / bundle["files"]["manifest.json"]).read_text(encoding="utf-8")
+                self.assertNotIn(self.NOTE, cloud)
+                self.assertNotIn("seen_fp", cloud)
+
+    def test_note_on_another_card_is_not_kept(self):
+        with files("sqlite") as (jp, _md, version):
+            self.save(jp, version, "r2", option=0, human_note=self.NOTE)
+            self.assertNotIn("human_note", review_pack.answers_state(jp)["answers"]["r2"])
+
+
 class InterfaceTests(Base):
     """Тест 24 и условие архитектора: результат «не записано» читается без JSON; rt.py — код выхода 3."""
 
