@@ -1417,7 +1417,7 @@ def _accept_model_result_once(store, request_id, result):
     text = "\n\n".join(section["text"] for section in accepted["sections"])
     if "{{q:" in text:
         raise ValueError("служебные маркеры цитат в ответе не допускаются")
-    labelled = model_tasks.version(request["model_task"]) != 1
+    labelled = _quotes_one_by_one(request["model_task"])     # одно правило: версия задания, не равная 1
     if labelled:
         # Локальные добавления к ответу модели, в облако не передаются. Время начала раздела
         # (по словам его evidence) стоит отдельной строкой перед текстом раздела и попадает
