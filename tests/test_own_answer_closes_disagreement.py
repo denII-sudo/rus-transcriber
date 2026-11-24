@@ -308,6 +308,16 @@ class NewRevisionAfterOpenTests(Base):
                 self.assertFalse(rep.get("replaced_cards"))
                 self.assertEqual((self.card(jp)["rev"], review_pack.manifest(jp).get("pack_rev")), (2, pack_rev))
 
+    def test_repeated_replacement_of_a_plain_card_writes_nothing(self):
+        """У обычной карточки вопрос новой редакции берётся из манифеста: повтор замены не дописывает начало
+        второй раз и новой редакции не создаёт (иначе rev рос бы при каждом «Применить»)."""
+        with files("sqlite", result()) as (jp, _md, _v):
+            self.assertEqual(review_pack.open_after_answer_cards(jp, ["r4"]), ["r4"])
+            card = self.card(jp, "r4")
+            self.assertEqual((card["rev"], card["question"].count(review_pack.OPEN_AFTER_ANSWER)), (2, 1))
+            self.assertEqual(review_pack.open_after_answer_cards(jp, ["r4"]), [])
+            self.assertEqual(self.card(jp, "r4")["rev"], 2)
+
     def test_failed_replacement_heals_on_the_next_apply(self):
         """Сбой между фиксацией ответа и заменой карточки: ответ применён, карточка прежняя, отчёт называет
         сбой; следующее «Применить» карточку заменяет."""

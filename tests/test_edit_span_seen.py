@@ -197,10 +197,11 @@ class AgentChangesSeenWords(unittest.TestCase):
             with self.subTest(backend=backend), files(backend) as (jp, md):
                 human_sees_all(jp, md)
                 transcript.apply_review(jp, md, [{"id": "r2", "text": "новое"}], by="human")   # w2 — слово человека
-                before = (transcript.load(jp), jp.read_bytes())
-                with self.assertRaises(ValueError):
-                    transcript.edit_span(jp, md, 0.2, 1.5, "тесто новое дальше", by="claude")
-                self.assertEqual((transcript.load(jp), jp.read_bytes()), before)
+                before = transcript.load(jp)["segments"]
+                # PR 13б: не ошибка, а противоречие — слова и отметки «видел» не меняются, у места — предложение
+                _, rep = transcript.edit_span(jp, md, 0.2, 1.5, "тесто новое дальше", by="claude")
+                self.assertIs(rep["written"], False)
+                self.assertEqual(transcript.load(jp)["segments"], before)
                 self.assertEqual(seen_of(jp, "w1"), SEEN_1)
 
     def test_failed_save_leaves_no_mark_and_retry_works(self):
