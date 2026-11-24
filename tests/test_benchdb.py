@@ -414,11 +414,9 @@ class PrivacyTests(unittest.TestCase):
         three_runs(bench)
         benchdb.apply_load(bench)
         text = json.dumps(dump(bench), ensure_ascii=False)
-        for bad in (":\\\\", "\\\\\\\\", "/Users/", SECRET_NAME, SECRET_WORD, "Иван", Path(_TMP).name, "texts.json\""):
-            if bad == "texts.json\"":
-                continue                       # имя файла текстов (только <run_id>.texts.json) — ссылка, не путь
+        # в JSON одна обратная косая выглядит как две: «:\» — путь диска, «\\\\» — сетевой путь
+        for bad in (":\\\\", "\\\\\\\\", "/Users/", SECRET_NAME, SECRET_WORD, "Иван", Path(_TMP).name):
             self.assertNotIn(bad, text, bad)
-        self.assertNotIn("C:\\", text)
 
     def test_file_names_in_the_log_are_names_only(self):
         bench = new_bench()

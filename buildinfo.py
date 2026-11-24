@@ -14,7 +14,7 @@ import subprocess
 
 MANIFEST = "build-info.json"
 ROOT_FILES = (
-    "server.py", "worker.py", "bench.py", "runinfo.py", "buildinfo.py", "backends.py",
+    "server.py", "worker.py", "bench.py", "runinfo.py", "benchdb.py", "buildinfo.py", "backends.py",
     "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py",
     "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
     "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hypotheses.py", "hypstore.py", "hotspots.py",
