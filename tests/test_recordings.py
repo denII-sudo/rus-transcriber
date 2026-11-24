@@ -7,6 +7,7 @@ import http.client
 import socket
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import conspect
@@ -235,7 +236,65 @@ class AnswerRevisionGuardTests(unittest.TestCase):
             self.assertEqual(helper.card_state(jp)[0], ["первый", "два", "последний"])
 
 
+class _World:
+    """Запись, подготовленная настоящим кодом программы, и снимок всех её файлов.
+
+    Подготовка (папка, база, фиксация результата, файлы стенограммы) — самая дорогая часть варианта и у
+    всех вариантов одна и та же. Её делают настоящим кодом один раз, затем перед каждым вариантом папка
+    очищается и файлы возвращаются из снимка на то же место (пути записаны в базе) с прежним временем
+    изменения. Удаление строгое: незакрытый файл или соединение — ошибка, а не тихая протечка;
+    после восстановления набор файлов сверяется со снимком.
+    """
+
+    def __init__(self, root, db, jp, md, extra):
+        self.root, self.db, self.jp, self.md, self.extra = root, db, jp, md, extra
+        self.signature = self.listing()
+        self.dirs = sorted(self.signature[0])
+        self.files = {rel: ((root / rel).read_bytes(), size_time[1])
+                      for rel, size_time in self.signature[1].items()}
+
+    def listing(self):
+        dirs, files = set(), {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            here = Path(dirpath).relative_to(self.root)
+            dirs.update(here / name for name in dirnames)
+            for name in filenames:
+                st = (Path(dirpath) / name).stat()
+                files[here / name] = (st.st_size, st.st_mtime_ns)
+        return dirs, files
+
+    def restore(self):
+        for child in self.root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for rel in self.dirs:
+            (self.root / rel).mkdir(parents=True, exist_ok=True)
+        for rel, (data, mtime_ns) in self.files.items():
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            os.utime(path, ns=(mtime_ns, mtime_ns))
+        if self.listing() != self.signature:
+            raise AssertionError(f"после восстановления набор файлов {self.root} не равен снимку")
+
+
 class WorkerSnapshotTests(unittest.TestCase):
+    _world_base = None      # у вспомогательных экземпляров из других модулей (без setUpClass) — новая запись на вызов
+    _worlds = {}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        base = Path(tempfile.mkdtemp(prefix="worker-snapshot-"))
+        cls._world_base, cls._worlds = base, {}
+
+        def clean():
+            cls._world_base, cls._worlds = None, {}
+            shutil.rmtree(base)
+        cls.addClassCleanup(clean)
+
     def worker_result(self):
         return {
             "file": "synthetic.wav",
@@ -273,47 +332,83 @@ class WorkerSnapshotTests(unittest.TestCase):
             data["review"][0].pop("word_ids", None)
         return data
 
-    @contextlib.contextmanager
-    def answer_files(self, backend, data=None):
-        """Пара файлов стенограммы в выбранном режиме хранения: (jp, md). Папка и база — временные."""
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            db, audio = root / "state.sqlite3", root / "sample.wav"
-            audio.write_bytes(b"synthetic")
-            data = copy.deepcopy(data or self.answer_result())
-            data["file"] = str(audio)
-            layout = recordings.document_layout(audio)
-            layout["root"].mkdir()
-            store = None
-            with mock.patch.object(settings.paths, "STATE_DB", db), \
-                    mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
-                try:
-                    if backend == "sqlite":
-                        store = recordings.initialize_store(db, display_name="Тест")
-                        root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
-                        rid = str(uuid.uuid4())
-                        recordings.commit_worker_result(
-                            store, data, audio, root_id, recordings.operation_context(store, "model"),
-                            recording_id=rid, operation_id=str(uuid.uuid4()),
-                            generated_at="2026-11-16T00:00:00Z", document_paths=targets)
-                        recordings.materialize_recording(store, rid)
-                        jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
-                    else:
-                        jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
-                        transcript.save(data, jp, md)
-                    yield jp, md
-                finally:
-                    if store:
-                        store.close()
-
     @staticmethod
-    def answer_card(jp, md, answers, recommended=0):
-        """Собрать пакет, по очереди сохранить и применить ответы человека: [(текст, голос?)] | {"option": n}.
-        -> отчёт последнего применения."""
-        question = {"id": "r1", "question": "Проверьте", "recommended": recommended, "options": [
+    def answer_question(recommended=0):
+        return {"id": "r1", "question": "Проверьте", "recommended": recommended, "options": [
             {"label": "Другое слово", "decision": {"text": "другое"}},
             {"label": "Третье слово", "decision": {"text": "третье"}}]}
-        pack = review_pack.build(jp, [question])
+
+    @contextlib.contextmanager
+    def answer_files(self, backend, data=None, with_pack=False, stage=None, stage_name=""):
+        """Пара файлов стенограммы в выбранном режиме хранения: (jp, md). Папка и база — временные.
+
+        with_pack=True — в записи уже собран пакет вопросов (его берёт answer_card через self.stage_result);
+        stage(jp, md) — свой шаг подготовки, выполняемый один раз (stage_name — его имя для снимка).
+        Внутри WorkerSnapshotTests запись готовится один раз, дальше возвращается из снимка (_World)."""
+        if with_pack:
+            stage, stage_name = (lambda jp, md: review_pack.build(jp, [self.answer_question()])), "pack"
+        data = copy.deepcopy(data or self.answer_result())
+        if self._world_base is None:                      # вспомогательный экземпляр: запись на один вызов
+            with tempfile.TemporaryDirectory() as temp:
+                world = self.prepare_world(backend, data, Path(temp), stage)
+                self.stage_result = world.extra
+                with self.world_patches(world):
+                    yield world.jp, world.md
+            return
+        key = (backend, json.dumps(data, ensure_ascii=False, sort_keys=True), stage_name)
+        world = self._worlds.get(key)
+        if world is None:
+            root = self._world_base / f"world{len(self._worlds)}"
+            root.mkdir()
+            world = self._worlds[key] = self.prepare_world(backend, data, root, stage)
+        world.restore()
+        self.stage_result = world.extra
+        with self.world_patches(world):
+            yield world.jp, world.md
+
+    @staticmethod
+    @contextlib.contextmanager
+    def world_patches(world):
+        with mock.patch.object(settings.paths, "STATE_DB", world.db), \
+                mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
+            yield
+
+    def prepare_world(self, backend, data, root, stage=None):
+        """Настоящий путь программы: фиксация результата и файлы стенограммы; затем stage; база закрыта."""
+        db, audio = root / "state.sqlite3", root / "sample.wav"
+        audio.write_bytes(b"synthetic")
+        data["file"] = str(audio)
+        layout = recordings.document_layout(audio)
+        layout["root"].mkdir()
+        store = None
+        with mock.patch.object(settings.paths, "STATE_DB", db), \
+                mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
+            try:
+                if backend == "sqlite":
+                    store = recordings.initialize_store(db, display_name="Тест")
+                    root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                    rid = str(uuid.uuid4())
+                    recordings.commit_worker_result(
+                        store, data, audio, root_id, recordings.operation_context(store, "model"),
+                        recording_id=rid, operation_id=str(uuid.uuid4()),
+                        generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                    recordings.materialize_recording(store, rid)
+                    jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
+                else:
+                    jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
+                    transcript.save(data, jp, md)
+            finally:
+                if store:
+                    store.close()
+            extra = stage(jp, md) if stage else None
+        return _World(root, db, jp, md, extra)
+
+    @staticmethod
+    def answer_card(jp, md, answers, recommended=0, pack=None):
+        """Собрать пакет (или взять готовый: answer_files(with_pack=True) и self.stage_result), по очереди
+        сохранить и применить ответы человека: [(текст, голос?)] | {"option": n}. -> отчёт последнего применения."""
+        if pack is None:
+            pack = review_pack.build(jp, [WorkerSnapshotTests.answer_question(recommended)])
         result = None
         for answer in answers:
             row = {"id": "r1", "version": pack["version"]}
@@ -376,16 +471,16 @@ class WorkerSnapshotTests(unittest.TestCase):
             for ids in (False, True):
                 for text, speaker in named:
                     with self.subTest(backend=backend, word_ids=ids, answer=text), \
-                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
-                        self.answer_card(jp, md, [(text, False)])
+                            self.answer_files(backend, self.answer_result(ids), with_pack=True) as (jp, md):
+                        self.answer_card(jp, md, [(text, False)], pack=self.stage_result)
                         self.assertEqual(self.card_state(jp)[:2], (["тест"], [speaker]))
                         if "не Анна" in text:      # отрицаемое имя не назначено ни одной правкой
                             edits = transcript.load(jp).get("edits") or []
                             self.assertNotIn("Анна", json.dumps(edits, ensure_ascii=False).replace(text, ""))
                 for text in to_human:
                     with self.subTest(backend=backend, word_ids=ids, answer=text), \
-                            self.answer_files(backend, self.answer_result(ids)) as (jp, md):
-                        result = self.answer_card(jp, md, [(text, False)])
+                            self.answer_files(backend, self.answer_result(ids), with_pack=True) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, False)], pack=self.stage_result)
                         self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "human"))
                         self.assertTrue(result["free_text"]["left_to_human"])
 
@@ -440,60 +535,39 @@ class WorkerSnapshotTests(unittest.TestCase):
                             store.close()
 
     def test_negative_does_not_undo_applied_answer_in_both_modes(self):
+        question = {"id": "r1", "question": "Проверьте", "options": [
+            {"label": "Другое", "decision": {"text": "другое"}}]}
+
+        def applied_option(jp, md):
+            """Пакет собран и ответ-вариант применён: у всех вариантов теста это одно и то же начало."""
+            pack = review_pack.build(jp, [question])
+            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "option": 0}],
+                                    "local", trusted_actor="human")
+            core.apply_answers_files(jp, md)
+            return pack
+
+        data = self.worker_result()
+        data["review"][0].pop("word_ids", None)
         for backend in ("legacy_files", "sqlite"):
             for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
                                                          "это неверно", "нет, неверно", "не согласен с этим",
                                                          "неверно: слово")
                                for mode in ("typed", "voice")):
-                with self.subTest(backend=backend, answer=text, mode=mode), tempfile.TemporaryDirectory() as temp:
-                    root = Path(temp)
-                    db, audio = root / "state.sqlite3", root / "sample.wav"
-                    audio.write_bytes(b"synthetic")
-                    data = self.worker_result()
-                    data["file"] = str(audio)
-                    data["review"][0].pop("word_ids", None)
-                    layout = recordings.document_layout(audio)
-                    layout["root"].mkdir()
-                    store = None
-                    with mock.patch.object(settings.paths, "STATE_DB", db):
-                        try:
-                            if backend == "sqlite":
-                                store = recordings.initialize_store(db, display_name="Тест")
-                                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
-                                rid = str(uuid.uuid4())
-                                recordings.commit_worker_result(
-                                    store, data, audio, root_id, recordings.operation_context(store, "model"),
-                                    recording_id=rid, operation_id=str(uuid.uuid4()),
-                                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
-                                recordings.materialize_recording(store, rid)
-                                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
-                            else:
-                                jp = layout["root"] / layout["paths"]["json"]
-                                md = layout["root"] / layout["paths"]["md"]
-                                transcript.save(data, jp, md)
-                            question = {"id": "r1", "question": "Проверьте", "options": [
-                                {"label": "Другое", "decision": {"text": "другое"}}]}
-                            with mock.patch.object(review_pack, "cut_clip",
-                                                   side_effect=lambda _s, t1, _t2, _out: t1):
-                                pack = review_pack.build(jp, [question])
-                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"], "option": 0}],
-                                                    "local", trusted_actor="human")
-                            core.apply_answers_files(jp, md)
-                            before = transcript.load(jp)
-                            self.assertEqual(before["segments"][0]["words"][0]["w"], "другое")
-                            review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
-                                                          "text": text, "heard": mode == "voice"}],
-                                                    "local", trusted_actor="human")
-                            result = core.apply_answers_files(jp, md)
-                            after = transcript.load(jp)
-                            self.assertEqual(after["segments"], before["segments"])
-                            self.assertEqual(after["review"], before["review"])
-                            self.assertEqual(after["edits"], before["edits"])
-                            self.assertFalse(result["reverted"])
-                            self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
-                        finally:
-                            if store:
-                                store.close()
+                with self.subTest(backend=backend, answer=text, mode=mode), \
+                        self.answer_files(backend, data, stage=applied_option, stage_name="option applied") as (jp, md):
+                    pack = self.stage_result
+                    before = transcript.load(jp)
+                    self.assertEqual(before["segments"][0]["words"][0]["w"], "другое")
+                    review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
+                                                  "text": text, "heard": mode == "voice"}],
+                                            "local", trusted_actor="human")
+                    result = core.apply_answers_files(jp, md)
+                    after = transcript.load(jp)
+                    self.assertEqual(after["segments"], before["segments"])
+                    self.assertEqual(after["review"], before["review"])
+                    self.assertEqual(after["edits"], before["edits"])
+                    self.assertFalse(result["reverted"])
+                    self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
 
     # Ответы на карточку «тест» у Глеба с рекомендацией «другое» (вариант 1) и вариантом 2 «третье».
     # Закрытый список отрицаний: печатью и голосом — стенограмма не меняется, место открыто.
@@ -507,8 +581,8 @@ class WorkerSnapshotTests(unittest.TestCase):
             for text in self.NEGATIVES:
                 for heard in (False, True):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
-                            self.answer_files(backend) as (jp, md):
-                        result = self.answer_card(jp, md, [(text, heard)])
+                            self.answer_files(backend, with_pack=True) as (jp, md):
+                        result = self.answer_card(jp, md, [(text, heard)], pack=self.stage_result)
                         self.assertEqual(self.card_state(jp), (["тест"], ["Глеб"], "open"))
                         self.assertIn("слово", result["free_text"]["left_to_human"][0]["why"])
 
@@ -517,12 +591,12 @@ class WorkerSnapshotTests(unittest.TestCase):
             for negative in ("неверно", "совсем не верно", "неверно: слово"):
                 for heard in (False, True):
                     with self.subTest(backend=backend, answer=negative, voice=heard, then="text"), \
-                            self.answer_files(backend) as (jp, md):
-                        self.answer_card(jp, md, [(negative, heard), ("слово", False)])
+                            self.answer_files(backend, with_pack=True) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), ("слово", False)], pack=self.stage_result)
                         self.assertEqual(self.card_state(jp)[0], ["слово"])
                     with self.subTest(backend=backend, answer=negative, voice=heard, then="option"), \
-                            self.answer_files(backend) as (jp, md):
-                        self.answer_card(jp, md, [(negative, heard), {"option": 1}])
+                            self.answer_files(backend, with_pack=True) as (jp, md):
+                        self.answer_card(jp, md, [(negative, heard), {"option": 1}], pack=self.stage_result)
                         self.assertEqual(self.card_state(jp)[0], ["третье"])
 
     # Остальные ответы — как до закрытого списка отрицаний: (ответ, итог печатью, итог голосом),
@@ -575,8 +649,8 @@ class WorkerSnapshotTests(unittest.TestCase):
             for text, typed, voice in self.AS_BEFORE:
                 for heard, (word, status) in ((False, typed), (True, voice)):
                     with self.subTest(backend=backend, answer=text, voice=heard), \
-                            self.answer_files(backend) as (jp, md):
-                        self.answer_card(jp, md, [(text, heard)])
+                            self.answer_files(backend, with_pack=True) as (jp, md):
+                        self.answer_card(jp, md, [(text, heard)], pack=self.stage_result)
                         words, speakers, got = self.card_state(jp)
                         self.assertEqual((" ".join(words), speakers, got), (word, ["Глеб"], status))
 
