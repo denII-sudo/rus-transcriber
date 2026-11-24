@@ -142,6 +142,20 @@ class OnlyChangedWordsAreMarked(unittest.TestCase):
                     self.assertFalse(hc.has_human_mark(w1))
 
 
+    def test_speaker_change_with_same_text_is_marked(self):
+        # Тот же текст, другой говорящий: слово помечается по говорящему, с via. Иначе смена говорящего
+        # человеком не держала бы слово от агента (human_touched читает provenance.speaker).
+        for backend in BACKENDS:
+            for by in ("claude", "human"):
+                with self.subTest(backend=backend, by=by), hc.files(backend) as (jp, md, _):
+                    transcript.edit_span(jp, md, 0.2, 0.2, "тест", speaker="Вера", by=by)
+                    w1 = hc.word(jp, "w1")
+                    self.assertEqual(w1["provenance"]["speaker"],
+                                     {"by": by, "edit": "span@0.20", "via": "edit_span"})
+                    self.assertNotIn("text", w1["provenance"])
+                    self.assertEqual(transcript.human_touched(w1), by == "human")
+                    self.assertNotIn("provenance", hc.word(jp, "w2"))
+
 class HumanSpanOverHumanCardAnswer(unittest.TestCase):
     def test_conflict_names_author_and_hints_reopen(self):
         for backend in BACKENDS:
