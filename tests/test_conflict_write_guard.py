@@ -577,10 +577,11 @@ class PromiseTests(fixtures.ScreenCase):
                 self.assertEqual(self.new_conflicts_on(case), ["json"])
 
     def test_snapshot_without_the_new_stop_reason_is_refused(self):
-        """Страница, открытая до обновления, держит снимок без новой причины остановки: заменять по нему нельзя."""
+        """Страница, открытая до обновления, обещала замену, не зная соседа, изменённого после решения: снимок без
+        этой остановки устарел, заменять по нему нельзя. Состав снимка прежний — причина входит в stops_for."""
         case = self.prepare("document", "md", "same", "decided changed")
         snapshot = dict(self.snapshot(case))
-        snapshot.pop("stops_changed", None)
+        self.assertNotIn("stops_changed", snapshot)
         snapshot["stops_for"] = []    # прежний экран соседа не видел и обещал замену
         before = case.path.read_bytes()
         self.refused("api/conflict/resolve", {"snapshot": snapshot, "confirm": True})
