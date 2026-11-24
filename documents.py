@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import storage
@@ -53,7 +53,8 @@ class NotWritten(storage.Conflict):
     """Ничего не записано: перед записью файл записи оказался изменён вне программы или недоступен.
 
     Сообщение по-русски, с именем файла и следующим шагом. Ревизии и очередь не менялись.
-    kind — какой из трёх файлов, status — что с ним (external, unreadable, invalid_target, gone, damaged_copy)."""
+    kind — какой из трёх файлов (None, если дело не в файле), status — что случилось: external, unreadable,
+    invalid_target, gone, damaged_copy; root (папка не подтверждена), locked (папку записи держит другая программа)."""
 
     def __init__(self, message, kind=None, status=None):
         super().__init__(message)
@@ -371,10 +372,16 @@ def guard_before_write(store, recording_id):
     try:
         root = _authorized_root(store, row["root_id"], row["root_path"])
     except (OSError, ValueError) as exc:
-        raise NotWritten("Не записано: папка с файлами записи недоступна или не подтверждена. "
-                         "Ничего не сохранено. Откройте экран программы и проверьте папку.", None,
-                         "invalid_target") from exc
-    with _file_lock(root):
+        raise NotWritten("Не записано: папка с файлами записи недоступна или не подтверждена программой "
+                         "(её удалили или перенесли, либо база восстановлена из резерва). Ничего не сохранено. "
+                         "Верните папку на место или подтвердите её мастером восстановления: rt.py db-restore.",
+                         None, "root") from exc
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_file_lock(root))
+        except OSError as exc:
+            raise NotWritten("Не записано: папку записи сейчас держит другая программа (идёт запись файлов). "
+                             "Ничего не сохранено. Подождите немного и повторите действие.", None, "locked") from exc
         row, document, paths = _head(store, recording_id)
         if row["state"] == "conflict":
             return
