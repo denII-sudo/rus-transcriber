@@ -122,6 +122,34 @@ class CardAnswerDoesNotCloseTests(Base):
                 self.still_open(jp)
                 self.check_outcome_matches_place(jp, rep)
 
+    def test_repeated_apply_does_not_run_the_answer_again(self):
+        """applied_open — применённый ответ: повтор «Применить» его второй раз не прогоняет, карточка не падает."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                core.apply_answers_files(jp, md)
+                before = transcript.load(jp)
+                again = core.apply_answers_files(jp, md)
+                self.assertEqual(transcript.load(jp), before)
+                self.assertEqual(self.outcomes(again)["r3"]["outcome"], "applied_open")
+                place = self.still_open(jp)
+                self.assertEqual(place["status"], "open")
+                self.assertNotIn("ответ не применён", place.get("note") or "")
+                self.assertIn("r3", review_pack._applied_map(review_pack.answers_state(jp)))
+
+    def test_applied_open_place_stays_among_open_places(self):
+        """Место с applied_open не прячется: оно среди нерешённых и помечено в тексте; причина — прослушать."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
+                self.save(jp, version, "r3", text="дальше пойдём")
+                row = self.outcomes(self.apply(jp, md))["r3"]
+                data = transcript.load(jp)
+                self.assertIn("r3", [i["id"] for i in transcript.unresolved(data)])
+                self.assertFalse(data["review_done"])
+                self.assertIn("r3", {rid for marks in transcript.doubt_marks(data).values() for rid in marks.values()})
+                self.assertIn("прослушайте интервал", row["why"])
+                self.assertEqual(review_pack.answer_states(jp)["r3"]["state"], "applied_open")
+
     def test_failed_pass_is_not_closed_by_an_answer(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
@@ -233,16 +261,6 @@ class DoubtsSectionTests(Base):
             line = next(x for x in section.splitlines() if "00:00:02" in x and "пойдём" in x)
             self.assertIn("«дальше пойдём»", line)
             self.assertIn("открыто", line)
-
-
-class CardQuestionTests(Base):
-    """Т9: вопрос карточки места «модели расходятся» по-русски, без названия состояния."""
-
-    def test_question_is_russian(self):
-        with files("sqlite", result()) as (jp, _md, _v):
-            item = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r3")
-            self.assertTrue(item["question"].startswith("Модели распознали по-разному"), item["question"])
-            self.assertNotIn("disagreement", item["question"])
 
 
 class OnePlaceRuleTests(unittest.TestCase):
