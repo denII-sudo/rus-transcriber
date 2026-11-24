@@ -56,6 +56,13 @@ class Sandbox(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="rt-hyp-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.hyp = self.root / "hypotheses"
+        # paths.py при импорте ставит HF_HOME и TORCH_HOME на кэш установленной программы; hypstore ищет веса в
+        # HF_HOME раньше своего каталога кэша. Без подмены в установленной копии тест хэшировал бы настоящие веса.
+        env = mock.patch.dict(os.environ, {"HF_HOME": str(self.root / "cache" / "huggingface"),
+                                           "TORCH_HOME": str(self.root / "cache" / "torch")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HF_HUB_CACHE", None)                       # восстановит env.stop
         for patch in (mock.patch.object(paths, "HYPOTHESES", self.hyp),
                       mock.patch.object(paths, "BENCH", self.root / "bench"),
                       mock.patch.object(paths, "CACHE", self.root / "cache"),
@@ -333,6 +340,15 @@ class StoreTests(Sandbox):
         self.assertNotEqual(first["files"][0]["sha256"], second["files"][0]["sha256"])
         self.assertEqual(first["files"][0]["file"], "gigaam/v3_e2e_rnnt.onnx")
         self.assertTrue(hypotheses.is_missing(hypstore.model_artifact("нет-такой", self.root / "cache", {})))
+
+    def test_sandbox_does_not_see_the_cache_of_the_installed_program(self):
+        """Тесты хранилища не читают и не хэшируют настоящие веса: кэши моделей — внутри песочницы теста."""
+        for name in ("HF_HOME", "TORCH_HOME"):
+            with self.subTest(name=name):
+                self.assertTrue(Path(os.environ[name]).resolve().is_relative_to(self.root.resolve()))
+        self.assertIsNone(os.environ.get("HF_HUB_CACHE"))          # не assertNotIn: при падении он печатает всё окружение
+        # даже если настоящий кэш есть, веса из песочницы и только они: чужой каталог не просматривается
+        self.assertEqual(hypstore._model_files("v3_e2e_rnnt", self.root / "cache"), [])
 
     def test_weight_files_are_those_the_engine_loads(self):
         """В общем хранилище gigaam-v3-onnx — только файлы своей модели; .ckpt PyTorch — только при движке torch;
