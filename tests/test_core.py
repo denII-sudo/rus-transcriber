@@ -417,9 +417,11 @@ class Answers(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(freeform.classify(text, self.names), {"kind": "name", "speaker": speaker})
         # обычная речь со словами «нет», «ни», «и», «не» без известных имён — текст, как раньше
-        for text in ("нет", "нет и не", "ни туда ни сюда", "и не говори", "нет, не надо", "Анна и Борис"):
+        for text in ("нет и не", "ни туда ни сюда", "и не говори", "нет, не надо", "Анна и Борис"):
             with self.subTest(text=text):
                 self.assertEqual(freeform.classify(text, self.names), {"kind": "text"})
+        # PR 6б: одиночное «нет» — короткое слово таблицы (A013), не отказ и не имя
+        self.assertEqual(freeform.classify("нет", self.names), {"kind": "short_word"})
 
     def test_one_negation_rule_for_names_and_labels(self):
         # «не» и «ни» перед именем отрицают его одинаково — и в имени без двоеточия, и в метке «Имя:»
@@ -458,7 +460,7 @@ class Answers(unittest.TestCase):
 
     def test_classify(self):
         c = freeform.classify
-        self.assertEqual(c("да", self.names), {"kind": "agree"})
+        self.assertEqual(c("да", self.names), {"kind": "short_word"})      # PR 6б: таблица В8
         self.assertEqual(c("Борис", self.names), {"kind": "name", "speaker": "Борис"})
         self.assertEqual(c("не Анна, а Вера", self.names), {"kind": "name", "speaker": "Вера"})
         self.assertEqual(c("", self.names), {"kind": "skip"})

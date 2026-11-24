@@ -198,7 +198,8 @@ audio{width:100%;height:36px}
                   apply_conflict: "не применён — слова изменились", blocked_preflight: "не применён — пересекается с другой карточкой",
                   undo_conflict: "отмена не выполнена — прежний ответ на месте",
                   source_conflict: "не применён — стенограмма изменилась", not_found: "не применён — место не найдено",
-                  not_applied: "не применён", cloud_saved: "сохранён в облаке — не применён",
+                  not_applied: "не применён", pause_refused: "не применён — нужна кнопка паузы",
+                  hint: "не применён — см. подсказку", cloud_saved: "сохранён в облаке — не применён",
                   cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте"};
   const cardStatus = (it, a) => (man.conflicts || []).some(c => c.id === it.id) ? "конфликт — требуется проверка" :
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "требует проверки" : STATUS[stateOf(it, a)] || "не применён";
@@ -301,6 +302,7 @@ audio{width:100%;height:36px}
     if (d.reopen) parts.push("снова открыть место");
     if (d.listened === "silence") parts.push("подтвердить после прослушивания: тишина");
     if (d.listened === "words") parts.push("подтвердить после прослушивания: слова верны");
+    if (d.listened === "interjections") parts.push("подтвердить после прослушивания: только междометия, не записывать");
     if (d.note) parts.push(`примечание: ${d.note}`);
     // номера слов человеку ничего не говорят: показываем, сколько слов места подтверждается
     if (Array.isArray(d.word_ids)) parts.push(`подтвердить говорящего у слов места (${d.word_ids.length})`);

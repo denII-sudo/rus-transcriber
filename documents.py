@@ -13,7 +13,7 @@ from pathlib import Path
 import storage
 
 FORMAT_VERSION = 2
-RENDERER_VERSION = 1
+RENDERER_VERSION = 2   # 2 — пометка «[междометия, не расшифровано]» в разделе «Текст» (PR 6б)
 MAX_CONFLICT_BYTES = 8 * 1024 * 1024
 # Порядок записи трёх файлов одной версии (текущий комплект, архив и восстановление): manifest последним,
 # он описывает md и json. Порядок не берётся из паспорта: ключи путей в сохранённом JSON отсортированы.
@@ -928,6 +928,10 @@ def _public_review(review):
                     any(type(x) not in (int, float) for x in gap) or gap[0] > gap[1]):
                 raise ValueError("invalid review gap")
             public["gap"] = list(gap)
+        listening = item.get("listening")
+        if isinstance(listening, dict) and isinstance(listening.get("result"), str):
+            # итог прослушивания человеком — без автора, времени и отпечатка
+            public["listening"] = {"result": listening["result"]}
         result["review"].append(public)
     result["answers"] = {}
     for ident, answer in review.get("answers", {}).items():
@@ -1197,7 +1201,12 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
         lines.append(f"- {name}: слов {row['words']}, реплик {row['segments']}, доля слов {share}")
     lines += ["", "## Текст", ""]
     lines += ["Сомнительные места и возможные пропуски перечислены в разделе «Сомнения».", ""]
-    for segment in transcript.get("segments", []):
+    import transcript as transcript_rules
+    marks_before, marks_tail = transcript_rules.interjection_layout(transcript.get("segments", []),
+                                                                    review.get("review", []))
+    for index, segment in enumerate(transcript.get("segments", [])):
+        for mark in marks_before.get(index, ()):
+            lines += [mark, ""]
         speaker = segment.get("speaker")
         speaker = _md(names.get(speaker, speaker)) if speaker else "говорящий неизвестен"
         words = segment.get("words", [])
@@ -1210,6 +1219,8 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
         lines.append(f'<a id="segment-{anchor}"></a>')
         lines.append(f"**{prefix}{speaker}:** {_md(text)}")
         lines.append("")
+    for mark in marks_tail:
+        lines += [mark, ""]
     for item in review.get("review", []):
         if "gap" in item:
             lines.append(f"_Возможный пропуск речи: {_md(item['gap'][0])}–{_md(item['gap'][1])}; "

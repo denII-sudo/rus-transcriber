@@ -265,9 +265,14 @@ def render_md(data, text_only=False):
     marks = doubt_marks(data) if data.get("review") else {}
     if marks:
         lines.append(DOUBT_LEGEND + "\n")
+    before, tail = interjection_layout(data.get("segments") or [], data.get("review") or [])
     for si, seg in enumerate(data["segments"]):
+        for mark in before.get(si, ()):
+            lines += [mark, ""]
         lines.append(_seg_line(seg, marks.get(si)))
         lines.append("")
+    for mark in tail:
+        lines += [mark, ""]
     if text_only:
         return "\n".join(lines).rstrip() + "\n"
     q = data.get("quality") or {}
@@ -607,6 +612,49 @@ def is_gap_place(item):
     """Место-пропуск: «missed» в причинах (диаризация и проход без слов: ["missed"], ["asr", "missed"])."""
     reasons = item.get("reasons")
     return isinstance(reasons, (list, tuple)) and "missed" in reasons
+
+
+def gap_interval(item):
+    """(начало, конец) интервала прослушивания места (поле gap), если оба — конечные числа и начало < конца."""
+    gap = item.get("gap")
+    if isinstance(gap, (list, tuple)) and len(gap) == 2 and all(_finite_number(x) for x in gap) and gap[0] < gap[1]:
+        return gap[0], gap[1]
+    return None
+
+
+INTERJECTIONS_MARK = "_[междометия, не расшифровано] {t1}–{t2}_"
+
+
+def interjection_marks(review_items):
+    """[(начало, конец, id)] мест, закрытых кнопкой «только междометия», по времени. Одна для обоих отрисовщиков."""
+    out = []
+    for item in review_items or []:
+        listening = item.get("listening")
+        times = gap_interval(item)
+        if isinstance(listening, dict) and listening.get("result") == "interjections" and times:
+            out.append((times[0], times[1], str(item.get("id"))))
+    return sorted(out)
+
+
+def interjection_layout(segments, review_items):
+    """Где стоят пометки «[междометия, не расшифровано]»: ({номер реплики: [строки перед ней]}, [строки в конце]).
+    Пометка — перед первой репликой, начало которой не раньше начала паузы."""
+    before, tail = {}, []
+    starts = []
+    for seg in segments:
+        start = seg.get("start")
+        if not _finite_number(start):
+            words = [w.get("s") for w in seg.get("words") or [] if _finite_number(w.get("s"))]
+            start = words[0] if words else None
+        starts.append(start)
+    for t1, t2, _rid in interjection_marks(review_items):
+        line = INTERJECTIONS_MARK.format(t1=hms(t1), t2=hms(t2))
+        at = next((si for si, start in enumerate(starts) if start is not None and start >= t1), None)
+        if at is None:
+            tail.append(line)
+        else:
+            before.setdefault(at, []).append(line)
+    return before, tail
 
 
 def in_pause(s, t1, t2):
@@ -969,10 +1017,22 @@ PAUSE_EMPTY_TEXT = ("вариант с текстом в пустую паузу
                     "впишите услышанное в поле ответа («Имя: слова»)")
 
 
-def _empty_pause_refusal(decision):
+# Кнопки прослушивания пропуска (В7): у каждого места-пропуска с годным интервалом gap.
+LISTEN_SILENCE = "Прослушал: слов нет"
+LISTEN_INTERJECTIONS = "Прослушал: только междометия, не записывать"
+LISTEN_WORDS = "Прослушал: слова в стенограмме верны"
+PAUSE_BUTTONS_HINT = f" или нажмите «{LISTEN_SILENCE}» или «{LISTEN_INTERJECTIONS}», если слов нет"
+PAUSE_HAS_WORDS = ("в паузе есть слова («{words}»): сначала исправьте их правкой отрезка или ответом "
+                   "на их карточку")
+
+
+def _empty_pause_refusal(decision, item=None):
     if decision.get("text"):
-        return PAUSE_EMPTY_TEXT
-    return PAUSE_EMPTY_SPEAKER if decision.get("speaker") else PAUSE_EMPTY_AS_IS
+        why = PAUSE_EMPTY_TEXT
+    else:
+        why = PAUSE_EMPTY_SPEAKER if decision.get("speaker") else PAUSE_EMPTY_AS_IS
+    # кнопки называются, только если они есть на карточке (у места годный интервал gap)
+    return why + (PAUSE_BUTTONS_HINT if item is not None and gap_interval(item) else "")
 EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правки by — "claude" (правка агента, в том числе по поручению '
                              'человека) или "human" (текст продиктовал человек, только командной строкой); '
                              'без автора правка не принимается')
@@ -1620,18 +1680,32 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             report.setdefault("conflicts", []).append({"id": it["id"], "why": "нужно отдельное подтверждение прослушивания"})
             continue
         if "listened" in d:
-            if by != "human" or not it.get("asr_problem") or d["listened"] not in ("words", "silence") \
+            gap_place = is_gap_place(it)
+
+            def refuse(why, rid=it["id"], pause=gap_place):
+                report.setdefault("conflicts", []).append({"id": rid, "why": why})
+                if pause:                  # исход «нужна кнопка паузы» (core)
+                    report.setdefault("pause_refused", []).append(rid)
+
+            allowed = ("words", "silence", "interjections") if gap_place else ("words", "silence")
+            if by != "human" or not (it.get("asr_problem") or gap_place) or d["listened"] not in allowed \
                     or d.get("human_after"):
-                report.setdefault("conflicts", []).append({"id": it["id"], "why": "нет явного подтверждения человека"})
+                refuse("нет явного подтверждения человека")
                 continue
-            start, end = it.get("gap", [None, None])
-            if start is None or end is None or end <= start:
-                report.setdefault("conflicts", []).append({"id": it["id"], "why": "неверный интервал"})
+            interval = gap_interval(it)
+            if interval is None:
+                refuse("неверный интервал")
                 continue
+            start, end = interval
+            # отпечаток — по словам, перекрывающим интервал: его пересверяет _save_locked
             heard_words = _interval_words(data, start, end)
-            if (d["listened"] == "silence" and heard_words) or (d["listened"] == "words" and not heard_words):
-                report.setdefault("conflicts", []).append({"id": it["id"], "why":
-                    "выбранный ответ противоречит словам стенограммы; сначала исправьте стенограмму"})
+            # у пропуска проверка — по словам, начатым в паузе: хвост слова до паузы ей не принадлежит (6а)
+            checked = [w for _, _, w in pause_words(data, start, end)] if gap_place else heard_words
+            if gap_place and d["listened"] in ("silence", "interjections") and checked:
+                refuse(PAUSE_HAS_WORDS.format(words=" ".join(str(w.get("w", "")) for w in checked)))
+                continue
+            if (d["listened"] == "silence" and checked) or (d["listened"] == "words" and not checked):
+                refuse("выбранный ответ противоречит словам стенограммы; сначала исправьте стенограмму")
                 continue
             it["listening"] = {"by": "human", "result": d["listened"],
                                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1642,7 +1716,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             continue
         if is_gap_place(it) and _place_time(it) is not None and not pause_words(data, *_place_time(it)):
             # В паузе нет слов: подтверждать, подписывать и заменять нечего. Соседнее слово ей не принадлежит.
-            report.setdefault("conflicts", []).append({"id": it["id"], "why": _empty_pause_refusal(d)})
+            report.setdefault("conflicts", []).append({"id": it["id"], "why": _empty_pause_refusal(d, it)})
+            report.setdefault("pause_refused", []).append(it["id"])
             continue
         target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
         loc = _find_span(data, target)

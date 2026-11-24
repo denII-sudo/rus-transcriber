@@ -3,7 +3,8 @@
 Порядок старшинства: ответ человека > отпечаток голоса > распознавание (основная, вторая и третья модели) > эвристики.
 
 Для каждой карточки со свободным текстом:
-  1. вид ответа: только имя («Борис», «не Анна, а Вера») / согласие («да», «верно») / правка текста;
+  1. вид ответа: только имя («Борис», «не Анна, а Вера») / короткий ответ по таблице answer_phrases.tsv
+     («да», «верно», похожее на оценку «согласен» — таблица В8 в card_edits) / правка текста;
   2. правка разбирается на реплики по меткам «Имя:» (или имя в начале фразы перед словом с заглавной);
      «…» в конце — «дальше без изменений»;
   3. окно стенограммы — все слова во времени клипа ±1 с;
@@ -39,7 +40,8 @@ MIN_ANCHORS = 0.3
 
 ANSWER_PHRASES_PATH = Path(__file__).with_name("answer_phrases.tsv")
 _ANSWER_PHRASE_KINDS = (
-    "agree", "negative_prefix", "negative_intensifier", "negative_core",
+    "short_word", "confirm", "evaluation_stem",
+    "negative_prefix", "negative_intensifier", "negative_core",
 )
 
 
@@ -75,7 +77,7 @@ def _read_answer_phrases(path=ANSWER_PHRASES_PATH):
 
     phrases = {kind: [] for kind in _ANSWER_PHRASE_KINDS}
     seen_ids = set()
-    seen_texts = set()
+    seen_texts = set()          # (kind, фраза): повтор проверяется внутри категории («нет» — и слово, и приставка)
     try:
         for row in reader:
             line = reader.line_num
@@ -92,10 +94,13 @@ def _read_answer_phrases(path=ANSWER_PHRASES_PATH):
                 raise ValueError(f"{path.name}, строка {line}: неизвестный kind {kind}")
             if not phrase.strip():
                 raise ValueError(f"{path.name}, строка {line}: пустой text")
-            if phrase in seen_texts:
+            if (kind, phrase) in seen_texts:
                 raise ValueError(f"{path.name}, строка {line}: повторная фраза")
+            other = {"short_word": "confirm", "confirm": "short_word"}.get(kind)
+            if other and (other, phrase) in seen_texts:
+                raise ValueError(f"{path.name}, строка {line}: фраза «{phrase}» и в short_word, и в confirm")
             seen_ids.add(phrase_id)
-            seen_texts.add(phrase)
+            seen_texts.add((kind, phrase))
             phrases[kind].append(phrase)
     except csv.Error as exc:
         line = reader.line_num or 1
@@ -113,7 +118,7 @@ def _read_answer_phrases(path=ANSWER_PHRASES_PATH):
 
 
 _ANSWER_PHRASES = _read_answer_phrases()
-AGREE = set(_ANSWER_PHRASES["agree"])
+
 # Закрытый список отрицаний: ответ (или его часть до двоеточия) после norm — ровно [приставка] [усилитель] отрицание.
 # Такой ответ ничего не меняет и не подтверждает. Других отрицаний нет: остальное разбирается как раньше.
 NEGATIVE_PREFIXES = tuple(_ANSWER_PHRASES["negative_prefix"])
@@ -139,6 +144,19 @@ def _morph():
 
 def norm(w):
     return re.sub(r"[^\wё-]", "", (w or "").lower().replace("ё", "е")).strip("-")   # ⟦…⟧ тоже убирается
+
+
+def _phrase_key(text):
+    return " ".join(norm(x) for x in (text or "").split() if norm(x))
+
+
+# Короткие ответы (В8): слово, которое может быть и словом стенограммы, и оценкой; подтверждение «слова верны»;
+# начало слова, похожего на оценку (ответ вне таблицы, не длиннее EVALUATION_MAX_WORDS слов).
+SHORT_WORDS = frozenset(_phrase_key(x) for x in _ANSWER_PHRASES["short_word"])
+CONFIRMS = frozenset(_phrase_key(x) for x in _ANSWER_PHRASES["confirm"])
+EVALUATION_STEMS = tuple(_phrase_key(x) for x in _ANSWER_PHRASES["evaluation_stem"])
+EVALUATION_MAX_WORDS = 4
+SHORT_KINDS = ("short_word", "confirm", "evaluation")
 
 
 def tokens(text):
@@ -258,11 +276,16 @@ def classify(text, names):
         return {"kind": "skip"}
     if negative_answer(text):
         return {"kind": "negative"}
-    if t in AGREE:
-        return {"kind": "agree"}
+    if t in CONFIRMS:
+        return {"kind": "confirm"}
+    if t in SHORT_WORDS:
+        return {"kind": "short_word"}
     ws = t.split()
     mentions = _name_mentions(ws, names)
     if not mentions:
+        # ответ вне таблицы, похожий на оценку («согласен», «рекомендую»): не слова стенограммы
+        if len(ws) <= EVALUATION_MAX_WORDS and any(w.startswith(EVALUATION_STEMS) for w in ws):
+            return {"kind": "evaluation"}
         return {"kind": "text"}
     filler = NEGATED_NAME_FILLER if any(neg for *_, neg in mentions) else NAME_FILLER
     covered = {k for pos, count, _, _ in mentions for k in range(pos, pos + count)}
@@ -474,13 +497,46 @@ def _pause_answer(item, rep, flat, words, inside):
         return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
     here = " ".join(w["w"] for w in inside)
     if len(middle) == len(inside) and all(same(t, w) for t, w in zip(middle, inside)):
-        # те же слова уже стоят в паузе: вставлять нечего; открытое место закроется как «как есть» (confirm_pause)
+        # те же слова уже стоят в паузе: вставлять нечего; открытое место закроется как «как есть» (confirm_as_is)
         rep["applied"] = [f"уже вписано: «{here}»"]
-        rep["confirm_pause"] = True
+        rep["confirm_as_is"] = True
         return {"kind": "missed", "edits": [], "covered": (t_a, t_b), "report": rep}
     rep["human"] = (f"в паузе уже есть слова («{here}»), ответ с ними не совпадает; исправьте их правкой "
                     "отрезка или ответом на карточку этих слов")
     return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+
+
+# Подсказки на короткий ответ (В8): место остаётся открытым, стенограмма не меняется.
+HINT_PAUSE_CONFIRM = ("паузу коротким ответом не закрыть: нажмите «" + T.LISTEN_SILENCE + "» или «" +
+                      T.LISTEN_INTERJECTIONS + "»; если в паузе сказано это слово — напишите «Имя: {answer}»")
+HINT_EVALUATION = ("ответ похож на оценку, а не на услышанные слова: место осталось открытым; "
+                   "выберите вариант или напишите «Имя: слова»")
+HINT_WORD = ("короткий ответ «{answer}» не совпадает со словами места («{place}»): чтобы вписать его, "
+             "напишите «Имя: {answer}»; чтобы подтвердить слова — «верно» или вариант «как есть»")
+HINT_DISAGREE = "модели расходятся — короткое «{answer}» не говорит, чей вариант верен: "
+HINT_DISAGREE_OPTION = "выберите вариант «{label}» или впишите услышанные слова"
+HINT_DISAGREE_WORDS = "впишите услышанные слова"
+
+
+def _short_answer(item, kind, text, place, is_gap):
+    """Короткий ответ по таблице В8. -> "as_is" (подтвердить слова места), текст подсказки или None (это слова).
+    В подсказке фраза человека как есть (ё и регистр сохраняются); сравнение со словами места — по ключу."""
+    answer, key = " ".join(text.split()), _phrase_key(text)
+    if kind == "evaluation":
+        return HINT_EVALUATION
+    if is_gap:
+        return None if kind == "short_word" else HINT_PAUSE_CONFIRM.format(answer=answer)
+    if kind == "short_word":
+        here = " ".join(norm(w["w"]) for w in place if norm(w["w"]))
+        if place and here == key:
+            return "as_is"
+        return HINT_WORD.format(answer=answer, place=" ".join(w["w"] for w in place) or "—")
+    if "asr" in (item.get("reasons") or []):       # «модели расходятся»: «верно» не говорит, чей вариант
+        label = next((str(o.get("label", "")) for o in item.get("options") or []
+                      if not {k for k in (o.get("decision") or {}) if k != "note"}), None)
+        return HINT_DISAGREE.format(answer=answer) + (
+            HINT_DISAGREE_OPTION.format(label=label) if label else HINT_DISAGREE_WORDS)
+    return "as_is"
 
 
 def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=frozenset()):
@@ -519,14 +575,29 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         rep["kind"] = "unmatched"
         rep["human"] = "отрицательная метка неоднозначна; укажите говорящего и слова отдельно"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
-    if c["kind"] == "agree":
-        return {"kind": "agree", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "negative":
         rep["human"] = "ответ — отказ, стенограмма не менялась; впишите услышанное слово или выберите вариант"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":
         rep["human"] = "указано только отрицание имени; выберите говорящего"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+    if c["kind"] in SHORT_KINDS:
+        if item.get("answer_mode") == "speaker":
+            if c["kind"] != "evaluation":
+                # Названное исключение: на карточке подтверждения говорящего короткий ответ — как прежнее
+                # согласие, ничего не меняет; оценка разбирается как прежний текст.
+                return {"kind": "agree", "edits": [], "covered": None, "report": rep}
+        else:
+            short = _short_answer(item, c["kind"], text, place, is_gap)
+            if short == "as_is":
+                # слова места верны: открытое место закроется тем же путём, что вариант «как есть»
+                rep["confirm_as_is"] = True
+                rep["applied"] = [f"подтверждено как есть: «{' '.join(w['w'] for w in place)}»"]
+                return {"kind": c["kind"], "edits": [], "covered": None, "report": rep}
+            if short:
+                # подсказка: место остаётся открытым, к человеку не уходит
+                rep["kind"], rep["human"] = "hint", short
+                return {"kind": "hint", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "name" and is_gap and not place:
         rep["human"] = ("в паузе нет слов: одно имя ничего не подписывает; "
                         "напишите «Имя: услышанные слова»")
