@@ -855,7 +855,11 @@ def restore_recording_revision(snapshot):
             root_id=snapshot["root_id"],
             generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         completed = recordings.materialize_recording(store, snapshot["recording_id"])
-        result["materialized"] = (snapshot["recording_id"], result["document_revision"]) in completed
+        failure = documents.unsynced(store, snapshot["recording_id"], result["document_revision"], completed)
+        result["materialized"] = failure is None
+        result["outcome"] = "written" if failure is None else failure.status
+        if failure is not None:
+            result["reason"] = str(failure)
         return result
     except (OSError, ValueError, KeyError) as ex:
         raise CoreError(f"возврат не выполнен или формирование не завершено: {ex}") from ex
@@ -870,6 +874,28 @@ CONFLICT_SHOWN_LINES, CONFLICT_SHOWN_CHARS = 200, 500   # строк разли�
 CONFLICT_DIFF_CELLS = 90000    # сколько пар строк сравнивать точно на одном участке; для большего ищутся опоры
 CONFLICT_DIFF_WORK = 2000000   # бюджет уточнения сверх первичного поиска опор, пропорционального входу
 
+_KNOWN_CONFLICTS = {
+    "stale revisions": "Запись изменилась после показа. Обновите её и повторите действие.",
+    "unresolved document conflict": "Сначала решите конфликт внешней правки документа.",
+    "unresolved conspect conflict": "Сначала решите конфликт внешней правки свёртки.",
+    "conflict already resolved": "Этот конфликт уже решён. Обновите список.",
+    "restored copy is inactive": "Восстановленная копия базы не активирована.",
+    "restore copy requires explicit rebind": "Восстановленная копия требует явного подключения папок.",
+    "external file too large to preserve; manual resolution required":
+        "Файл слишком велик для сохранения копии: нужен отдельный ручной разбор.",
+}
+
+
+def say_error(ex):
+    """Текст отказа для человека и агента: известные английские коды хранилища переведены, остальное как было.
+
+    Русские исходы записи (documents.NotWritten, documents.NotSynced) уже со словами и идут без изменений."""
+    import storage
+    if isinstance(ex, storage.Conflict):
+        return _KNOWN_CONFLICTS.get(str(ex), str(ex))
+    return str(ex)
+
+
 def explain_error(ex):
     """Русское пояснение сбоя хранилища или базы для экрана; неизвестный сбой — с исходной причиной."""
     import storage
@@ -879,16 +905,7 @@ def explain_error(ex):
                                        and ("locked" in low or "busy" in low)):
         return "База записей сейчас занята другой операцией. Подождите немного и повторите."
     if isinstance(ex, storage.Conflict):
-        known = {
-            "stale revisions": "Запись изменилась после показа. Обновите её и повторите действие.",
-            "unresolved document conflict": "Сначала решите конфликт внешней правки документа.",
-            "unresolved conspect conflict": "Сначала решите конфликт внешней правки свёртки.",
-            "conflict already resolved": "Этот конфликт уже решён. Обновите список.",
-            "restored copy is inactive": "Восстановленная копия базы не активирована.",
-            "restore copy requires explicit rebind": "Восстановленная копия требует явного подключения папок.",
-            "external file too large to preserve; manual resolution required":
-                "Файл слишком велик для сохранения копии: нужен отдельный ручной разбор.",
-        }
+        known = _KNOWN_CONFLICTS
         return known.get(text, text if re.search("[А-Яа-яЁё]", text)
                          else f"Действие не выполнено: состояние записи не позволяет его выполнить (причина: {text}).")
     if isinstance(ex, storage.StorageError) and re.search("[А-Яа-яЁё]", text):
@@ -1092,14 +1109,18 @@ def _conflict_item(store, row, rows, cache):
         status = "resolved" if row["resolved"] else "open"
         last_of_file = row["seq"] == max(other["seq"] for other in same_object
                                          if other["relative_path"] == row["relative_path"])
+        equal_to_program = False
         if not row["resolved"] and not row["kind"].startswith("archive_"):
-            _listed_program_version(store, row, cache)    # повреждена — строка «повреждена», замена выключена
+            program = _listed_program_version(store, row, cache)[1]   # повреждена — строка «повреждена»
+            if not row["preserved"]:    # копии нет: конфликт закрывается, только если файл уже равен версии программы
+                equal_to_program = _file_at(store, row, row["relative_path"])[1] == program.get(row["kind"])
         if row["resolved"] and last_of_file and _queue_unfinished(store, row):
             program = _listed_program_version(store, row, cache)[1].get(row["kind"])
             if program is not None and _file_at(store, row, row["relative_path"])[1] != program:
                 status = "not_written"
         item.update(status=status,
-                    can_replace=status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
+                    can_replace=status == "open" and (row["preserved"] or equal_to_program)
+                    and not row["kind"].startswith("archive_"),
                     can_retry=status == "not_written" and not any(not other["resolved"] for other in same_object))
         if status in ("open", "not_written"):    # у истории копии не читаются: их проверит скачивание
             item["copy_problem"] = _copy_problem(store, row)
@@ -1147,9 +1168,10 @@ def _refusal(row, state):
     if row["kind"].startswith("archive_"):
         return ("Это архивная копия прежней версии: программа записывает её один раз и не меняет, поэтому "
                 "заменить её здесь нельзя. Свою версию можно скачать. Решить такой конфликт на этом экране нельзя.")
-    if not row["preserved"]:
+    if not row["preserved"] and state != "program":
         return ("Файл больше 8 МиБ, поэтому программа не сохранила его копию и не заменяет его: он остаётся "
-                "на диске как есть. Решить такой конфликт на этом экране нельзя.")
+                "на диске как есть. Заменить его здесь нельзя. Когда файл снова станет равен версии программы "
+                "(её копия в истории записи), здесь можно будет закрыть конфликт: файл при этом не изменится.")
     if state == "missing":
         return _missing_text(row, "обновите список, и замена станет доступна.")
     if state == "unavailable":
@@ -1758,9 +1780,10 @@ def _replace_file(store, row, snapshot=None):
     if snapshot is not None and facts["snapshot"] != snapshot:
         raise CoreError("Показанное сравнение устарело: конфликт или версия программы изменились. "
                         "Откройте сравнение заново.")
-    try:
+    try:     # без копии (файл больше 8 МиБ) закрывается лишь конфликт, файл уже равен версии программы и не меняется
         result = getattr(store, f"resolve_{row['scope']}_conflict")(
-            row["conflict_id"], str(uuid.uuid4()), recordings.operation_context(store, "human"))
+            row["conflict_id"], str(uuid.uuid4()), recordings.operation_context(store, "human"),
+            **({} if row["preserved"] else {"without_copy": True}))
     except (storage.Busy, sqlite3.Error) as ex:
         raise CoreError("Решение не записано, файл не тронут. " + explain_error(ex)) from ex
     except (OSError, ValueError, storage.StorageError) as ex:
@@ -1810,6 +1833,22 @@ def _damaged_copies_warning(copies):
     return [f"Повреждённых сохранённых копий правок: {len(copies)}. В резерве они такие же повреждённые: "
             "вернуть по ним правку нельзя. Если файл с правкой ещё цел, сохраните его отдельно.",
             *(f"- «{item['relative_path']}» — конфликт {item['conflict_id']}" for item in copies)]
+
+
+def _not_written_warning(rows):
+    """Предупреждение о ревизиях, которые восстановление могло записать, но не записало (очередь pending).
+
+    Конфликты и сбои, пришедшие из резерва, сюда не входят: они видны на экране конфликтов, как и раньше.
+    Первая строка без путей и имён: её получает и агент."""
+    if not rows:
+        return []
+    count = len({row["recording_id"] for row in rows})
+    return [f"Восстановлено, но не все файлы записей сформированы: записей — {count}, ревизий — {len(rows)}. "
+            "Если файл занят другой программой или защищён от записи, закройте его или снимите защиту; затем "
+            "запустите sync_recording_documents для записи или повторите действие с ней — файлы допишутся.",
+            *(f"- запись {row['recording_id']}, ревизия {row['document_revision']}: " +
+              ("файл занят другой программой или защищён от записи" if row["error_code"] == "busy"
+               else "ждёт предыдущую ревизию этой записи") for row in rows)]
 
 
 def backup_store(destination):
@@ -1877,6 +1916,10 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
             materialized = []
             for root_id, path in mapping.items():
                 materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
+            # PR 5б-2: занятый или защищённый от записи файл больше не обрывает восстановление — называем, что осталось
+            not_written = [dict(row) for row in store.db.execute(
+                "SELECT recording_id, document_revision, error_code FROM document_outbox "
+                "WHERE state = 'pending' ORDER BY recording_id, document_revision")]
             validation = storage.validate_copy(staged, allow_damaged_copies=True)
         finally:
             store.close()
@@ -1895,10 +1938,10 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
     except OSError as ex:
         raise CoreError(f"не удалось опубликовать восстановленную базу (возможно, программа "
                         f"запущена — закройте её и повторите); файл остался: {staged}") from ex
-    warning = _damaged_copies_warning(validation.get("damaged_copies"))
+    warning = _not_written_warning(not_written) + _damaged_copies_warning(validation.get("damaged_copies"))
     return {"destination": str(destination), "installation_id": installation_id,
             "previous_saved_as": previous_saved_as, "validation": validation,
-            "materialized": materialized, **({"warning": warning} if warning else {})}
+            "materialized": materialized, "not_written": not_written, **({"warning": warning} if warning else {})}
 
 
 def live(s, job_id):
@@ -2149,6 +2192,7 @@ def list_document_conflicts(recording_id):
 def _resolve_for_agent(scope, recording_id, conflict_id):
     """MCP: после подтверждения в окне заменить файл версией программы. Ответ и ошибки прежние;
     новое одно: если файла на месте нет, отказ до записи решения."""
+    import documents
     import recordings
     import storage
     if scope == "document":
@@ -2165,14 +2209,23 @@ def _resolve_for_agent(scope, recording_id, conflict_id):
         row = _conflict_row(store, recording_id, conflict_id, scope)
         if _file_at(store, row, row["relative_path"])[0] == "missing":
             raise CoreError(_missing_text(row, "затем повторите."))
+        extra = {}
+        if not row["preserved"]:       # копии нет: закрыть можно, только если файл уже равен версии программы
+            facts = _conflict_facts(store, row)
+            if not facts["can_replace"]:
+                raise CoreError(facts["reason"])
+            extra = {"without_copy": True}
         if scope == "document":
             result = store.resolve_document_conflict(
-                conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
+                conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"), **extra)
             completed = recordings.materialize_recording(store, recording_id)
-            result["materialized"] = (recording_id, result["document_revision"]) in completed
+            failure = documents.unsynced(store, recording_id, result["document_revision"], completed)
+            result["materialized"] = failure is None
+            if failure is not None:       # решение принято, файл не дописан: исход словами, а не голое false
+                result["outcome"], result["reason"] = failure.status, str(failure)
         else:
             result = store.resolve_conspect_conflict(
-                conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
+                conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"), **extra)
             completed = recordings.materialize_conspects(store, recording_id, conspect_id=result["conspect_id"])
             result["materialized"] = (result["conspect_id"], result["revision"]) in completed
         return result
@@ -2634,8 +2687,7 @@ def apply_answers_files(jp, md):
                 if result.get("unchanged"):     # commit ничего не записал: как при candidate == initial
                     return _answers_synced(store, binding["recording_id"], jp, report)
                 completed = recordings.materialize_recording(store, binding["recording_id"])
-                if (binding["recording_id"], result["document_revision"]) not in completed:
-                    raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
+                _require_answers_written(store, binding["recording_id"], result["document_revision"], completed)
                 return _answers_refreshed(store, binding["recording_id"], jp, report)
         finally:
             store.close()
@@ -2653,9 +2705,16 @@ def _answers_synced(store, recording_id, jp, report):
     latest = recordings.document_binding(store, recording_id)
     if recordings.document_sync_state(store, recording_id, latest["document_revision"]) != "synced":
         completed = recordings.materialize_recording(store, recording_id)
-        if (recording_id, latest["document_revision"]) not in completed:
-            raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
+        _require_answers_written(store, recording_id, latest["document_revision"], completed)
     return _answers_refreshed(store, recording_id, jp, report)
+
+
+def _require_answers_written(store, recording_id, revision, completed):
+    """Ответы уже в базе; если файлы не дописаны, исход словами (тип CoreError, как у прежнего отказа)."""
+    import documents
+    failure = documents.unsynced(store, recording_id, revision, completed)
+    if failure is not None:
+        raise CoreError(str(failure)) from failure
 
 
 def _answers_refreshed(store, recording_id, jp, report):

@@ -337,8 +337,7 @@ def write_review_pack_state(document_path, state):
             binding["recording_id"], expected, str(uuid.uuid4()), context, review=review,
             root_id=binding["root_id"], generated_at=datetime.now(timezone.utc).isoformat())
         completed = materialize_recording(store, binding["recording_id"])
-        if (binding["recording_id"], result["document_revision"]) not in completed:
-            raise storage.StorageError("review committed; document materialization is pending")
+        documents.require_written(store, binding["recording_id"], result["document_revision"], completed)
         return result
     finally:
         store.close()
@@ -387,7 +386,9 @@ def save_conspect_files(document_path, files, *, create=False):
              str(uuid.uuid4()), current_operation_context(store))
         completed = materialize_conspects(store, recording_id, conspect_id=conspect_id)
         if (conspect_id, result["conspect_revision"]) not in completed:
-            raise storage.StorageError("conspect committed; materialization is pending")
+            raise storage.StorageError(
+                "Свёртка записана в базу, но её файлы ещё не обновлены. Повторите действие позже: программа "
+                "допишет файлы при следующей записи (или запустите sync_recording_documents).")
         return result
     finally:
         store.close()

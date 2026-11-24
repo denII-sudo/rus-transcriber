@@ -87,7 +87,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.24.9"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.24.10"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -108,9 +108,9 @@ async def _gated(action, args, lines_fn, run_fn, *, require_human=False):
         except confirm.NotConfirmed as ex:
             return str(ex)
         except core.CoreError as ex:
-            return f"Ошибка: {ex}"
+            return f"Ошибка: {core.say_error(ex)}"
         except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-            return f"Ошибка: {ex}"
+            return f"Ошибка: {core.say_error(ex)}"
     return await asyncio.to_thread(work)
 
 
@@ -160,7 +160,7 @@ def start_workflow(audio_path: str, require_conspect: bool = False,
         })
         return json.dumps(result, ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -169,7 +169,7 @@ def workflow_status(request_id: str) -> str:
     try:
         return json.dumps(core.workflow_status(request_id), ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -192,7 +192,7 @@ def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000, res
     try:
         return json.dumps(core.workflow_model_task(request_id, offset, limit, restart=restart), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -201,7 +201,7 @@ def workflow_questions(request_id: str) -> str:
     try:
         return json.dumps(core.workflow_questions(request_id), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -212,7 +212,7 @@ async def workflow_abandon_request(request_id: str) -> str:
         if confirm.mode() == "off":
             return "Ошибка: для отказа от результата требуется подтверждение человека"
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
     return await _gated(
         "Отказ от незавершённого запуска", snapshot,
         lambda: [f"Источник: {snapshot['source']}", f"Задача: {snapshot['job_id']}",
@@ -229,7 +229,7 @@ async def workflow_mark_reviewed(request_id: str) -> str:
         if confirm.mode() == "off":
             return "Ошибка: для подтверждения проверки нужен канал подтверждения человека"
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
     return await _gated(
         "Подтверждение проверки стенограммы", snapshot,
         lambda: [f"Стенограмма: {snapshot['document']}",
@@ -245,7 +245,7 @@ def workflow_change_policy(request_id: str, policy: dict, expected_revision: int
     try:
         return json.dumps(core.workflow_change_policy(request_id, policy, expected_revision), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -259,7 +259,7 @@ def workflow_execute_model(request_id: str, retry_failed: bool = False, restart:
         return json.dumps(core.workflow_execute_model(request_id, retry_failed=retry_failed, restart=restart),
                           ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
     except llm_provider.ProviderError as ex:
         return json.dumps({"error_code": ex.code, "error": str(ex)}, ensure_ascii=False)
 
@@ -286,7 +286,7 @@ def workflow_repair_quotes(request_id: str, allow_cloud_model: bool = False) -> 
         return json.dumps(core.workflow_repair_quotes(request_id, via="mcp", allow_cloud_model=True),
                           ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
     except llm_provider.ProviderError as ex:
         return json.dumps({"error_code": ex.code, "error": str(ex)}, ensure_ascii=False)
 
@@ -299,7 +299,7 @@ def workflow_model_part(request_id: str, part_index: int) -> str:
     try:
         return json.dumps(core.workflow_model_part(request_id, part_index), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -308,7 +308,7 @@ def workflow_model_part_result(request_id: str, part_index: int, result: dict) -
     try:
         return json.dumps(core.workflow_model_part_result(request_id, part_index, result), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -317,7 +317,7 @@ def workflow_model_result(request_id: str, result: dict) -> str:
     try:
         return json.dumps(core.workflow_model_result(request_id, result), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -326,7 +326,7 @@ def workflow_list(limit: int = 20) -> str:
     try:
         return json.dumps(core.workflow_list(limit), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -335,7 +335,7 @@ def recording_history(recording_id: str, kind: str = "transcript") -> str:
     try:
         return json.dumps(core.recording_revisions(recording_id, kind), ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -344,7 +344,7 @@ def read_recording_revision(recording_id: str, kind: str, revision: int) -> str:
     try:
         return json.dumps(core.read_recording_revision(recording_id, kind, revision), ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -355,7 +355,7 @@ async def restore_recording_revision(recording_id: str, source_revision: int, re
         if confirm.mode() == "off":
             return "Ошибка: для возврата ревизии нужен канал подтверждения человека"
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
     return await _gated(
         "Возврат прежней ревизии как текущей", snapshot,
         lambda: [f"Стенограмма: {snapshot['document']}",
@@ -504,7 +504,7 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
                 data, unknown = transcript.rename(s["json"], s["markdown"], names,
                                                   expected_versions=expected)
             except (ValueError, storage.StorageError) as ex:
-                raise core.CoreError(str(ex)) from ex
+                raise core.CoreError(core.say_error(ex)) from ex
             msg = {"speakers": data["speakers"], "mapping": data["speaker_names"], "markdown": s["markdown"]}
             if data.get("_conspects"):
                 msg["conspects"] = data["_conspects"]
@@ -534,7 +534,7 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
                                      "Подтвердить имена говорящих?"] + lines,
                              lambda: run(expected), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -596,7 +596,7 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
             return "Правку с авторством человека вносите через локальную карточку с подтверждением"
         return json.dumps(core.edit_span(job_id, t1, t2, text, speaker, note, by), ensure_ascii=False, indent=1)
     except (core.CoreError, storage.StorageError, ValueError) as ex:
-        return str(ex)
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -605,8 +605,8 @@ def reopen_review(job_id: str, ids: str) -> str:
     решить их заново через apply_review. Карточки пересобирать не нужно."""
     try:
         return json.dumps(core.reopen_review(job_id, ids), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # запись ревизии: исход недописанного файла словами
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -619,8 +619,8 @@ def legacy_speaker_review(job_id: str, build_pack: bool = False) -> str:
     подтверждает. После применения ответов — preview_voice_profiles и update_voice_profiles."""
     try:
         return json.dumps(core.legacy_speaker_review(job_id, build_pack), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # build_pack пишет запись
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -732,7 +732,7 @@ async def conspect_mark_reviewed(job_id: str, name: str = "конспект") ->
     try:
         snapshot = core.describe_conspect_confirmation(job_id, name)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
     return await _gated("Подтверждение проверки конспекта", snapshot,
                         lambda: [f"Конспект: {name}", f"Задача: {job_id}",
                                  f"Ревизия источника: {snapshot['source_revision']}",
@@ -746,7 +746,7 @@ def conspect_candidates(job_id: str, conspect_text: str) -> str:
     try:
         return json.dumps(core.preview_conspect_candidates(job_id, conspect_text), ensure_ascii=False, indent=1)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -761,7 +761,7 @@ async def conspect_link_selected(job_id: str, conspect_text: str, selections: di
         snapshot, report = core.prepare_selected_conspect(job_id, name, conspect_text, selections)
         lines = core.selected_conspect_confirmation_lines(job_id, name, snapshot, report, selections)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
     return await _gated("Выбор мест цитат", snapshot, lambda: lines,
                         lambda: core.save_selected_conspect(snapshot, conspect_text, selections),
                         require_human=True)
@@ -833,7 +833,7 @@ def initialize_recording_store(display_name: str = "") -> str:
                            "identity": identity, "recording_backend": settings.recording_backend()},
                           ensure_ascii=False, indent=2)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"initialized": False, "error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"initialized": False, "error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -842,7 +842,7 @@ def find_recording_results(source_path: str) -> str:
     try:
         return json.dumps(core.find_recording_results(source_path), ensure_ascii=False)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -856,7 +856,7 @@ def read_recording_result(recording_id: str) -> str:
             quality["interaction"] = {"omitted": "см. conversation_hotspots"}
         return json.dumps(result, ensure_ascii=False)
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -865,7 +865,7 @@ def sync_recording_documents(recording_id: str) -> str:
     try:
         return json.dumps(core.sync_recording_documents(recording_id), ensure_ascii=False)
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -874,7 +874,7 @@ def list_conspect_conflicts(recording_id: str) -> str:
     try:
         return json.dumps(core.list_conspect_conflicts(recording_id), ensure_ascii=False)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -889,7 +889,7 @@ async def request_review_answer_verification(recording_id: str, answer_ids: list
                      "Подтвердить следующие ответы как проверенные человеком:"] + snapshot["lines"],
             lambda: core.confirm_review_answers(snapshot), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -898,7 +898,7 @@ def list_document_conflicts(recording_id: str) -> str:
     try:
         return json.dumps(core.list_document_conflicts(recording_id), ensure_ascii=False)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 def _replace_window(what, plan):
@@ -953,7 +953,7 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_document_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -978,7 +978,7 @@ async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
                      f"Размер копии: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
             lambda: core.resolve_conspect_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -993,7 +993,7 @@ def set_recording_display_name(display_name: str) -> str:
             store.close()
         return json.dumps({"display_name": name}, ensure_ascii=False)
     except (OSError, ValueError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -1003,7 +1003,7 @@ def set_recording_backend(backend: str) -> str:
         settings.set_recording_backend(backend)
         return json.dumps({"recording_backend": settings.recording_backend()}, ensure_ascii=False)
     except (ValueError, RuntimeError, OSError, storage.StorageError) as ex:
-        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+        return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -1122,8 +1122,8 @@ def build_review_pack(job_id: str, items: list[dict] | None = None) -> str:
     2–4 варианта. Пересборка меняет version: ответы на прежние вопросы не применятся."""
     try:
         return json.dumps(core.build_review_pack(job_id, items), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
-        return str(ex)
+    except (core.CoreError, storage.StorageError) as ex:      # состояние пакета пишется в запись
+        return core.say_error(ex)
 
 
 @mcp.tool()
@@ -1202,7 +1202,7 @@ def preview_voice_profiles(job_id: str, group_override: str = "") -> str:
         return json.dumps(core.preview_voice_learning(job_id, group_override or None),
                           ensure_ascii=False, indent=1)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -1219,7 +1219,7 @@ async def update_voice_profiles(job_id: str, group_override: str = "") -> str:
     try:
         snapshot = await asyncio.to_thread(core.prepare_voice_action, job_id, group_override or None)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
     return await _gated("Обновление голосового профиля", snapshot,
                         lambda: core.voice_action_lines(snapshot), lambda: core.start_voice_update(snapshot),
                         require_human=True)
@@ -1233,7 +1233,7 @@ async def revoke_voice_profiles(job_id: str) -> str:
         if not snapshot["report"]["existing_contributions"]:
             return "Вкладов этой записи в профиле нет."
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
     return await _gated("Отзыв голосового вклада", snapshot,
                         lambda: core.voice_action_lines(snapshot, revoke=True),
                         lambda: core.revoke_voice_source(snapshot), require_human=True)
@@ -1256,7 +1256,7 @@ def voice_quality(group: str = "") -> str:
     try:
         return json.dumps(core.voice_quality(group), ensure_ascii=False, indent=1)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -1280,7 +1280,7 @@ def voice_refresh_plan(group: str = "") -> str:
     try:
         return json.dumps(core.voice_refresh_plan(group), ensure_ascii=False, indent=1)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()
@@ -1294,7 +1294,7 @@ async def backup_voice_profiles(group: str = "") -> str:
                                      "Старые резервы не заменяются и не удаляются."],
                             lambda: core.backup_voice_profiles(group), require_human=True)
     except core.CoreError as ex:
-        return f"Ошибка: {ex}"
+        return f"Ошибка: {core.say_error(ex)}"
 
 
 @mcp.tool()

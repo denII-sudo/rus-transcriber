@@ -133,9 +133,12 @@ class ScreenCase(unittest.TestCase):
         self.base = Path(tempfile.mkdtemp(prefix="conflict-replace-")).resolve()
 
         def remove():
-            # соединения SQLite обработчиков экрана держат файл базы в Windows
-            gc.collect()
+            # соединения SQLite обработчиков экрана могут держать файл базы в Windows:
+            # сборщик мусора нужен только если папка не удалилась сразу
             shutil.rmtree(self.base, ignore_errors=True)
+            if self.base.exists():
+                gc.collect()
+                shutil.rmtree(self.base, ignore_errors=True)
         self.addCleanup(remove)
         self.database = self.base / "state.sqlite3"
         for patcher in (mock.patch.object(paths, "STATE_DB", self.database),
@@ -1050,18 +1053,29 @@ class ConflictReplaceTests(ScreenCase):
         self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
         self.assertEqual(self.item(case)["status"], "resolved")
 
-    def test_write_stopped_by_other_recording_can_be_retried(self):
+    def test_busy_file_of_other_recording_does_not_stop_this_replacement(self):
         root = self.base / "common"
         other = self.recording(root=root, ident="00000000-0000-4000-8000-000000000001")
         mine = self.recording(root=root, ident="ffffffff-0000-4000-8000-000000000001")
         case = self.conflict("document", rec=mine)
         snapshot = self.snapshot(case)
+        before = other.files["md"].read_bytes()
         self.change_text(other, "другая запись")
+        revision = self.store.db.execute("SELECT max(document_revision) FROM document_versions WHERE recording_id=?",
+                                         (other.rid,)).fetchone()[0]
         with failing_replace(other.files["md"]):
-            self.assertEqual(self.replace(snapshot)["outcome"], "not_written")
-        self.assertEqual(case.path.read_bytes(), case.saved)
-        self.assertIs(self.item(case)["can_retry"], True)
-        self.assertEqual(self.retry(case)["outcome"], "replaced")
+            result = self.replace(snapshot)
+        # PR 5б-2: чужая недописанная запись не останавливает эту (раньше — «не записано», нужен был повтор)
+        self.assertEqual(result["outcome"], "replaced")
+        self.assertEqual(case.path.read_bytes(), self.program(mine, "document", "md"))
+        self.assertEqual(self.item(case)["status"], "resolved")
+        # чужая запись: ревизия ждёт в очереди с кодом busy, её файл не тронут; следующая запись допишет его
+        state = self.store.db.execute("SELECT state, error_code FROM document_outbox WHERE recording_id=? AND "
+                                      "document_revision=?", (other.rid, revision)).fetchone()
+        self.assertEqual(tuple(state), ("pending", "busy"))
+        self.assertEqual(other.files["md"].read_bytes(), before)
+        self.assertIn((other.rid, revision), self.materialize(other, "document"))
+        self.assertEqual(other.files["md"].read_bytes(), self.program(other, "document", "md"))
 
     def test_document_replaced_while_second_file_waits(self):
         case = self.conflict("document", kind="json")
@@ -1471,6 +1485,12 @@ class ConflictMCPCompatibilityTests(ScreenCase):
                 case = self.conflict(scope)
                 with failing_replace(case.path):
                     answer = self.resolve(case)
+                if scope == "document":
+                    # PR 5б-2: занятый файл документа — не исключение: решение записано, исход назван словами
+                    shown = json.loads(answer)
+                    self.assertEqual((shown["materialized"], shown["outcome"]), (False, "later"))
+                    self.assertIn(case.path.name, shown["reason"])
+                    continue
                 self.assertTrue(answer.startswith("Ошибка:"), answer)
                 self.assertIn("synthetic busy file", answer)
 
@@ -1758,12 +1778,18 @@ async function run(sc) {
     const data = replies[key] || {};
     return {ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(data)), headers: {get: () => ""}};
   }
-  const context = {document, fetch, setTimeout, clearTimeout, console, encodeURIComponent, decodeURIComponent,
-    requestAnimationFrame: f => setTimeout(f, 0), location: {pathname: "/t/"}, URL, confirm: () => false};
+  // Таймер Node в Windows срабатывает не раньше ~15 мс, поэтому нулевые таймеры страницы идут через
+  // setImmediate (порядок тот же, ожидание — доли миллисекунды); остальные таймеры — настоящие.
+  const pageTimeout = (f, delay, ...rest) => delay ? setTimeout(f, delay, ...rest) : setImmediate(f, ...rest);
+  const pageClear = handle => (handle && handle.constructor && handle.constructor.name === "Immediate"
+    ? clearImmediate(handle) : clearTimeout(handle));
+  const context = {document, fetch, setTimeout: pageTimeout, clearTimeout: pageClear, console, encodeURIComponent,
+    decodeURIComponent, requestAnimationFrame: f => setImmediate(f), location: {pathname: "/t/"}, URL,
+    confirm: () => false};
   context.window = context;
   vm.createContext(context);
   vm.runInContext(script, context);
-  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setTimeout(r, 0)); };
+  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   await settle();
   const out = {};
   const card = () => every().find(e => String(e.className).split(" ").includes("conflict"));
