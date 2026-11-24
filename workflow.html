@@ -192,6 +192,11 @@ async function loadConspects() {
       div.innerHTML = `<p><b>${esc(c.name)}</b> · ревизия ${esc(c.current_revision)} ·
         по тексту ревизии ${esc(c.source_revision)}</p>
         <p class="muted">Файлы: ${Object.values(c.files || {}).map(esc).join(" · ") || "ещё не сформированы"}</p>`;
+      if (c.quote_repair && c.quote_repair.unlinked > 0) {
+        const note = document.createElement("p");
+        note.textContent = `Не найдено в стенограмме цитат: ${c.quote_repair.unlinked} из ${c.quote_repair.total}.`;
+        div.appendChild(note);
+      }
       for (const s of c.sections || []) {
         const p = document.createElement("p");
         p.textContent = s.text || "";
