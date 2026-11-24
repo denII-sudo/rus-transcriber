@@ -723,6 +723,16 @@ def _conspect_screen_sections(payload):
             if isinstance(item, dict) and isinstance(item.get("text"), str)]
 
 
+def quote_repair_view(payload):
+    """Цитаты свёртки «по одной» для строки экрана: сколько не найдено в стенограмме и достигнут ли порог
+    исправления (порог и счёт — workflow.quotes_need_repair, workflow.quote_counts). None — у остальных свёрток."""
+    import workflow
+    counts = workflow.quote_counts(payload)
+    if counts is None:
+        return None
+    return {"unlinked": counts[0], "total": counts[1], "needed": workflow.quotes_need_repair(*counts)}
+
+
 def recording_conspects(recording_id):
     """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
     import recordings
@@ -742,6 +752,7 @@ def recording_conspects(recording_id):
                            "current_revision": item["current_revision"],
                            "source_revision": item["source_revision"],
                            "sections": _conspect_screen_sections(item["payload"]),
+                           "quote_repair": quote_repair_view(item["payload"]),
                            "files": files})
         return result
     finally:

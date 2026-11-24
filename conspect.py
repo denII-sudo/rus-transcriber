@@ -35,6 +35,9 @@ from pathlib import Path
 import quotes as Q
 
 PLACE = re.compile(r"\{\{q:(\d+)\}\}")
+# Слот ненайденной цитаты (РАР-7, 7.5в): {{u:N}}; сборка раскрывает его по списку obj["unlinked"].
+SLOT = re.compile(r"\{\{([qu]):(\d+)\}\}")
+SLOT_MARKS = ("{{q:", "{{u:")           # служебные знаки шаблона: в тексте ответа модели их быть не может
 _locks_guard = threading.Lock()
 _thread_locks = {}
 _held_locks = threading.local()
@@ -275,6 +278,9 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
     within — слова раздела (ID): цитата ищется только среди них;
     unlinked="mark" — несвязанная цитата остаётся в тексте без кавычек с пометкой (UNLINKED_MARKS),
     число таких цитат — в unlinked_count; по умолчанию "reject": текст не меняется;
+    unlinked="slot" — как "mark", но вместо пометки в шаблоне стоит слот {{u:N}}, а в obj["unlinked"] —
+    {"id", "quote", "why", "at"}: at — место «цитаты» с кавычками в исходном тексте (без метки перед ней);
+    сборка (render) печатает ту же пометку, что и "mark";
     labels — метка говорящего вплотную перед цитатой считается частью цитаты: убирается из текста,
     в цитате остаётся written_label, автора пишет сборка.
     """
@@ -286,7 +292,7 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
         first.setdefault(w, []).append(i)
     names = {seg["speaker"] for seg in data["segments"]}
     id_counts = Counter(w.get("word_id") for seg in data["segments"] for w in seg.get("words") or [])
-    quotes, unlinked, candidates_report = {}, [], []
+    quotes, unlinked, candidates_report, slots = {}, [], [], []
     selections = selections or {}
     consumed = set()
     out, pos, n = [], 0, 0
@@ -294,10 +300,14 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
     def mark_unlinked(m, q, why):
         nonlocal pos
         unlinked.append(q)
-        if unlinked_mode == "mark":
+        if unlinked_mode in ("mark", "slot"):
             cut = label_cut(m)[0]
             out.append(conspect_md[pos:cut])
-            out.append(f"{q} ({UNLINKED_MARKS[why]})")
+            if unlinked_mode == "slot":
+                slots.append({"id": str(len(slots) + 1), "quote": q, "why": why, "at": [m.start(2) - 1, m.end()]})
+                out.append("{{u:%d}}" % len(slots))
+            else:
+                out.append(f"{q} ({UNLINKED_MARKS[why]})")
             pos = m.end()
 
     def label_cut(m):
@@ -387,8 +397,10 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
     obj = {"version": 2, "template": "".join(out), "quotes": quotes,
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "analysis_revision": None}
-    if unlinked_mode == "mark":
+    if unlinked_mode in ("mark", "slot"):
         obj["unlinked_count"] = len(unlinked)
+    if unlinked_mode == "slot":
+        obj["unlinked"] = slots
     return obj, {"linked": n, "unlinked": unlinked, "candidates": candidates_report,
                  "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision")}
 
@@ -491,8 +503,15 @@ def render(obj, data, update_last=True):
         starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
                   for word in seg.get("words") or [] if _start(word) is not None}
 
+    slots = {item.get("id"): item for item in obj.get("unlinked") or [] if isinstance(item, dict)}
+
     def sub(m):
-        key = m.group(1)
+        if m.group(1) == "u":
+            item = slots.get(m.group(2))
+            if item is None or item.get("why") not in UNLINKED_MARKS or not isinstance(item.get("quote"), str):
+                return m.group(0)               # неизвестный или негодный слот остаётся как есть
+            return f"{item['quote']} ({UNLINKED_MARKS[item['why']]})"
+        key = m.group(2)
         q = obj["quotes"].get(key)
         if not q:
             return m.group(0)
@@ -543,7 +562,7 @@ def render(obj, data, update_last=True):
         when = f", {_clock(min(found))}" if found else ""
         return f"{author}: {body} (по распознаванию, {'не прослушано' if unheard else 'не проверено'}{when})"
 
-    body_md = PLACE.sub(sub, obj["template"])
+    body_md = SLOT.sub(sub, obj["template"])         # один проход: вставленный текст не раскрывается повторно
     header = _labels_header(obj, data, rep["analysis_needs_review"])
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
