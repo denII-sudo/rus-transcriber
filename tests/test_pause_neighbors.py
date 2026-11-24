@@ -24,6 +24,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
 
 import core  # noqa: E402
+import quotes  # noqa: E402
 import recordings  # noqa: E402
 import review_pack  # noqa: E402
 import settings  # noqa: E402
@@ -830,6 +831,93 @@ class OldPackFreeAnswersTests(FreeAnswerCase):
                     self.assertEqual(self.texts(jp), want_texts)
                     self.assertUntouchedNeighbors(jp)
                     self.assertEqual(self.manifest_sha(jp), sha)
+
+
+class DoubtMarksPauseTests(unittest.TestCase):
+    """Тест 19 (ответ владельца на раздел 9, вариант А): открытая пустая пауза помечает ⟦…⟧ последнее слово до неё
+    и первое после; слово «в 0,01 с от края» больше не слово паузы; цитата рядом с такой паузой сомнительна."""
+
+    def make(self, words=None, speaker="Анна"):
+        words = words or [word("w1", "раз", 0.5), word("w2", "два", 1.0), word("w3", "три", 3.0),
+                          word("w4", "четыре", 3.5), word("w5", "пять", 4.0), word("w6", "шесть", 4.5)]
+        text = " ".join(w["w"] for w in words)
+        return {"segments": [{"speaker": speaker, "start": words[0]["s"], "end": words[-1]["e"], "text": text,
+                              "words": words}], "review": []}
+
+    def marks(self, item, data=None):
+        data = data or self.make()
+        data["review"] = [item]
+        return transcript.doubt_marks(data)
+
+    def test_empty_open_pause_marks_the_word_before_and_the_word_after(self):
+        self.assertEqual(self.marks(gap(1.5, 3.0)), {0: {1: "r1", 2: "r1"}})
+
+    def test_pause_left_for_human_is_marked_too(self):
+        self.assertEqual(self.marks(gap(1.5, 3.0, status="human")), {0: {1: "r1", 2: "r1"}})
+
+    def test_word_within_a_hundredth_of_the_edge_is_not_a_pause_word_any_more(self):
+        words = [word("w1", "раз", 0.5), word("w2", "два", 1.0), word("w3", "три", 3.0), word("w4", "ещё", 3.01),
+                 word("w5", "пять", 4.0)]
+        # «три» — первое слово после паузы; «ещё» в 0,01 с от края раньше тоже помечалось, теперь нет
+        self.assertEqual(self.marks(gap(1.5, 3.0), self.make(words)), {0: {1: "r1", 2: "r1"}})
+
+    def test_pause_with_its_own_words_marks_only_them(self):
+        words = [word("w1", "раз", 0.5), word("w2", "два", 1.0), word("w3", "полтора", 2.0), word("w4", "три", 3.0)]
+        self.assertEqual(self.marks(gap(1.5, 3.0), self.make(words)), {0: {2: "r1"}})
+
+    def test_neighbors_in_different_segments_are_marked_each_in_its_own(self):
+        data = {"segments": [
+            {"speaker": "Анна", "start": 0.5, "end": 1.2, "text": "раз два",
+             "words": [word("w1", "раз", 0.5), word("w2", "два", 1.0)]},
+            {"speaker": "Борис", "start": 3.0, "end": 3.7, "text": "три четыре",
+             "words": [word("w3", "три", 3.0), word("w4", "четыре", 3.5)]}], "review": [gap(1.5, 3.0)]}
+        self.assertEqual(transcript.doubt_marks(data), {0: {1: "r1"}, 1: {0: "r1"}})
+
+    def test_pause_at_the_edges_of_the_recording_marks_one_word(self):
+        self.assertEqual(self.marks(gap(5.0, 6.0)), {0: {5: "r1"}})
+        self.assertEqual(self.marks(gap(0.0, 0.4)), {0: {0: "r1"}})
+
+    def test_neighbors_render_as_one_doubt_span(self):
+        data = self.make()
+        marks = self.marks(gap(1.5, 3.0), data)
+        self.assertEqual(transcript._marked_text(data["segments"][0], marks[0]),
+                         "раз ⟦два три⟧ четыре пять шесть")
+
+    def test_resolved_pause_is_not_marked(self):
+        for status in ("done", "applied", "accepted"):
+            self.assertEqual(self.marks(gap(1.5, 3.0, status=status)), {}, status)
+
+    def test_bad_time_marks_nothing_and_does_not_raise(self):
+        for t1, t2 in ((None, 2.0), (float("nan"), 2.0), ("1", 2.0), (3.0, 2.0)):
+            item = {"id": "r1", "status": "open", "t1": t1, "t2": t2, "reasons": ["missed"], "speaker": "Анна"}
+            self.assertEqual(self.marks(item), {}, (t1, t2))
+
+    def test_gap_among_other_reasons_is_a_pause(self):
+        self.assertEqual(self.marks(gap(1.5, 3.0, reasons=["asr", "missed"])), {0: {1: "r1", 2: "r1"}})
+
+    def test_word_place_keeps_the_old_rule(self):
+        self.assertEqual(self.marks(place(3.0)), {0: {2: "r2"}})
+        self.assertEqual(self.marks(place(2.99, 3.01)), {0: {2: "r2"}})
+
+    def test_quote_next_to_an_open_empty_pause_is_in_doubt(self):
+        data = self.make()
+        data["review"] = [gap(1.5, 3.0)]
+        for quote, want in (("«раз два»", ["r1"]), ("«три четыре»", ["r1"]), ("«два три»", ["r1"]),
+                            ("«четыре пять шесть»", None)):
+            with self.subTest(quote=quote):
+                rep = quotes.check(f"Анна: {quote}", data)
+                rows = rep["problems"] if want else []
+                if want:
+                    self.assertEqual(rows[0].get("doubt"), want, rep)
+                else:
+                    self.assertEqual(rep["summary"]["in_doubt"], 0, rep)
+                    self.assertEqual(rep["summary"]["verbatim"], 1, rep)
+
+    def test_quote_is_not_in_doubt_once_the_pause_is_resolved(self):
+        data = self.make()
+        data["review"] = [gap(1.5, 3.0, status="done")]
+        rep = quotes.check("Анна: «два три»", data)
+        self.assertEqual(rep["summary"]["in_doubt"], 0, rep)
 
 
 if __name__ == "__main__":
