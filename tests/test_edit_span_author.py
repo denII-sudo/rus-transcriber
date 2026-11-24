@@ -157,16 +157,19 @@ class OnlyChangedWordsAreMarked(unittest.TestCase):
                     self.assertNotIn("provenance", hc.word(jp, "w2"))
 
 class HumanSpanOverHumanCardAnswer(unittest.TestCase):
-    def test_conflict_names_author_and_hints_reopen(self):
+    def test_contradiction_instead_of_error(self):
+        """PR 13б: прежде отказ с подсказкой reopen; теперь слова не меняются, у места — противоречие."""
         for backend in BACKENDS:
             with self.subTest(backend=backend), hc.files(backend) as (jp, md, _):
                 transcript.apply_review(jp, md, [{"id": "r1", "text": "другое"}], by="human")
-                before = state(jp)
-                with self.assertRaises(ValueError) as ctx:
-                    transcript.edit_span(jp, md, 0.2, 0.5, "третье", by="human")
-                self.assertIn("ответом человека на карточку", str(ctx.exception))
-                self.assertIn("reopen", str(ctx.exception))
-                self.assertEqual(state(jp), before)
+                words = [w["w"] for s in transcript.load(jp)["segments"] for w in s["words"]]
+                _, rep = transcript.edit_span(jp, md, 0.2, 0.5, "третье", by="human")
+                self.assertIs(rep["written"], False)
+                self.assertTrue(rep["text"].startswith("не записано: противоречие, карточка r1"), rep["text"])
+                data = transcript.load(jp)
+                self.assertEqual([w["w"] for s in data["segments"] for w in s["words"]], words)
+                place = next(i for i in data["review"] if i["id"] == "r1")
+                self.assertEqual([p["text"] for p in place["contradiction"]["proposals"]], ["третье"])
 
 
 if __name__ == "__main__":

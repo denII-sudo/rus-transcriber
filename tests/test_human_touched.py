@@ -72,9 +72,10 @@ class AgentSpanEditKeepsOffHumanWord(unittest.TestCase):
     def refused(self, hook):
         for backend in BACKENDS:
             with self.subTest(backend=backend, via="edit_span"), hc.files(backend, hook) as (jp, md, _):
-                with self.assertRaises(ValueError) as ctx:
-                    transcript.edit_span(jp, md, 0.2, 0.5, "тесть", by="claude")
-                self.assertIn("на отрезке есть подтверждённые человеком слова", str(ctx.exception))
+                # PR 13б: не ошибка, а противоречие — слово человека не меняется
+                _, rep = transcript.edit_span(jp, md, 0.2, 0.5, "тесть", by="claude")
+                self.assertIs(rep["written"], False)
+                self.assertTrue(rep["text"].startswith("не записано: противоречие"), rep["text"])
                 self.assertEqual(hc.word(jp, "w1")["w"], "тест")
             with self.subTest(backend=backend, via="apply_word_edits"), hc.files(backend, hook) as (jp, md, _):
                 _, rep = transcript.apply_word_edits(
