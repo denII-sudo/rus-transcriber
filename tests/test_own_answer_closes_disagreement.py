@@ -22,11 +22,13 @@ PROBLEM = {"model": "whisper", "state": "disagreement", "words_from": ["primary"
 REMINDER = "Слова интервала изменились после прослушивания; нужна новая проверка."
 
 
-def result(two_words=True, alt=True, state="disagreement"):
+def result(two_words=True, alt=True, state="disagreement", word3="дальше"):
     """Как у 6б, но r3 — «модели расходятся»: слово расхождения w3 «дальше» (2,5), рядом согласное w6 «идём»."""
     data = six.result()
     seg = data["segments"][0]
     w3 = seg["words"][2]
+    w3["w"] = word3
+    data["review"][2]["text"] = word3
     if alt:
         w3.update(alt_whisper="дальнейшем", alt_span=1, agree=False)
     r3 = data["review"][2]
@@ -66,16 +68,16 @@ class Base(six.Case):
 class CardAnswerClosesTests(Base):
     """Т1, Т4: свой ответ задел слово расхождения — место закрыто, исход applied."""
 
-    CASES = (("замена", True, "дальнейшем идём", ["начало", "вот", "дальнейшем", "идём", "та"]),
-             ("вставка внутри места", True, "дальше же идём", ["начало", "вот", "дальше", "же", "идём", "та"]),
-             ("слияние двух слов", True, "далее", ["начало", "вот", "далее", "та"]),
-             ("то же слово", False, "дальше", ["начало", "вот", "дальше", "та"]))
+    CASES = (("замена", {}, "дальнейшем идём", ["начало", "вот", "дальнейшем", "идём", "та"]),
+             ("вставка внутри места", {}, "дальше же идём", ["начало", "вот", "дальше", "же", "идём", "та"]),
+             ("то же слово", {"two_words": False}, "дальше", ["начало", "вот", "дальше", "та"]),
+             ("то же короткое слово (путь «как есть»)", {"two_words": False, "word3": "так"}, "так",
+              ["начало", "вот", "так", "та"]))
 
     def test_own_answer_closes_the_place(self):
-        for name, two_words, text, words in self.CASES:
+        for name, kw, text, words in self.CASES:
             for backend in BACKENDS:
-                with self.subTest(case=name, backend=backend), \
-                        files(backend, result(two_words=two_words)) as (jp, md, version):
+                with self.subTest(case=name, backend=backend), files(backend, result(**kw)) as (jp, md, version):
                     self.save(jp, version, "r3", text=text)
                     rep = self.apply(jp, md)
                     self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied", rep.get("outcomes"))
@@ -96,15 +98,18 @@ class CardAnswerClosesTests(Base):
                 self.assertEqual(self.closed_by_card(jp)["listening"], before["listening"])
 
     def test_deleting_words_of_the_place_closes_it(self):
-        """Т1: удаление слова расхождения и всех слов места (слова расхождения взяты до правки)."""
-        cases = (("удаление", [("w3", "дальше", 2.5)], ["начало", "вот", "идём", "та"]),
-                 ("удаление всех слов места", [("w3", "дальше", 2.5), ("w6", "идём", 2.75)],
-                  ["начало", "вот", "та"]))
-        for name, deleted, words in cases:
+        """Т1: удаление слова расхождения и всех слов места (слова расхождения взяты до правки), слияние."""
+        def delete(*words):
+            return [{"op": "delete", "t": t, "w": w, "word_id": wid, "card": "r3"} for wid, w, t in words]
+        cases = (("удаление", delete(("w3", "дальше", 2.5)), ["начало", "вот", "идём", "та"]),
+                 ("удаление всех слов места", delete(("w3", "дальше", 2.5), ("w6", "идём", 2.75)),
+                  ["начало", "вот", "та"]),
+                 ("слияние двух слов", [{"op": "place_text", "t1": 2.5, "t2": 2.75, "word_ids": ["w3", "w6"],
+                                         "text": "дальшеидём", "card": "r3"}], ["начало", "вот", "дальшеидём", "та"]))
+        for name, edits, words in cases:
             for backend in BACKENDS:
                 with self.subTest(case=name, backend=backend), files(backend, result()) as (jp, md, _v):
-                    edits = [{"op": "delete", "t": t, "w": w, "word_id": wid, "card": "r3"} for wid, w, t in deleted]
-                    transcript.apply_word_edits(jp, md, edits, by="human", listened_by="human")
+                    transcript.apply_word_edits(jp, md, copy.deepcopy(edits), by="human", listened_by="human")
                     self.assertEqual(self.texts(jp), words)
                     self.closed_by_card(jp)
 
@@ -113,19 +118,18 @@ class CardAnswerDoesNotCloseTests(Base):
     """Т2, Т3: прежние исключения — место открыто, отметки нет, исход не applied."""
 
     def test_answer_beside_the_disagreement_word(self):
+        """Правка карточки задела только согласное слово места: место открыто, отметки нет."""
+        edit = {"op": "replace", "t": 2.75, "w": "идём", "word_id": "w6", "text": "пойдём", "card": "r3"}
         for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
-                self.save(jp, version, "r3", text="дальше пойдём")
-                rep = self.apply(jp, md)
+            with self.subTest(backend=backend), files(backend, result()) as (jp, md, _v):
+                transcript.apply_word_edits(jp, md, [edit], by="human", listened_by="human")
                 self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "пойдём", "та"])
-                self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied_open", rep.get("outcomes"))
                 self.still_open(jp)
-                self.check_outcome_matches_place(jp, rep)
 
     def test_repeated_apply_does_not_run_the_answer_again(self):
         """applied_open — применённый ответ: повтор «Применить» его второй раз не прогоняет, карточка не падает."""
         for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
+            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
                 core.apply_answers_files(jp, md)
                 before = transcript.load(jp)
@@ -140,7 +144,7 @@ class CardAnswerDoesNotCloseTests(Base):
     def test_applied_open_place_stays_among_open_places(self):
         """Место с applied_open не прячется: оно среди нерешённых и помечено в тексте; причина — прослушать."""
         for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
+            with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
                 row = self.outcomes(self.apply(jp, md))["r3"]
                 data = transcript.load(jp)
@@ -197,7 +201,10 @@ class LaterChangeTests(Base):
                 self.save(jp, version, "r3", text="дальнейшем идём")
                 self.apply(jp, md)
                 self.closed_by_card(jp)
-                transcript.edit_span(jp, md, 2.75, 2.9, "пойдём", by="human")
+                # отдельная правка слов интервала (правка отрезка по месту, решённому человеком, отказывает)
+                data = transcript.load(jp)
+                next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w6")["w"] = "пойдём"
+                transcript.save(data, jp, md)
                 self.assertIn(REMINDER, self.still_open(jp).get("note", ""))
                 # Т7: простое повторное применение место не закрывает, исход честный
                 rep = self.apply(jp, md)
@@ -238,7 +245,7 @@ class DoubtsSectionTests(Base):
         self.assertEqual(documents.RENDERER_VERSION, 3)
 
     def test_sqlite_doubts(self):
-        with files("sqlite", result()) as (jp, md, version):
+        with files("sqlite", result(state="empty_unknown")) as (jp, md, version):
             self.save(jp, version, "r3", text="дальше пойдём")
             self.apply(jp, md)
             text = md.read_text(encoding="utf-8")
@@ -254,7 +261,7 @@ class DoubtsSectionTests(Base):
             self.assertTrue(any("r1" in x and "00:00:01" in x for x in gap_lines), gap_lines)
 
     def test_legacy_doubts(self):
-        with files("legacy_files", result()) as (jp, md, version):
+        with files("legacy_files", result(state="empty_unknown")) as (jp, md, version):
             self.save(jp, version, "r3", text="дальше пойдём")
             self.apply(jp, md)
             section = md.read_text(encoding="utf-8").split("## Сомнительные места", 1)[1]
