@@ -366,7 +366,8 @@ class RootNotConfirmed(SyncedRecording):
             documents.guard_before_write(env.store, rid)
         text = str(caught.exception)
         self.assertTrue(text.startswith("Не записано"))
-        self.assertIn("rt.py db-restore", text)
+        self.assertIn("верните её на прежнее место", text)
+        self.assertIn("Если база восстановлена из резерва — завершите восстановление: rt.py db-restore.", text)
         self.assertEqual((env.conflicts(), counts(env.store)), ([], db))
 
 
