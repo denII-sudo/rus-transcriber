@@ -946,5 +946,149 @@ class DoubtMarksPauseTests(unittest.TestCase):
         self.assertEqual(rep["summary"]["in_doubt"], 0, rep)
 
 
+class OldPackSeventhPointTests(FreeAnswerCase):
+    """Седьмая точка чтения word_ids (core._apply_answers_files_locked, sqlite): пропуск идёт по слову паузы."""
+
+    def test_old_pack_neighbor_id_does_not_conflict_with_an_answer_that_relabels_the_pause_words(self):
+        data = custom_result([("w1", "начало", 0.5, "Анна"), ("w4", "ага", 1.4, "Анна"),
+                              ("w2", "Ну", 2.0, "Борис"), ("w3", "дальше", 2.5, "Борис")],
+                             [gap(1.0, 2.0, id="r1")])
+        for backend in BACKENDS:
+            for ids in (None, ["w2"], ["w4"]):
+                with self.subTest(backend=backend, word_ids=ids),                         pause_files(backend, data, one_question()) as (jp, md, version):
+                    if ids is not None:
+                        state = review_pack.answers_state(jp)
+                        state["manifest"]["items"][0]["word_ids"] = ids
+                        review_pack._write_answers(jp, state)
+                    self.save(jp, version, text="Борис")
+                    rep = self.apply(jp, md)
+                    self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
+                    speakers = {w["word_id"]: s["speaker"] for s in transcript.load(jp)["segments"]
+                                for w in s["words"]}
+                    self.assertEqual(speakers, {"w1": "Анна", "w4": "Борис", "w2": "Борис", "w3": "Борис"})
+
+
+class PauseConfirmRefusedTests(FreeAnswerCase):
+    """Ответ равен словам паузы, но «как есть» человека отказало (asr_problem): не «применено», а человеку."""
+
+    @staticmethod
+    def data():
+        data = pause_result(inside=True)
+        data["review"][0] = gap(1.0, 2.0, id="r1", reasons=["asr", "missed"], gap=[1.0, 2.0],
+                                asr_problem={"model": "whisper", "state": "empty_unknown", "words_from": []})
+        return data
+
+    def test_open_place_with_asr_problem_goes_to_human_with_the_reason(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend, self.data(), one_question()) as (jp, md, version):
+                self.save(jp, version, text="Анна: ага")
+                rep = self.apply(jp, md)
+                row = self.outcomes(rep)["r1"]
+                self.assertEqual(row["outcome"], "not_applied", rep.get("outcomes"))
+                self.assertIn("нужно отдельное подтверждение прослушивания", row.get("detail", ""))
+                item = self.place_of(jp, "r1")
+                self.assertEqual(item["status"], "human")
+                self.assertIn("прослушайте паузу", item.get("note", ""))
+                self.assertNotIn("by", self.word(jp, "w4"))
+                self.assertNotIn("r1", rep.get("successful_ids") or [])
+
+    def test_place_without_asr_problem_still_closes(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend),                     pause_files(backend, pause_result(inside=True), one_question()) as (jp, md, version):
+                self.save(jp, version, text="Анна: ага")
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied")
+                self.assertEqual(self.place_of(jp, "r1")["status"], "resolved")
+
+
+class WorkflowPlaceTimeTests(unittest.TestCase):
+    """workflow._place_time читает только t1/t2, как на main до PR 6а (правило линии 2 6а не меняет)."""
+
+    def test_place_with_only_t_is_unlocated_for_a_quote(self):
+        data = {"segments": [{"speaker": "Анна", "words": [word("w1", "раз", 0.5), word("w2", "два", 3.0)]}],
+                "review": [{"id": "r1", "status": "open", "t": 3.0, "reasons": ["asr"]}]}
+        self.assertEqual(workflow.quote_blockers(data, ["w1"]), [{"id": "r1", "reason": "unlocated"}])
+        self.assertIsNone(workflow._place_time({"t": 3.0}))
+        self.assertEqual(workflow._place_time({"t1": 1.0, "t2": 2.0}), (1.0, 2.0))
+        self.assertEqual(transcript._place_time({"t": 3.0}), (3.0, 3.0))
+
+
+class UncaughtBreakageTests(FreeAnswerCase):
+    """Края, которые предразбор PR показал непойманными: выбор реплики, один токен для префикса и суффикса,
+    старые word_ids пропуска в card_edits / plan / preflight, неконечное время в предложениях голоса."""
+
+    def test_find_span_prefers_the_segment_of_the_places_speaker(self):
+        data = {"segments": [
+            {"speaker": "Борис", "words": [word("w1", "эх", 2.0)]},
+            {"speaker": "Анна", "words": [word("w2", "ага", 2.2)]}]}
+        self.assertEqual(transcript._find_span(data, gap(1.5, 3.0, speaker="Анна")), (1, 0, 1))
+        self.assertEqual(transcript._find_span(data, gap(1.5, 3.0, speaker="Борис")), (0, 0, 1))
+
+    def test_one_token_is_not_used_both_as_prefix_and_as_suffix(self):
+        data = custom_result([("w1", "Ну", 0.5, "Анна"), ("w2", "Ну", 2.0, "Анна"), ("w3", "дальше", 2.5, "Анна")],
+                             [gap(1.0, 2.0, id="r1")])
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                _rep, texts, result = self.run_answer(backend, data, "Анна: Ну")
+                self.assertEqual(texts, ["Ну", "Ну", "дальше"])
+                item = next(i for i in result["review"] if i["id"] == "r1")
+                self.assertEqual(item["status"], "human")
+                self.assertIn("(«Ну»)", item.get("note", ""))
+                self.assertNotIn("Ну Ну", item.get("note", ""))
+
+    def test_old_pack_neighbor_id_is_not_the_target_of_a_plain_text_answer(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend),                     pause_files(backend, pause_result(inside=True), one_question()) as (jp, md, version):
+                state = review_pack.answers_state(jp)
+                state["manifest"]["items"][0]["word_ids"] = ["w2"]
+                review_pack._write_answers(jp, state)
+                self.save(jp, version, text="вот")
+                self.apply(jp, md)
+                self.assertEqual(self.word(jp, "w2")["w"], "Ну")
+                self.assertNotIn("by", self.word(jp, "w2"))
+
+    def test_plan_does_not_close_a_pause_whose_words_are_not_inside_the_answer(self):
+        import freeform
+        data = pause_result(inside=True)
+        data["review"].append(gap(1.41, 2.0, id="r4"))          # слов, начатых в [1,41; 2,0), нет; «ага» в 1,4 — вне
+        item = {"id": "r1", "t1": 1.0, "t2": 2.0, "speaker": "Анна", "reasons": ["missed"], "text": ""}
+        _e, _r, closed, _c = freeform.plan({"items": [item]},
+                                           {"r1": {"text": "Анна: ага", "ts": "2026-11-23T10:00:00"}}, data)
+        self.assertEqual(closed, {})
+
+    def test_plan_closes_places_through_an_old_pack_pause_with_neighbor_word_ids(self):
+        import freeform
+        data = pause_result(inside=True)
+        data["review"].append(place(1.4, id="r3", word_ids=["w4"]))
+        item = {"id": "r1", "t1": 1.0, "t2": 2.0, "speaker": "Анна", "reasons": ["missed"], "text": "",
+                "word_ids": ["w2"]}
+        _e, _r, closed, _c = freeform.plan({"items": [item]},
+                                           {"r1": {"text": "Анна: ага", "ts": "2026-11-23T10:00:00"}}, data)
+        self.assertEqual(closed, {"r3": "r1"})
+
+    def test_old_pack_neighbor_id_does_not_make_the_pause_overlap_the_word_card(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), pause_files(backend) as (jp, md, version):
+                state = review_pack.answers_state(jp)
+                next(i for i in state["manifest"]["items"] if i["id"] == "r1")["word_ids"] = ["w2"]
+                review_pack._write_answers(jp, state)
+                self.save(jp, version, aid="r1", text="Анна: вот")
+                self.save(jp, version, aid="r2", option=0)
+                rep = self.apply(jp, md)
+                rows = self.outcomes(rep)
+                self.assertEqual((rows["r1"]["outcome"], rows["r2"]["outcome"]), ("applied", "applied"))
+                self.assertFalse(rep.get("preflight_conflicts"))
+
+    def test_voice_suggestions_skip_a_pause_with_non_finite_time(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                data = VoiceSuggestionTests.data()
+                data["review"][0]["t1"] = bad
+                data["review"][0].pop("t", None)
+                found = voices.legacy_speaker_places(data)
+                self.assertEqual(found["places"], [])
+                self.assertEqual(found["skipped"]["no_words"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

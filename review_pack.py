@@ -66,6 +66,9 @@ OUTCOME_REASONS = {
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
+# ответ совпал со словами паузы, но вложенное «как есть» человека отказало (например, нужно прослушивание)
+PAUSE_CONFIRM_REFUSAL = ("слова паузы совпали с ответом, но место не закрылось: {why}; "
+                         "прослушайте паузу и подтвердите её отдельно")
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -811,7 +814,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
                "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
-    confirmed = []
+    confirmed, confirm_refusals = [], {}
     if not dry_run:
         # ответ совпал со словами, уже стоящими в паузе: открытое место закрывается тем же путём, что «как есть»
         still_open = {r["id"] for r in T.load(json_path).get("review") or []
@@ -819,9 +822,16 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         confirmed = [r["id"] for r in reports if r.get("confirm_pause") and r["id"] not in blocked
                      and r["id"] in still_open]
         if confirmed:
-            T.apply_review(json_path, md_path, [{"id": cid} for cid in confirmed], by="human")
+            _, nested = T.apply_review(json_path, md_path, [{"id": cid} for cid in confirmed], by="human")
+            refused = {c.get("id"): c.get("why") for c in nested.get("conflicts") or []}
+            done = set(nested.get("successful_ids") or [])
+            not_closed = [cid for cid in confirmed if cid not in done]
+            confirmed = [cid for cid in confirmed if cid in done]
+            confirm_refusals = {cid: PAUSE_CONFIRM_REFUSAL.format(why=refused.get(cid) or "место не закрылось")
+                                for cid in not_closed}
     human = [{"id": aid, "why": reason, "answer": free[aid].get("text")}
              for aid, reason in missing_reasons.items()]
+    human += [{"id": cid, "why": why, "answer": free[cid].get("text")} for cid, why in confirm_refusals.items()]
     for r in reports:
         if r["id"] in conflict_ids:
             human.append({"id": r["id"], "why": "ответы на карточки конфликтуют", "answer": r["answer"]})

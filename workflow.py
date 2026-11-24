@@ -344,7 +344,15 @@ def _open_places(review):
 # Правило слов места живёт в transcript.py (РАР-6.1, PR 6а): здесь только имена для прежних вызовов.
 PLACE_TIME_TOLERANCE = transcript.WORD_PLACE_TOLERANCE
 _seconds = transcript._finite_number
-_place_time = transcript._place_time
+
+
+def _place_time(item):
+    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None. Только t1/t2, как до PR 6а
+    (у transcript._place_time есть ещё запасное «t»: это правило линии 2 6а не меняет)."""
+    t1, t2 = item.get("t1"), item.get("t2")
+    return (t1, t2) if _seconds(t1) and _seconds(t2) and t1 <= t2 else None
+
+
 _word_in_place = transcript.word_in_place
 
 

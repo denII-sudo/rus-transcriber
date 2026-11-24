@@ -2703,8 +2703,16 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     if draft is not None:
         items = {item["id"]: item for item in (P.manifest(jp) or {}).get("items") or []}
         already_applied = P._applied_map(draft["state"])
+        now = transcript.load(jp)
+        places = {r.get("id"): r for r in now.get("review") or []}
         for aid, answer in free.items():
-            ids = (items.get(aid) or {}).get("word_ids")
+            place = places.get(aid) or {}
+            if transcript.is_gap_place(place):
+                # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
+                found = transcript.place_words(now, place)
+                ids = found[0] if found else None
+            else:
+                ids = (items.get(aid) or {}).get("word_ids")
             if not ids or aid in already_applied or aid in (revision_conflicts or {}):
                 continue
             preview = P.apply_free(jp, md, {aid: answer}, dry_run=True)
