@@ -742,7 +742,7 @@ def quote_repair_state(store, name):
                 "reason": "это не свёртка запроса; исправление цитат недоступно"}
     request_id = name[len("workflow-"):]
     try:
-        problem = workflow.quote_repair_problem(store, workflow.get(store, request_id))
+        problem = workflow.quote_repair_problem(store, workflow.get(store, request_id), screen=True)
     except (KeyError, ValueError, storage.StorageError):
         return {"request_id": request_id, "available": False, "reason": "запрос этой свёртки не найден"}
     return {"request_id": request_id, "available": problem is None, "reason": problem}
@@ -770,13 +770,14 @@ def workflow_repair_quotes_info(request_id):
         store.close()
 
 
-def workflow_repair_quotes(request_id, *, via, snapshot=None):
+def workflow_repair_quotes(request_id, *, via, snapshot=None, allow_cloud_model=False):
     """Один вызов облака по явному согласию человека (экран: со снимком; MCP: с allow_cloud_model=true)."""
     import recordings
     import workflow
     store = recordings.open_store()
     try:
-        return workflow.repair_quotes(store, request_id, via=via, snapshot=snapshot)
+        return workflow.repair_quotes(store, request_id, via=via, snapshot=snapshot,
+                                      allow_cloud_model=allow_cloud_model)
     finally:
         store.close()
 

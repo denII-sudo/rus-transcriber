@@ -267,7 +267,7 @@ def make_server(port):
                     if not isinstance(snapshot, dict):
                         return self._send(400, {"error": "Нет снимка того, что уйдёт в облако: откройте окно заново."})
                     return self._send(200, core.workflow_repair_quotes(
-                        str(snapshot.get("request_id", "")), via="screen", snapshot=snapshot))
+                        str(snapshot.get("request_id", "")), via="screen", snapshot=snapshot, allow_cloud_model=True))
                 if u == "api/restore/prepare":
                     return self._send(200, core.prepare_restore_snapshot(
                         str(body.get("recording_id", "")), int(body.get("source_revision", 0)),

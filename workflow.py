@@ -1555,7 +1555,11 @@ REPAIR_MAX_QUOTES = 60
 REPAIR_WHO = "opencode/openai/gpt-6-luna"
 REPAIR_OLD = ("свёртка собрана до этой возможности; исправление недоступно. Новая свёртка — "
               "workflow_execute_model(restart=true): весь текст снова уйдёт в облако.")
+REPAIR_OLD_SCREEN = ("свёртка собрана до этой возможности; исправление недоступно. Новую свёртку может собрать "
+                     "ИИ-агент заново: весь текст снова уйдёт в облако.")
 REPAIR_CHANGED = "что уйдёт в облако, изменилось: посмотрите снова"
+REPAIR_RUNNING = "исправление цитат по этому запросу уже идёт; дождитесь ответа"
+REPAIR_LIVE_MARGIN_SEC = 120         # к таймауту вызова и запуска сервера OpenCode (llm_provider): живой вызов
 _LEADING_LABEL = re.compile(r"^(Участник\s+\d+|Говорящий не определён)\s*[:—–-]\s*")
 
 
@@ -1643,23 +1647,25 @@ def quote_repair_task(store, request):
     return task, meta
 
 
-def quote_repair_problem(store, request):
+def quote_repair_problem(store, request, *, screen=False):
     """Почему исправление цитат недоступно, или None. Только чтение; единственная запись условий.
 
     Экран, MCP и исполнение спрашивают эту функцию; ни одна проверка здесь облако не вызывает.
+    screen=True — для человека на экране: без имён инструментов агента.
     """
+    old = REPAIR_OLD_SCREEN if screen else REPAIR_OLD
     if (not request["policy"]["require_conspect"] or request["state"] != "completed"
             or request["model_task"] is None or not request["recording_id"]):
         return "готовой модельной свёртки у этого запроса нет"
     if not _quotes_one_by_one(request["model_task"]):
-        return REPAIR_OLD
+        return old
     if not request["policy"]["allow_cloud_model"]:
         return ("облако запрещено политикой этого запроса; для облачной обработки нужен новый запрос "
                 "с разрешением")
     saved = _repair_conspect(store, request)
     payload = saved["payload"] if saved else {}
     if payload.get("quote_policy") != 1 or not isinstance(payload.get("unlinked"), list):
-        return REPAIR_OLD
+        return old
     unlinked, total = quote_counts(payload)
     if not quotes_need_repair(unlinked, total):
         return (f"не найдено {unlinked} из {total} цитат: исправление доступно от {REPAIR_MIN_UNLINKED} "
@@ -1685,7 +1691,7 @@ def _repair_snapshot(request, saved, task, meta):
 def quote_repair_prepare(store, request_id):
     """Снимок того, что уйдёт в облако, для окна согласия на экране. Conflict с причиной, если недоступно."""
     request = get(store, request_id)
-    problem = quote_repair_problem(store, request)
+    problem = quote_repair_problem(store, request, screen=True)
     if problem:
         raise storage.Conflict(problem)
     task, meta = quote_repair_task(store, request)
@@ -1843,17 +1849,23 @@ def _save_repair(store, request, run_id, meta, answers):
     return counts, result["conspect_revision"], saved["conspect_id"], True
 
 
-def repair_quotes(store, request_id, *, via, snapshot=None):
+def repair_quotes(store, request_id, *, via, snapshot=None, allow_cloud_model=False):
     """Один вызов облака: исправить ненайденные цитаты готовой свёртки. via — «screen» или «mcp».
 
-    Отказы до вызова (условия, устаревший снимок) облако не вызывают и запуска не пишут. Отказы после вызова
-    (формат ответа, смена стенограммы или свёртки) пишут шаг failed, свёртку не меняют; повтора нет.
+    allow_cloud_model — согласие человека на эту отправку: без настоящего True отказ до чтения базы.
+    Отказы до вызова (согласие, условия, устаревший снимок, уже идущий вызов) облако не вызывают и запуска не
+    пишут. Отказы после вызова (формат ответа, смена стенограммы или свёртки) пишут шаг failed, свёртку не
+    меняют; повтора нет. Один живой вызов на запрос: проверяется в базе, в той же транзакции, что и запись
+    запуска (экран и MCP — разные процессы).
     """
+    import datetime
     import llm_provider
+    if allow_cloud_model is not True:
+        raise ValueError("отправка в облако — только по явному согласию человека (allow_cloud_model=True)")
     if via not in ("screen", "mcp") or (via == "screen" and snapshot is None):
         raise ValueError("исправление запускает экран (со снимком) или MCP")
     request = get(store, request_id)
-    problem = quote_repair_problem(store, request)
+    problem = quote_repair_problem(store, request, screen=(via == "screen"))
     if problem:
         raise storage.Conflict(problem)
     task, meta = quote_repair_task(store, request)
@@ -1866,6 +1878,13 @@ def repair_quotes(store, request_id, *, via, snapshot=None):
                                (meta["conspect_id"],)).fetchone()
         if row is None or row["current_revision"] != meta["conspect_revision"]:
             raise storage.Conflict(REPAIR_CHANGED)
+        # Живой запуск этого запроса (моложе таймаута вызова с запасом) — отказ до клиента; старше — оборванный.
+        alive = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=llm_provider.REQUEST_TIMEOUT_SEC + llm_provider.STARTUP_TIMEOUT_SEC + REPAIR_LIVE_MARGIN_SEC)
+        for running in store.db.execute("SELECT updated_at FROM workflow_runs WHERE request_id=? AND "
+                                        "kind='quote_repair' AND state='running'", (request_id,)).fetchall():
+            if datetime.datetime.fromisoformat(running["updated_at"]) >= alive:
+                raise storage.Conflict(REPAIR_RUNNING)
         # Запуск, оставшийся running от оборванного процесса, больше не ждётся: interrupted.
         store.db.execute("UPDATE workflow_steps SET state='interrupted', updated_at=? WHERE state='running' AND "
                          "run_id IN (SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='quote_repair')",

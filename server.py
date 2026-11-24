@@ -283,7 +283,8 @@ def workflow_repair_quotes(request_id: str, allow_cloud_model: bool = False) -> 
             raise ValueError("allow_cloud_model — логическое значение true или false")
         if not allow_cloud_model:
             return json.dumps(core.workflow_repair_quotes_info(request_id), ensure_ascii=False)
-        return json.dumps(core.workflow_repair_quotes(request_id, via="mcp"), ensure_ascii=False)
+        return json.dumps(core.workflow_repair_quotes(request_id, via="mcp", allow_cloud_model=True),
+                          ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
     except llm_provider.ProviderError as ex:

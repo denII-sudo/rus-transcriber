@@ -4,7 +4,9 @@
 создания и вызовы; настоящий `generate` не вызывается. Утверждённые владельцем тексты (запрос модели, описание
 MCP, строка INSTRUCTIONS, окно согласия на экране) закреплены здесь дословно: правка — только через утверждение.
 """
+import ast
 import copy
+import datetime
 import http.client
 import json
 import re
@@ -158,7 +160,8 @@ class RepairBase(unittest.TestCase):
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
             try:
                 snapshot = workflow.quote_repair_prepare(self.store, request) if via == "screen" else None
-                self.result = workflow.repair_quotes(self.store, request, via=via, snapshot=snapshot)
+                self.result = workflow.repair_quotes(self.store, request, via=via, snapshot=snapshot,
+                                                     allow_cloud_model=True)
             finally:
                 self.client = client
         return self.result
@@ -210,7 +213,7 @@ class ThresholdAndProblemTests(RepairBase):
         self.assertIn("1 из 3", workflow.quote_repair_problem(self.store, workflow.get(self.store, request)))
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(storage.Conflict):
-            workflow.repair_quotes(self.store, request, via="mcp")
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
         self.assertEqual((client.created, self.runs(request)), (0, []))
 
     def test_a_request_that_forbids_the_cloud_is_refused_even_with_the_flag(self):
@@ -218,7 +221,7 @@ class ThresholdAndProblemTests(RepairBase):
         self.assertIn("запрещ", workflow.quote_repair_problem(self.store, workflow.get(self.store, request)))
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(storage.Conflict):
-            workflow.repair_quotes(self.store, request, via="mcp")
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
         self.assertEqual(client.created, 0)
 
     def test_request_not_completed_or_old_task_is_refused(self):
@@ -236,6 +239,24 @@ class ThresholdAndProblemTests(RepairBase):
         self.assertIn("собрана до этой возможности",
                       workflow.quote_repair_problem(self.store, workflow.get(self.store, request)))
 
+    def test_the_screen_never_names_an_agent_tool_but_the_agent_gets_it(self):
+        request, recording = self.ready()
+        self.rewrite_conspect(recording, lambda payload: payload.pop("unlinked"))
+        got = workflow.get(self.store, request)
+        for_agent = workflow.quote_repair_problem(self.store, got)
+        for_human = workflow.quote_repair_problem(self.store, got, screen=True)
+        self.assertIn("workflow_execute_model(restart=true)", for_agent)
+        self.assertEqual(for_human, "свёртка собрана до этой возможности; исправление недоступно. Новую свёртку "
+                                    "может собрать ИИ-агент заново: весь текст снова уйдёт в облако.")
+        self.assertEqual(core.recording_conspects(recording)[0]["quote_repair"]["reason"], for_human)
+        with self.assertRaises(storage.Conflict) as caught:
+            workflow.quote_repair_prepare(self.store, request)
+        self.assertEqual(str(caught.exception), for_human)
+        self.assertEqual(self.call_info(request)["reason"], for_agent)
+
+    def call_info(self, request):
+        return json.loads(server.workflow_repair_quotes(request))
+
     def test_a_file_changed_outside_the_program_is_refused_before_the_cloud(self):
         request, recording = self.ready()
         md = next(item for item in self.root.rglob("*.conspect.md"))
@@ -243,7 +264,7 @@ class ThresholdAndProblemTests(RepairBase):
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaisesRegex(
                 storage.Conflict, "изменён вне программы"):
-            workflow.repair_quotes(self.store, request, via="mcp")
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
         self.assertEqual((client.created, self.runs(request)), (0, []))
 
     def test_screen_view_has_every_state(self):
@@ -308,6 +329,17 @@ class TaskTests(RepairBase):
         payload["evidence"][0]["evidence"] = ["нет-такого-слова"]
         task, meta = workflow._repair_task_from(payload, self.store.get_current(recording))
         self.assertEqual((meta["sections"], meta["left"]), ([1], 1))
+
+    def test_the_limit_is_sixty_quotes(self):
+        self.assertEqual(workflow.REPAIR_MAX_QUOTES, 60)
+        request, recording = self.ready()
+        payload = copy.deepcopy(self.store.list_conspects(recording)[0]["payload"])
+        first = payload["unlinked"][0]
+        payload["unlinked"] = [dict(first, id=str(number), at=[first["at"][0] + number, first["at"][1] + number])
+                               for number in range(1, 62)]
+        task, meta = workflow._repair_task_from(payload, self.store.get_current(recording))
+        self.assertEqual((len(meta["ids"]), meta["left"], meta["sections"]), (60, 1, [first["section"]]))
+        self.assertEqual(len(task["sections"][0]["quotes"]), 60)
 
     def test_limits_keep_whole_sections_and_say_how_many_are_left(self):
         request, recording = self.ready()
@@ -408,7 +440,7 @@ class ApplyTests(RepairBase):
         request, _ = self.ready()
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(ValueError):
-            workflow.repair_quotes(self.store, request, via="screen")
+            workflow.repair_quotes(self.store, request, via="screen", allow_cloud_model=True)
         self.assertEqual((client.created, self.runs(request)), (0, []))
 
     def test_a_slot_whose_place_in_the_text_moved_is_left_alone(self):
@@ -436,6 +468,64 @@ class ApplyTests(RepairBase):
         self.assertEqual(self.revision(recording), 2)
         self.assertEqual(self.step(request)[0], "completed")
 
+    def test_the_execution_layer_refuses_without_a_real_consent(self):
+        request, _ = self.ready()
+        client = fake_cloud(reply(q1="x"))
+        with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
+            for consent in ({}, {"allow_cloud_model": False}, {"allow_cloud_model": 1}, {"allow_cloud_model": "true"},
+                            {"allow_cloud_model": None}):
+                with self.subTest(consent=consent):
+                    with self.assertRaises(ValueError):
+                        workflow.repair_quotes(self.store, request, via="mcp", **consent)
+                    with self.assertRaises(ValueError):
+                        core.workflow_repair_quotes(request, via="mcp", **consent)
+        self.assertEqual((client.created, self.runs(request)), (0, []))
+
+    def test_every_caller_of_the_repair_passes_the_consent_on(self):
+        calls = []
+        for path in sorted(HTML.parent.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("repair_quotes", "workflow_repair_quotes")
+                        and isinstance(node.func.value, ast.Name) and node.func.value.id in ("workflow", "core")):
+                    keys = {kw.arg: kw.value for kw in node.keywords}
+                    calls.append((path.name, node.func.attr, "allow_cloud_model" in keys,
+                                  isinstance(keys.get("allow_cloud_model"), ast.Constant)
+                                  and keys["allow_cloud_model"].value is True))
+        self.assertEqual(sorted(calls), [("core.py", "repair_quotes", True, False),
+                                         ("server.py", "workflow_repair_quotes", True, True),
+                                         ("workflow_page.py", "workflow_repair_quotes", True, True)])
+
+    def test_an_unknown_way_in_is_refused_before_any_client(self):
+        request, _ = self.ready()
+        client = fake_cloud(reply(q1="x"))
+        with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
+            for via in ("web", "", None, "MCP"):
+                with self.subTest(via=via), self.assertRaises(ValueError):
+                    workflow.repair_quotes(self.store, request, via=via, snapshot={}, allow_cloud_model=True)
+        self.assertEqual((client.created, self.runs(request)), (0, []))
+
+    def test_the_main_step_restarted_while_the_model_answers_writes_nothing(self):
+        request, recording = self.ready()
+
+        def restart():
+            workflow.prepare_model_task(self.store, request, restart=True)    # без облака: только новый шаг
+        with self.assertRaises(llm_provider.ProviderError) as caught:
+            self.run_repair(request, reply(q1="перенести срок", q2=None, q3=None), during=restart)
+        self.assertEqual(caught.exception.code, "revision_changed")
+        self.assertEqual((self.step(request)[0], self.revision(recording)), ("failed", 1))
+
+    def test_a_request_whose_main_step_was_restarted_is_refused_before_any_client(self):
+        request, recording = self.ready()
+        with mock.patch.object(llm_provider.OpenCodeTextClient, "generate"):
+            workflow.prepare_model_task(self.store, request, restart=True)
+        self.assertEqual(workflow.get(self.store, request)["state"], "waiting_model")
+        client = fake_cloud(reply(q1="x"))
+        with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(storage.Conflict):
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
+        self.assertEqual((client.created, self.runs(request)), (0, []))
+
     def test_wrong_format_changes_nothing_and_is_not_retried(self):
         request, recording = self.ready()
         for bad in (None, {"quotes": [{"id": "9", "quote": "а"}]}, reply(q1="а", q2="б")):
@@ -462,7 +552,7 @@ class ApplyTests(RepairBase):
         client = fake_cloud(reply(q1="перенести срок", q2="согласен с этим", q3="нет такого"))
         client.cleanup_warnings = [llm_provider.SESSION_LEFT_WARNING]
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
-            workflow.repair_quotes(self.store, request, via="mcp")
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
         self.assertEqual(self.step(request)[1]["warnings"], [llm_provider.SESSION_LEFT_WARNING])
 
     def test_the_task_that_went_out_is_stored_in_the_step(self):
@@ -513,20 +603,26 @@ class ApplyTests(RepairBase):
         snapshot = workflow.quote_repair_prepare(self.store, request)
         client = fake_cloud(reply(q1="перенести срок", q2=None, q3=None))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client):
-            workflow.repair_quotes(self.store, request, via="screen", snapshot=snapshot)
+            workflow.repair_quotes(self.store, request, via="screen", snapshot=snapshot, allow_cloud_model=True)
             before = self.revision(recording)
             with self.assertRaises(storage.Conflict):
-                workflow.repair_quotes(self.store, request, via="screen", snapshot=snapshot)
+                workflow.repair_quotes(self.store, request, via="screen", snapshot=snapshot, allow_cloud_model=True)
         self.assertEqual((client.created, self.revision(recording)), (1, before))
+
+    def aged_run(self, request, seconds):
+        """Запуск running, начатый seconds секунд назад (шаг и запуск)."""
+        then = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)).isoformat()
+        run = str(uuid.uuid4())
+        self.store.db.execute("INSERT INTO workflow_runs VALUES (?, ?, 'quote_repair', 'running', 'x', ?, ?)",
+                              (run, request, then, then))
+        self.store.db.execute("INSERT INTO workflow_steps VALUES (?, ?, 'quote_repair', 'running', NULL, ?, ?)",
+                              (str(uuid.uuid4()), run, then, then))
+        return run
 
     def test_a_run_left_running_by_a_killed_process_becomes_interrupted(self):
         request, recording = self.ready()
-        now = storage._now()
-        run = str(uuid.uuid4())
-        self.store.db.execute("INSERT INTO workflow_runs VALUES (?, ?, 'quote_repair', 'running', 'x', ?, ?)",
-                              (run, request, now, now))
-        self.store.db.execute("INSERT INTO workflow_steps VALUES (?, ?, 'quote_repair', 'running', NULL, ?, ?)",
-                              (str(uuid.uuid4()), run, now, now))
+        self.aged_run(request, llm_provider.REQUEST_TIMEOUT_SEC + llm_provider.STARTUP_TIMEOUT_SEC
+                      + workflow.REPAIR_LIVE_MARGIN_SEC + 5)
         self.run_repair(request, reply(q1="перенести срок", q2=None, q3=None))
         states = sorted(row["state"] for row in self.runs(request))
         self.assertEqual(states, ["completed", "interrupted"])
@@ -537,13 +633,41 @@ class ApplyTests(RepairBase):
         self.assertEqual(workflow.get(self.store, request)["state"], "completed")
         self.assertIsNone(core.workflow_status(request)["request"]["model_failure"])
 
+    def test_a_live_run_of_the_same_request_refuses_a_second_call_before_any_client(self):
+        request, recording = self.ready()
+        self.aged_run(request, 30)                         # другой процесс начал вызов полминуты назад
+        client = fake_cloud(reply(q1="x"))
+        with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaisesRegex(
+                storage.Conflict, "уже идёт"):
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
+        self.assertEqual((client.created, self.revision(recording)), (0, 1))
+        self.assertEqual(sorted(row["state"] for row in self.runs(request)), ["running"])   # прежний не тронут
+
+    def test_a_second_call_inside_the_first_one_is_refused_and_the_first_one_writes(self):
+        request, recording = self.ready()
+        snapshot = workflow.quote_repair_prepare(self.store, request)
+        seen = []
+
+        def second():
+            try:
+                workflow.repair_quotes(self.store, request, via="screen", snapshot=snapshot, allow_cloud_model=True)
+            except storage.Conflict as ex:
+                seen.append(str(ex))
+        result = self.run_repair(request, reply(q1="перенести срок", q2=None, q3=None), during=second)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("уже идёт", seen[0])
+        self.assertEqual((self.client.created, len(self.client.calls)), (1, 1))
+        self.assertEqual((result["fixed"], result["unquoted"]), (1, 2))
+        self.assertEqual(self.revision(recording), 2)
+        self.assertEqual([row["state"] for row in self.runs(request)], ["completed"])
+
     def test_a_repeat_sends_only_the_remaining_slots_and_stops_below_the_threshold(self):
         request, recording = self.ready()
         self.run_repair(request, reply(q1="перенести срок", q2="согласен с этим", q3="нет такого"))
         self.assertEqual(len(self.store.list_conspects(recording)[0]["payload"]["unlinked"]), 1)
         client = fake_cloud(reply(q1="x"))
         with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(storage.Conflict):
-            workflow.repair_quotes(self.store, request, via="mcp")
+            workflow.repair_quotes(self.store, request, via="mcp", allow_cloud_model=True)
         self.assertEqual(client.created, 0)
 
     def test_a_rebuild_keeps_repaired_quotes_and_remaining_slots(self):
@@ -718,6 +842,34 @@ class ScreenHttpTests(RepairBase):
             status, answer = self.post("api/quotes/repair/confirm", {"snapshot": snapshot, "allow_cloud_model": True})
         self.assertEqual(status, 400)
         self.assertIn("нет ответа", answer["error"])
+
+
+class WindowMarkupTests(unittest.TestCase):
+    """Поведение окна проверяется глазами (см. отчёт PR); здесь — то, что закрепляется текстом страницы."""
+    def setUp(self):
+        html = HTML.read_text(encoding="utf-8")
+        start = html.index("async function repairQuotes(")
+        self.window = html[start:html.index("async function loadConspects(")]
+        self.lines = html[html.index("const repairLines = "):start]
+
+    def test_the_cancel_button_of_the_window_is_labelled_and_closes_it(self):
+        self.assertIn('cancel.textContent = "Отмена";', self.window)
+        self.assertIn('cancel.onclick = () => { host.innerHTML = ""; };', self.window)
+
+    def test_the_window_only_sends_by_the_send_button(self):
+        self.assertIn('send.textContent = "Отправить";', self.window)
+        self.assertEqual(self.window.count("api/quotes/repair/confirm"), 1)
+        self.assertEqual(self.window.count("send.onclick = async () =>"), 1)
+        self.assertNotIn("send.onclick(", self.window)
+        self.assertNotIn("send.click(", self.window)
+        self.assertIn("allow_cloud_model: true", self.window)
+
+    def test_the_buttons_are_locked_while_the_model_answers(self):
+        self.assertIn("send.disabled = cancel.disabled = opener.disabled = true;", self.window)
+        self.assertIn("Модель отвечает, это может занять до 5 минут…", self.window)
+
+    def test_the_left_line_is_shown_only_when_something_is_left(self):
+        self.assertIn("s.left > 0", self.lines)
 
 
 class ApprovedTextTests(unittest.TestCase):
