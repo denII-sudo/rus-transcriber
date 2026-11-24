@@ -151,7 +151,6 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(rows(bench, "SELECT value FROM meta WHERE key='schema_version'"), [("1",)])
         self.assertEqual(rows(bench, "SELECT value FROM meta WHERE key='key_version'"), [("1",)])
         self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(0,)])
-        self.assertEqual(paths.BENCH_DB.name, benchdb.DB_NAME)
         self.assertTrue(benchdb.DB_NAME.startswith("bench_"))     # tools/check_repo.py не пускает bench_*
 
     def test_reopen_changes_nothing(self):
@@ -651,6 +650,381 @@ class CommandTests(unittest.TestCase):
         cli.assert_called_once()
         self.assertIn("удалением файла базы", benchdb.HELP_APPEND_ONLY)
         self.assertIn("удалением файла базы", (Path(rt.__file__).read_text(encoding="utf-8")))
+
+
+class BrokenStructureTests(unittest.TestCase):
+    """Файл, прошедший kind, schema_version и run_id, но с неверной структурой, не роняет загрузку."""
+
+    BREAKS = {
+        "hardware_is_string": lambda r: r["testbed"].__setitem__("hardware", "oops"),
+        "chunks_nan": lambda r: r["results"][0].__setitem__("chunks", float("nan")),
+        "chunks_infinity": lambda r: r["results"][0].__setitem__("chunks", float("inf")),
+        "started_is_dict": lambda r: r.__setitem__("started_utc", {"a": 1}),
+        "reasons_is_number": lambda r: r["preflight"].__setitem__("reasons", 5),
+        "duplicate_variant_id": lambda r: r["results"].append(dict(r["results"][0])),
+        "results_is_string": lambda r: r.__setitem__("results", "x"),
+        "models_is_string": lambda r: r.__setitem__("models", "x"),
+        "environment_is_list": lambda r: r.__setitem__("environment", [1, 2]),
+        "devices_not_list_of_dicts": lambda r: r["testbed"]["hardware"].__setitem__("devices", ["x", 3]),
+        "huge_integer": lambda r: r["results"][0].__setitem__("chunks", 10 ** 30),
+        "params_is_list": lambda r: r.__setitem__("params", [1]),
+    }
+
+    def setup(self, name):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        broken = record("20261102-100000-bbbbbb")
+        self.BREAKS[name](broken)
+        write(bench, broken)
+        write(bench, record("20261103-100000-cccccc"))
+        return bench
+
+    def test_middle_broken_file_is_rejected_and_the_rest_loaded(self):
+        for name in self.BREAKS:
+            with self.subTest(name):
+                bench = self.setup(name)
+                plan = benchdb.plan_load(bench)                     # показ тоже не падает
+                self.assertEqual(plan["counts"], {"new": 2, "rejected": 1}, plan)
+                rep = benchdb.apply_load(bench)
+                self.assertEqual(rep["counts"], {"loaded": 2, "rejected": 1}, rep)
+                self.assertEqual(sorted(r for (r,) in rows(bench, "SELECT run_id FROM run")),
+                                 ["20261101-100000-aaaaaa", "20261103-100000-cccccc"])
+                (outcome, reason, run_id), = rows(bench, "SELECT outcome, reason, run_id FROM import_log "
+                                                         "WHERE outcome='rejected'")
+                self.assertTrue(reason)
+                self.assertEqual(run_id, "20261102-100000-bbbbbb")
+                self.assertEqual(benchdb.apply_load(bench)["counts"], {"known": 3})
+
+    def test_failure_in_the_middle_of_a_file_rolls_back_only_that_file(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        write(bench, record("20261102-100000-bbbbbb"))
+        write(bench, record("20261103-100000-cccccc"))
+        real = benchdb._insert
+
+        def failing(con, table, row, ignore=False):
+            if table == "measurement" and row["run_id"] == "20261102-100000-bbbbbb":
+                raise sqlite3.IntegrityError("синтетический сбой")
+            return real(con, table, row, ignore)
+        with mock.patch.object(benchdb, "_insert", failing):
+            rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"loaded": 2, "rejected": 1})
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run WHERE run_id='20261102-100000-bbbbbb'"), [(0,)])
+        self.assertEqual(rows(bench, "SELECT count(*) FROM measurement WHERE run_id='20261102-100000-bbbbbb'"),
+                         [(0,)])                                    # строка прогона откатилась вместе с измерением
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(2,)])
+
+    def test_locked_base_is_not_recorded_as_a_rejected_file(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        real = benchdb._insert
+
+        def locked(con, table, row, ignore=False):
+            if table == "measurement":
+                raise sqlite3.OperationalError("database is locked")
+            return real(con, table, row, ignore)
+        with mock.patch.object(benchdb, "_insert", locked):
+            with self.assertRaises(benchdb.BenchDbError):
+                benchdb.apply_load(bench)
+        self.assertEqual(rows(bench, "SELECT count(*) FROM import_log"), [(0,)])
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+
+    def test_unreadable_file_does_not_stop_the_load(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        write(bench, record("20261102-100000-bbbbbb"))
+        write(bench, record("20261103-100000-cccccc"))
+        real = Path.read_bytes
+
+        def read(self):
+            if self.name == "20261102-100000-bbbbbb.json":
+                raise PermissionError("синтетический отказ")
+            return real(self)
+        with mock.patch.object(Path, "read_bytes", read):
+            rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"loaded": 2, "rejected": 1})
+        self.assertEqual([i["reason"] for i in rep["files"] if i["action"] == "rejected"], ["файл не читается"])
+        self.assertEqual(rows(bench, "SELECT count(*) FROM import_log"), [(2,)])     # нечитаемый не записан
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"known": 2, "loaded": 1})
+
+    def test_not_a_dict_foreign_kind_and_bad_run_id_are_rejected(self):
+        bench = new_bench()
+        runs = bench / "runs"
+        (runs / "list.json").write_text("[1, 2]", encoding="utf-8")
+        foreign = record("20261102-100000-bbbbbb")
+        foreign["kind"] = "eval"
+        (runs / "20261102-100000-bbbbbb.json").write_text(json.dumps(foreign), encoding="utf-8")
+        bad = record("../escape")
+        (runs / "x.json").write_text(json.dumps(bad), encoding="utf-8")
+        nan = (runs / "nan.json")
+        nan.write_text('{"kind": "bench", "schema_version": NaN, "run_id": "a1"}', encoding="utf-8")
+        rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"rejected": 4})
+        reasons = " | ".join(i["reason"] for i in rep["files"])
+        for part in ("не объект", "вид файла", "run_id"):
+            self.assertIn(part, reasons)
+
+    def test_cli_never_shows_a_traceback(self):
+        import contextlib
+        import io
+        import argparse
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        broken = record("20261102-100000-bbbbbb")
+        self.BREAKS["hardware_is_string"](broken)
+        write(bench, broken)
+        for cmd, apply in (("status", False), ("load", False), ("load", True), ("status", False)):
+            out, err = io.StringIO(), io.StringIO()
+            ns = argparse.Namespace(bench_cmd=cmd, apply=apply, historical=None, first=None, second=None)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = benchdb.cli(ns, bench_dir=bench)
+            self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+            self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+        out, err = io.StringIO(), io.StringIO()
+        ns = argparse.Namespace(bench_cmd="load", apply=False, historical=None, first=None, second=None)
+        with mock.patch.object(benchdb, "plan_load", side_effect=RuntimeError("синтетический сбой")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = benchdb.cli(ns, bench_dir=bench)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+        self.assertIn("RuntimeError", err.getvalue())
+
+
+class RejectedIsNotForeverTests(unittest.TestCase):
+
+    def test_rejected_file_is_rechecked_by_a_newer_loader_only(self):
+        bench = new_bench()
+        newer = record("20261101-100000-aaaaaa")
+        newer["schema_version"] = 2
+        (bench / "runs" / "20261101-100000-aaaaaa.json").write_text(json.dumps(newer), encoding="utf-8")
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"rejected": 1})
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"known": 1})       # тот же загрузчик — не заново
+        with mock.patch.object(benchdb, "RUN_FORMATS", (1, 2)), mock.patch.object(benchdb, "LOADER_VERSION", "benchdb-next"):
+            self.assertEqual(benchdb.plan_load(bench)["counts"], {"new": 1})
+            self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+        self.assertEqual(rows(bench, "SELECT loader_version, outcome FROM import_log ORDER BY log_id"),
+                         [(benchdb.LOADER_VERSION, "rejected"), ("benchdb-next", "loaded")])    # журнал дописан
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(1,)])
+
+    def test_same_loader_version_with_changed_rule_does_not_recheck(self):
+        bench = new_bench()
+        (bench / "runs" / "broken.json").write_text("{", encoding="utf-8")
+        benchdb.apply_load(bench)
+        before = benchdb.db_path(bench).read_bytes()
+        benchdb.apply_load(bench)
+        self.assertEqual(benchdb.db_path(bench).read_bytes(), before)
+
+    def test_texts_file_that_appears_later_is_added_to_a_loaded_run(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        texts = bench / "runs" / "20261101-100000-aaaaaa.texts.json"
+        saved = texts.read_bytes()
+        texts.unlink()                                              # файл прогона скопирован раньше файла текстов
+        benchdb.apply_load(bench)
+        self.assertEqual(rows(bench, "SELECT count(*) FROM raw_output"), [(0,)])
+        texts.write_bytes(saved)
+        rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"known": 1})
+        self.assertEqual(rows(bench, "SELECT file_name, sha256 FROM raw_output"),
+                         [(texts.name, hashlib.sha256(saved).hexdigest())])
+        before = benchdb.db_path(bench).read_bytes()
+        benchdb.apply_load(bench)
+        self.assertEqual(benchdb.db_path(bench).read_bytes(), before)             # второй раз — без записи
+
+
+class ConnectionAndSchemaTests(unittest.TestCase):
+
+    def test_refused_base_is_closed_at_once(self):
+        bench = new_bench()
+        benchdb.apply_load(bench)
+        con = sqlite3.connect(benchdb.db_path(bench))
+        con.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        con.commit()
+        con.close()
+        with self.assertRaises(benchdb.BenchDbError):
+            benchdb.apply_load(bench)
+        os.remove(benchdb.db_path(bench))                           # на Windows не удалится, если соединение открыто
+
+    def test_foreign_tables_are_refused_and_closed(self):
+        bench = new_bench()
+        con = sqlite3.connect(benchdb.db_path(bench))
+        con.execute("CREATE TABLE other (x)")
+        con.commit()
+        con.close()
+        before = benchdb.db_path(bench).read_bytes()
+        with self.assertRaises(benchdb.BenchDbError):
+            benchdb.apply_load(bench)
+        self.assertEqual(benchdb.db_path(bench).read_bytes(), before)
+        os.remove(benchdb.db_path(bench))
+
+    def test_garbage_file_is_refused_by_both_openers_and_closed(self):
+        bench = new_bench()
+        benchdb.db_path(bench).write_bytes(b"this is not a sqlite database " * 20)
+        for opener in (benchdb.open_read, benchdb._open_write):
+            with self.assertRaises(benchdb.BenchDbError):
+                opener(bench)
+        os.remove(benchdb.db_path(bench))
+
+    def test_empty_file_is_not_a_base_for_readers_and_is_filled_by_the_loader(self):
+        bench = new_bench()
+        benchdb.db_path(bench).write_bytes(b"")
+        self.assertFalse(benchdb.status(bench)["db_exists"])
+        self.assertEqual(benchdb.plan_load(bench)["counts"], {})
+        write(bench, record("20261101-100000-aaaaaa"))
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+
+    def test_schema_creation_is_atomic(self):
+        bench = new_bench()
+        with mock.patch.object(benchdb.runinfo, "utc_now", side_effect=RuntimeError("синтетический сбой")):
+            with self.assertRaises(RuntimeError):
+                benchdb.apply_load(bench)
+        con = sqlite3.connect(benchdb.db_path(bench))
+        try:
+            self.assertEqual(con.execute("SELECT count(*) FROM sqlite_master").fetchone(), (0,))   # ни meta, ни таблиц
+        finally:
+            con.close()
+        write(bench, record("20261101-100000-aaaaaa"))
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+
+    def test_simultaneous_first_start_gives_one_base_and_no_false_refusals(self):
+        import threading
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        barrier = threading.Barrier(4)
+        results, errors = [], []
+
+        def worker():
+            barrier.wait()
+            try:
+                results.append(benchdb.apply_load(bench)["counts"])
+            except Exception as ex:                                 # noqa: BLE001 — тест собирает любой сбой
+                errors.append(repr(ex))
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(sum((list(c) for c in results), [])), ["known", "known", "known", "loaded"])
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(1,)])
+        self.assertEqual(rows(bench, "SELECT value FROM meta WHERE key='schema_version'"), [("1",)])
+
+    def test_newer_schema_stops_plan_and_historical_dry_run(self):
+        bench = new_bench()
+        benchdb.apply_load(bench)
+        con = sqlite3.connect(benchdb.db_path(bench))
+        con.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        con.commit()
+        con.close()
+        write(bench, record("20261101-100000-aaaaaa"))
+        hist = Path(_TMP) / f"{os.urandom(4).hex()}-h.json"
+        hist.write_text(json.dumps({"format": "bench-historical-1", "entries": []}), encoding="utf-8")
+        with self.assertRaises(benchdb.BenchDbError):
+            benchdb.plan_load(bench)
+        with self.assertRaises(benchdb.BenchDbError):
+            benchdb.load_historical(bench, hist, apply=False)
+        with self.assertRaises(benchdb.BenchDbError):
+            benchdb.status(bench)
+        os.remove(benchdb.db_path(bench))
+
+
+class UncoveredBeforeTests(unittest.TestCase):
+    """Поломки, которых прежние тесты не замечали."""
+
+    def test_path_in_a_run_field_does_not_reach_the_base(self):
+        bench = new_bench()
+        rec = record("20261101-100000-aaaaaa")
+        rec["params"]["model"] = "C:\\Users\\Иван\\модели\\rnnt.onnx"
+        rec["variants"][0]["label"] = "лежит в \\\\сервер\\папка\\файл"
+        rec["results"][0]["note"] = "/home/ivan/запись.wav"
+        rec["choice"]["main"] = "D:\\Записи\\Секрет\\a.wav"
+        write(bench, rec)
+        benchdb.apply_load(bench)
+        text = json.dumps(dump(bench), ensure_ascii=False)
+        for bad in ("Иван", "сервер", "ivan", "Секрет", "D:\\\\"):
+            self.assertNotIn(bad, text, bad)
+        self.assertIn("<путь>", text)
+
+    def axes(self, bench, run_id="20261101-100000-aaaaaa", variant="onnx-cpu"):
+        (a,), = rows(bench, "SELECT axes_json FROM measurement WHERE run_id=? AND variant_id=?", run_id, variant)
+        return json.loads(a)
+
+    def test_axes_known_flags_and_values(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        benchdb.apply_load(bench)
+        ax = self.axes(bench)
+        self.assertTrue(all(ax[k]["known"] for k in benchdb.AXES))
+        self.assertEqual(ax["device"]["value"], {"backend": "cpu", "providers": ["CPUExecutionProvider"],
+                                                 "device": "CPU"})
+        self.assertEqual(ax["unit"]["value"]["duration"], 1.0)
+        self.assertEqual(ax["environment"]["value"]["packages"], {"numpy": "2.0.0", "onnxruntime": "1.20.0"})
+        self.assertEqual(ax["environment"]["value"]["drivers"], [["Synthetic GPU", "1.2.3"]])
+        self.assertEqual(ax["power"]["value"]["source"], "ac")
+        self.assertEqual(ax["model"]["value"], {"name": "v3_e2e_rnnt", "revision": None})
+        self.assertEqual(ax["config"]["value"]["requested"]["asr_backend"], "onnx-cpu")
+
+    def test_axes_unknown_when_the_run_file_lacks_the_data(self):
+        bench = new_bench()
+        rec = record("20261101-100000-aaaaaa", hardware={"status": "not_measured", "reason": "нет"})
+        rec["environment"]["packages"]["key"] = {}
+        rec["results"][0].pop("backend_name")
+        del rec["audio"]
+        write(bench, rec)
+        benchdb.apply_load(bench)
+        ax = self.axes(bench)
+        self.assertEqual({k for k in benchdb.AXES if not ax[k]["known"]}, {"unit", "device", "testbed", "environment"})
+        self.assertTrue(ax["power"]["known"] and ax["model"]["known"] and ax["config"]["known"])
+
+    def test_model_revision_is_taken_from_the_hf_cache_entry(self):
+        bench = new_bench()
+        rec = record("20261101-100000-aaaaaa")
+        rec["variants"][0]["asr_model"] = "onnx-community/whisper-large-v3-turbo"
+        write(bench, rec)
+        benchdb.apply_load(bench)
+        self.assertEqual(self.axes(bench)["model"]["value"]["revision"], "r" * 40)
+
+    def test_status_counts_conflicts_and_rejected(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        (bench / "runs" / "broken.json").write_text("{", encoding="utf-8")
+        benchdb.apply_load(bench)
+        p = bench / "runs" / "20261101-100000-aaaaaa.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["duration_sec"] = 1.0
+        p.write_text(json.dumps(data), encoding="utf-8")
+        benchdb.apply_load(bench)
+        st = benchdb.status(bench)
+        self.assertEqual((st["conflicts"], st["rejected"], st["runs"], st["not_loaded"]), (1, 1, 1, 0))
+
+    def test_texts_reference_needs_the_matching_name_and_a_readable_file(self):
+        bench = new_bench()
+        write(bench, record("20261101-100000-aaaaaa"))
+        p = bench / "runs" / "20261101-100000-aaaaaa.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["texts_file"] = "other.texts.json"                    # имя не по run_id
+        p.write_text(json.dumps(data), encoding="utf-8")
+        write(bench, record("20261102-100000-bbbbbb"))
+        (bench / "runs" / "20261102-100000-bbbbbb.texts.json").unlink()     # записан в файле прогона, но исчез
+        rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"loaded": 2})
+        self.assertEqual(rows(bench, "SELECT count(*) FROM raw_output"), [(0,)])
+
+    def test_historical_foreign_format_is_rejected_and_logged(self):
+        bench = new_bench()
+        bad = Path(_TMP) / f"{os.urandom(4).hex()}-bad.json"
+        bad.write_text(json.dumps({"format": "other", "entries": []}), encoding="utf-8")
+        rep = benchdb.load_historical(bench, bad, apply=True)
+        self.assertEqual(rep["counts"], {"rejected": 1})
+        (name, outcome, reason), = rows(bench, "SELECT file_name, outcome, reason FROM import_log")
+        self.assertEqual(outcome, "rejected")
+        self.assertTrue(name.startswith("historical-"))
+        self.assertNotIn(bad.name, name)
+        self.assertEqual(benchdb.load_historical(bench, bad, apply=True)["counts"], {"known": 1})
+
+    def test_status_uses_correct_plural_forms(self):
+        for n, word in ((1, "прогон"), (2, "прогона"), (5, "прогонов"), (11, "прогонов"), (21, "прогон"), (22, "прогона")):
+            self.assertEqual(benchdb.plural(n, ("прогон", "прогона", "прогонов")), word, n)
 
 
 class FilesTests(unittest.TestCase):
