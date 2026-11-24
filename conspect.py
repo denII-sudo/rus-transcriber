@@ -610,8 +610,18 @@ def _rerender_locked(json_path, name=None):
     jp = Path(json_path)
     import transcript
     import recordings
-    data = transcript.load(jp)
     store, binding = recordings.open_for_document(jp)
+    review_revision = None
+    try:
+        if store is not None:
+            # Ревизия разбора читается до загрузки стенограммы: если разбор изменится между ними, в свёртке
+            # останется старая ревизия и следующая проверка (recordings.refresh_conspects) её пересоберёт.
+            review_revision = store.get_current(binding["recording_id"])["review"]["revision"]
+        data = transcript.load(jp)
+    except BaseException:
+        if store is not None:
+            store.close()
+        raise
     if store is not None:
         try:
             out = {}
@@ -621,6 +631,8 @@ def _rerender_locked(json_path, name=None):
                     continue
                 md, rep = render(obj, data)
                 obj["source_revision"] = data.get("source_revision")
+                if obj.get("quote_policy") == 1:
+                    obj["assembly_review_revision"] = review_revision
                 paths = recordings.document_binding(store, binding["recording_id"])["root"]
                 cj, cm = paths / saved["json_relative"], paths / saved["md_relative"]
                 write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),

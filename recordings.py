@@ -443,10 +443,17 @@ def refresh_conspects(store, recording_id, document_path):
             "SELECT 1 FROM conspect_outbox o JOIN conspects c USING(conspect_id) "
             "WHERE c.recording_id=? AND o.state!='synced' LIMIT 1", (recording_id,)).fetchone():
         raise storage.Conflict("conspect materialization is not synchronized")
-    source_revision = store.get_current(recording_id)["transcript"]["revision"]
+    current = store.get_current(recording_id)
+    source_revision, review_revision = current["transcript"]["revision"], current["review"]["revision"]
     report = {}
     for saved in store.list_conspects(recording_id):
-        if saved["payload"].get("assembly_revision") != source_revision:
+        payload = saved["payload"]
+        # Свёртка «цитаты по одной» (quote_policy 1) показывает цитаты по текущему разбору: она устаревает и
+        # когда изменилась только ревизия разбора (место закрыто, слова те же). Остальные — по стенограмме.
+        stale = (payload.get("assembly_revision") != source_revision
+                 or (payload.get("quote_policy") == 1
+                     and payload.get("assembly_review_revision") != review_revision))
+        if stale:
             report.update(conspect.rerender(document_path, saved["name"]))
     return report
 

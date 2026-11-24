@@ -18,6 +18,7 @@ from unittest import mock
 import conspect
 import llm_provider
 import model_tasks
+import paths
 import recordings
 import storage
 import test_p3_workflow as p3
@@ -284,6 +285,10 @@ class SqliteModeTests(unittest.TestCase):
             transcript=None, review=review, root_id=binding["root_id"], generated_at="2026-01-01T00:00:01Z")
         recordings.materialize_recording(self.store, recording)
 
+    def refresh(self, recording):
+        with mock.patch.object(paths, "STATE_DB", self.root / "state.sqlite3"):
+            return recordings.refresh_conspects(self.store, recording, self.document_path(recording))
+
     def document_path(self, recording):
         binding = recordings.document_binding(self.store, recording)
         return binding["root"] / binding["paths"]["json"]
@@ -342,7 +347,7 @@ class SqliteModeTests(unittest.TestCase):
                 item["status"] = "resolved"
         self.commit(recording, resolve)
         with mock.patch.object(llm_provider.OpenCodeTextClient, "generate") as cloud:
-            report = recordings.refresh_conspects(self.store, recording, self.document_path(recording))
+            report = self.refresh(recording)
         cloud.assert_not_called()
         self.assertEqual(len(report), 1)
         _, md = self.conspect_files(recording)
@@ -350,7 +355,7 @@ class SqliteModeTests(unittest.TestCase):
         self.assertIn("Цитат: 2 в кавычках, 0 без проверки", md)
         self.assertNotIn("не проверено,", md)
         # повторный вызов без изменений ничего не пересобирает
-        self.assertEqual(recordings.refresh_conspects(self.store, recording, self.document_path(recording)), {})
+        self.assertEqual(self.refresh(recording), {})
 
 
 class FileModeTests(unittest.TestCase):
