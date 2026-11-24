@@ -16,7 +16,7 @@
     python rt.py voice-backup [--group ИМЯ]    # открытый резерв профилей в voice-backups
     python rt.py voice-preview ЗАДАЧА [--group ИМЯ]  # --group только при неизвестной группе
     python rt.py voice-update ЗАДАЧА [--group ИМЯ]   # перед запуском спрашивает подтверждение
-    python rt.py screen [--port 8766]          # локальный экран П5 в браузере (запуск, состояние, резерв)
+    python rt.py screen [--port 8766]          # локальный экран в браузере (запуск, состояние, резерв)
     python rt.py workflow-list [--limit 20]    # последние запросы workflow
     python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
     python rt.py db-restore РЕЗЕРВ.sqlite3 [--dest ПУТЬ] [--root ID=ПУТЬ]
