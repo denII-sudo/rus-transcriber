@@ -69,6 +69,20 @@ def result(inside=False, r2_word="вот", gap_key=True, extra_review=()):
         "review": review}
 
 
+def two_replies():
+    """Те же слова двумя репликами: «начало» до паузы, остальное — после неё."""
+    data = result()
+    seg = data["segments"][0]
+    first, second = dict(seg, words=seg["words"][:1], start=0.5, end=1.05), \
+        dict(seg, words=seg["words"][1:], start=2.0, end=3.2)
+    first["text"], second["text"] = "начало", "вот дальше та"
+    # другой говорящий: соседние реплики одного говорящего сохранение сливает в одну
+    second.update(speaker="Борис", label="speaker-2")
+    data["segments"] = [first, second]
+    data["speakers"], data["speaker_labels"] = ["Анна", "Борис"], ["speaker-1", "speaker-2"]
+    return data
+
+
 AS_IS = {"label": "Оставить как есть", "decision": {}}
 
 
@@ -300,25 +314,26 @@ class PauseButtonsApplyTests(Case):
     def test_interjections_mark_in_both_renderers(self):
         """Тест 7 (оба): пометка на месте паузы, слов не добавилось."""
         self.assertEqual(documents.RENDERER_VERSION, 2)
+        data = two_replies()
         for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+            with self.subTest(backend=backend), files(backend, data) as (jp, md, version):
                 self.press(jp, version, INTERJECTIONS)
                 rep = self.apply(jp, md)
                 self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
                 self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "та"])
                 text = md.read_text(encoding="utf-8")
+                # sqlite: файл — документ documents.prepare (раздел «Текст»), а не render_md
+                self.assertEqual("## Текст" in text, backend == "sqlite")
                 self.assertEqual(text.count(MARK), 1, text)
                 self.assertIn(f"_{MARK} 00:00:01–00:00:02_", text)
+                # пометка — между репликой до паузы и репликой после неё
+                self.assertLess(text.index("начало"), text.index(MARK))
+                self.assertLess(text.index(MARK), text.index("вот дальше та"))
                 short = transcript.render_md(transcript.load(jp), text_only=True)
                 self.assertIn(MARK, short)
 
     def test_mark_goes_between_replies_by_time(self):
-        data = result()
-        seg = data["segments"][0]
-        first, second = dict(seg, words=seg["words"][:1], start=0.5, end=1.05), \
-            dict(seg, words=seg["words"][1:], start=2.0, end=3.2)
-        first["text"], second["text"] = "начало", "вот дальше та"
-        data["segments"] = [first, second]
+        data = two_replies()
         data["review"][0]["listening"] = {"by": "human", "result": "interjections"}
         lines = transcript.render_md(data, text_only=True).splitlines()
         at = [n for n, line in enumerate(lines) if MARK in line]
