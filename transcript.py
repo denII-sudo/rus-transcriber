@@ -8,6 +8,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -558,6 +559,135 @@ def _refresh_conspects(json_path):
         return conspect.rerender(json_path)
     except Exception as ex:
         return {"error": f"{type(ex).__name__}: {ex}"}
+
+
+# ---------- правило «слова места» (РАР-6.1, PR 6а; реестр правил, строка 8) ----------
+# Место-пропуск (причина «missed»: речи в записи нет, слов внутри не должно быть) владеет только словами,
+# НАЧАТЫМИ внутри него: полуоткрытый интервал [t1, t2) в целых сотых. Слово рядом с паузой ей не принадлежит.
+# Места-слова остаются по word_ids или по закрытому интервалу с допуском. Исключение, названное здесь и в
+# описании PR: при применении ответа (_find_span) место-слово ищется по началу слова в одной реплике, а для
+# цитат (word_in_place) — ещё и по перекрытию во всех репликах; это два разных правила, 6а их не сводит.
+WORD_PLACE_TOLERANCE = 0.01   # допуск мест-слов, секунды (прежде workflow.PLACE_TIME_TOLERANCE)
+
+
+def _cents(t):
+    """Время в целых сотых. Пакет хранит round(t, 2), поэтому сначала так же округляем: round(t * 100)
+    расходится с round(t, 2) на временах вида x,xx5."""
+    return int(round(round(float(t), 2) * 100))
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _place_time(item):
+    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None (время негодно)."""
+    t1, t2 = item.get("t1", item.get("t")), item.get("t2", item.get("t"))
+    return (t1, t2) if _finite_number(t1) and _finite_number(t2) and t1 <= t2 else None
+
+
+def is_gap_place(item):
+    """Место-пропуск: «missed» в причинах (диаризация и проход без слов: ["missed"], ["asr", "missed"])."""
+    reasons = item.get("reasons")
+    return isinstance(reasons, (list, tuple)) and "missed" in reasons
+
+
+def in_pause(s, t1, t2):
+    """Единственная запись правила «слово в паузе»: начало слова в [t1, t2), в целых сотых."""
+    return _cents(t1) <= _cents(s) < _cents(t2)
+
+
+def pause_words(data, t1, t2):
+    """[(номер реплики, номер слова, слово)] слов, начатых в паузе [t1, t2), в порядке стенограммы.
+
+    t1, t2 — конечные числа (проверяет вызывающий); слова без конечного начала пропускаются."""
+    out = []
+    for si, seg in enumerate(data.get("segments") or []):
+        for k, w in enumerate(seg.get("words") or []):
+            if _finite_number(w.get("s")) and in_pause(w["s"], t1, t2):
+                out.append((si, k, w))
+    return out
+
+
+def word_in_place(start, end, t1, t2):
+    """Правило пересечения слова [start, end] с местом-словом [t1, t2] (секунды): для цитат и пометок 7.3.
+
+    Слово в месте, если его начало лежит в [t1 − допуск; t2 + допуск] (у мест распознавания t1 — начало
+    первого слова, t2 — начало последнего) или если слово перекрывает место отрезком положительной длины
+    (start < t2 и end > t1). Слово, которое лишь касается начала места своим концом (end == t1), не входит.
+    """
+    return (t1 - WORD_PLACE_TOLERANCE <= start <= t2 + WORD_PLACE_TOLERANCE
+            or (start < t2 and end > t1))
+
+
+def place_words(data, item, *, pause_neighbors=False):
+    """Слова места: (ID слов в порядке стенограммы, это_пауза) или None, если место привязать нельзя.
+
+    Договор с этапом 7.5 (plan-7-5.md, раздел 3). Пропуск: word_ids места не читаются, слова — pause_words.
+    Иное место: его word_ids (какого-то нет в стенограмме, повтор, не строка — None) или, без word_ids,
+    слова по word_in_place. это_пауза — внутри места нет слов; при pause_neighbors=True тогда возвращаются
+    ID последнего слова до места и первого после. Чистая функция: данные не меняет.
+    """
+    times = _place_time(item)
+    if times is None:
+        return None
+    t1, t2 = times
+    gap_place = is_gap_place(item)
+    ids = item.get("word_ids")
+    order = []                                  # (слово, позиция в стенограмме)
+    for seg in data.get("segments") or []:
+        for w in seg.get("words") or []:
+            order.append(w)
+    if not gap_place and isinstance(ids, list) and ids:
+        if not all(isinstance(x, str) and x for x in ids) or len(ids) != len(set(ids)):
+            return None
+        by_id = {w.get("word_id"): w for w in order if w.get("word_id")}
+        if any(x not in by_id for x in ids):
+            return None
+        wanted = set(ids)
+        return [w["word_id"] for w in order if w.get("word_id") in wanted], False
+    timed = [(pos, w) for pos, w in enumerate(order) if _finite_number(w.get("s"))]
+    if not timed:
+        return None
+    if gap_place:
+        inside = [w for _pos, w in timed if in_pause(w["s"], t1, t2)]
+    else:
+        def end_of(w):
+            e = w.get("e")
+            return e if _finite_number(e) and e >= w["s"] else w["s"]
+        inside = [w for _pos, w in timed if word_in_place(w["s"], end_of(w), t1, t2)]
+    chosen = inside
+    if not inside and pause_neighbors:
+        if gap_place:
+            before = [(w["s"], pos, w) for pos, w in timed if _cents(w["s"]) < _cents(t1)]
+            after = [(w["s"], pos, w) for pos, w in timed if _cents(w["s"]) >= _cents(t2)]
+        else:
+            before = [(w["s"], pos, w) for pos, w in timed if w["s"] < t1 - WORD_PLACE_TOLERANCE]
+            after = [(w["s"], pos, w) for pos, w in timed if w["s"] > t2 + WORD_PLACE_TOLERANCE]
+        chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else [])             + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
+    if any(not isinstance(w.get("word_id"), str) or not w.get("word_id") for w in chosen):
+        return None
+    return [w["word_id"] for w in chosen], not inside
+
+
+def places_overlap(x, y):
+    """Единственное правило пересечения двух мест (карточек): True, если они делят время.
+
+    Оба места-слова — прежняя формула с допуском. Иначе полуоткрытые интервалы в сотых: пропуск
+    [t1, t2), место-слово [t1, t2 + 1 сотая) (начала его слов от t1 до t2 включительно). Место с негодным
+    временем ни с чем не пересекается."""
+    tx, ty = _place_time(x), _place_time(y)
+    if tx is None or ty is None:
+        return False
+    gx, gy = is_gap_place(x), is_gap_place(y)
+    if not gx and not gy:
+        return tx[0] <= ty[1] + WORD_PLACE_TOLERANCE and ty[0] <= tx[1] + WORD_PLACE_TOLERANCE
+
+    def interval(times, is_gap):
+        return _cents(times[0]), _cents(times[1]) + (0 if is_gap else 1)
+    a0, a1 = interval(tx, gx)
+    b0, b1 = interval(ty, gy)
+    return a0 < b1 and b0 < a1
 
 
 # ---------- разбор сомнительных мест ----------
