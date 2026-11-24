@@ -776,6 +776,7 @@ if ($Source -ne $Target) {
         "migrate.py"
         "data_io.py"
         "core.py"
+        "core_voices.py"
         "confirm.py"
         "tmpfiles.py"
         "selfcheck.py"

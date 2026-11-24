@@ -19,7 +19,7 @@ ROOT_FILES = (
     "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
     "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "hypotheses.py", "hypstore.py", "hotspots.py",
     "quotes.py", "conspect.py", "review_pack.py", "freeform.py", "answer_phrases.tsv", "jobslots.py",
-    "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py",
+    "settings.py", "migrate.py", "data_io.py", "core.py", "core_voices.py", "confirm.py", "tmpfiles.py",
     "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py",
     "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1",
 )
