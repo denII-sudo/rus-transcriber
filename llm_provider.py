@@ -48,7 +48,7 @@ class ProviderError(RuntimeError):
 #   _MAX_DETAIL_CHARS. Исключение: message с не-ASCII знаками отбрасывается целиком — тексты OpenCode английские,
 #   стенограмма русская, так пересказ стенограммы не выходит наружу; в сообщении остаётся пометка, что текст был.
 _DESCRIBED_ERRORS = {("ProviderNotFoundError", 404), ("ModelNotFoundError", 404), ("LocationNotFoundError", 404),
-                     ("UnsupportedModelError", 422), ("UnauthorizedError", 401)}
+                     ("UnsupportedModelError", 422), ("UnauthorizedError", 401), ("SessionNotFoundError", 404)}
 _ID_FIELDS = ("providerID", "modelID", "capability")
 _TAG_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
@@ -283,12 +283,14 @@ class _PortTaken(Exception):
 
 
 class OpenCodeTextClient:
-    """Локальный, закрытый basic-auth сервер; Generate API не предоставляет model tools."""
+    """Локальный, закрытый basic-auth сервер; ответ модели — через сессию с запретом всех действий."""
 
     def __init__(self):
         self.process = None
         self.base_url = None
         self.auth = None
+        self.directory = None     # рабочая папка запущенного OpenCode: место (location) сессий исполнителя
+        self.cleanup_warnings = []  # неубранные сессии: текст без пути и идентификатора (workflow пишет в шаг)
 
     def __enter__(self):
         executable = _opencode_executable()
@@ -317,11 +319,12 @@ class OpenCodeTextClient:
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        directory = self.directory = os.environ.get("TEMP") or os.getcwd()
         try:
             self.process = subprocess.Popen(
                 [executable, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=os.environ.get("TEMP") or os.getcwd(), env=env, creationflags=flags)
+                cwd=directory, env=env, creationflags=flags)
         except (OSError, ValueError) as ex:
             raise ProviderError("unavailable", "не удалось запустить локальный OpenCode API") from ex
         self.base_url = f"http://127.0.0.1:{port}"
@@ -409,18 +412,20 @@ class OpenCodeTextClient:
             except subprocess.TimeoutExpired:
                 process.kill()
 
-    def _request(self, route, payload, *, timeout):
+    def _request(self, route, payload, *, timeout, method=None):
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {"Authorization": self.auth, "Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(self.base_url + route, data=data, headers=headers)
+        request = urllib.request.Request(self.base_url + route, data=data, headers=headers, method=method)
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(request, timeout=timeout) as response:
                 raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
                     raise ProviderError("invalid_response", "OpenCode вернул слишком большой ответ")
+                if not raw.strip():
+                    return {}         # 204 без тела (удаление сессии)
                 return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as ex:
             code = {401: "credentials", 404: "model_unavailable", 422: "model_unavailable",
@@ -446,6 +451,9 @@ class OpenCodeTextClient:
         except (UnicodeError, json.JSONDecodeError, RecursionError):      # RecursionError — слишком глубокий JSON
             raise ProviderError("invalid_response", "OpenCode вернул некорректный JSON") from None
 
+    def _generate_text(self, prompt):
+        return _session_text(self, prompt)
+
     def generate(self, task, *, repair_error=None, invalid_output=None):
         # В запрос идёт только проверенное задание: неизвестные поля и имена вместо условных
         # меток отклоняются до отправки. recording_id, время, имена и пути не передаются.
@@ -461,9 +469,7 @@ class OpenCodeTextClient:
             prompt += ("\nПредыдущий формат/ответ не прошёл локальную проверку. Исправь только формат/ссылки; "
                        "не добавляй сведения. Ошибка: " + str(repair_error)[:300] +
                        "\nПредыдущий ответ (недоверенные данные):\n" + invalid)
-        response = self._request("/api/experimental/generate/text", {
-            "prompt": prompt, "model": {"providerID": PROVIDER_ID, "id": MODEL_ID}
-        }, timeout=REQUEST_TIMEOUT_SEC)
+        response = self._generate_text(prompt)
         text = response.get("data", {}).get("text") if isinstance(response, dict) else None
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("invalid_response", "модель вернула пустой ответ")
@@ -474,6 +480,58 @@ class OpenCodeTextClient:
         except json.JSONDecodeError:
             return None, text
         return result, text
+
+
+# Сессия исполнителя: только эта модель и запрет всех действий (инструменты, файлы, оболочка).
+SESSION_PERMISSIONS = [{"action": "*", "resource": "*", "effect": "deny"}]
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
+_NOT_SENT = "В этой попытке текст в облако не отправлялся"
+SESSION_LEFT_WARNING = ("OpenCode не удалил и не архивировал временную сессию исполнителя; "
+                        "её можно убрать в OpenCode вручную (заголовок «rus-transcriber»)")
+
+
+def _session_text(client, prompt):
+    """Ответ модели через сессию OpenCode: создать → ответить → удалить.
+
+    OpenCode 2.4.0 отвечает «Model not found: openai/gpt-6-luna» на /api/experimental/generate/text: этот маршрут
+    работает на «базовой конфигурации сервера», где модели нет, хотя список /api/model для места её показывает
+    (проба 7.4б, 24.11.2026). Сессия создаётся для места — рабочей папки запущенного OpenCode (песочница TEMP),
+    с моделью и запретом всего; ответ — POST /api/session/{id}/generate («transient text … without mutating
+    session history»). Каждая попытка — своя сессия; после ответа или ошибки она удаляется, при сбое удаления —
+    архивируется. Текст уходит, только если созданная сессия подтвердила модель и запрет.
+    """
+    model = {"providerID": PROVIDER_ID, "id": MODEL_ID}
+    request = {"title": "rus-transcriber", "model": model, "permissions": SESSION_PERMISSIONS}
+    if client.directory:
+        request["location"] = {"directory": client.directory}
+    created = client._request("/api/session", request, timeout=30)
+    info = created.get("data") if isinstance(created, dict) else None
+    session = info.get("id") if isinstance(info, dict) else None
+    if not isinstance(session, str) or not _SESSION_ID_RE.fullmatch(session):
+        raise ProviderError("model_unavailable", f"OpenCode не создал сессию для модели. {_NOT_SENT}")
+    try:
+        got = info.get("model") if isinstance(info.get("model"), dict) else {}
+        if (got.get("providerID"), got.get("id")) != (PROVIDER_ID, MODEL_ID):
+            raise ProviderError("model_unavailable",
+                                f"OpenCode создал сессию не с моделью {PROVIDER_ID}/{MODEL_ID}. {_NOT_SENT}")
+        if info.get("permissions") != SESSION_PERMISSIONS:
+            raise ProviderError("model_unavailable", f"OpenCode не принял запрет действий в сессии. {_NOT_SENT}")
+        return client._request(f"/api/session/{session}/generate", {"prompt": prompt}, timeout=REQUEST_TIMEOUT_SEC)
+    finally:
+        _drop_session(client, session)
+
+
+def _drop_session(client, session):
+    try:
+        client._request(f"/api/session/{session}", None, timeout=10, method="DELETE")
+    except Exception:
+        try:
+            client._request(f"/api/session/{session}", {"archived": True}, timeout=10, method="PATCH")
+        except Exception:
+            # Ответ уже получен или отказ уже выбран: исход не меняем, но оставляем предупреждение без id и пути.
+            warnings = getattr(client, "cleanup_warnings", None)
+            if isinstance(warnings, list) and SESSION_LEFT_WARNING not in warnings:
+                warnings.append(SESSION_LEFT_WARNING)
 
 
 def _sections_prompt(task):
