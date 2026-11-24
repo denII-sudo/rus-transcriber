@@ -58,5 +58,37 @@ class AgentKeepsOffWordTouchedBySpeaker(unittest.TestCase):
                 self.assertEqual(hc.word(jp, "w1")["w"], "тест")
 
 
+def by_human(jp, md):
+    """Слово w1: автор слова — человек (`by`)."""
+    data = transcript.load(jp)
+    word = next(w for s in data["segments"] for w in s["words"] if w["word_id"] == "w1")
+    word["by"] = "human"
+    transcript.save(data, jp, md)
+
+
+class AgentSpanEditKeepsOffHumanWord(unittest.TestCase):
+    """Правка отрезка t1–t2 агентом (ветка отрезка в `apply_word_edits`): слово человека не меняется."""
+
+    def refused(self, hook):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend, via="edit_span"), hc.files(backend, hook) as (jp, md, _):
+                with self.assertRaises(ValueError) as ctx:
+                    transcript.edit_span(jp, md, 0.2, 0.5, "тесть", by="claude")
+                self.assertIn("на отрезке есть подтверждённые человеком слова", str(ctx.exception))
+                self.assertEqual(hc.word(jp, "w1")["w"], "тест")
+            with self.subTest(backend=backend, via="apply_word_edits"), hc.files(backend, hook) as (jp, md, _):
+                _, rep = transcript.apply_word_edits(
+                    jp, md, [{"op": "place_text", "t1": 0.2, "t2": 0.5, "text": "тесть", "word_ids": ["w1"],
+                              "card": "a1"}], by="claude")
+                self.assertIn("на отрезке есть подтверждённые человеком слова", rep["failed"].get("a1", ""))
+                self.assertEqual(hc.word(jp, "w1")["w"], "тест")
+
+    def test_word_by_human(self):
+        self.refused(by_human)
+
+    def test_word_touched_only_through_speaker_provenance(self):
+        self.refused(speaker_only)
+
+
 if __name__ == "__main__":
     unittest.main()
