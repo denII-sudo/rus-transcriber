@@ -83,7 +83,8 @@ class ProposalInsteadOfRefusalTests(Base):
 
     def test_human_span_over_as_is(self):
         """Находка: «как есть» прежде молча перезаписывалось правкой отрезка человека."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 self.answer_r2_as_is(jp, md, version)
                 rep = core.edit_span_files(jp, md, 2.0, 2.0, "вон", by="human")
@@ -93,7 +94,8 @@ class ProposalInsteadOfRefusalTests(Base):
 
     def test_unchanged_text_is_not_a_contradiction(self):
         """Правка отрезка тем же текстом по подтверждённому слову — не противоречие (только «видел»)."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 self.answer_r4(jp, md, version)
                 rep = core.edit_span_files(jp, md, 3.0, 3.0, "тот", by="human")
@@ -118,7 +120,8 @@ class ProposalInsteadOfRefusalTests(Base):
                 self.assertEqual(self.card(jp, "r4")["rev"], 2)
 
     def test_agent_review_over_place_left_to_human(self):
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, _v):
                 transcript.apply_review(jp, md, [{"id": "r2", "status": "human"}], by="human")
                 rep = core.apply_review_files(jp, md, [{"id": "r2", "text": "вон"}], by="claude")
@@ -130,9 +133,15 @@ class ProposalInsteadOfRefusalTests(Base):
 
     def test_human_card_over_agent_edit_applies_at_once(self):
         """Тест 13: человек карточкой по правке агента — сразу применяется, противоречия нет."""
-        for backend in BACKENDS:
-            with self.subTest(backend=backend), files(backend) as (jp, md, version):
-                transcript.edit_span(jp, md, 3.0, 3.0, "ту", by="claude")
+        # правка агента — до сборки пакета: правка после сборки — другой отказ (слова карточки изменились, 13а)
+        data = six.result()
+        w5 = data["segments"][0]["words"][3]
+        w5.update(w="ту", edited="span@3.00", by="claude",
+                  provenance={"text": {"by": "claude", "edit": "span@3.00", "via": "edit_span"}})
+        data["segments"][0]["text"] = " ".join(w["w"] for w in data["segments"][0]["words"])
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
+            with self.subTest(backend=backend), files(backend, data) as (jp, md, version):
                 self.press(jp, version, "Заменить на «тот»", "r4")
                 rep = core.apply_answers_files(jp, md)
                 self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
@@ -153,7 +162,8 @@ class ProposalInsteadOfRefusalTests(Base):
 
     def test_repeat_of_the_same_proposal_creates_nothing_and_second_is_a_new_option(self):
         """Тест 18: повтор того же предложения ничего не создаёт; второе предложение — новый вариант."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 self.answer_r4(jp, md, version)
                 core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
@@ -183,7 +193,8 @@ class ProposalInsteadOfRefusalTests(Base):
     def test_human_span_over_own_span_edit(self):
         """В-1, владелец: «Карточка противоречия (Recommended)». Человек правит отрезок поверх своей прежней
         правки отрезка (карточки не было): не прежний отказ, а противоречие на новом месте."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 transcript.edit_span(jp, md, 0.5, 0.5, "начала", by="human")
                 rep = core.edit_span_files(jp, md, 0.45, 0.6, "начали", by="human")
@@ -223,7 +234,8 @@ class ChoiceTests(Base):
         with files("sqlite") as (jp, md, version):
             self.contradicted(jp, md, version)
             labels = self.labels(jp, "r4")
-            self.assertEqual([label[:len(KEEP)] for label in labels], [KEEP, ACCEPT, RAW])
+            self.assertEqual([next(p for p in (KEEP, ACCEPT, RAW) if label.startswith(p)) for label in labels],
+                             [KEEP, ACCEPT, RAW])
             self.assertIn("«тот»", labels[0])
             self.assertIn("«тут»", labels[1])
             self.assertIn("агент", labels[1])
@@ -234,12 +246,13 @@ class ChoiceTests(Base):
             # «как распознано» совпадает с подтверждённым — варианта нет
             self.answer_r2_as_is(jp, md, version)
             core.edit_span_files(jp, md, 2.0, 2.0, "вон", by="human")
-            self.assertEqual([label[:len(KEEP)] for label in self.labels(jp, "r2")], [KEEP, ACCEPT])
+            self.assertEqual([next(p for p in (KEEP, ACCEPT, RAW) if label.startswith(p))
+                              for label in self.labels(jp, "r2")], [KEEP, ACCEPT])
 
     def test_each_choice(self):
         cases = ((KEEP, "тот"), (ACCEPT, "тут"), (RAW, "та"))
         for backend in BACKENDS:
-            for prefix, text in cases:
+            for prefix, text in (cases if backend == "sqlite" else cases[1:2]):
                 with self.subTest(backend=backend, choice=prefix), files(backend) as (jp, md, version):
                     self.contradicted(jp, md, version)
                     self.choose(jp, version, "r4", prefix)
@@ -262,6 +275,8 @@ class ChoiceTests(Base):
                 self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
                 self.assertEqual(self.word(jp, "w5")["w"], "те")
                 self.assertEqual(self.place_of(jp, "r4")["contradiction"]["proposals"], [])
+            if backend != "sqlite":
+                continue                   # «Оставить человеку» от режима хранения не зависит
             with self.subTest(backend=backend, how="human"), files(backend) as (jp, md, version):
                 self.contradicted(jp, md, version)
                 self.save(jp, version, "r4", rev=self.card(jp, "r4")["rev"], kind="human")
@@ -273,7 +288,8 @@ class ChoiceTests(Base):
     def test_exception_only_for_the_contradiction_card(self):
         """Исключение в overwrite_refusal — только для карточки противоречия этого слова: ответ другой карточки
         по тому же слову по-прежнему конфликт двух человеческих правок (тест 14)."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 # w1 исправлен правкой отрезка человека; агент предлагает другое — новое место r5
                 transcript.edit_span(jp, md, 0.5, 0.5, "начала", by="human")

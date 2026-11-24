@@ -291,7 +291,8 @@ class NewRevisionAfterOpenTests(Base):
 
     def test_closed_answer_keeps_its_revision(self):
         """Т26: обычный applied новой редакции не создаёт; повтор «Применить» после rev 2 ничего не пишет."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend, result()) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальнейшем идём")
                 rep = core.apply_answers_files(jp, md)
@@ -326,7 +327,8 @@ class NewRevisionAfterOpenTests(Base):
     def test_new_text_on_the_new_revision_is_not_a_two_human_edit_conflict(self):
         """Т27: свой текст на rev 2 по словам, изменённым ответом rev 1 той же карточки, применяется:
         прежняя правка — той же карточки, правило двух человеческих правок не срабатывает."""
-        for backend in BACKENDS:
+        # режимы хранения здесь не различаются: только sqlite (оба режима — в соседних тестах)
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend, result(state="empty_unknown")) as (jp, md, version):
                 self.save(jp, version, "r3", text="дальше пойдём")
                 core.apply_answers_files(jp, md)
