@@ -296,6 +296,11 @@ class TaskTests(RepairBase):
         self.assertEqual(workflow._repair_labels(payload, transcript),
                          {1: "Участник 1", 2: model_tasks.UNKNOWN_SPEAKER, 3: model_tasks.UNKNOWN_SPEAKER})
 
+    def test_a_label_that_is_not_a_conventional_one_is_never_sent(self):
+        transcript = {"segments": [{"speaker": "Анна Синтетическая", "words": [{"word_id": "a"}]}]}
+        payload = {"speaker_labels": [{"label": "Анна Синтетическая", "word_ids": ["a"]}]}
+        self.assertEqual(workflow._repair_labels(payload, transcript), {1: model_tasks.UNKNOWN_SPEAKER})
+
     def test_a_section_without_words_is_not_sent_and_counts_as_left(self):
         request, recording = self.ready()
         saved = self.store.list_conspects(recording)[0]
@@ -337,7 +342,8 @@ class TaskTests(RepairBase):
                      reply(q1="а", q2="б", q3="в"), reply(q1="а", q1b="б"), reply(q1="а", q2=5),
                      {"quotes": [{"id": "1", "quote": "а"}, {"id": "2", "quote": "б", "x": 1}]},
                      {"quotes": [{"id": "1", "quote": "а"}, {"id": "2", "quote": "б"}], "x": 1},
-                     reply(q1="а", q2="я" * 501), {"quotes": [{"id": 1, "quote": "а"}, {"id": "2", "quote": "б"}]}]:
+                     reply(q1="а", q2="я" * 501), {"quotes": [{"id": 1, "quote": "а"}, {"id": "2", "quote": "б"}]},
+                     {"quotes": [{"id": "1", "quote": "а"}, {"id": "1", "quote": "б"}, {"id": "2", "quote": "б"}]}]:
             with self.assertRaises(ValueError):
                 model_tasks.validate_quote_repair(task, item)
 
@@ -396,6 +402,38 @@ class ApplyTests(RepairBase):
         result = self.run_repair(request, reply(q1="…", q2="слов нет в записи", q3="нет такого"))
         self.assertEqual((result["fixed"], result["unquoted"], result["failed"]), (0, 0, 3))
         self.assertEqual(self.revision(recording), 1)            # ничего не исправлено — ревизии нет
+        self.assertEqual(self.step(request)[0], "completed")
+
+    def test_the_screen_never_calls_without_a_snapshot(self):
+        request, _ = self.ready()
+        client = fake_cloud(reply(q1="x"))
+        with mock.patch.object(llm_provider, "OpenCodeTextClient", client), self.assertRaises(ValueError):
+            workflow.repair_quotes(self.store, request, via="screen")
+        self.assertEqual((client.created, self.runs(request)), (0, []))
+
+    def test_a_slot_whose_place_in_the_text_moved_is_left_alone(self):
+        request, recording = self.ready()
+        saved = self.store.list_conspects(recording)[0]
+        payload = copy.deepcopy(saved["payload"])
+        slot = next(item for item in payload["unlinked"] if item["id"] == "1")
+        section = payload["evidence"][slot["section"]]
+        section["text"] = section["text"][:slot["at"][0]] + "«нет такоЕ»" + section["text"][slot["at"][1]:]
+        snap = self.store.get_current(recording)
+        data = {**snap["transcript"]["payload"], "recording_id": recording,
+                "source_revision": snap["transcript"]["revision"], "review": []}
+        new, counts = workflow._apply_quote_repair(payload, data, ["1"], {"1": "перенести срок"})
+        self.assertEqual((counts["fixed"], counts["failed"]), (0, 1))
+        self.assertEqual(new["evidence"], payload["evidence"])
+
+    def test_files_that_cannot_be_written_are_reported_after_the_database_write(self):
+        request, recording = self.ready()
+
+        def outside_edit():
+            md = next(item for item in self.root.rglob("*.conspect.md"))
+            md.write_text(md.read_text(encoding="utf-8") + "\nправка человека\n", encoding="utf-8")
+        with self.assertRaises(storage.StorageError):
+            self.run_repair(request, reply(q1="перенести срок", q2=None, q3=None), during=outside_edit)
+        self.assertEqual(self.revision(recording), 2)
         self.assertEqual(self.step(request)[0], "completed")
 
     def test_wrong_format_changes_nothing_and_is_not_retried(self):
@@ -492,6 +530,10 @@ class ApplyTests(RepairBase):
         self.run_repair(request, reply(q1="перенести срок", q2=None, q3=None))
         states = sorted(row["state"] for row in self.runs(request))
         self.assertEqual(states, ["completed", "interrupted"])
+        steps = sorted(row["state"] for row in self.store.db.execute(
+            "SELECT s.state FROM workflow_steps s JOIN workflow_runs r USING(run_id) "
+            "WHERE r.request_id=? AND r.kind='quote_repair'", (request,)))
+        self.assertEqual(steps, ["completed", "interrupted"])
         self.assertEqual(workflow.get(self.store, request)["state"], "completed")
         self.assertIsNone(core.workflow_status(request)["request"]["model_failure"])
 
