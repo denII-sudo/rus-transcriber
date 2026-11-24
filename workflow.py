@@ -13,6 +13,7 @@ import model_tasks
 import product_policy
 import recordings
 import storage
+import transcript
 
 
 def create(store, source, policy=None):
@@ -343,31 +344,19 @@ def _open_places(review):
     return [item for item in review.get("review", []) if _place_unresolved(item)]
 
 
-# Допуск на округление времени: то же правило, по которому transcript._find_span находит
-# слова места без ссылок при применении ответа человека.
-PLACE_TIME_TOLERANCE = 0.01
-
-
-def _seconds(value):
-    return type(value) in (int, float) and math.isfinite(value)
+# Правило слов места живёт в transcript.py (РАР-6.1, PR 6а): здесь только имена для прежних вызовов.
+PLACE_TIME_TOLERANCE = transcript.WORD_PLACE_TOLERANCE
+_seconds = transcript._finite_number
 
 
 def _place_time(item):
-    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None (время негодно)."""
+    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None. Только t1/t2, как до PR 6а
+    (у transcript._place_time есть ещё запасное «t»: это правило линии 2 6а не меняет)."""
     t1, t2 = item.get("t1"), item.get("t2")
     return (t1, t2) if _seconds(t1) and _seconds(t2) and t1 <= t2 else None
 
 
-def _word_in_place(start, end, t1, t2):
-    """Правило пересечения слова [start, end] с местом [t1, t2] (секунды).
-
-    Слово в месте, если его начало лежит в [t1 − допуск; t2 + допуск] (у мест распознавания
-    t1 — начало первого слова, t2 — начало последнего) или если слово перекрывает место
-    отрезком положительной длины (start < t2 и end > t1). Слово, которое лишь касается
-    начала места своим концом (end == t1), в место не входит.
-    """
-    return (t1 - PLACE_TIME_TOLERANCE <= start <= t2 + PLACE_TIME_TOLERANCE
-            or (start < t2 and end > t1))
+_word_in_place = transcript.word_in_place
 
 
 def _closed_unheard(item):

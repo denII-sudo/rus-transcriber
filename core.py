@@ -2704,11 +2704,20 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
         return [snapshot(word, segment.get("speaker"))
                 for word in (segment.get("words") or [])[w1:w2]]
 
+    def select_pause(data, item):
+        # Слова пропуска — начатые в его паузе (transcript.pause_words); пустая пауза — пустой снимок, не None.
+        times = transcript._place_time(item)
+        if times is None:
+            return None
+        return [snapshot(word, data["segments"][si].get("speaker"))
+                for si, _k, word in transcript.pause_words(data, *times)]
+
     conflicts = {}
     for item in manifest.get("items") or []:
         aid = item.get("id")
         answer = answers.get(aid)
-        ids = item.get("word_ids")
+        gap = transcript.is_gap_place(item)
+        ids = None if gap else item.get("word_ids")      # у пропуска word_ids пакета не читаются
         if not answer or aid in applied:
             continue
         if sqlite and source is None:
@@ -2717,9 +2726,10 @@ def _answer_revision_conflicts(current, manifest, state, source, *, sqlite):
         if not ids:
             # Старый вид карточки: ответ ищет место по времени. Сравниваем ровно те
             # слова, которые он перезапишет, включая говорящего и все измерения provenance.
-            if sqlite and "word_ids" not in item:
-                actual = select_by_time(current, item)
-                original = select_by_time(source, item)
+            if sqlite and (gap or "word_ids" not in item):
+                pick = select_pause if gap else select_by_time
+                actual = pick(current, item)
+                original = pick(source, item)
                 if actual is None or original is None or actual != original:
                     conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
             continue
@@ -2745,8 +2755,16 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     if draft is not None:
         items = {item["id"]: item for item in (P.manifest(jp) or {}).get("items") or []}
         already_applied = P._applied_map(draft["state"])
+        now = transcript.load(jp)
+        places = {r.get("id"): r for r in now.get("review") or []}
         for aid, answer in free.items():
-            ids = (items.get(aid) or {}).get("word_ids")
+            place = places.get(aid) or {}
+            if transcript.is_gap_place(place):
+                # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
+                found = transcript.place_words(now, place)
+                ids = found[0] if found else None
+            else:
+                ids = (items.get(aid) or {}).get("word_ids")
             if not ids or aid in already_applied or aid in (revision_conflicts or {}):
                 continue
             preview = P.apply_free(jp, md, {aid: answer}, dry_run=True)

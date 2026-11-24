@@ -8,6 +8,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -69,6 +70,23 @@ def doubt_marks(data):
     """{номер реплики: {номер слова: id места}} — слова нерешённых мест (по времени: индексы сдвигаются)."""
     out = {}
     for it in unresolved(data):
+        if is_gap_place(it):
+            # пропуск (ответ владельца, вариант А): слова паузы — начатые в ней; у пустой паузы помечены последнее
+            # слово до неё и первое после, чтобы цитата рядом с непрослушанной паузой не считалась проверенной
+            times = _place_time(it)
+            if times is None:
+                continue
+            inside = pause_words(data, *times)
+            if inside:
+                # при наложении речи — реплика того, кому место приписано (как у мест-слов)
+                best = min((data["segments"][si]["speaker"] != it.get("speaker"), si)
+                           for si in {x[0] for x in inside})[1]
+                found = [x for x in inside if x[0] == best]
+            else:
+                found = neighbors_of_pause(data, *times)
+            for si, k, _w in found:
+                out.setdefault(si, {})[k] = it["id"]
+            continue
         t1, t2 = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
         if t1 is None:
             continue
@@ -560,9 +578,163 @@ def _refresh_conspects(json_path):
         return {"error": f"{type(ex).__name__}: {ex}"}
 
 
+# ---------- правило «слова места» (РАР-6.1, PR 6а; реестр правил, строка 8) ----------
+# Место-пропуск (причина «missed»: речи в записи нет, слов внутри не должно быть) владеет только словами,
+# НАЧАТЫМИ внутри него: полуоткрытый интервал [t1, t2) в целых сотых. Слово рядом с паузой ей не принадлежит.
+# Места-слова остаются по word_ids или по закрытому интервалу с допуском. Исключение, названное здесь и в
+# описании PR: при применении ответа (_find_span) место-слово ищется по началу слова в одной реплике, а для
+# цитат (word_in_place) — ещё и по перекрытию во всех репликах; это два разных правила, 6а их не сводит.
+WORD_PLACE_TOLERANCE = 0.01   # допуск мест-слов, секунды (прежде workflow.PLACE_TIME_TOLERANCE)
+
+
+def _cents(t):
+    """Время в целых сотых. Пакет хранит round(t, 2), поэтому сначала так же округляем: round(t * 100)
+    расходится с round(t, 2) на временах вида x,xx5."""
+    return int(round(round(float(t), 2) * 100))
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _place_time(item):
+    """(t1, t2) места, если оба — конечные числа и t1 <= t2; иначе None (время негодно)."""
+    t1, t2 = item.get("t1", item.get("t")), item.get("t2", item.get("t"))
+    return (t1, t2) if _finite_number(t1) and _finite_number(t2) and t1 <= t2 else None
+
+
+def is_gap_place(item):
+    """Место-пропуск: «missed» в причинах (диаризация и проход без слов: ["missed"], ["asr", "missed"])."""
+    reasons = item.get("reasons")
+    return isinstance(reasons, (list, tuple)) and "missed" in reasons
+
+
+def in_pause(s, t1, t2):
+    """Единственная запись правила «слово в паузе»: начало слова в [t1, t2), в целых сотых."""
+    return _cents(t1) <= _cents(s) < _cents(t2)
+
+
+def pause_words(data, t1, t2):
+    """[(номер реплики, номер слова, слово)] слов, начатых в паузе [t1, t2), в порядке стенограммы.
+
+    t1, t2 — конечные числа (проверяет вызывающий); слова без конечного начала пропускаются."""
+    out = []
+    for si, seg in enumerate(data.get("segments") or []):
+        for k, w in enumerate(seg.get("words") or []):
+            if _finite_number(w.get("s")) and in_pause(w["s"], t1, t2):
+                out.append((si, k, w))
+    return out
+
+
+def neighbors_of_pause(data, t1, t2):
+    """[(номер реплики, номер слова, слово)]: последнее слово с началом до паузы [t1, t2) и первое после неё
+    (что есть; равные времена — по порядку стенограммы: «до» — позднее, «после» — раньше). Слова без конечного
+    начала пропускаются. Одна запись для place_words(pause_neighbors=True) и пометок ⟦…⟧ (doubt_marks)."""
+    timed = [(si, k, w) for si, seg in enumerate(data.get("segments") or [])
+             for k, w in enumerate(seg.get("words") or []) if _finite_number(w.get("s"))]
+    before = [x for x in timed if _cents(x[2]["s"]) < _cents(t1)]
+    after = [x for x in timed if _cents(x[2]["s"]) >= _cents(t2)]
+    key = lambda x: (x[2]["s"], x[0], x[1])
+    return ([max(before, key=key)] if before else []) + ([min(after, key=key)] if after else [])
+
+
+def word_in_place(start, end, t1, t2):
+    """Правило пересечения слова [start, end] с местом-словом [t1, t2] (секунды): для цитат и пометок 7.3.
+
+    Слово в месте, если его начало лежит в [t1 − допуск; t2 + допуск] (у мест распознавания t1 — начало
+    первого слова, t2 — начало последнего) или если слово перекрывает место отрезком положительной длины
+    (start < t2 и end > t1). Слово, которое лишь касается начала места своим концом (end == t1), не входит.
+    """
+    return (t1 - WORD_PLACE_TOLERANCE <= start <= t2 + WORD_PLACE_TOLERANCE
+            or (start < t2 and end > t1))
+
+
+def place_words(data, item, *, pause_neighbors=False):
+    """Слова места: (ID слов в порядке стенограммы, это_пауза) или None, если место привязать нельзя.
+
+    Договор с этапом 7.5 (plan-7-5.md, раздел 3). Пропуск: word_ids места не читаются, слова — pause_words.
+    Иное место: его word_ids (какого-то нет в стенограмме, повтор, не строка — None) или, без word_ids,
+    слова по word_in_place. это_пауза — внутри места нет слов; при pause_neighbors=True тогда возвращаются
+    ID последнего слова до места и первого после. Чистая функция: данные не меняет.
+    """
+    times = _place_time(item)
+    if times is None:
+        return None
+    t1, t2 = times
+    gap_place = is_gap_place(item)
+    ids = item.get("word_ids")
+    order = []                                  # (слово, позиция в стенограмме)
+    for seg in data.get("segments") or []:
+        for w in seg.get("words") or []:
+            order.append(w)
+    if not gap_place and isinstance(ids, list) and ids:
+        if not all(isinstance(x, str) and x for x in ids) or len(ids) != len(set(ids)):
+            return None
+        by_id = {w.get("word_id"): w for w in order if w.get("word_id")}
+        if any(x not in by_id for x in ids):
+            return None
+        wanted = set(ids)
+        return [w["word_id"] for w in order if w.get("word_id") in wanted], False
+    timed = [(pos, w) for pos, w in enumerate(order) if _finite_number(w.get("s"))]
+    if not timed:
+        return None
+    if gap_place:
+        inside = [w for _pos, w in timed if in_pause(w["s"], t1, t2)]
+    else:
+        def end_of(w):
+            e = w.get("e")
+            return e if _finite_number(e) and e >= w["s"] else w["s"]
+        inside = [w for _pos, w in timed if word_in_place(w["s"], end_of(w), t1, t2)]
+    chosen = inside
+    if not inside and pause_neighbors:
+        if gap_place:
+            chosen = [w for _si, _k, w in neighbors_of_pause(data, t1, t2)]
+        else:
+            before = [(w["s"], pos, w) for pos, w in timed if w["s"] < t1 - WORD_PLACE_TOLERANCE]
+            after = [(w["s"], pos, w) for pos, w in timed if w["s"] > t2 + WORD_PLACE_TOLERANCE]
+            chosen = ([max(before, key=lambda x: (x[0], x[1]))[2]] if before else []) \
+                + ([min(after, key=lambda x: (x[0], x[1]))[2]] if after else [])
+    if any(not isinstance(w.get("word_id"), str) or not w.get("word_id") for w in chosen):
+        return None
+    return [w["word_id"] for w in chosen], not inside
+
+
+def places_overlap(x, y):
+    """Единственное правило пересечения двух мест (карточек): True, если они делят время.
+
+    Оба места-слова — прежняя формула с допуском. Иначе полуоткрытые интервалы в сотых: пропуск
+    [t1, t2), место-слово [t1, t2 + 1 сотая) (начала его слов от t1 до t2 включительно). Место с негодным
+    временем ни с чем не пересекается."""
+    tx, ty = _place_time(x), _place_time(y)
+    if tx is None or ty is None:
+        return False
+    gx, gy = is_gap_place(x), is_gap_place(y)
+    if not gx and not gy:
+        return tx[0] <= ty[1] + WORD_PLACE_TOLERANCE and ty[0] <= tx[1] + WORD_PLACE_TOLERANCE
+
+    def interval(times, is_gap):
+        return _cents(times[0]), _cents(times[1]) + (0 if is_gap else 1)
+    a0, a1 = interval(tx, gx)
+    b0, b1 = interval(ty, gy)
+    return a0 < b1 and b0 < a1
+
+
 # ---------- разбор сомнительных мест ----------
 def _find_span(data, it):
-    """Находит место по времени слов (индексы сдвигаются после правок)."""
+    """Находит место по времени слов (индексы сдвигаются после правок).
+
+    Пропуск — слова, начатые в его паузе [t1, t2); word_ids места не читаются (старые пакеты несли в них ID
+    соседнего слова). Пустая пауза — None."""
+    if is_gap_place(it):
+        times = _place_time(it)
+        if times is None:
+            return None
+        in_segment = {}
+        for si, k, _w in pause_words(data, *times):
+            in_segment.setdefault(si, []).append(k)
+        locs = [(si, ks[0], ks[-1] + 1) for si, ks in in_segment.items()]
+        return next((loc for loc in locs if data["segments"][loc[0]].get("speaker") == it.get("speaker")),
+                    locs[0] if locs else None)
     if "word_ids" in it:
         target = it["word_ids"]
         if not isinstance(target, list) or not target or not all(isinstance(x, str) and x for x in target) \
@@ -788,6 +960,19 @@ def _counts_text(changed, seen, seen_changed):
 
 
 HELD_FOR_HUMAN = "место оставлено человеку"
+# Отказы варианта карточки на пустой паузе (apply_review): слов нет — «как есть», подпись и замена не к чему.
+PAUSE_EMPTY_AS_IS = ("в паузе нет слов — подтверждать «как есть» нечего; "
+                     "впишите услышанное в поле ответа («Имя: слова»)")
+PAUSE_EMPTY_SPEAKER = ("в паузе нет слов — подписывать говорящего нечему; "
+                       "впишите услышанное в поле ответа («Имя: слова»)")
+PAUSE_EMPTY_TEXT = ("вариант с текстом в пустую паузу не вписывается; "
+                    "впишите услышанное в поле ответа («Имя: слова»)")
+
+
+def _empty_pause_refusal(decision):
+    if decision.get("text"):
+        return PAUSE_EMPTY_TEXT
+    return PAUSE_EMPTY_SPEAKER if decision.get("speaker") else PAUSE_EMPTY_AS_IS
 EDIT_SPAN_AUTHOR_REQUIRED = ('edit_span: укажите автора правки by — "claude" (правка агента, в том числе по поручению '
                              'человека) или "human" (текст продиктовал человек, только командной строкой); '
                              'без автора правка не принимается')
@@ -859,21 +1044,42 @@ def overwrite_refusal(word, data, writer, card):
 
 def _held_places(data):
     """Места, оставленные человеку (статус human): (id() их слов, их отрезки). Агент их не меняет и не
-    закрывает, пока нет правила о поручении такого места ИИ."""
+    закрывает, пока нет правила о поручении такого места ИИ.
+
+    Отрезок — (a, b, пропуск?): у места-слова закрытый [t1 − допуск; t2 + допуск], у пропуска — [t1, t2) в
+    сотых (_span_has_time, _span_overlaps). Слова пропуска — слова паузы; соседнее слово ему не принадлежит."""
     words, spans = set(), []
     all_words = [w for seg in data.get("segments") or [] for w in seg.get("words") or []]
     for it in data.get("review") or []:
         if it.get("status") != "human":
             continue
+        if is_gap_place(it):
+            times = _place_time(it)
+            if times is not None:
+                spans.append((times[0], times[1], True))
+                words.update(id(w) for _si, _k, w in pause_words(data, *times))
+            continue
         t1, t2 = it.get("t1", it.get("t")), it.get("t2", it.get("t"))
         if t1 is not None and t2 is not None:
-            spans.append((t1 - 0.01, t2 + 0.01))
+            spans.append((t1 - WORD_PLACE_TOLERANCE, t2 + WORD_PLACE_TOLERANCE, False))
         ids = it.get("word_ids")
         if ids:
             words.update(id(w) for w in all_words if w.get("word_id") in ids)
         elif t1 is not None and t2 is not None:
-            words.update(id(w) for w in all_words if t1 - 0.01 <= w["s"] <= t2 + 0.01)
+            words.update(id(w) for w in all_words if t1 - WORD_PLACE_TOLERANCE <= w["s"] <= t2 + WORD_PLACE_TOLERANCE)
     return words, spans
+
+
+def _span_has_time(spans, t):
+    """Попадает ли время t (начало вставляемого слова) в один из отрезков _held_places."""
+    return t is not None and any(in_pause(t, a, b) if gap else a <= t <= b for a, b, gap in spans)
+
+
+def _span_overlaps(spans, t1, t2):
+    """Пересекает ли явный отрезок правки [t1, t2] один из отрезков _held_places."""
+    return any((_cents(t1) < _cents(b) and _cents(a) <= _cents(t2)) if gap
+               else (a <= t2 + WORD_PLACE_TOLERANCE and t1 - WORD_PLACE_TOLERANCE <= b)
+               for a, b, gap in spans)
 
 
 def _diff_words(old, new_text, item_id, refuse=None):
@@ -1062,7 +1268,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             return k is not None and id(flat[k]["w"]) in held_words
 
         def held_time(t):
-            return t is not None and any(a <= t <= b for a, b in held_spans)
+            return _span_has_time(held_spans, t)
 
         removed = set()
         for e in eds:
@@ -1100,8 +1306,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     return f"на отрезке {e['t1']}–{e['t2']} с нет слов, а говорящий не указан"
                 if by != "human" and any(human_touched(flat[k]["w"]) for k in ks):
                     return "на отрезке есть подтверждённые человеком слова"
-                if any(held(k) for k in ks) or (not ks and any(
-                        a <= e["t2"] + 0.01 and e["t1"] - 0.01 <= b for a, b in held_spans)):
+                if any(held(k) for k in ks) or (not ks and _span_overlaps(held_spans, e["t1"], e["t2"])):
                     return HELD_FOR_HUMAN
                 names = list(dict.fromkeys(flat[k]["spk"] for k in ks))
                 if len(names) > 1 and not e.get("speaker") and (e.get("text") or "").strip():
@@ -1434,6 +1639,10 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             it["status"] = "resolved"
             report["kept"] += 1
             report["successful_ids"].append(it["id"])
+            continue
+        if is_gap_place(it) and _place_time(it) is not None and not pause_words(data, *_place_time(it)):
+            # В паузе нет слов: подтверждать, подписывать и заменять нечего. Соседнее слово ей не принадлежит.
+            report.setdefault("conflicts", []).append({"id": it["id"], "why": _empty_pause_refusal(d)})
             continue
         target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
         loc = _find_span(data, target)

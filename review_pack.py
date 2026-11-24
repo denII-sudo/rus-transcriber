@@ -66,6 +66,9 @@ OUTCOME_REASONS = {
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
+# ответ совпал со словами паузы, но вложенное «как есть» человека отказало (например, нужно прослушивание)
+PAUSE_CONFIRM_REFUSAL = ("слова паузы совпали с ответом, но место не закрылось: {why}; "
+                         "прослушайте паузу и подтвердите её отдельно")
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -177,7 +180,9 @@ def build(json_path, items, base_url_note=None):
         loc = T._find_span(data, it)
         target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
         ids = [w.get("word_id") for w in target_words]
-        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) else {}
+        # Пропуск ссылается на слова временем паузы: ID соседнего слова в карточку не попадают (PR 6а).
+        target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) \
+            and not T.is_gap_place(it) else {}
         question = q.get("question") or "Как правильно?"
         if it.get("asr_problem"):
             problem = it["asr_problem"]
@@ -687,7 +692,7 @@ def decisions(json_path):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
                 continue
-            if "word_ids" in it:
+            if "word_ids" in it and not T.is_gap_place(it):     # у пропуска старый пакет нёс ID соседа
                 d["word_ids"] = it["word_ids"]
             note = f"{src}: {it['options'][a['option']]['label']}"
             if aid in conflicted:
@@ -758,7 +763,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         aid = item["id"]
         if aid not in valid_free:
             continue
-        if "word_ids" in item:
+        if "word_ids" in item and not T.is_gap_place(item):     # пропуск: слова — по времени паузы
             ids = item["word_ids"]
             all_words = [w for s in data["segments"] for w in s.get("words") or []]
             all_ids = Counter(w.get("word_id") for w in all_words)
@@ -809,8 +814,24 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
                "relabel": 0, "replace": 0, "insert": 0}
     items = {r["id"]: r for r in data.get("review") or []}
+    confirmed, confirm_refusals = [], {}
+    if not dry_run:
+        # ответ совпал со словами, уже стоящими в паузе: открытое место закрывается тем же путём, что «как есть»
+        still_open = {r["id"] for r in T.load(json_path).get("review") or []
+                      if r.get("status", "open") in ("open", "human")}
+        confirmed = [r["id"] for r in reports if r.get("confirm_pause") and r["id"] not in blocked
+                     and r["id"] in still_open]
+        if confirmed:
+            _, nested = T.apply_review(json_path, md_path, [{"id": cid} for cid in confirmed], by="human")
+            refused = {c.get("id"): c.get("why") for c in nested.get("conflicts") or []}
+            done = set(nested.get("successful_ids") or [])
+            not_closed = [cid for cid in confirmed if cid not in done]
+            confirmed = [cid for cid in confirmed if cid in done]
+            confirm_refusals = {cid: PAUSE_CONFIRM_REFUSAL.format(why=refused.get(cid) or "место не закрылось")
+                                for cid in not_closed}
     human = [{"id": aid, "why": reason, "answer": free[aid].get("text")}
              for aid, reason in missing_reasons.items()]
+    human += [{"id": cid, "why": why, "answer": free[cid].get("text")} for cid, why in confirm_refusals.items()]
     for r in reports:
         if r["id"] in conflict_ids:
             human.append({"id": r["id"], "why": "ответы на карточки конфликтуют", "answer": r["answer"]})
@@ -831,7 +852,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
             "closed_via": closed, "conflicts": conflicts, "left_to_human": human,
-            "successful_ids": [r["id"] for r in reports if r["id"] in rep["cards"]
+            "successful_ids": [r["id"] for r in reports if (r["id"] in rep["cards"] or r["id"] in confirmed)
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
                                and not r.get("human")
                                and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
@@ -860,23 +881,30 @@ def preflight_answers(json_path, md_path, decisions_, free):
     claims = {}
     for aid in ids:
         it = items.get(aid) or {}
-        target = set(it.get("word_ids") or []) | set(planned.get(aid) or [])
+        gap_card = T.is_gap_place(it)       # пропуск: цель — слова паузы; word_ids пакета не читаются
+        own = set(T.place_words(data, it)[0] if T.place_words(data, it) else []) if gap_card \
+            else set(it.get("word_ids") or [])
+        target = own | set(planned.get(aid) or [])
         t1, t2 = it.get("t1"), it.get("t2")
-        if not target and t1 is not None and t2 is not None:
+        if not target and not gap_card and t1 is not None and t2 is not None:
             # Старые карточки адресуются временем: берём все слова в диапазоне,
             # а не выбранный эвристикой первый сегмент.
             target = {w.get("word_id") for s in data.get("segments") or [] for w in s.get("words") or []
                       if t1 - 0.01 <= w["s"] <= t2 + 0.01 and w.get("word_id")}
-        claims[aid] = {"ids": target, "legacy": not bool(it.get("word_ids")), "t1": t1, "t2": t2}
+        claims[aid] = {"ids": target, "legacy": gap_card or not bool(it.get("word_ids")), "t1": t1, "t2": t2,
+                       "gap": gap_card}
     conflicts = []
     ordered = sorted(ids)
     for i, a in enumerate(ordered):
         for b in ordered[i + 1:]:
             x, y = claims[a], claims[b]
             shared = x["ids"] & y["ids"]
-            legacy_overlap = (x["legacy"] or y["legacy"]) and all(
-                v is not None for v in (x["t1"], x["t2"], y["t1"], y["t2"])) and \
-                x["t1"] <= y["t2"] + 0.01 and y["t1"] <= x["t2"] + 0.01
+            if x["gap"] or y["gap"]:
+                legacy_overlap = T.places_overlap(items.get(a) or {}, items.get(b) or {})
+            else:
+                legacy_overlap = (x["legacy"] or y["legacy"]) and all(
+                    v is not None for v in (x["t1"], x["t2"], y["t1"], y["t2"])) and \
+                    x["t1"] <= y["t2"] + 0.01 and y["t1"] <= x["t2"] + 0.01
             if shared or legacy_overlap:
                 conflicts.append({"cards": [a, b], "why": "ответы затрагивают общие слова или неоднозначный старый диапазон"})
     return conflicts
