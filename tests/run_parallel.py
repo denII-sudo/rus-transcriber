@@ -55,6 +55,7 @@ GROUP_TIMEOUT = 900                   # секунд на группу; пред
 SUMMARY_RAN = re.compile(r"^Ran (\d+) tests? in ([\d.]+)s\s*$", re.M)
 SUMMARY_STATUS = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
 DURATION_LINE = re.compile(r"(?:^|\s)(\d+\.\d+)s\s+\S+ \(([\w.]+)\)\s*$", re.M)
+DATA_SUBDIR = "data"                  # папка данных группы внутри её TEMP
 SQLITE_COST = 4.5                     # цена варианта в режиме sqlite к варианту legacy_files (К-2 плана: 0,42 против 0,09 с)
 
 
@@ -283,9 +284,10 @@ def write_table(path, table):
 # ---------- процессы ----------
 
 def group_env(sandbox, tests_dir):
-    data, temp = Path(sandbox) / "data", Path(sandbox) / "tmp"
+    # данные — внутри временной папки: tests/test_data_safety проверяет, что папка данных лежит под TEMP
+    temp = Path(sandbox) / "tmp"
+    data = temp / DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
-    temp.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, RUS_TRANSCRIBER_DATA=str(data), TEMP=str(temp), TMP=str(temp),
                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
                GIT_OPTIONAL_LOCKS="0")
@@ -356,7 +358,7 @@ class Run:
         self.ended = time.time()
         self.summary = parse_summary(self.output)
         try:
-            self.leftover = sorted(p.name for p in self.tmp.iterdir())
+            self.leftover = sorted(p.name for p in self.tmp.iterdir() if p.name != DATA_SUBDIR)
         except OSError:
             self.leftover = []
 

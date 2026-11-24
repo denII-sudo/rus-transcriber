@@ -340,6 +340,7 @@ class RunTests(Synthetic):
         self.assertEqual(len({s[1] for s in seen}), 3)
         for data, temp, tmp in seen:
             self.assertEqual(temp, tmp)
+            self.assertIn(Path(temp), Path(data).parents)               # как требует test_data_safety: данные под TEMP
             self.assertNotEqual(data, os.environ.get("RUS_TRANSCRIBER_DATA"))
             self.assertFalse(Path(data).parent.parent.exists(), "песочница не убрана")
         self.assertRegex(text, r"\[g\d\] ")
