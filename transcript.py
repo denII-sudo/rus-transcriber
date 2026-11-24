@@ -1277,15 +1277,16 @@ def propose_contradiction(data, words, proposal, confirmed=None):
     return item["id"], True
 
 
-def settle_contradiction(item, choice, by, proposal=None):
-    """Выбор человека на карточке противоречия: итог — в историю, предложений больше нет."""
+def settle_contradiction(item, choice, by, proposal=None, note=None):
+    """Выбор человека на карточке противоречия: итог — в историю, предложений больше нет.
+    note — примечание человека (human_note): только здесь, в ответе и в журнале правок."""
     record = item.get(CONTRADICTION) or {}
     if not record.get("proposals"):
         return
     record.setdefault("history", []).append({
         "choice": choice, "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "confirmed": record.get("confirmed"), "proposals": record["proposals"],
-        **({"proposal": proposal} if proposal else {})})
+        **({"proposal": proposal} if proposal else {}), **({"human_note": note} if note else {})})
     record["proposals"] = []
 
 
@@ -2091,6 +2092,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                       "after": {"text": " ".join(w["w"] for w in (data["segments"][si]["words"] if new_spk == seg["speaker"]
                                                                    else ws)[w1:w2]) if new_text else before["text"],
                                 "speaker": new_spk}, "note": d.get("note"),
+                      **({"human_note": d["human_note"]} if d.get("human_note") else {}),
                       **({"seen_changed": seen_changed} if seen_changed and by != "human" else {})})
         it["status"] = "resolved"
         report["applied"] += 1
@@ -2113,7 +2115,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
     for d in decisions:
         it = items.get(d.get("id"))
         if by == "human" and it and d.get(CONTRADICTION) and it["id"] in report["successful_ids"]:
-            settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"))
+            settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"), d.get("human_note"))
     # решение применено, но место ещё раз показать человеку (например, ответы двух режимов разошлись)
     for d in decisions:
         it = items.get(d.get("id"))

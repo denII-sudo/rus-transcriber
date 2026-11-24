@@ -162,7 +162,8 @@ _CARD_FP_FIELDS = ("question", "options", "recommended", "answer_mode", "word_id
 _ANSWER_PRIVATE = ("applied_answer", "keep_request")
 # В облако не уходит и путь к голосовому файлу на этом компьютере (в нём имя пользователя Windows):
 # облачный голос идёт через audio_id, страница поле audio не читает.
-_ANSWER_LOCAL = _ANSWER_PRIVATE + ("audio",)
+# human_note — примечание человека на карточке противоречия (PR 13б): остаётся на этом компьютере
+_ANSWER_LOCAL = _ANSWER_PRIVATE + ("audio", "human_note")
 
 
 def card_rev(item):
@@ -862,6 +863,10 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         for k in ("text", "audio", "heard", "by"):
             if a.get(k) is not None:
                 ans[k] = a[k]
+        note = a.get("human_note")
+        if isinstance(note, str) and note.strip() and "seen_fp" in it:
+            # примечание — только на карточке противоречия (В-3); ответом оно не разбирается
+            ans["human_note"] = note.strip()[:2000]
         if a.get("kind") == "keep":
             # «Не отменять»: вместо подготовленной отмены (или ждущего ответа) снова сохраняется применённый
             # ответ — целиком, из копии, которую хранит заменивший его ответ (время, источник, услышанное).
@@ -1061,6 +1066,8 @@ def decisions(json_path):
                 d["human_after"] = True
                 rep["human"].append(aid)
             d["note"] = (d.get("note") + "; " if d.get("note") else "") + note
+            if a.get("human_note"):
+                d["human_note"] = a["human_note"]
             rep["applied_from_answers"] += 1
         elif k == "human":
             # Только статус места: «Оставить человеку» ничего не подтверждает (слова без отметок человека).
@@ -1342,7 +1349,7 @@ def _cloud_answer(a):
 
 def _cloud_item(it):
     """Карточка для облака: без отпечатка слов паузы, служебных полей и путей ответов в истории."""
-    out = {f: x for f, x in it.items() if f != "listen_fp"}
+    out = {f: x for f, x in it.items() if f not in ("listen_fp", "seen_fp")}
     if it.get("history"):
         out["history"] = [dict(h, answer=_cloud_answer(h["answer"])) if isinstance(h.get("answer"), dict)
                           else dict(h) for h in it["history"]]
