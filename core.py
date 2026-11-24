@@ -733,6 +733,54 @@ def quote_repair_view(payload):
     return {"unlinked": counts[0], "total": counts[1], "needed": workflow.quotes_need_repair(*counts)}
 
 
+def quote_repair_state(store, name):
+    """Для кнопки на экране: запрос свёртки, доступно ли исправление цитат и почему нет. Только чтение."""
+    import storage
+    import workflow
+    if not name.startswith("workflow-"):
+        return {"request_id": None, "available": False,
+                "reason": "это не свёртка запроса; исправление цитат недоступно"}
+    request_id = name[len("workflow-"):]
+    try:
+        problem = workflow.quote_repair_problem(store, workflow.get(store, request_id))
+    except (KeyError, ValueError, storage.StorageError):
+        return {"request_id": request_id, "available": False, "reason": "запрос этой свёртки не найден"}
+    return {"request_id": request_id, "available": problem is None, "reason": problem}
+
+
+def workflow_repair_quotes_prepare(request_id):
+    """Снимок для окна согласия на экране: что уйдёт в облако. Ничего не отправляет."""
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.quote_repair_prepare(store, request_id)
+    finally:
+        store.close()
+
+
+def workflow_repair_quotes_info(request_id):
+    """MCP без согласия: доступно ли исправление, почему нет, сколько уйдёт. Ничего не отправляет."""
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.quote_repair_info(store, request_id)
+    finally:
+        store.close()
+
+
+def workflow_repair_quotes(request_id, *, via, snapshot=None):
+    """Один вызов облака по явному согласию человека (экран: со снимком; MCP: с allow_cloud_model=true)."""
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.repair_quotes(store, request_id, via=via, snapshot=snapshot)
+    finally:
+        store.close()
+
+
 def recording_conspects(recording_id):
     """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
     import recordings
@@ -752,7 +800,9 @@ def recording_conspects(recording_id):
                            "current_revision": item["current_revision"],
                            "source_revision": item["source_revision"],
                            "sections": _conspect_screen_sections(item["payload"]),
-                           "quote_repair": quote_repair_view(item["payload"]),
+                           "quote_repair": (None if quote_repair_view(item["payload"]) is None else
+                                            {**quote_repair_view(item["payload"]),
+                                             **quote_repair_state(store, item["name"])}),
                            "files": files})
         return result
     finally:
