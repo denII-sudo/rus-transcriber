@@ -56,6 +56,8 @@ def merge_answer_draft(data, state):
     result["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
     result["interaction_events_evicted"] = state.get("interaction_events_dropped", 0)
     result["applications"] = copy.deepcopy(state.get("application_events") or [])
+    # Как при записи в БД: исчезнувшие слова не остаются в карточках документа (manifest не трогаем).
+    _prune_missing_word_ids(result, result)
     return result
 
 
