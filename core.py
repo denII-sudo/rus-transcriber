@@ -1340,7 +1340,7 @@ def _conflict_facts(store, row):
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
                 "program_hash": program_hash, "also_replaces": also, "waits_for": waits,
-                "stops_for": stops, "stops_changed": changed}}
+                "stops_for": stops}}    # причины остановки в снимок не входят: состав снимка прежний
 
 
 def _lines(text):
