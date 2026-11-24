@@ -156,6 +156,9 @@ _CARD_FP_FIELDS = ("question", "options", "recommended", "answer_mode", "word_id
                    "speaker", "text")
 # Копии для «Не отменять» нужны только живому ответу, не ответу в истории карточки.
 _ANSWER_PRIVATE = ("applied_answer", "keep_request")
+# В облако не уходит и путь к голосовому файлу на этом компьютере (в нём имя пользователя Windows):
+# облачный голос идёт через audio_id, страница поле audio не читает.
+_ANSWER_LOCAL = _ANSWER_PRIVATE + ("audio",)
 
 
 def card_rev(item):
@@ -1183,10 +1186,10 @@ def cloud_bundle(json_path, artifact_url=None):
     # Отпечаток слов интервала паузы (listen_fp) нужен только сверке на ноутбуке (decisions): в облако не уходит.
     # Ответ прежней редакции карточки в облако не уходит: страница показывает его из истории карточки.
     out = dict(man, items=[_cloud_item(it) for it in man["items"]],
-               answers={k: {f: x for f, x in v.items() if f not in _ANSWER_PRIVATE}
-                             for k, v in store.get("answers", {}).items()
-                             if v.get("version") == man["version"] and answer_is_current(v, items.get(k))},
-               applied_answers=store.get("applied_answers") or {}, answer_states=answer_states_of(store, man),
+               answers={k: _cloud_answer(v) for k, v in store.get("answers", {}).items()
+                        if v.get("version") == man["version"] and answer_is_current(v, items.get(k))},
+               applied_answers={k: _cloud_answer(v) for k, v in (store.get("applied_answers") or {}).items()},
+               answer_states=answer_states_of(store, man),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
                clips_removed=not have, artifact_url=meta.get("artifact_url"))
@@ -1209,12 +1212,18 @@ def cloud_bundle(json_path, artifact_url=None):
             "applied": out["applied"], "answered": len(out["answers"]), "items": len(man["items"])}
 
 
+def _cloud_answer(a):
+    """Ответ для облака: без служебных полей ноутбука и без локального пути к голосовому файлу.
+    Подпись применённого ответа (applied_answers — список) идёт как есть."""
+    return {f: x for f, x in a.items() if f not in _ANSWER_LOCAL} if isinstance(a, dict) else a
+
+
 def _cloud_item(it):
-    """Карточка для облака: без отпечатка слов паузы и без служебных полей ответов в истории."""
+    """Карточка для облака: без отпечатка слов паузы, служебных полей и путей ответов в истории."""
     out = {f: x for f, x in it.items() if f != "listen_fp"}
     if it.get("history"):
-        out["history"] = [dict(h, answer={f: x for f, x in h["answer"].items() if f not in _ANSWER_PRIVATE})
-                          if isinstance(h.get("answer"), dict) else dict(h) for h in it["history"]]
+        out["history"] = [dict(h, answer=_cloud_answer(h["answer"])) if isinstance(h.get("answer"), dict)
+                          else dict(h) for h in it["history"]]
     return out
 
 

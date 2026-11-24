@@ -354,6 +354,36 @@ class ClipTests(Case):
             self.assertEqual(Path(self.item(jp, "r2")["clip"]).parent.as_posix(), man["clips_dir"])
 
 
+class CloudTests(Case):
+    def test_cloud_bundle_carries_no_local_paths(self):
+        """Находка П-13а-1: путь к голосовому файлу на этом компьютере (поле ответа audio) не уходит в облако —
+        ни из ответов, ни из applied_answers, ни из ответов в истории карточки; других путей ноутбука тоже нет."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                user = "secret-user-13a"
+                voice = str(Path(_TMP) / "Users" / user / "voice" / "r1.webm")
+                self.save(jp, version, "r1", kind="free", text="вон", audio=voice, heard=True)
+                self.assertEqual(self.outcomes(core.apply_answers_files(jp, md))["r1"], "applied")
+                review_pack.upsert_cards(jp, [question("r1", "вам", "Новый вопрос")], why="тест")
+                self.assertEqual(self.item(jp, "r1")["history"][0]["answer"]["audio"], voice)   # на ноутбуке цел
+                self.save(jp, version, "r3", kind="free", text="тот", audio=voice, heard=True)
+                state = review_pack.answers_state(jp)
+                # подпись применённого ответа в виде словаря с путём (на случай прежнего формата)
+                state.setdefault("applied_answers", {})["r3"] = {"kind": "free", "text": "тот", "audio": voice}
+                review_pack._write_answers(jp, state)
+                bundle = review_pack.cloud_bundle(jp)
+                raw = (review_pack.pack_dir(jp) / bundle["files"]["manifest.json"]).read_text(encoding="utf-8")
+                for marker in (user, Path(_TMP).name):
+                    self.assertNotIn(marker, raw, "в облачный пакет попал путь ноутбука")
+                cloud = json.loads(raw)
+                self.assertEqual((cloud["answers"]["r3"]["text"], cloud["answers"]["r3"]["heard"]), ("тот", True))
+                self.assertNotIn("audio", cloud["answers"]["r3"])
+                self.assertEqual(cloud["applied_answers"]["r3"], {"kind": "free", "text": "тот"})
+                [past] = next(i for i in cloud["items"] if i["id"] == "r1")["history"]
+                self.assertEqual(past["answer"]["text"], "вон")
+                self.assertNotIn("audio", past["answer"])
+
+
 class OldPackTests(Case):
     def test_pack_without_rev_is_read_without_rewrite(self):
         """Тест 8: пакет до 13а (без rev, pack_rev, clips_dir) читается как rev 1 / pack_rev 0 без перезаписи."""
