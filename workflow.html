@@ -622,6 +622,17 @@ function effectOf(p) {
   return p.effect || ((p.waits_for || []).length ? "wait" : p.file_state === "changed" ? "recopy" : "replace");
 }
 
+// Чем остановится запись (core._set_stops): повреждённые копии и файлы, изменённые после решения.
+function stopsWords(p) {
+  const changedAfter = p.stops_changed || [];
+  const damaged = (p.stops_for || []).filter(n => !changedAfter.includes(n));
+  const parts = [];
+  if (damaged.length) parts.push(`повреждённая копия (${damaged.map(n => `«${n}»`).join(", ")})`);
+  if (changedAfter.length) parts.push(`файл ${changedAfter.map(n => `«${n}»`).join(", ")}: его изменили после ` +
+    "принятого решения, и программа покажет по нему новый конфликт");
+  return parts.join("; ");
+}
+
 function confirmBox(box, panel, c, p) {
   const ask = node("div", "", "ask");
   const changed = p.file_state === "changed";
@@ -631,9 +642,9 @@ function confirmBox(box, panel, c, p) {
     ? node("p", `Файл «${c.relative_path}» уже равен версии программы. Подтверждение лишь закроет этот конфликт: ` +
         "сам файл не изменится.", "warn")
     : effect === "stopped"
-    ? node("p", `Сейчас файл «${c.relative_path}» не изменится: запись остановит повреждённая копия ` +
-        `(${(p.stops_for || []).map(n => `«${n}»`).join(", ")}). Подтверждение только запишет решение, отменить его ` +
-        "нельзя. Если ту копию разобрать, программа " + (changed
+    ? node("p", `Сейчас файл «${c.relative_path}» не изменится: запись остановит ` + stopsWords(p) +
+        ". Подтверждение только запишет решение, отменить его " +
+        "нельзя. Если тот файл разобрать, программа " + (changed
           ? "не заменит этот изменённый файл, а покажет новый конфликт. Сохраните файл отдельно сами."
           : "заменит файл сама, если вы его с тех пор не меняли, и ваша правка пропадёт из него. Пока идёт замена, " +
             "не сохраняйте этот файл в других программах."), "bad")
