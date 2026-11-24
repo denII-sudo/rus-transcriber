@@ -103,7 +103,8 @@ audio{width:100%;height:36px}
   "use strict";
   const LOCAL = /^(127\.0\.0\.1|localhost)$/.test(location.hostname);
   const REASONS = {asr: "модели расходятся", conf: "модель не уверена", voice: "голоса похожи",
-                   overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь"};
+                   overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь",
+                   contradiction: "противоречие"};
   const NUM = ["1", "2", "3", "4"];
   let man = null, answers = {}, live = {}, showAll = false, api = null;
   const pageSession = typeof window !== "undefined" && window.crypto && window.crypto.randomUUID ?
@@ -370,7 +371,10 @@ audio{width:100%;height:36px}
     stateEl.textContent = "Сохраняю…";
     editing.delete(it.id);
     try {
-      const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a});
+      // примечание человека — только на карточке противоречия (PR 13б, В-3); ответом оно не разбирается
+      const noteEl = it.seen_fp && stateEl.parentElement && stateEl.parentElement.querySelector(".human-note");
+      const note = noteEl ? noteEl.value.trim() : "";
+      const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a, ...(note ? {human_note: note} : {})});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
       render();
@@ -542,7 +546,14 @@ audio{width:100%;height:36px}
       free.append(preview);
     }
     free.onsubmit = (e) => { e.preventDefault(); if (inp.value.trim()) send(it, {text: inp.value.trim()}, state); };
-    c.append(free, state);
+    c.append(free);
+    if (it.seen_fp) {
+      const noteRow = document.createElement("div"); noteRow.className = "free";
+      const note = document.createElement("input"); note.className = "human-note";
+      note.placeholder = "Примечание (необязательно): остаётся в истории записи, в стенограмму не попадает";
+      noteRow.append(note); c.append(noteRow);
+    }
+    c.append(state);
     return c;
   }
 
