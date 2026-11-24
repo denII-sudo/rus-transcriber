@@ -1319,8 +1319,7 @@ def _span_contradiction(data, pairs, text, speaker, by, card):
 
     def decided(w):
         mark = human_confirmation(w, data)
-        return mark if mark and mark["card"] != card and not (by == "human" and mark["via"] == "edit_span") \
-            else None
+        return mark if mark and mark["card"] != card else None      # в том числе своя правка отрезка (В-1)
     words = [w for w, _ in pairs]
     if by != "human":
         touched = [w for w in words if human_touched(w)]
