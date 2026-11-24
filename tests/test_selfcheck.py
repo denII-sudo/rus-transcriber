@@ -123,5 +123,37 @@ class SelfCheck(unittest.TestCase):
         self.assertFalse(Path(env["TEMP"]).exists())
 
 
+    def test_timeout_names_the_limit_in_minutes(self):
+        def run(cmd, **kwargs):
+            raise selfcheck.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        with mock.patch.object(selfcheck.subprocess, "run", side_effect=run):
+            result = selfcheck.run_tests(timeout=720)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["ran"], 0)
+        self.assertEqual(result["error"], "тесты не уложились в 12 мин (720 с)")
+
+
+class InstallerSelfCheckStepTests(unittest.TestCase):
+    """Шаг 10 install.ps1: обещанный предел совпадает с selfcheck, причина без чисел показывается текстом."""
+
+    def setUp(self):
+        self.text = (Path(__file__).resolve().parent.parent / "install.ps1").read_text(encoding="utf-8-sig")
+
+    def test_installer_announces_the_same_limit_as_selfcheck(self):
+        self.assertEqual(selfcheck.TESTS_TIMEOUT % 60, 0)
+        minutes = selfcheck.TESTS_TIMEOUT // 60
+        self.assertIn(f"предел — {minutes} мин. Окно не закрывайте", self.text)
+        # объявление стоит до запуска selfcheck.py, иначе человек видит молчание
+        self.assertLess(self.text.index("Окно не закрывайте"), self.text.index('(Join-Path $Target "selfcheck.py")'))
+
+    def test_installer_shows_the_error_instead_of_empty_counts(self):
+        step = self.text[self.text.index('Step "10/10"'):]
+        error_at = step.index("if ($t -and $t.error) {")
+        counts_at = step.index("тестов {1}, падений {2}")
+        self.assertLess(error_at, step.index("} else {", error_at))
+        self.assertLess(step.index("} else {", error_at), counts_at)
+        self.assertIn("самопроверка: $($t.error)", step)
+
 if __name__ == "__main__":
     unittest.main()

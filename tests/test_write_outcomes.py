@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -323,9 +324,12 @@ class RestoreFromBackupNamesWhatIsNotWritten(unittest.TestCase):
     setUp = test_p5_screen.P5ServiceTests.setUp
     tearDown = test_p5_screen.P5ServiceTests.tearDown
     make_recording = test_p5_screen.P5ServiceTests.make_recording
+    change_text = test_p5_screen.P5ServiceTests.change_text
 
-    def restore(self, names=()):
+    def restore(self, names=(), later_revisions=0):
         ident, root_id, doc_paths = self.make_recording()
+        for number in range(later_revisions):      # ревизии за первой: они ждут её, пока файл занят
+            self.change_text(ident, root_id, f"правка{number}")
         backup = self.base / "backup.sqlite3"
         core.backup_store(backup)
         user_id = self.store.current_identity()["user_id"]
@@ -345,6 +349,24 @@ class RestoreFromBackupNamesWhatIsNotWritten(unittest.TestCase):
         self.assertIn("защищён от записи", first)
         self.assertIn("sync_recording_documents", first)
         self.assertTrue(any(ident in line for line in report["warning"][1:]))
+        self.assertTrue(report["warning"][1].endswith("файл занят другой программой или защищён от записи"),
+                        report["warning"][1])
+
+    def test_warning_lines_tell_the_busy_revision_from_the_one_waiting_behind_it(self):
+        ident, report = self.restore(["json"], later_revisions=1)
+        rows = sorted(report["not_written"], key=lambda row: row["document_revision"])
+        self.assertEqual([row["recording_id"] for row in rows], [ident, ident])
+        busy_row, waiting_row = rows
+        self.assertEqual(busy_row["error_code"], "busy")
+        self.assertNotEqual(waiting_row["error_code"], "busy")
+        lines = report["warning"][1:3]
+        self.assertEqual(len(lines), 2, report["warning"])
+        busy_line, waiting_line = (next(x for x in lines if f"ревизия {row['document_revision']}:" in x)
+                                   for row in (busy_row, waiting_row))
+        self.assertTrue(busy_line.endswith("файл занят другой программой или защищён от записи"), busy_line)
+        self.assertTrue(waiting_line.endswith("ждёт предыдущую ревизию этой записи"), waiting_line)
+        self.assertNotIn("занят", waiting_line)
+        self.assertNotIn("ждёт предыдущую", busy_line)
 
     def test_restore_that_wrote_everything_has_no_such_warning(self):
         ident, report = self.restore()
@@ -418,10 +440,14 @@ class OneRussianTextEverywhere(unittest.TestCase):
                     "    raise core.CoreError(message)\n"
                     "core.apply_answers_files = refused\n"
                     "sys.argv = ['review_page.py', sys.argv[1], '--status', sys.argv[2], '--markdown', sys.argv[3],"
-                    " '--port', '19380']\n"
+                    " '--port', sys.argv[5]]\n"
                     "review_page.main()\n")
+            with socket.socket() as probe:      # свободный порт: постоянный мог быть занят другой программой
+                probe.bind(("127.0.0.1", 0))
+                port = min(probe.getsockname()[1], 65535 - 20)      # bind_free_port перебирает 20 портов вверх
             proc = subprocess.Popen([sys.executable, "-B", "-c", code, str(root / "demo.transcript.json"),
-                                     str(status), str(root / "demo.transcript.md"), message], cwd=str(REPO), env=env,
+                                     str(status), str(root / "demo.transcript.md"), message, str(port)],
+                                    cwd=str(REPO), env=env,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 url = None
