@@ -207,15 +207,19 @@ class ReplaceTests(Case):
                 self.assertEqual([c["id"] for c in self.item(jp, "r3")["history"][0]["conflicts"]], ["r3"])
                 self.assertEqual(self.item(jp, "r1")["history"][0]["answer"]["option"], 1)
                 state["answers"]["r1"] = stale                    # как после обрыва между manifest и ответами
+                free = {k: v for k, v in stale.items() if k != "option"}
+                state["answers"]["r3"] = dict(free, id="r3", kind="free", text="тута")   # свой текст старой редакции
                 review_pack._write_answers(jp, state)
                 decisions, rep = review_pack.decisions(jp)
                 self.assertEqual(decisions, [])
                 self.assertIn("r1", rep["unanswered"])
+                self.assertEqual(review_pack.free_answers(jp), {})
                 self.assertNotIn("r1", review_pack.answer_states(jp))
                 self.assertNotIn("r1", json.loads((review_pack.pack_dir(jp) / review_pack.cloud_bundle(jp)["files"]
                                                    ["manifest.json"]).read_text(encoding="utf-8"))["answers"])
                 core.apply_answers_files(jp, md)
-                self.assertEqual(self.texts(jp)["w1"], "вот", "ответ старой редакции применился")
+                self.assertEqual((self.texts(jp)["w1"], self.texts(jp)["w3"]), ("вот", "та"),
+                                 "ответ старой редакции применился")
 
     def test_late_card_is_checked_against_its_own_transcript_revision(self):
         """Условие архитектора (б), (в): карточка, собранная позже пакета, сверяется при «Применить» с ревизией,
