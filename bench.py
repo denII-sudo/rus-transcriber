@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -566,21 +567,50 @@ def choice_summary(results, family, threshold):
 
 
 
+def _third_model_name(variant, model):
+    """Имя третьей модели варианта: у Whisper — asr_third_model или Whisper large-v3-turbo, у других — asr_model."""
+    if variant.get("family") == WHISPER:
+        return variant.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
+    return variant.get("asr_model", model)
+
+
 def run_one(variant, npy, model, chunk_max, max_repeat=3):
     """Выполняется в дочернем процессе: грузит бэкенд, распознаёт куски, печатает JSON.
-    max_repeat — asr_third_max_repeat родительского процесса (для подсчёта слов третьей модели)."""
+    max_repeat — asr_third_max_repeat родительского процесса (чистка текста третьей модели).
+
+    Методика bench-2 (runinfo.METHOD_VERSION): вариант считается теми же функциями, что расшифровка.
+    Куски — words.make_chunks по всему отрывку как одной области речи (диаризации в тесте нет), у третьей
+    модели — worker.whisper_plan (Whisper — до 28 с, другая модель — куски основного прохода). Основная
+    и вторая модели — worker.timestamped_pass: слова со временами и сведения о кусках. Третья модель —
+    transcribe_texts со сведениями о кусках, как в worker.whisper_pass, слова — worker._whisper_words
+    (та же чистка). Цепочка движков и повтор на CPU из whisper_pass не берутся: тест меряет один заданный
+    вариант. PyTorch (эталон точности) времён слов не отдаёт: у него, как раньше, только текст по
+    кускам worker.split_at_pauses без нахлёста."""
     from backends import OnnxASR, TorchASR, WhisperCT2, WhisperOV, make_asr
-    from worker import split_at_pauses
+    import transcript
+    import worker
     audio = np.load(npy)
+    dur = len(audio) / SR
     family = variant.get("family", RNNT)
-    if family == WHISPER:            # Whisper всё равно считает окно 30 с
-        chunk_max = max(float(chunk_max), 28.0)
-    chunks = split_at_pauses(audio, 0.0, len(audio) / SR, max_len=chunk_max,
-                             search=min(4.0, chunk_max / 2))
-    pieces = [audio[int(s * SR):int(e * SR)] for s, e in chunks]
+    third_family = family in THIRD_FAMILIES
+    model = variant.get("asr_model", model)
+    if family == TORCH:
+        cuts = worker.split_at_pauses(audio, 0.0, dur, max_len=chunk_max, search=min(4.0, chunk_max / 2))
+        chunks = [{"a": s, "b": e, "own": (s, e)} for s, e in cuts]
+    else:
+        chunks = W.make_chunks(audio, [(0.0, dur)], max_len=float(chunk_max))
+    plan = None
+    if third_family:
+        plan = worker.whisper_plan(audio, [(0.0, dur)], chunks,
+                                   {"asr_third_model": _third_model_name(variant, model), "asr_third_mode": "all",
+                                    "asr_third_max_repeat": max_repeat},
+                                   types.SimpleNamespace(whisper="all", whisper_max_repeat=max_repeat),
+                                   [], None)
+        pieces = plan["pieces"]
+    else:
+        pieces = [audio[int(c["a"] * SR):int(c["b"] * SR)] for c in chunks]
     if not pieces:
         raise RuntimeError("не удалось нарезать запись на куски")
-    model = variant.get("asr_model", model)
     from backends import actual_providers
     cache0 = runinfo.cache_counts(paths.CACHE)       # до загрузки: по разнице видно компиляцию и скачивание
     fallbacks = []
@@ -588,7 +618,7 @@ def run_one(variant, npy, model, chunk_max, max_repeat=3):
     if variant["asr_backend"] == "torch":
         asr = TorchASR(model)
     elif family == WHISPER:
-        third = variant.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
+        third = _third_model_name(variant, model)
         if variant["asr_backend"] == "whisper-ov":
             asr = WhisperOV(third, device="GPU", quant=variant.get("asr_third_quant", "fp16"),
                             language="ru", batch=4)
@@ -610,29 +640,50 @@ def run_one(variant, npy, model, chunk_max, max_repeat=3):
                       pad_to=variant.get("pad_to_seconds", 0), batch=variant.get("asr_batch", 1),
                       quant=variant.get("quant") or None,
                       allow_npu=bool(variant.get("allow_npu", False)))
-    # прогрев: первая компиляция/загрузка не должна попадать в замер скорости
+    # прогрев тем же вызовом на первом куске: первая компиляция/загрузка не должна попадать в замер скорости
     t_first = time.time()
-    if family == WHISPER:
+    if third_family:
         asr.transcribe_texts(pieces[:1])
-    else:
+    elif family == TORCH:
         asr.transcribe(pieces[0])
+    else:
+        asr.transcribe_timestamped(pieces[:1])
     t_first = time.time() - t_first
     load = time.time() - t0
     cache1 = runinfo.cache_counts(paths.CACHE)       # вне замеряемых интервалов
+    diagnostics = []
     t1 = time.time()
-    if family == WHISPER:
-        texts = asr.transcribe_texts(pieces)
-    else:
+    if third_family:
+        texts = asr.transcribe_texts(pieces, diagnostics=diagnostics)
+    elif family == TORCH:
         texts = asr.transcribe_many(pieces)
+    else:
+        quality = {"asr_diagnostics": {}, "asr_run": {"models": {}}}
+        hyp = worker.timestamped_pass(family, asr, audio, chunks, quality, model, None)
+        diagnostics = quality["asr_diagnostics"][family]["chunks"]
     work = time.time() - t1
-    chunk_words = [chunk_word_count(t, family, max_repeat) for t in texts]   # вне замеряемого интервала
+    # вне замеряемого интервала: слова гипотезы и слова кусков по правилу конвейера
+    if third_family:
+        hyp, _ = worker._whisper_words(plan, texts, diagnostics, [])
+        whisper = transcript.asr_model_caps(plan["model"])["whisper"]
+        chunk_words = [sum(1 for t in W.third_text(tx, max_repeat, whisper)[0].split() if W.norm_word(t))
+                       for tx in texts]
+        text = " ".join(hyp)
+    elif family == TORCH:
+        hyp, diagnostics = None, None
+        chunk_words = [chunk_word_count(t, family, max_repeat) for t in texts]
+        text = " ".join(texts)
+    else:
+        chunk_words = [sum(1 for w in hyp if c["own"][0] - 1e-3 <= w["s"] < c["own"][1] + 1e-3
+                           and W.norm_word(w["w"])) for c in chunks]
+        text = " ".join(w["w"] for w in hyp)
     # что получилось фактически: имя бэкенда после прогона (пакет мог откатиться на поштучное),
     # провайдеры сессии, откаты make_asr — по ним видно, что «GPU» на самом деле посчитан на процессоре
     fact = {"backend_name": getattr(asr, "name", None),
             "providers_actual": actual_providers(getattr(asr, "model", None)) or None,
             "compile_sec": getattr(asr, "compile_sec", None),
             "fallbacks": [str(x)[:200] for x in fallbacks] or None,
-            # слова куска — по правилу конвейера (chunk_word_count); пустой кусок — 0 слов
+            # слова куска — по правилу конвейера; пустой кусок — 0 слов
             "chunk_words": chunk_words,
             "empty_chunks": chunk_words.count(0),
             "peak_memory_mb": runinfo.peak_memory_mb(),
@@ -640,7 +691,8 @@ def run_one(variant, npy, model, chunk_max, max_repeat=3):
     print("@@RESULT@@" + json.dumps({"load_sec": round(load, 1), "first_chunk_sec": round(t_first, 1),
                                      "asr_sec": round(work, 3), "chunks": len(pieces),
                                      "family": family, "device": device_of(variant), **fact,
-                                     "text": " ".join(texts)}, ensure_ascii=False))
+                                     "text": text, "hyp_words": hyp, "diagnostics": diagnostics},
+                                    ensure_ascii=False))
 
 
 def best_of(results, family, min_similarity=0.97):
@@ -706,12 +758,19 @@ def family_refs(results):
     return refs
 
 
-def tiebreak_stats(main_text, ctc_text, third_text):
-    """Чем третья модель помогла бы голосованию «два из трёх» (words.vote3) на этих текстах.
+def tiebreak_stats(main, ctc, third, diagnostics=None):
+    """Чем третья модель помогла бы голосованию «два из трёх» на этих гипотезах.
 
-    contested — слова RNN-T, с которыми CTC не согласен (только там третья модель что-то решает);
-    for_rnnt — из них третья модель согласна с RNN-T; for_ctc — согласна с CTC (vote3 заменил бы
-    слово); unresolved — разошлись все три (останется спорным для человека).
+    main и ctc — слова основной и второй модели со временами (bench-2: из worker.timestamped_pass) или
+    текст (прежний вызов: слова получают нулевые времена); third — слова-строки третьей модели или текст.
+    Голосование — words.combine_hypotheses, как в расшифровке; diagnostics — сведения о кусках
+    {"primary"|"second"|"whisper": {"chunks": [...]}}: сбойный кусок другой модели исключает из
+    голосования только свой отрезок.
+
+    contested — слова основной, с которыми вторая не согласна (только там третья модель что-то решает);
+    for_rnnt — из них третья модель согласна с основной; for_ctc — голосование заменило слово;
+    unresolved — разошлись все три (останется спорным для человека); inserted — вставлено;
+    skipped_spans — сколько отрезков исключено из голосования (только при diagnostics).
     Это согласие моделей между собой, а не точность: эталонной расшифровки человеком здесь нет.
     Числа e2e-моделей пишут цифрами, а Multilingual — словами, поэтому числа попадают в unresolved.
     """
@@ -720,19 +779,29 @@ def tiebreak_stats(main_text, ctc_text, third_text):
 
     def toks(text):          # как в расшифровке: токен из одних знаков («—») — не слово
         return [t for t in (text or "").split() if W.norm_word(t)]
-    main = [{"w": w, "s": 0.0, "e": 0.0} for w in toks(main_text)]
-    ctc = [{"w": w, "s": 0.0, "e": 0.0} for w in toks(ctc_text)]
-    third = toks(third_text)
+
+    def timed(x):
+        if isinstance(x, str) or x is None:
+            return [{"w": w, "s": 0.0, "e": 0.0} for w in toks(x)]
+        return [w for w in x if W.norm_word(w["w"])]
+    main, ctc = timed(main), timed(ctc)
+    third = toks(third) if isinstance(third, str) or third is None else [t for t in third if W.norm_word(t)]
     a = [W.norm_word(w["w"]) for w in main]
     ag_ctc, _ = W._ops(a, [W.norm_word(w["w"]) for w in ctc])
     ag_third, _ = W._ops(a, [W.norm_word(w) for w in third])
     contested = sum(1 for x in ag_ctc if not x)
     for_rnnt = sum(1 for x, y in zip(ag_ctc, ag_third) if not x and y)
     voted = copy.deepcopy(main)
-    st = W.vote3(voted, copy.deepcopy(ctc), third)
-    return {"contested": contested, "for_rnnt": for_rnnt, "for_ctc": st["replaced"],
-            "unresolved": st["disputed"], "inserted": st["inserted"]}
-
+    fused = W.combine_hypotheses({"primary": voted, "second": copy.deepcopy(ctc), "whisper": third},
+                                 diagnostics or {})
+    st = fused["quality"].get("vote") or {}
+    out = {"contested": contested, "for_rnnt": for_rnnt, "for_ctc": st.get("replaced", 0),
+           "unresolved": st.get("disputed", 0), "inserted": st.get("inserted", 0)}
+    if diagnostics is not None:
+        out["skipped_spans"] = (fused["quality"].get("vote3_partial") or {}).get("spans", 0)
+        if fused["quality"].get("vote3_skipped"):
+            out["vote_skipped"] = fused["quality"]["vote3_skipped"]
+    return out
 
 
 def saved_settings(main, second=None, whisper=None, model="v3_e2e_rnnt", min_similarity=None):
@@ -900,12 +969,21 @@ def main():
         # польза кандидата в третью модель: считается, только если есть и RNN-T, и CTC
         vote_ok = bool(refs.get(RNNT) and refs.get(CTC))
         if vote_ok:
-            import words as W
+            # bench-2: голосуют гипотезы со временами и сведениями о кусках (как в расшифровке). У эталона
+            # PyTorch времён слов нет — основной гипотезой голосования берётся эталон RNN-T без PyTorch.
+            vote_refs = family_refs([r for r in results if r.get("family") != TORCH])
+            main_ref, ctc_ref = vote_refs.get(RNNT) or refs[RNNT], vote_refs.get(CTC) or refs[CTC]
             for r in results:
                 if r.get("family") in THIRD_FAMILIES and r.get("text", "").strip():
-                    # расшифровка чистит текст любой третьей модели, с её же max_repeat
-                    r["vote"] = tiebreak_stats(refs[RNNT]["text"], refs[CTC]["text"],
-                                               clean_third(r["text"], max_repeat))
+                    hyps = (main_ref.get("hyp_words"), ctc_ref.get("hyp_words"), r.get("hyp_words"))
+                    diags = (main_ref.get("diagnostics"), ctc_ref.get("diagnostics"), r.get("diagnostics"))
+                    if all(h is not None for h in hyps) and all(d is not None for d in diags):
+                        r["vote"] = tiebreak_stats(*hyps, {"primary": {"chunks": diags[0]},
+                                                           "second": {"chunks": diags[1]},
+                                                           "whisper": {"chunks": diags[2]}})
+                    else:      # результат без гипотез (подмена в тестах): текст, как в bench-1
+                        r["vote"] = tiebreak_stats(main_ref["text"], ctc_ref["text"],
+                                                   clean_third(r["text"], max_repeat))
 
         main_family = CTC if "ctc" in str(a.model).lower() else RNNT
         best_main = best_of(results, main_family, threshold)
@@ -1043,6 +1121,9 @@ def main():
         texts = {r["id"]: r.get("text", "") for r in results}
         for r in results:
             r.pop("text", None)
+            # слова гипотез и сведения о кусках нужны только голосованию отчёта: в файл прогона не идут
+            r.pop("hyp_words", None)
+            r.pop("diagnostics", None)
         # Файл прогона — история: он не перезаписывается, в отличие от bench_report.md и bench_texts.json,
         # которые по-прежнему хранят только последний прогон.
         cond_end = runinfo.conditions(paths.JOBS, slot_limit, own_slots=1, load_interval=0.0)

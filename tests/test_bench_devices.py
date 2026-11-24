@@ -794,7 +794,13 @@ class ChunkWordCountTests(unittest.TestCase):
         import backends
         tmp = Path(tempfile.mkdtemp(prefix="rt-bench-one-", dir=_TMP))
         npy = tmp / "audio.npy"
-        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))      # 20 + 20 + 5 с
+        # bench-2: куски — words.make_chunks, как в расшифровке (у основной 4 куска, у Whisper — 2)
+        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))
+        import types
+
+        def res(*toks):
+            return types.SimpleNamespace(tokens=[" " + t for t in toks], logprobs=None,
+                                         timestamps=[0.5 + 0.3 * i for i in range(len(toks))])
 
         class FakeOnnx:
             name = "cpu"
@@ -802,11 +808,10 @@ class ChunkWordCountTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            def transcribe(self, piece):
-                return "раз"
-
-            def transcribe_many(self, pieces):
-                return ["", ". , —", "раз два три"][:len(pieces)]
+            def transcribe_timestamped(self, pieces, progress=None, diagnostics=None):
+                if diagnostics is not None:
+                    diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                return [res(), res(".", ",", "—"), res("раз", "два", "три"), res("раз", "два", "три")][:len(pieces)]
 
         class FakeWhisper:
             name = "whisper-ct2"
@@ -814,7 +819,9 @@ class ChunkWordCountTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            def transcribe_texts(self, pieces):
+            def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+                if diagnostics is not None:
+                    diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
                 return ["Продолжение следует...", " ".join(f"слово{i}" for i in range(40))][:len(pieces)]
 
         out = io.StringIO()
@@ -825,13 +832,15 @@ class ChunkWordCountTests(unittest.TestCase):
             bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
                           "v3_e2e_rnnt", 20.0)
             # max_repeat родителя (asr_third_max_repeat) доходит до подсчёта слов кусков
-            FakeWhisper.transcribe_texts = lambda self, pieces: ["да " * 6, "слово"][:len(pieces)]
+            FakeWhisper.transcribe_texts = lambda self, pieces, progress=None, diagnostics=None: (
+                diagnostics.extend({"index": i, "state": "ok", "attempts": []} for i in range(len(pieces)))
+                if diagnostics is not None else None) or ["да " * 6, "слово"][:len(pieces)]
             bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
                           "v3_e2e_rnnt", 20.0, 2)
         got = [json.loads(line[len("@@RESULT@@"):]) for line in out.getvalue().splitlines()
                if line.startswith("@@RESULT@@")]
         self.assertEqual([(r["chunks"], r["chunk_words"], r["empty_chunks"]) for r in got],
-                         [(3, [0, 0, 3], 2), (2, [0, 40], 1), (2, [2, 1], 0)])
+                         [(4, [0, 0, 3, 3], 2), (2, [0, 40], 1), (2, [2, 1], 0)])
 
 
 class ConditionsReportTests(unittest.TestCase):

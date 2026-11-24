@@ -152,7 +152,7 @@ class VoteLikeTranscriptionTests(unittest.TestCase):
     def hyps(self):
         main = [wd("раз", 1), wd("два", 2), wd("три", 7), wd("четыре", 8)]
         ctc = [wd("пять", 7), wd("четыре", 8)]                    # кусок 0–5 с у второй — ошибка
-        third = ["раз", "шесть", "пять", "четыре"]
+        third = ["раз", "два", "пять", "четыре"]
         diag = {"primary": {"chunks": [{"state": "ok", "own_span": [0.0, 5.0]},
                                        {"state": "ok", "own_span": [5.0, 10.0]}]},
                 "second": {"chunks": [{"state": "error", "own_span": [0.0, 5.0]},
@@ -169,7 +169,10 @@ class VoteLikeTranscriptionTests(unittest.TestCase):
         self.assertEqual((got["for_ctc"], got["unresolved"], got["inserted"]),
                          (vote["replaced"], vote["disputed"], vote["inserted"]))
         self.assertEqual(got["skipped_spans"], 1)
-        self.assertEqual(got["for_ctc"], 1)                   # «три» → «пять» вне сбойного отрезка
+        # прежний подсчёт по текстам сбойного куска не видел и считал голосование по всей записи
+        old = bench.tiebreak_stats(" ".join(w["w"] for w in main), " ".join(w["w"] for w in ctc),
+                                   " ".join(third))
+        self.assertNotEqual((old["for_ctc"], old["unresolved"]), (got["for_ctc"], got["unresolved"]))
 
     def test_text_arguments_keep_old_meaning(self):
         self.assertEqual(bench.tiebreak_stats("раз два три", "раз пять три", "раз шесть три"),
