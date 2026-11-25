@@ -137,7 +137,7 @@ def recording_list():
                        "Как перенести их в базу — docs/legacy-migration.md.")
         return {"available": False, "items": [], "total": 0, "truncated": False, "reason": reason,
                 "backend": backend}
-    store = recordings.open_store()
+    store = recordings.open_store(readonly=True)    # только чтение (query_only)
     try:
         store.current_identity()
         store.db.execute("BEGIN")    # одна транзакция чтения: строки списка — из одного состояния базы
@@ -164,7 +164,7 @@ def recording_view(recording_id):
         storage._uuid(recording_id)
     except ValueError:
         raise core.CoreError("Неверный номер записи.") from None
-    store = recordings.open_store()
+    store = recordings.open_store(readonly=True)    # только чтение (query_only)
     try:
         store.current_identity()
         if recordings.recording_head(store, recording_id) is None:
