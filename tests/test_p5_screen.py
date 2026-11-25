@@ -13,16 +13,18 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import documents
 import model_tasks
 import paths
 import recordings
+import settings
 import storage
 import workflow
 
 import core
+import core_screen
 import rt
 import workflow_page
 
@@ -263,6 +265,236 @@ class P5ServiceTests(unittest.TestCase):
         # без mapping мастер не выполняется
         with self.assertRaises(core.CoreError):
             core.restore_from_backup(backup, self.base / "other.sqlite3", {}, user_id)
+
+
+class ScreenRecordingListTests(unittest.TestCase):
+    """М-5: список всех записей базы на экране и открытие записи без запроса — только чтение."""
+
+    def setUp(self):
+        self.base = sandbox(self)
+        self.patcher = mock.patch.object(paths, "STATE_DB", self.base / "state.sqlite3")
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.store = storage.initialize(self.base / "state.sqlite3", initial_display_name="Тест")
+        self.addCleanup(self.store.close)
+
+    def make_recording(self, name, *, quality=None, review=(), title=None, recorded_at=None, materialize=True):
+        source = self.base / "Записи" / name
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(b"synthetic")
+        layout = recordings.document_layout(source, "")
+        layout["root"].mkdir()
+        root_id, doc_paths = recordings.prepare_new_layout(self.store, layout["root"], layout["paths"])
+        ident = str(uuid.uuid4())
+        words = [{"w": "секретное", "s": 0, "e": 1}, {"w": "слово", "s": 1, "e": 2}]
+        data = {"file": str(source), "duration": "00:00:02", "speakers": ["Анна Тестова"],
+                "names_confirmed": True, "quality": dict(quality or {}), "review": [], "review_done": False,
+                "segments": [{"start": 0, "end": 2, "speaker": "Анна Тестова", "words": words}]}
+        if title is not None:
+            data["title"] = title
+        if recorded_at is not None:
+            data["recorded_at"] = recorded_at
+        recordings.commit_worker_result(
+            self.store, data, source, root_id, recordings.operation_context(self.store, "model"),
+            recording_id=ident, operation_id=str(uuid.uuid4()),
+            generated_at="2026-01-01T00:00:00Z", document_paths=doc_paths)
+        if review:
+            current = self.store.get_current(ident)
+            payload = current["review"]["payload"]
+            payload["review"] = [dict(item, id=f"r{index}", t=0, t1=0, t2=1, text="секретное")
+                                 for index, item in enumerate(review, 1)]
+            self.store.commit_change_with_document(
+                ident, {"source_revision": 1, "review_revision": 1}, str(uuid.uuid4()),
+                recordings.operation_context(self.store, "human"), review=payload, root_id=root_id,
+                generated_at="2026-01-01T00:01:00Z")
+        if materialize:
+            recordings.materialize_recording(self.store, ident)
+        return ident
+
+    def by_name(self):
+        return {item["name"]: item for item in core_screen.recording_list()["items"]}
+
+    def test_without_store_the_list_explains_why_it_is_empty(self):
+        self.store.close()
+        (self.base / "state.sqlite3").unlink()
+        with mock.patch.object(settings, "recording_backend", return_value="legacy_files"):
+            listed = core_screen.recording_list()
+        self.assertEqual((listed["available"], listed["items"], listed["total"]), (False, [], 0))
+        self.assertIn("Базы записей ещё нет", listed["reason"])
+        self.assertIn("legacy-migration", listed["reason"])
+        with mock.patch.object(settings, "recording_backend", return_value="sqlite"):
+            self.assertNotIn("в файлах", core_screen.recording_list()["reason"])
+
+    def test_empty_store_lists_nothing(self):
+        listed = core_screen.recording_list()
+        self.assertEqual((listed["available"], listed["items"], listed["total"], listed["truncated"]),
+                         (True, [], 0, False))
+
+    def test_rows_show_origin_variant_request_and_names(self):
+        program = self.make_recording("Встреча.wav", title="Планёрка", recorded_at="2026-11-01T10:00:00")
+        self.make_recording("Старая.wav", quality={"migration": {"tool": "t", "variant": {"tag": "a", "main": True}}})
+        self.make_recording("Старая-2.wav", quality={"migration": {"tool": "t", "variant": {"tag": "b", "main": False}}})
+        self.make_recording("Старая-3.wav", quality={"migration": {"tool": "t"}})
+        request = workflow.create(self.store, self.base / "Записи" / "Встреча.wav", {"require_conspect": False})
+        with self.store._transaction():
+            self.store.db.execute("UPDATE workflow_requests SET recording_id=? WHERE request_id=?", (program, request))
+        rows = self.by_name()
+        self.assertEqual(set(rows), {"Встреча.wav", "Старая.wav", "Старая-2.wav", "Старая-3.wav"})
+        first = rows["Встреча.wav"]
+        self.assertEqual((first["origin"], first["variant"], first["title"], first["recorded_at"], first["duration"]),
+                         ("program", None, "Планёрка", "2026-11-01T10:00:00", "00:00:02"))
+        self.assertEqual(first["request"], {"request_id": request, "state": workflow.get(self.store, request)["state"]})
+        self.assertIs(first["names_confirmed"], True)
+        self.assertIsNone(first["error"])
+        self.assertEqual((rows["Старая.wav"]["origin"], rows["Старая.wav"]["variant"]),
+                         ("migrated", {"tag": "a", "main": True}))
+        self.assertEqual(rows["Старая-2.wav"]["variant"], {"tag": "b", "main": False})
+        self.assertEqual(rows["Старая-3.wav"]["variant"], {"tag": None, "main": None})
+        self.assertIsNone(rows["Старая.wav"]["request"])
+
+    def test_places_are_counted_by_the_program_rule(self):
+        self.make_recording("Разбор.wav", review=[{"status": "open"}, {"status": "human"},
+                                                  {"status": "resolved"}, {}])
+        self.make_recording("Чисто.wav", review=[{"status": "resolved"}])
+        self.make_recording("Пусто.wav")
+        rows = self.by_name()
+        self.assertEqual(rows["Разбор.wav"]["places"], {"unresolved": 3, "open": 2, "total": 4})
+        self.assertEqual(rows["Чисто.wav"]["places"], {"unresolved": 0, "open": 0, "total": 1})
+        self.assertEqual(rows["Пусто.wav"]["places"], {"unresolved": 0, "open": 0, "total": 0})
+
+    def test_document_state_conflicts_and_conspects(self):
+        synced = self.make_recording("Записана.wav")
+        self.make_recording("Ждёт.wav", materialize=False)
+        conflicted = self.make_recording("Конфликт.wav")
+        failed = self.make_recording("Сбой.wav")
+        binding = recordings.document_binding(self.store, conflicted)
+        (Path(binding["root"]) / binding["paths"]["md"]).write_text("внешняя правка", encoding="utf-8")
+        self.change_text(conflicted)
+        with self.store._transaction():
+            self.store.db.execute("UPDATE document_outbox SET state='error' WHERE recording_id=?", (failed,))
+        binding = recordings.document_binding(self.store, synced)
+        self.store.save_conspect(
+            synced, str(uuid.uuid4()), "заметки", 1, None, {"sections": []}, b'{"sections": []}', b"# synthetic\n",
+            "заметки.conspect.json", "заметки.conspect.md", binding["root_id"], str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"))
+        rows = self.by_name()
+        self.assertEqual({name: row["document_sync"] for name, row in rows.items()},
+                         {"Записана.wav": "synced", "Ждёт.wav": "pending", "Конфликт.wav": "conflict",
+                          "Сбой.wav": "error"})
+        self.assertEqual(rows["Конфликт.wav"]["open_conflicts"], 1)
+        self.assertEqual(rows["Записана.wav"]["open_conflicts"], 0)
+        self.assertEqual((rows["Записана.wav"]["conspects"], rows["Ждёт.wav"]["conspects"]), (1, 0))
+        # решённый конфликт не считается открытым
+        with self.store._transaction():
+            self.store.db.execute(
+                "UPDATE document_conflicts SET resolution_operation_id=(SELECT operation_id FROM operations LIMIT 1) "
+                "WHERE recording_id=?", (conflicted,))
+        self.assertEqual(self.by_name()["Конфликт.wav"]["open_conflicts"], 0)
+
+    def change_text(self, ident):
+        current = self.store.get_current(ident)
+        transcript = current["transcript"]["payload"]
+        transcript["segments"][0]["words"][1]["w"] = "исправлено"
+        binding = recordings.document_binding(self.store, ident)
+        self.store.commit_change_with_document(
+            ident, {"source_revision": current["transcript"]["revision"],
+                    "review_revision": current["review"]["revision"]},
+            str(uuid.uuid4()), recordings.operation_context(self.store, "human"),
+            transcript=transcript, review=current["review"]["payload"], root_id=binding["root_id"],
+            generated_at="2026-01-01T00:02:00Z")
+        recordings.materialize_recording(self.store, ident)
+
+    def test_list_shows_no_paths_text_or_speaker_names(self):
+        self.make_recording("Встреча.wav", review=[{"status": "open"}])
+        dumped = json.dumps(core_screen.recording_list(), ensure_ascii=False)
+        for secret in (str(self.base), "Записи", "секретное", "Анна", "segments", "words", "location", "speakers"):
+            self.assertNotIn(secret, dumped)
+        self.assertIn("Встреча.wav", dumped)
+
+    def test_latest_change_comes_first(self):
+        first = self.make_recording("Первая.wav")
+        self.make_recording("Вторая.wav")
+        operations = [row[0] for row in self.store.db.execute("SELECT created_at FROM operations ORDER BY created_at")]
+        self.assertEqual(len(set(operations)), len(operations))
+        self.assertEqual([item["name"] for item in core_screen.recording_list()["items"]], ["Вторая.wav", "Первая.wav"])
+        self.change_text(first)
+        self.assertEqual([item["name"] for item in core_screen.recording_list()["items"]], ["Первая.wav", "Вторая.wav"])
+
+    def test_unreadable_row_is_marked_and_the_rest_still_listed(self):
+        broken = self.make_recording("Сломана.wav")
+        self.make_recording("Целая.wav")
+        with self.store._transaction():
+            self.store.db.execute("UPDATE transcript_revisions SET payload='{' WHERE recording_id=?", (broken,))
+        rows = self.by_name()
+        self.assertIn("сломана.wav", rows)    # имя — из пути в базе, он хранится в нижнем регистре
+        self.assertTrue(rows["сломана.wav"]["error"].startswith("Запись не читается"))
+        self.assertNotIn("places", rows["сломана.wav"])
+        self.assertIsNone(rows["Целая.wav"]["error"])
+        with self.assertRaises((core.CoreError, storage.StorageError)):
+            core_screen.recording_view(broken)
+
+    def test_list_is_capped(self):
+        for name in ("А.wav", "Б.wav", "В.wav"):
+            self.make_recording(name)
+        with mock.patch.object(core_screen, "RECORDING_LIST_LIMIT", 2):
+            listed = core_screen.recording_list()
+        self.assertEqual((len(listed["items"]), listed["total"], listed["truncated"]), (2, 3, True))
+
+    def test_view_matches_request_result_and_rejects_bad_ids(self):
+        ident = self.make_recording("Встреча.wav")
+        request = workflow.create(self.store, self.base / "Записи" / "Встреча.wav", {"require_conspect": False})
+        with self.store._transaction():
+            self.store.db.execute("UPDATE workflow_requests SET recording_id=? WHERE request_id=?", (ident, request))
+        view = core_screen.recording_view(ident)
+        self.assertEqual(view["recording"]["name"], "Встреча.wav")
+        self.assertEqual([item["request_id"] for item in view["requests"]], [request])
+        self.assertEqual(workflow_page.result_view(view["data"]),
+                         workflow_page.result_view(core.read_recording_result(ident)))
+        for bad in ("", "не-номер", str(uuid.uuid4()).upper(), str(uuid.uuid4())):
+            with self.subTest(bad=bad), self.assertRaises(core.CoreError):
+                core_screen.recording_view(bad)
+
+    def test_http_routes_are_read_only_and_guarded(self):
+        ident = self.make_recording("Встреча.wav")
+        srv, url, _ = workflow_page.make_server(8790)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        prefix, host = urlsplit(url).path, f"127.0.0.1:{srv.server_port}"
+
+        def request(method, target, headers=None, body=None):
+            conn = http.client.HTTPConnection(host, timeout=10)
+            try:
+                fields = {"Host": host}
+                fields.update(headers or {})
+                conn.request(method, target, body=body, headers=fields)
+                response = conn.getresponse()
+                return response.status, json.loads(response.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        status, listed = request("GET", prefix + "api/recordings")
+        self.assertEqual((status, [item["recording_id"] for item in listed["items"]]), (200, [ident]))
+        status, opened = request("GET", prefix + f"api/recording?recording_id={ident}")
+        self.assertEqual(status, 200)
+        self.assertEqual(opened["result"], workflow_page.result_view(core.read_recording_result(ident)))
+        self.assertEqual((opened["recording"]["name"], opened["requests"]), ("Встреча.wav", []))
+        self.assertEqual(request("GET", prefix + "api/recordings", {"Host": "evil.example"})[0], 403)
+        self.assertEqual(request("GET", prefix.rstrip("/") + "x/api/recordings")[0], 403)
+        for bad in ("не-номер", str(uuid.uuid4())):
+            with self.subTest(bad=bad):
+                status, error = request("GET", prefix + f"api/recording?recording_id={quote(bad)}")
+                self.assertEqual(status, 400)
+                self.assertRegex(error["error"], "[А-Яа-яЁё]")
+                self.assertNotIn("Traceback", error["error"])
+        # записи через эти адреса нет: POST получает отказ, а не сброс соединения
+        for route in ("api/recordings", "api/recording"):
+            with self.subTest(route=route):
+                status, error = request("POST", prefix + route, {
+                    "Origin": f"http://{host}", "Content-Type": "application/json"}, b'{"recording_id": "x"}')
+                self.assertEqual(status, 404)
+                self.assertIn("error", error)
 
 
 class P5ScreenHTTPTests(unittest.TestCase):

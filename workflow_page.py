@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402,F401
 import core  # noqa: E402
+import core_screen  # noqa: E402  (список записей — напрямую, без переотдачи через core.py)
 import llm_provider  # noqa: E402
 import storage  # noqa: E402
 
@@ -224,6 +225,13 @@ def make_server(port):
                     if not recording_id:
                         return self._send(200, {"recording_id": None})
                     return self._send(200, result_view(core.read_recording_result(recording_id)))
+                if u == "api/recordings":
+                    return self._send(200, core_screen.recording_list())
+                if u == "api/recording":
+                    # запись без запроса: тот же вид результата, что у api/result, и сводка записи рядом
+                    view = core_screen.recording_view(q.get("recording_id", ""))
+                    return self._send(200, {"recording": view["recording"], "requests": view["requests"],
+                                            "result": result_view(view["data"])})
                 if u == "api/conspects":
                     recording_id = q.get("recording_id", "")
                     return self._send(200, {"conspects": core.recording_conspects(recording_id)})
