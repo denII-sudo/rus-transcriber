@@ -44,12 +44,12 @@ PCM = "c0ffee" * 10 + "abcd"            # хэш звука (64 знака): о�
 
 PRIMARY = [{"w": "тест", "s": 0.2, "e": 0.5, "c": 0.9}, {"w": "слово", "s": 0.7, "e": 1.0, "c": 0.4},
            {"w": SECRET, "s": 1.2, "e": 1.5, "c": 0.8}]
-THIRD = ["тест", "слава", SECRET]       # третья спорит только на «слово»
+THIRD = ["тест", "слива", SECRET]       # третья спорит только на «слово»
 QUESTIONS = [
     {"id": "r1", "question": "Как правильно?", "recommended": 1, "options": [
         {"label": "другое", "decision": {"text": "другое"}}, {"label": "тест", "decision": {"text": "тест"}}]},
     {"id": "r2", "question": "Как правильно?", "recommended": 0, "options": [
-        {"label": "слово", "decision": {"text": "слово"}}, {"label": "слава", "decision": {"text": "слава"}}]},
+        {"label": "слово", "decision": {"text": "слово"}}, {"label": "слива", "decision": {"text": "слива"}}]},
 ]
 
 
@@ -212,7 +212,7 @@ class WorkAnalysis(unittest.TestCase):
         rid, _jp = self.src.recording({"r1": {"option": 0}, "r2": {"option": 0}})
         _a, s = self.analyze()
         text = (s / "export" / "analysis.json").read_text(encoding="utf-8")
-        for bad in (SECRET, "другое", "слава", rid, str(self.base), '"r1"', '"r2"', "w1"):
+        for bad in (SECRET, "другое", "слива", rid, str(self.base), '"r1"', '"r2"', "w1"):
             self.assertNotIn(bad, text)
 
     def test_answers_not_of_human_and_unanswered_are_separate_rows(self):
@@ -325,7 +325,7 @@ class Rules(unittest.TestCase):
         self.assertFalse(lab_work.models_agree(rec, 0.7, 1.0))         # «слово» — третья против
         rec["vote_trace"]["roles"] = ["primary", "second"]
         self.assertIsNone(lab_work.models_agree(rec, 0.2, 0.5))
-        self.assertEqual(lab_work.role_texts(hyp_record("r", "s"), 0.7, 1.0)["third"], ["слава"])
+        self.assertEqual(lab_work.role_texts(hyp_record("r", "s"), 0.7, 1.0)["third"], ["слива"])
         self.assertIsNone(lab_work.role_texts(hyp_record("r", "s", heard=False), 0.7, 1.0)["third"])
 
 
