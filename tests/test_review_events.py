@@ -63,6 +63,8 @@ class ReviewEvents(unittest.TestCase):
     def setUp(self):
         recordings._REVIEW_EVENTS_BACKUP_FAILED.clear()
         self.addCleanup(recordings._REVIEW_EVENTS_BACKUP_FAILED.clear)
+        recordings._REVIEW_EVENTS_BACKUP_DONE.clear()
+        self.addCleanup(recordings._REVIEW_EVENTS_BACKUP_DONE.clear)
 
     def test_event_is_a_row_not_a_revision(self):
         """Показ и проигрывание — строки таблицы; номер ревизии разбора не растёт; повтор показа в сессии — нет."""
@@ -207,7 +209,7 @@ class ReviewEvents(unittest.TestCase):
             with mock.patch.object(storage.Store, "backup", side_effect=OSError("no space")) as backup:
                 shown = review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)
                 self.assertFalse(shown["stored"])
-                self.assertEqual(shown["warning"], recordings.REVIEW_EVENTS_NOT_UPGRADED)
+                self.assertTrue(shown["warning"].startswith(recordings.REVIEW_EVENTS_NOT_UPGRADED), shown["warning"])
                 self.assertIn("база не обновлена", shown["warning"])
                 # текст говорит правду: показы не записываются, «прослушано» записывается
                 self.assertIn("показы карточек и проигрывания не записываются", shown["warning"])
@@ -238,6 +240,67 @@ class ReviewEvents(unittest.TestCase):
                     review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)
             self.assertTrue(review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)["stored"])
             self.assertEqual(len(head(jp)["table"]), 1)
+
+    def test_table_retry_reuses_ready_backup(self):
+        """Ф204-3: резерв удался, создание таблицы упало — следующее событие только создаёт таблицу; файл резерва
+        удалён — делается новый резерв."""
+        with files("sqlite") as (jp, _md, version):
+            drop_events_table(jp)
+            folder = head(jp)["db"].parent / "db-backups"
+            real_backup = storage.Store.backup
+            with mock.patch.object(storage.Store, "backup", autospec=True, side_effect=real_backup) as backup, \
+                    mock.patch.object(storage.Store, "create_review_events_table",
+                                      side_effect=storage.Busy("database is busy")):
+                for _ in range(2):
+                    with self.assertRaises(storage.Busy):
+                        review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)
+            self.assertEqual(backup.call_count, 1, "повтор создания таблицы делает новый полный резерв")
+            backups = sorted(folder.glob("*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            self.assertIsNone(head(jp)["table"])
+            self.assertTrue(review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)["stored"])
+            self.assertEqual(sorted(folder.glob("*.sqlite3")), backups)
+            self.assertEqual(len(head(jp)["table"]), 1)
+        with files("sqlite") as (jp, _md, version):
+            drop_events_table(jp)
+            folder = head(jp)["db"].parent / "db-backups"
+            with mock.patch.object(storage.Store, "create_review_events_table",
+                                   side_effect=storage.Busy("database is busy")):
+                with self.assertRaises(storage.Busy):
+                    review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)
+            for path in folder.glob("*.sqlite3"):
+                path.unlink()
+            self.assertTrue(review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)["stored"])
+            self.assertEqual(len(list(folder.glob("*.sqlite3"))), 1, "резерв не сделан заново")
+
+    def test_backup_failure_names_reason(self):
+        """Ф204-4: предупреждение называет причину; совет про диск — только при нехватке места; в журнале страницы
+        (stderr) — категория и тип ошибки, без пути базы; незаконченного файла в db-backups нет."""
+        import contextlib
+        import errno
+        import io
+        cases = (
+            (OSError(errno.ENOSPC, "No space left on device"), recordings.BACKUP_NO_SPACE, True),
+            (PermissionError(errno.EACCES, "Permission denied"), recordings.BACKUP_LOCKED, False),
+            (storage.StorageError("conflict copy hash mismatch"), recordings.BACKUP_INVALID_COPY, False),
+        )
+        for error, reason, disk in cases:
+            with self.subTest(reason=reason), files("sqlite") as (jp, _md, version):
+                recordings._REVIEW_EVENTS_BACKUP_FAILED.clear()
+                drop_events_table(jp)
+                db = head(jp)["db"]
+                stderr = io.StringIO()
+                with mock.patch("storage.validate_copy", side_effect=error), contextlib.redirect_stderr(stderr):
+                    shown = review_pack.add_interaction_event(jp, "r1", version, "card_visible", SESSION)
+                self.assertFalse(shown["stored"])
+                self.assertEqual(shown["warning"], recordings.review_events_warning(reason))
+                self.assertIn(f"Причина: {reason}.", shown["warning"])
+                self.assertEqual("место на диске" in shown["warning"], disk, shown["warning"])
+                self.assertIn("страницу карточек", shown["warning"])
+                log = stderr.getvalue()
+                self.assertIn(f"резерв базы перед обновлением не удался: {reason} ({type(error).__name__})", log)
+                self.assertNotIn(str(db.parent), log)
+                self.assertEqual(list((db.parent / "db-backups").glob("*")), [])
 
     def test_storage_refuses_event_without_table(self):
         with files("sqlite") as (jp, _md, _version):
