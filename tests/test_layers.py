@@ -325,6 +325,30 @@ class ServerGateTests(unittest.TestCase):
         self.assertTrue(result["revoke_removes_all_source_contributions"])
         self.assertIn("у всех", result["warning"])
 
+    def test_resolve_voice_failed_replace_leaves_profile_and_no_temp(self):
+        # аудит 25.11.2026, А6а: при сбое замены профиль прежний и временных файлов не остаётся
+        gd = put_group("lay-tmp")
+        key = str((paths.DATA_DIR / "demo2.wav").resolve())
+        profile = {"version": 3, "sources": {}, "speakers": {},
+                   "quarantine": {key: {"Анна": {"from": "demo2.transcript.json"}}}}
+        raw = json.dumps(profile, ensure_ascii=False)
+        (gd / "voices.json").write_text(raw, encoding="utf-8")
+        with mock.patch.object(confirm, "require"), \
+             mock.patch("os.replace", side_effect=OSError("занято")):
+            with self.assertRaises(OSError):
+                self.server.resolve_voice("Анна", "demo2.transcript.json", "same", "lay-tmp")
+        self.assertEqual((gd / "voices.json").read_text(encoding="utf-8"), raw)
+        self.assertEqual([p.name for p in gd.iterdir() if p.name not in ("voices.json", "vocab.json")], [])
+
+    def test_read_limited_text_refuses_grown_file(self):
+        # аудит 25.11.2026, А6б: файл, выросший после проверки размера, не читается целиком
+        p = paths.DATA_DIR / "lay-limit.md"
+        p.write_bytes("﻿абв".encode("utf-8"))
+        self.assertEqual(self.server._read_limited_text(p, 64), "абв")
+        p.write_bytes(b"x" * 65)
+        with self.assertRaises(ValueError):
+            self.server._read_limited_text(p, 64)
+
     def test_selected_quote_requires_person(self):
         snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}
         report = {"candidates": [{"quote_index": 1, "quote": "альфа бета", "candidates": [

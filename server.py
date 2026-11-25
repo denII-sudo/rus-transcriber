@@ -88,7 +88,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.25.10"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.25.11"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -654,6 +654,15 @@ def apply_review(job_id: str, decisions: list[dict]) -> str:
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
+def _read_limited_text(path, limit):
+    """Читает не больше limit байт: файл мог вырасти после проверки размера."""
+    with open(path, "rb") as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("файл конспекта слишком велик (лимит 2 МиБ)")
+    return data.decode("utf-8-sig")
+
+
 @mcp.tool()
 async def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") -> str:
     """Проверяет цитаты «…» конспекта по стенограмме задачи: дословны ли они и тот ли говорящий.
@@ -679,7 +688,7 @@ async def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str 
         return "Текст конспекта слишком велик (лимит 2 МиБ)"
 
     def run():
-        text = conspect_text or (path.read_text(encoding="utf-8-sig") if path else "")
+        text = conspect_text or (_read_limited_text(path, 2 * 1024 * 1024) if path else "")
         if not text.strip():
             return "Передайте conspect_text или conspect_path"
         res = quotes.check(text, transcript.load(s["json"]))
@@ -1360,12 +1369,8 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
         d["quarantine"][akey].pop(name, None)
         if not d["quarantine"][akey]:
             d["quarantine"].pop(akey)
-        import tempfile
-        import os
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=pf.parent, delete=False) as f:
-            json.dump(d, f, ensure_ascii=False)
-            tmp = f.name
-        os.replace(tmp, pf)
+        import data_io
+        data_io._write_json(pf, d)   # атомарно: fsync, при сбое временный файл убирается
     if decision == "different":
         remaining = sorted(n for n, s in (d.get("speakers") or {}).items()
                            if akey in (s.get("parts") or {}))
