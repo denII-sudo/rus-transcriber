@@ -1062,9 +1062,8 @@ class FilesTests(unittest.TestCase):
         raw.decode("utf-8")
 
     def test_module_is_registered_for_installation(self):
-        root = Path(benchdb.__file__).parent
-        self.assertIn('"benchdb.py"', (root / "install.ps1").read_text(encoding="utf-8"))
-        self.assertIn('"benchdb.py"', (root / "buildinfo.py").read_text(encoding="utf-8"))
+        import buildinfo
+        self.assertIn("benchdb.py", buildinfo.root_files(Path(benchdb.__file__).parent))
 
 
 if __name__ == "__main__":

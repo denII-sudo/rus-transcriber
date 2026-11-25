@@ -13,17 +13,12 @@ import re
 import subprocess
 
 MANIFEST = "build-info.json"
-ROOT_FILES = (
-    "server.py", "worker.py", "bench.py", "runinfo.py", "benchdb.py", "buildinfo.py", "backends.py",
-    "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py",
-    "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
-    "diar_fast.py", "vocab.py", "voices.py", "voice_sources.py", "gender.py", "words.py", "hypotheses.py",
-    "hypstore.py", "hotspots.py",
-    "quotes.py", "conspect.py", "review_pack.py", "freeform.py", "answer_phrases.tsv", "jobslots.py",
-    "settings.py", "migrate.py", "data_io.py", "core.py", "core_voices.py", "core_screen.py", "core_conflicts.py",
-    "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py",
-    "workflow_page.py", "cards.html", "workflow.html", "README.md", "install.ps1",
-)
+# Top-level program files are taken by suffix, so a new module needs no list entry here
+# or in install.ps1. Service scripts belong in tools/, not in the repository root.
+PROGRAM_SUFFIXES = (".py", ".html", ".tsv")
+FIXED_ROOT_FILES = ("README.md", "install.ps1")
+# ASCII only: install.ps1 reads the list from the console, whatever its code page.
+ROOT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 DOC_FILES = (
     "docs/model-download-certificate.md", "docs/2026-11-17-p3-workflow-handoff.md",
     "docs/2026-11-17-p4-opencode-openai-handoff.md", "docs/2026-11-17-p5-screen-handoff.md",
@@ -68,10 +63,34 @@ def file_hash(path):
     return h.hexdigest()
 
 
-def delivery_hashes(here):
-    """Only the agreed installation payload; never traverse worktrees or data."""
+def root_files(here):
+    """Program files at the top level only (never recursive), sorted.
+
+    Hidden or non-ASCII names and transcripts (*.transcript.*, kept out by .gitignore)
+    are not program files. A link with a program name is returned, so hashing or
+    --list-root refuses it instead of silently shipping less.
+    """
+    names = []
+    for path in Path(here).iterdir():
+        name = path.name
+        if not ROOT_NAME.fullmatch(name) or ".transcript." in name.lower():
+            continue
+        if not (name.lower().endswith(PROGRAM_SUFFIXES) or name in FIXED_ROOT_FILES):
+            continue
+        if _link(path) or path.is_file():
+            names.append(name)
+    return tuple(sorted(names))
+
+
+def delivery_hashes(here, root=None):
+    """Only the agreed installation payload; never traverse worktrees or data.
+
+    root limits top-level program files to these names: an installation keeps root
+    files the delivery does not ship, and they are neither hashed nor reported.
+    """
     here = Path(here)
-    names = [n for n in ROOT_FILES + DOC_FILES if (here / n).is_file()]
+    names = [n for n in root_files(here) if root is None or n in root]
+    names += [n for n in DOC_FILES if (here / n).is_file()]
     for sub in SUPPORT_DIRS:
         base = here / sub
         if _link(base):
@@ -120,14 +139,17 @@ def identity(here):
     here = Path(here)
     out = {"release": release(here), "commit": None, "source_state": "unknown",
            "payload_sha256": None, "manifest_status": "missing"}
+    git = (here / ".git").exists()
+    data = None if git else _manifest(here)
     try:
-        files = delivery_hashes(here)
+        # Our own inventory, only filtered by manifest names: no supplied path is read.
+        files = delivery_hashes(here, root=set(data["files"]) if data else None)
         out["payload_sha256"] = payload_hash(files) if files else None
     except (OSError, ValueError):
         out["manifest_status"] = "unreadable"
         return out
     # Do not accidentally inherit a parent repository when examining an installation.
-    if (here / ".git").exists():
+    if git:
         commit = _git(here, "rev-parse", "HEAD")
         status = _git(here, "status", "--porcelain", "--untracked-files=all")
         if commit and SHA.fullmatch(commit):
@@ -135,7 +157,6 @@ def identity(here):
                 "unknown" if status is None else "dirty" if status else "clean"),
                 manifest_status="git")
         return out
-    data = _manifest(here)
     if data:
         unchanged = files == data["files"] and out["release"] == data.get("release")
         out.update(commit=data.get("commit"),
@@ -149,12 +170,12 @@ def identity(here):
 def write_manifest(source, target):
     source, target = Path(source), Path(target)
     wanted = delivery_hashes(source)
-    copied = delivery_hashes(target)
+    copied = delivery_hashes(target, root=set(wanted))
     # A partial support-tree copy is allowed: the manifest describes what is actually
     # installed. Runtime and documented files are mandatory, and every included file
     # must still match the source byte for byte.
     files = {name: digest for name, digest in wanted.items() if name in copied}
-    required = [name for name in ROOT_FILES + DOC_FILES if name in wanted]
+    required = [name for name in root_files(source) + DOC_FILES if name in wanted]
     if (not files or any(name not in copied for name in required)
             or any(copied[name] != digest for name, digest in files.items())):
         raise ValueError("copied payload differs from source")
@@ -171,11 +192,32 @@ def write_manifest(source, target):
     return data
 
 
+def list_root(source, target=None):
+    """Names for install.ps1 step 4; refuses links in the source or under the same name
+    in the target, where Copy-Item would write through them."""
+    names = root_files(source)
+    places = [Path(source)] + ([Path(target)] if target else [])
+    if any(_link(place / name) for place in places for name in names):
+        raise ValueError("linked delivery entry")
+    return names
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", required=True)
     p.add_argument("--target")
+    p.add_argument("--list-root", action="store_true",
+                   help="print top-level program files of --source, one per line")
     a = p.parse_args()
+    if a.list_root:
+        try:
+            names = list_root(a.source, a.target)
+        except (OSError, ValueError):
+            p.exit(1, "Build identity: program files could not be listed.\n")
+        if not names:
+            p.exit(1, "Build identity: no program files found.\n")
+        print("\n".join(names))
+        return
     try:
         out = write_manifest(a.source, a.target) if a.target else identity(a.source)
     except (OSError, ValueError):
