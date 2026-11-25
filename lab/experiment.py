@@ -7,6 +7,7 @@
     <python> lab\\experiment.py prepare --sandbox D:\\trial-1 --voice-profiles copy --only-audio --audio "D:\\отрывок.m4a"
     <python> lab\\experiment.py add-audio --sandbox D:\\lab-1 --audio "D:\\отрывок.m4a" [--group <группа>]
     <python> lab\\experiment.py analyze --sandbox D:\\lab-1
+    <python> lab\\experiment.py export-bench --sandbox D:\\lab-1 [--to-data <папка данных> [--apply]]
 
 <python> — интерпретатор установленной программы: %LOCALAPPDATA%\\rus-transcriber\\.venv\\Scripts\\python.exe.
 Код конвейера берётся из этого клона, модели — из кэша установленной программы, без сети.
@@ -171,6 +172,43 @@ def cmd_analyze(a):
         print(f"ВНИМАНИЕ: пересведение не совпало с конвейером в {len(bad)} парах — см. раздел «Сверка» отчёта")
 
 
+def cmd_export_bench(a):
+    sandbox, marker, units_doc = lab_sandbox.load_sandbox(a.sandbox)
+    if a.apply and not a.to_data:
+        raise lab_sandbox.SandboxError("--apply нужен только вместе с --to-data")
+    db = lab_run.open_results(sandbox / "results" / "lab.sqlite3")
+    try:
+        out_dir = sandbox / "export" / "bench"
+        rep = lab_summary.export_bench(db, units_doc["units"], out_dir)
+    finally:
+        db.close()
+    print(f"Числа опытов для базы теста скорости (без текстов, имён и путей): {out_dir}")
+    print(f"  записано файлов: {len(rep['written'])}, без изменений: {len(rep['unchanged'])}, "
+          f"запусков в работе (не выгружены): {rep['running']}, отказов: {len(rep['refused'])}")
+    for r in rep["refused"]:
+        print(f"  ОТКАЗ {r['file']}: {', '.join(r['problems'])}")
+    code = 1 if rep["refused"] else 0
+    if a.to_data:
+        try:
+            cp = lab_summary.copy_bench_files(out_dir, a.to_data, apply=a.apply)
+        except ValueError as ex:
+            raise lab_sandbox.SandboxError(str(ex))
+        print(("Скопировано в " if a.apply else "Будет скопировано в ") + str(cp["target"]) + ": "
+              f"новых {len(cp['new'])}, уже есть такие же {len(cp['same'])}, "
+              f"чужое содержимое под тем же именем {len(cp['conflict'])}, не принято {len(cp['rejected'])}")
+        for name in cp["conflict"]:
+            print(f"  ОТКАЗ {name}: в папке уже файл с другим содержимым; он не перезаписан")
+        for name, why in cp["rejected"]:
+            print(f"  ОТКАЗ {name}: {why}")
+        if not a.apply and cp["new"]:
+            print("Ничего не записано. Чтобы записать: добавьте --apply")
+        if cp["conflict"] or cp["rejected"]:
+            code = 1
+        if a.apply:
+            print("Загрузить в базу теста скорости: rt.py bench-db load --apply")
+    return code
+
+
 def _split(value):
     return [x.strip() for x in (value or "").split(",") if x.strip()]
 
@@ -214,13 +252,18 @@ def main(argv=None):
     n.add_argument("--sandbox", required=True)
     n.add_argument("--baseline", default=lab_analyze.BASELINE, help="базовая конфигурация для сравнения")
     n.set_defaults(fn=cmd_analyze)
+    e = sub.add_parser("export-bench", help="числа опытов для базы теста скорости: export/bench/lab-<запуск>.json; "
+                       "с --to-data — копия в <папка данных>\\bench\\lab (запись только с --apply)")
+    e.add_argument("--sandbox", required=True)
+    e.add_argument("--to-data", default="", help="настоящая папка данных: показать, что будет скопировано")
+    e.add_argument("--apply", action="store_true", help="выполнить копирование в папку данных (только с --to-data)")
+    e.set_defaults(fn=cmd_export_bench)
     a = ap.parse_args(argv)
     try:
-        a.fn(a)
+        return a.fn(a) or 0
     except (lab_sandbox.SandboxError, lab_spec.SpecError) as ex:
         print(f"ОТКАЗ: {ex}", file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":
