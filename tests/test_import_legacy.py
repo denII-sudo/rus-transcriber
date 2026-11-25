@@ -79,11 +79,16 @@ class Fixture(unittest.TestCase):
         self.cj.write_text(json.dumps(legacy_conspect(self.tj), ensure_ascii=False), encoding="utf-8")
         self.pack = self.side / "встреча.v2.review"
         self.pack.mkdir()
+        # согласованный пакет старого формата: answers.json и manifest.json одной версии (так пишет review_pack.build)
         (self.pack / "answers.json").write_text(json.dumps({
-            "version": 4, "answers": {"r-time": {"id": "r-time", "version": "q7", "source": "local", "ts": 1794129404.7,
-                                                 "kind": "option", "option": 1},
-                                      "missing": {"id": "missing", "kind": "text", "text": "x"}},
+            "version": "q7", "answers": {"r-time": {"id": "r-time", "version": "q7", "source": "local",
+                                                    "ts": 1794129404.7, "kind": "option", "option": 1},
+                                         "missing": {"id": "missing", "kind": "text", "text": "x"}},
             "conflicts": [], "rejected": [], "applied_answers": {"r-time": True}, "applied_at": "2026-11-08T16:41:40"},
+            ensure_ascii=False), encoding="utf-8")
+        (self.pack / "manifest.json").write_text(json.dumps({
+            "version": "q7", "items": [{"id": "r-time", "question": "Кто говорит?", "text": "три", "t1": 5.4, "t2": 5.9,
+                                        "options": [{"label": "Анна"}, {"label": "Борис"}]}]},
             ensure_ascii=False), encoding="utf-8")
 
     def plan(self):
@@ -158,15 +163,22 @@ class ConversionTests(Fixture):
         self.assertEqual(transcript["title"], "из стенограммы")
         self.assertNotIn("title", transcript["quality"]["migration"]["field_sources"])
 
-    def test_answers_keep_origin_without_faking_question_version(self):
+    def test_answers_without_current_pack_are_archived_not_pending(self):
+        """В-1 «Перенос целиком»: ответы без текущего пакета (нет answers.json и manifest.json одной версии) не
+        становятся ответами разбора — иначе пересборка ждала бы их «Применить» (М-1); они хранятся как есть."""
         _, _, review, stats = self.snapshots()
-        answer = review["answers"]["r-time"]
-        self.assertEqual(answer["legacy_version"], "q7")
-        self.assertNotIn("version", answer)
-        self.assertEqual(answer["origin"], "legacy_review_pack:p")
+        self.assertEqual(review["answers"], {})
         self.assertIsNone(review.get("question_version"))
+        files = review["undo"]["legacy_review_packs"]["files"]
+        self.assertEqual(files[0]["file"], "p")
+        self.assertEqual(files[0]["answers"]["r-time"], {"version": "q7", "kind": "option"})
+        self.assertEqual(stats["pack_state"]["state"], "archived_only")
         review2 = {"review": [{"id": "a"}], "answers": {}}
         self.assertEqual(IL.import_answers(review2, {"a": {}, "b": {}}, "p"), (1, 1, 0))
+        review3 = {"review": [{"id": "a"}], "answers": {}}
+        IL.import_answers(review3, {"a": {"version": "q7"}}, "p", keep_version=True)
+        self.assertEqual(review3["answers"]["a"]["version"], "q7")
+        self.assertNotIn("legacy_version", review3["answers"]["a"])
 
     def test_conspect_markdown_restored_from_placeholders(self):
         md = IL.legacy_conspect_markdown(legacy_conspect(self.tj))
@@ -192,19 +204,25 @@ class ConversionTests(Fixture):
         self.assertEqual(runtime["recording_id"], saved["recording_id"])
         self.assertEqual(runtime["source_revision"], saved["source_revision"])
 
-    def test_archived_answers_are_imported_newest_first(self):
+    def test_archived_answers_stay_out_of_current_answers(self):
         (self.pack / "answers.20261108101950-aaaaaa.json").write_text(json.dumps({
             "version": "old", "answers": {"r-time": {"id": "r-time", "version": "q1", "kind": "option", "option": 0},
                                            "r-ok": {"id": "r-ok", "version": "q1", "kind": "option", "option": 0}}},
             ensure_ascii=False), encoding="utf-8")
-        legacy, source, packs, _, _ = IL._read_variant(self.plan()["recordings"][0], self.plan()["recordings"][0]["variants"][0])
+        legacy, source, packs, _, manifests = IL._read_variant(self.plan()["recordings"][0],
+                                                                self.plan()["recordings"][0]["variants"][0])
         self.assertEqual([p["name"] for p in packs],
                          ["встреча.v2.review", "встреча.v2.review/answers.20261108101950-aaaaaa.json"])
         _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "z"), metadata={},
-                                                 field_sources={}, variant={}, source=source, answers_packs=packs)
-        self.assertEqual(review["answers"]["r-time"]["legacy_version"], "q7")      # новый ответ победил
-        self.assertEqual(review["answers"]["r-ok"]["origin"],
-                         "legacy_review_pack:встреча.v2.review/answers.20261108101950-aaaaaa.json")
+                                                 field_sources={}, variant={}, source=source, answers_packs=packs,
+                                                 manifests=manifests)
+        # ответ текущего пакета — с версией пакета; ответ архива — не в ответах разбора, а в архиве как есть
+        self.assertEqual(review["answers"]["r-time"]["version"], "q7")
+        self.assertEqual(review["question_version"], "q7")
+        self.assertNotIn("r-ok", review["answers"])
+        files = review["undo"]["legacy_review_packs"]["files"]
+        self.assertEqual(files[0]["file"], "встреча.v2.review/answers.20261108101950-aaaaaa.json")
+        self.assertEqual(files[0]["answers"]["r-ok"]["version"], "q1")
 
     def test_human_page_answer_keeps_actor_without_legacy_label(self):
         review = {"review": [{"id": "a"}], "answers": {}}
@@ -322,21 +340,27 @@ class A1Tests(Fixture):
         self.assertIn("uuid5", rule)
         self.assertEqual(IL.recording_id_from({"recording_id": "не-uuid"}, self.tj, "x")[0], rid)
 
-    def test_questions_from_current_and_archived_manifests(self):
+    def test_questions_from_current_manifest_archive_kept_aside(self):
         legacy = json.loads(self.tj.read_text(encoding="utf-8"))
-        manifests = [{"name": "p", "version": "v2", "items": [{"id": "r-time", "question": "Кто говорит?", "text": "три",
-                                                             "word_ids": ["нет-такого"]}]},
+        manifests = [{"name": "p", "version": "v2", "current": True,
+                      "items": [{"id": "r-time", "question": "Кто говорит?", "text": "три", "word_ids": ["нет-такого"]},
+                                {"id": "лишний", "question": "?"}]},
                      {"name": "p/manifest.v1.json", "version": "v1", "items": [
                          {"id": "r-time", "question": "старый вопрос"}, {"id": "r-ok", "question": "Так?", "text": "аренды"},
                          {"id": "лишний", "question": "?"}]}]
+        packs = [{"name": "p", "answers": {}, "raw": {"version": "v2", "answers": {}}, "current": True}]
         _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "q"), metadata={},
-                                                 field_sources={}, variant={}, source={}, manifests=manifests)
+                                                 field_sources={}, variant={}, source={}, answers_packs=packs,
+                                                 manifests=manifests)
+        # вопросы — карточки текущего пакета (как review_pack.build пишет в базу), только к существующим местам
         qs = {q["id"]: q for q in review["questions"]}
-        self.assertEqual(set(qs), {"r-time", "r-ok"})
+        self.assertEqual(set(qs), {"r-time"})
         self.assertEqual(qs["r-time"]["question"], "Кто говорит?")
         self.assertNotIn("word_ids", qs["r-time"])            # ссылка на несуществующее слово отброшена
-        self.assertEqual(qs["r-ok"]["origin"], "legacy_review_pack:p/manifest.v1.json")
-        self.assertEqual(stats["questions"], 2)
+        self.assertEqual(stats["questions"], 1)
+        files = review["undo"]["legacy_review_packs"]["files"]
+        self.assertEqual([(f["file"], f["kind"]) for f in files], [("p/manifest.v1.json", "manifest")])
+        self.assertEqual([q["id"] for q in files[0]["questions"]], ["r-time", "r-ok", "лишний"])
 
     def test_md_check(self):
         import transcript
