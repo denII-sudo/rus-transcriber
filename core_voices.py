@@ -454,7 +454,7 @@ def voice_refresh_plan(group=""):
         sqlite_mode = settings.recording_backend() == "sqlite"
     except (ValueError, OSError):
         sqlite_mode = False
-    store = _refresh_store(groups, sqlite_mode)
+    store = _refresh_store() if sqlite_mode else None
     try:
         return _voice_refresh_groups(groups, jobs, store, sqlite_mode)
     finally:
@@ -462,19 +462,9 @@ def voice_refresh_plan(group=""):
             store.close()
 
 
-def _refresh_store(groups, sqlite_mode):
-    """База только на чтение: при sqlite или если в профилях есть ключи recording:<id>; недоступна — None."""
-    import voices
+def _refresh_store():
+    """База только на чтение (только при хранении в базе); недоступна — None."""
     import voice_sources
-    if not sqlite_mode:
-        try:
-            wanted = any(k.startswith(voice_sources.RECORDING_PREFIX)
-                         for name in groups if paths.voices_path(name).exists()
-                         for k in (voices.load_profile(paths.voices_path(name), convert=False).get("sources") or {}))
-        except (voices.VoiceProfileError, OSError, ValueError):
-            wanted = False
-        if not wanted:
-            return None
     try:
         return voice_sources._open_store_readonly()
     except Exception:   # noqa: BLE001 — план только показывает: без базы записи получают recording_missing
@@ -559,7 +549,7 @@ def _voice_refresh_groups(groups, jobs, store, sqlite_mode):
             continue
         entries = []
         for key, stored in sorted((data.get("sources") or {}).items()):
-            if key.startswith(voice_sources.RECORDING_PREFIX):
+            if sqlite_mode and key.startswith(voice_sources.RECORDING_PREFIX):
                 entry, audio_key = _refresh_recording_entry(store, key, stored, data)
             else:
                 jp = Path(key)

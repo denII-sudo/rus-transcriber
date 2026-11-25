@@ -496,7 +496,11 @@ class ManualSqlitePath(SyntheticStore):
 
 
 class AutoLearnSqlite(SyntheticStore):
-    """Автопополнение при обработке, когда записи хранятся в базе, и план обновления (Г3)."""
+    """Автопополнение при обработке, когда записи хранятся в базе, и план обновления (Г3).
+
+    Только при хранении в базе: файловый режим в новых доработках не учитывается (указание владельца
+    25.11.2026); его прежнее поведение закрепляют LegacyFilesBaseline и прежние тесты голосов.
+    """
 
     NAMES = ["Анна", "Борис", "Вера"]
 
@@ -509,10 +513,9 @@ class AutoLearnSqlite(SyntheticStore):
             {"group": "demo-group", "participants": [{"name": n} for n in self.NAMES]},
             ensure_ascii=False), encoding="utf-8")
         self.profile_path = self.group / "voices.json"
-        self.backend = "sqlite"
         for item in (patch.object(paths, "STATE_DB", self.db), patch.object(paths, "GROUPS", self.groups),
                      patch.object(paths, "JOBS", self.root / "jobs"),
-                     patch.object(settings, "recording_backend", side_effect=lambda: self.backend)):
+                     patch.object(settings, "recording_backend", return_value="sqlite")):
             item.start()
             self.addCleanup(item.stop)
 
@@ -675,17 +678,6 @@ class AutoLearnSqlite(SyntheticStore):
         self.assertEqual((learned, quality["voice_selection_report"]), ([], {"sqlite_source_not_supported": 1}))
         self.assertEqual(self.profile_path.read_bytes(), before)
 
-    def test_legacy_files_mode_learns_files_without_backup_as_before(self):
-        self.backend = "legacy_files"
-        self.save(self.other_profile())
-        source = self.root / "meeting.transcript.json"
-        source.write_text(json.dumps(legacy_data(self.audio), ensure_ascii=False), encoding="utf-8")
-        learned, quality, _ = self.auto()
-        self.assertEqual(learned, [source.name])
-        self.assertNotIn("legacy_file_in_sqlite_mode", quality["voice_selection_report"])
-        self.assertEqual(list(voices.load_profile(self.profile_path)["sources"]), [str(source.resolve())])
-        self.assertEqual(self.backups(), [])
-
     def test_refresh_plan_reads_records_and_migrated_copies_without_writing(self):
         legacy_path = self.root / "meeting.transcript.json"
         rid, export, _ = self.migrate(legacy_data(self.audio), legacy_path)
@@ -732,9 +724,6 @@ class AutoLearnSqlite(SyntheticStore):
         self.assertEqual((rows()[legacy_path.name]["status"], rows()[legacy_path.name]["needs_update"]),
                          ("changed", True))
         self.assertEqual(state, (self.db.read_bytes(), self.store.db.execute("PRAGMA data_version").fetchone()[0]))
-        self.backend = "legacy_files"                             # прежний режим: статус по старому файлу
-        self.assertEqual((rows()[legacy_path.name]["status"], rows()[legacy_path.name]["migrated_to"]),
-                         ("unchanged", None))
         self.assertEqual(self.profile_path.read_bytes(), before)
         self.assertEqual(self.backups(), [])
 
