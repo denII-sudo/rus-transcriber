@@ -713,7 +713,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.source = self.root / f"synthetic-{number}.wav"
         self.source.write_bytes(b"synthetic")
 
-    def run_refused(self, request, status, body):
+    def run_refused(self, request, status, body, restart=False):
         """Отказ OpenCode через весь путь: workflow.execute_model → история шага → ответ MCP, с журналом."""
         raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
 
@@ -733,7 +733,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
              mock.patch("core.workflow_execute_model",
                         lambda rid, **kw: workflow.execute_model(self.store, rid, **kw)), \
              contextlib.redirect_stderr(stderr):
-            answer = server.workflow_execute_model(request)
+            answer = server.workflow_execute_model(request, restart=restart)
         saved = workflow.get(self.store, request)
         failure = self.store.db.execute("SELECT result_json FROM workflow_steps WHERE state='failed' AND run_id=?",
                                         (saved["model_run_id"],)).fetchone()
@@ -743,26 +743,32 @@ class AutonomousWorkflowTests(unittest.TestCase):
     def test_refusal_markers_do_not_reach_message_history_mcp_or_journal(self):
         leaks = OpenCodePortOwnershipTests.LEAKS
         cores = OpenCodePortOwnershipTests.LEAK_CORES
-        bodies = []
+        statuses = ((404, "ModelNotFoundError"), (422, "UnsupportedModelError"),
+                    (502, "ModelNotFoundError"), (503, "ServiceUnavailableError"))
+        number = cases = 0
         for leak in leaks.values():
             for field in ("providerID", "modelID", "capability", "message"):
-                for status, tag in ((404, "ModelNotFoundError"), (422, "UnsupportedModelError"),
-                                    (502, "ModelNotFoundError"), (503, "ServiceUnavailableError")):
+                # Запрос и запись готовятся один раз на пару «вид утечки × поле» (84 мс): от кода ответа они не
+                # зависят. Первый код идёт обычным путём из «processed», остальные — явным «начать заново»
+                # (restart=True): новый шаг того же запроса, тот же путь отказа OpenCode → история → MCP → журнал.
+                self.fresh_source(number)
+                number += 1
+                request = self.prepare_request(segments=[self.segment("Спикер 1", ["синтетическая", "тайна",
+                                                                                     "стенограммы"], 0)])
+                for position, (status, tag) in enumerate(statuses):
                     body = {"_tag": tag, "providerID": "openai", "modelID": "gpt-6-luna", "capability": "text",
                             "message": "Model not found"}
                     body[field] = leak if field != "message" else f"Model not found: {leak}"
-                    bodies.append((status, body))
-        for number, (status, body) in enumerate(bodies):
-            with self.subTest(status=status, body=body):
-                self.fresh_source(number)
-                request = self.prepare_request(segments=[self.segment("Спикер 1", ["синтетическая", "тайна",
-                                                                                     "стенограммы"], 0)])
-                saved, answer, history, journal = self.run_refused(request, status, body)
-                self.assertEqual(saved["state"], "failed")
-                self.assertIn(body["_tag"], answer["error"])
-                for text in (answer["error"], history, journal):
-                    for core in cores:
-                        self.assertNotIn(core, text)
+                    cases += 1
+                    with self.subTest(status=status, body=body):
+                        saved, answer, history, journal = self.run_refused(request, status, body,
+                                                                           restart=position > 0)
+                        self.assertEqual(saved["state"], "failed")
+                        self.assertIn(body["_tag"], answer["error"])
+                        for text in (answer["error"], history, journal):
+                            for core in cores:
+                                self.assertNotIn(core, text)
+        self.assertEqual(cases, len(leaks) * 4 * len(statuses))
 
     def test_unreadable_refusal_body_fails_the_step_instead_of_leaving_it_waiting(self):
         for number, body in enumerate((b"[" * 60_000, b'{"_tag": "ModelNotFoundError", "x": ' + b"[" * 60_000)):
