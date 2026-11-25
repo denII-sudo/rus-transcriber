@@ -210,9 +210,10 @@ class TransferTests(PackFixture):
         report = core.apply_answers("recording:" + entry["recording_id"])     # было TypeError (М-1)
         self.assertIsInstance(report, dict)
 
-    def test_waiting_answer_on_unknown_revision_is_not_applied(self):
-        """Ждущий старый ответ не применяется вслепую: автора у него нет (штатная защита «Применить» требует
-        подтверждения), а ревизия, по которой собран пакет, неизвестна. Стенограмма не меняется."""
+    def test_waiting_answer_without_author_is_refused(self):
+        """Ждущий старый ответ без автора не применяется вслепую: штатная защита «Применить» требует
+        подтверждения (Ф207-1). Сверку ревизий проверяют тесты карточек настоящего вида (Ф207-5,
+        test_import_legacy_behavior.RealCardsApplyTests). Стенограмма не меняется."""
         self.init_db()
         entry = self.apply()
         import core
@@ -298,6 +299,28 @@ class TransferTests(PackFixture):
         rec = IL.repair_packs(IL.load_plan(self.write_plan()))["records"][0]
         self.assertEqual(rec["status"], "already_repaired")
         self.assertIn("новым переносом", rec["why"])
+
+    def test_old_pack_formats_are_named_in_inventory(self):
+        """Опись (а1) не отказывает старым видам пакета: рукописная фикстура — поля, которых нынешний код уже не
+        пишет (секунды, отметки true), и прежний формат answers.json с копией manifest и _expected_versions."""
+        self.write_pack(manifest={"version": VERSION, "items": []}, _expected_versions={"source_revision": 1})
+        packs, manifests = IL._read_pack_files([self.pack])
+        self.assertEqual(IL.unknown_pack_keys(packs, manifests), [])
+
+    def test_unknown_pack_key_refuses_record_before_writing(self):
+        """а1: ключ без назначения в описи — отказ записи unknown_pack_keys (код 1), ключ назван, ничего не
+        пишется; проверка без записи показывает это до apply."""
+        self.write_pack(new_state={"x": 1})
+        plan = self.write_plan()
+        self.init_db()
+        before = self.db_hashes()
+        entry = IL.run(self.plan(), "check")[0]
+        self.assertEqual(entry["status"], "unknown_pack_keys")
+        self.assertEqual(entry["unknown_pack_keys"], ["встреча.v2.review: new_state"])
+        with mock.patch.object(IL, "audio_facts", return_value={"audio_available": True}):
+            self.assertEqual(IL.run(self.plan(), "apply")[0]["status"], "unknown_pack_keys")
+            self.assertEqual(IL.main(["check", "--plan", str(plan)]), 1)
+        self.assertEqual(self.db_hashes(), before)
 
     def test_mismatched_versions_archive_answers(self):
         self.write_pack(version="другая")
@@ -474,6 +497,17 @@ class RepairTests(PackFixture):
         finally:
             store.close()
         self.assertEqual(IL.repair_packs(IL.load_plan(plan), apply=True)["records"][0]["status"], "already_repaired")
+
+    def test_unknown_pack_key_refuses_repair(self):
+        """а1 в ремонте: сухой прогон и --apply называют ключ, база не меняется, код 1."""
+        self.write_pack(new_state={"x": 1})
+        plan = self.write_plan()
+        before = self.db_hashes()
+        rec = IL.repair_packs(IL.load_plan(plan))["records"][0]
+        self.assertEqual((rec["status"], rec["unknown_pack_keys"]), ("unknown_pack_keys", ["встреча.v2.review: new_state"]))
+        self.assertEqual(self.run_main("--plan", str(plan), "--apply", "--data-dir", str(self.db.parent)), 1)
+        self.assertEqual(self.db_hashes(), before)
+        self.assertFalse((self.db.parent / "db-backups").exists())
 
     def test_not_migrated_and_nothing_to_repair(self):
         plan = self.plan()

@@ -44,6 +44,68 @@ REPAIR_TOOL = "tools/import_legacy.py repair-packs v1"
 NAMESPACE = uuid.UUID("6b1d3c5e-8f0a-4c11-9d6e-2a7f4b9e0c31")
 MAX_INTERACTION_EVENTS = 2000           # как storage.MAX_INTERACTION_EVENTS и review_pack.MAX_INTERACTION_EVENTS
 CLOSED_STATUSES = ("resolved", "human")
+
+# Опись пакета карточек старого формата (механизм А разбора причин М-1): у каждого ключа answers.json и
+# manifest.json и у каждого файла папки разбора — назначение при переносе. Ключ файла пакета, которого здесь нет,
+# — отказ записи unknown_pack_keys (решение Архитектора 26.11.2026, вариант а1), а не тихий пропуск: тихая потеря
+# состояния пакета и была М-1. Новый ключ формата карточек сначала получает здесь назначение (тест
+# tests/test_import_legacy_behavior.py собирает пакет программой и падает на ключе без назначения). Ключи ответа и
+# карточки переносятся целиком, как записаны (копия ответа и manifest), поэтому здесь не перечисляются.
+LEGACY_PACK_INVENTORY = {
+    "answers.json": {
+        "version": "question_version разбора и version ответов текущего пакета",
+        "answers": "answers разбора (текущий пакет) или undo.legacy_review_packs (архив, Р-2)",
+        "applied_answers": "undo.review_pack.applied_answers",
+        "applied_at": "undo.review_pack.applied_at; правило «не позже applied_at» — в отметки applied_answers",
+        "conflicts": "conflicts разбора",
+        "rejected": "rejected разбора",
+        "application_events": "undo.review_pack.application_events и applications разбора",
+        "application_events_dropped": "undo.review_pack.application_events_dropped",
+        "interaction_events": "interaction_events разбора (не больше MAX_INTERACTION_EVENTS)",
+        "interaction_events_dropped": "interaction_events_evicted разбора",
+        "heard": "undo.review_pack.heard",
+        "outcome_details": "undo.review_pack.outcome_details",
+        "undo_snapshots": "не переносится (Р-1): после переноса снимок не совпадёт; число — в отчёте",
+        "manifest": "не переносится: копия manifest.json, переносится сам manifest.json",
+        "_expected_versions": "не переносится: служебная сверка ревизий сборки в режиме базы",
+    },
+    "manifest.json": {
+        "version": "undo.review_pack.manifest.version",
+        "items": "undo.review_pack.manifest.items (word_ids чужих слов убираются); questions разбора",
+        "recording_id": "undo.review_pack.manifest: новый ID записи, прежний — legacy_recording_id",
+        "source_revision": "undo.review_pack.manifest: ревизия базы (1 или 0), прежняя — legacy_source_revision",
+        "job_json": "undo.review_pack.manifest.legacy_job_json; job_json ставит запись документа",
+        "pack_rev": "undo.review_pack.manifest.pack_rev",
+        "audio": "undo.review_pack.manifest.audio",
+        "audio_sha256": "undo.review_pack.manifest.audio_sha256",
+        "clips_dir": "undo.review_pack.manifest.clips_dir; клипы не копируются (Р-3)",
+        "speakers": "undo.review_pack.manifest.speakers",
+        "created": "undo.review_pack.manifest.created",
+    },
+    "files": {
+        "answers.json": "текущий пакет: состояние ответов",
+        "manifest.json": "текущий пакет: карточки",
+        "answers.*.json": "архив ответов прежних редакций: undo.legacy_review_packs (Р-2)",
+        "manifest.*.json": "архив карточек прежних редакций: undo.legacy_review_packs (Р-2)",
+        "answers.lock": "не переносится: замок записи ответов",
+        "cards.html": "не переносится: страница строится заново по базе",
+        "clips": "не переносится (Р-3): клипы остаются в старой папке, новая порция режется заново",
+        "voice": "не переносится: голосовые ответы остаются в старой папке, путь в ответе прежний",
+        "cloud.json": "не переносится: облачные карточки собираются заново",
+    },
+}
+
+
+def unknown_pack_keys(packs, manifests):
+    """Ключи файлов пакета без назначения в LEGACY_PACK_INVENTORY -> ["файл: ключ", …] (пусто — всё названо)."""
+    out = []
+    for rows, kind in ((packs, "answers.json"), (manifests, "manifest.json")):
+        known = LEGACY_PACK_INVENTORY[kind]
+        for row in rows:
+            body = row.get("raw") if kind == "answers.json" else row
+            skip = ("name", "current") if kind == "manifest.json" else ()
+            out += [f"{row['name']}: {k}" for k in sorted(body or {}) if k not in known and k not in skip]
+    return out
 DOC_SUBDIR = "v4"
 PLAN_VERSION = 1
 METADATA_FIELDS = ("title", "recorded_at", "recorded_timezone", "container", "codec",
@@ -633,6 +695,12 @@ def run(plan, mode, ffprobe=None):
                 entry = {"audio": rec["audio"], "transcript": variant["transcript"], "main": bool(variant.get("main"))}
                 try:
                     legacy, source, packs, conspects, manifests = _read_variant(rec, variant)
+                    unknown = unknown_pack_keys(packs, manifests)
+                    if unknown:
+                        # опись пакета (а1): ключ без назначения — отказ записи до сборки снимков, ничего не пишется
+                        entry.update(status="unknown_pack_keys", unknown_pack_keys=unknown, why=UNKNOWN_KEYS_WHY)
+                        report.append(entry)
+                        continue
                     rid, rule = recording_id_from(legacy, variant["transcript"], source["sha256"])
                     entry.update(recording_id=rid, recording_id_rule=rule, source_sha256=source["sha256"],
                                  legacy_recording_id=legacy.get("recording_id"),
@@ -788,10 +856,16 @@ def verify_set(report, out_dir):
     return v
 
 
+# исходы записи, при которых перенос не выполнен для неё: итог partial, код 1
+IMPORT_PROBLEMS = ("error", "conflict", "unknown_pack_keys")
+UNKNOWN_KEYS_WHY = ("в файлах пакета карточек есть ключи без назначения в описи LEGACY_PACK_INVENTORY — запись не "
+                    "переносится, чтобы не потерять их молча; нужна правка инструмента")
+
+
 def _status(mode, report, verification):
     if mode == "check":
         return "checked"
-    if any(e.get("status") in ("error", "conflict") for e in report):
+    if any(e.get("status") in IMPORT_PROBLEMS for e in report):
         return "partial"
     if verification and all(ok is not False for ok in verification["checks"].values()):
         return "verified_copy"
@@ -826,9 +900,10 @@ def write_artifacts(out_dir, plan, report, mode, verification=None):
         lines += ["## Проверки", ""] + [f"- {k}: {'да' if ok else 'НЕТ'}" for k, ok in verification["checks"].items()] + [""]
     if md_diff:
         lines += ["## MD отличается от рендера JSON (посмотреть человеку)", ""] + [f"- {n}" for n in md_diff] + [""]
-    problems = [e for e in report if e.get("status") in ("error", "conflict")]
+    problems = [e for e in report if e.get("status") in IMPORT_PROBLEMS]
     if problems:
-        lines += ["## Ошибки и конфликты", ""] + [f"- {Path(e['transcript']).name}: {e.get('error') or e.get('note')}"
+        lines += ["## Ошибки и конфликты", ""] + [f"- {Path(e['transcript']).name}: "
+                                                 f"{e.get('error') or e.get('why') or e.get('note')}"
                                                  for e in problems] + [""]
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return status
@@ -1073,6 +1148,9 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
     if check["status"] != "candidate":
         return check
     packs, manifests = _read_pack_files(variant.get("review_packs", []))
+    unknown = unknown_pack_keys(packs, manifests)
+    if unknown:
+        return {**check, "status": "unknown_pack_keys", "unknown_pack_keys": unknown, "why": UNKNOWN_KEYS_WHY}
     review, info = _repair_review(store, rid, review_db, transcript, mig, packs, manifests)
     out = {**check, **info}
     if review is None:
@@ -1235,7 +1313,7 @@ def main(argv=None):
     status = write_artifacts(a.out, plan, report, a.command, verification) if a.out else _status(a.command, report, None)
     print(_summary(report))
     print(f"статус: {status}")
-    return 0 if status in ("checked", "verified_copy") and not any(e["status"] == "error" for e in report) else 1
+    return 0 if status in ("checked", "verified_copy") and         not any(e["status"] in ("error", "unknown_pack_keys") for e in report) else 1
 
 
 if __name__ == "__main__":
