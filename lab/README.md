@@ -253,10 +253,15 @@ Whisper). Multilingual второй сохраняет времена слов; 
   вызван конвейер), `first_run_id`.
 - `unit_runs` — общий этап звука в запуске: `run_id`, `unit_id`, `state` (`running`, `done`,
   `error`), `error_kind`, `error` (хвост трассировки), `shared_json`: `duration_sec`,
-  `diarization_sha256`, `diarization_segments` (`[начало, конец, метка pyannote]`),
+  `pcm_sha256` (хэш звука — см. ниже), `diarization_sha256`, `diarization_segments` (`[начало, конец, метка pyannote]`),
   `diarization_info`, `turns`, `label_name` (метка → имя), `voices` (`voice_profile`,
   `profile_names`, `match`, `unmatched`, `voices_error`, `voices_off`), `timing`
   (`diarization_sec`, `voices_sec`, `embeddings_sec`). Векторов голосов нет.
+  Два хэша записи: `unit_id` и `audio_sha256` — хэш байтов файла, тот же, что поле `audio_sha256`
+  стенограммы в базе записей (по нему единица связывается с записями и ответами человека);
+  `pcm_sha256` — хэш звука (моно 16 кГц s16le), тот же, что у теста скорости и сохранённых гипотез
+  (`runinfo.audio_identity`, `hypstore`): он не меняется при пересохранении файла в другой контейнер.
+  В базах, собранных до появления поля, `pcm_sha256` нет.
 - `pairs` — пара: `pair_id`, `run_id`, `unit_id`, `config_id`, `config_sha256`, `state`
   (`done` или `error`), `started_utc`, `finished_utc`, `error_kind`, `error`,
   `diarization_sha256` (у пар одного звука из разных запусков можно проверить, что разделение

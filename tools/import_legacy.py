@@ -179,27 +179,10 @@ def basename_for(transcript_path):
 # ---------------------------------------------------------------- факты об аудио
 
 def audio_facts(audio_path, ffprobe=None):
-    """Только то, что следует из самого файла: наличие, SHA-256, контейнер и кодек (если есть ffprobe)."""
-    p = Path(audio_path)
-    if not p.is_file():
-        return {"audio_available": False}
-    facts = {"audio_available": True, "audio_sha256": sha256_file(p)}
-    ffprobe = ffprobe or shutil.which("ffprobe")
-    if ffprobe:
-        try:
-            out = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=format_name:stream=codec_name,codec_type",
-                                  "-of", "json", str(p)], capture_output=True, text=True, timeout=60,
-                                 stdin=subprocess.DEVNULL)
-            info = json.loads(out.stdout or "{}")
-            fmt = (info.get("format") or {}).get("format_name")
-            codec = next((s.get("codec_name") for s in info.get("streams") or [] if s.get("codec_type") == "audio"), None)
-            if fmt:
-                facts["container"] = fmt
-            if codec:
-                facts["codec"] = codec
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-    return facts
+    """Только то, что следует из самого файла: наличие, SHA-256, контейнер и кодек (если есть ffprobe).
+    Общее правило с расшифровкой — runinfo.audio_facts."""
+    import runinfo
+    return runinfo.audio_facts(audio_path, ffprobe)
 
 
 # ---------------------------------------------------------------- преобразование

@@ -606,6 +606,21 @@ class TrialOnAudioFile(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class SoundHash(unittest.TestCase):
+    """Хэш звука записи лаборатории — то же правило, что у теста скорости и сохранённых гипотез."""
+
+    def test_same_as_audio_identity(self):
+        import numpy as np
+        import hypstore
+        import runinfo
+        audio = np.linspace(-1.0, 1.0, 16000, dtype=np.float32)
+        ident = runinfo.audio_identity(Path(tempfile.gettempdir()) / "rt-no-such-file.wav",
+                                       hypstore.pcm_bytes(audio), 16000)
+        self.assertEqual(lab_run.pcm_sha256(audio), ident["excerpt"]["pcm_sha256"])
+        self.assertTrue(ident["excerpt"]["pcm_sha256"].startswith(ident["unit_id"]))
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
 class CaptureWithVoteTrace(unittest.TestCase):
     """Сведение с протоколом (trace) идёт через words.vote_n мимо vote3: Capture записывает то же, что без него,
     и mark_alt на исключённых отрезках не затирает способ сведения."""

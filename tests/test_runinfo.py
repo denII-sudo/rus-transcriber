@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import jobslots  # noqa: E402
@@ -55,6 +56,44 @@ class AudioIdentityTests(unittest.TestCase):
         self.assertIsNone(ident["audio_sha256"])
         self.assertIsNone(ident["size_bytes"])
         self.assertEqual(len(ident["excerpt"]["pcm_sha256"]), 64)
+
+
+class AudioFactsTests(unittest.TestCase):
+    """Сведения о файле аудио: общее правило расшифровки и переноса (runinfo.audio_facts)."""
+
+    def test_missing_file_gives_only_availability(self):
+        facts = runinfo.audio_facts(Path(tempfile.gettempdir()) / "rt-no-such-file.wav", ffprobe="нет-ffprobe")
+        self.assertEqual(facts, {"audio_available": False})
+
+    def test_file_hash_without_ffprobe(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.wav"
+            src.write_bytes(b"RIFF-synthetic")
+            facts = runinfo.audio_facts(src, ffprobe="нет-ffprobe")
+        self.assertEqual(facts, {"audio_available": True,
+                                 "audio_sha256": hashlib.sha256(b"RIFF-synthetic").hexdigest()})
+
+    def test_container_and_codec_from_ffprobe(self):
+        out = json.dumps({"format": {"format_name": "mov,mp4,m4a"},
+                          "streams": [{"codec_type": "video", "codec_name": "h264"},
+                                      {"codec_type": "audio", "codec_name": "aac"}]})
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.m4a"
+            src.write_bytes(b"synthetic")
+            with mock.patch.object(runinfo.subprocess, "run", return_value=mock.Mock(stdout=out)) as run:
+                facts = runinfo.audio_facts(src, ffprobe="ffprobe-synthetic")
+        self.assertEqual(run.call_args[0][0][0], "ffprobe-synthetic")
+        self.assertEqual(facts["container"], "mov,mp4,m4a")
+        self.assertEqual(facts["codec"], "aac")
+        self.assertEqual(facts["audio_sha256"], hashlib.sha256(b"synthetic").hexdigest())
+
+    def test_ffprobe_garbage_is_not_invented(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.wav"
+            src.write_bytes(b"synthetic")
+            with mock.patch.object(runinfo.subprocess, "run", return_value=mock.Mock(stdout="не json")):
+                facts = runinfo.audio_facts(src, ffprobe="ffprobe-synthetic")
+        self.assertEqual(set(facts), {"audio_available", "audio_sha256"})
 
 
 class EnvironmentTests(unittest.TestCase):
