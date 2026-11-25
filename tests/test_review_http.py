@@ -3,6 +3,8 @@ import http.client
 import json
 import os
 from pathlib import Path
+import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -164,6 +166,100 @@ class ReviewHTTP(unittest.TestCase):
             self.assertEqual(conn.getresponse().status, 413)
         finally:
             conn.close()
+
+    def raw_head(self, path, length, headers=None, target=None):
+        port = self.url.port
+        fields = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}", "Content-Type": "application/json",
+                  "Content-Length": str(length), "Connection": "close"}
+        fields.update(headers or {})
+        return (f"POST {target or self.url.path + path} HTTP/1.1\r\n"
+                + "".join(f"{k}: {v}\r\n" for k, v in fields.items()) + "\r\n").encode()
+
+    def raw_post(self, path, length, parts, pause=0.1, headers=None, target=None):
+        """Запрос на сыром сокете: заголовки с Content-Length=length и первая часть тела, после каждой паузы — следующая;
+        затем ответ читается до закрытия соединения. -> (статус, заголовки в нижнем регистре, тело, секунд до конца ответа)."""
+        port = self.url.port
+        head = self.raw_head(path, length, headers, target)
+        started = time.time()
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(head + parts[0])
+            for part in parts[1:]:
+                time.sleep(pause)
+                sock.sendall(part)
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        top, _, body = data.partition(b"\r\n\r\n")
+        lines = top.decode("iso-8859-1").split("\r\n")
+        headers = dict(line.lower().split(": ", 1) for line in lines[1:])
+        return int(lines[0].split()[1]), headers, body, time.time() - started
+
+    def test_413_for_a_body_that_arrives_after_the_refusal_still_reaches_the_client(self):
+        # Раньше сервер отвечал 413 по заголовку и закрывал соединение, пока тело ещё шло: в Windows клиент получал
+        # сброс (WinError 10053) вместо ответа. Теперь тело до MAX_DRAIN_BYTES дочитывается, потом идёт 413.
+        from review_page import MAX_ANSWER_BYTES
+        length = MAX_ANSWER_BYTES + 1
+        status, headers, body, _ = self.raw_post("api/answer", length, [b"x" * 100, b"x" * (length - 100)])
+        self.assertEqual(status, 413)
+        self.assertEqual(headers["connection"], "close")
+        self.assertIn("недопустимый размер", json.loads(body)["error"])
+
+    def test_every_early_refusal_reads_the_body_first_so_the_client_gets_the_answer(self):
+        # Отказы до чтения тела (403 по адресу, источнику и сессии, 404, 415, 413): тело приходит уже после отказа.
+        # Без дочитывания в Windows клиент получал сброс соединения вместо ответа (CI №201: 403 на api/event).
+        from review_page import MAX_ANSWER_BYTES
+        body = b'{"id": "r1", "version": "v", "text": "x"}'
+        wrong_session = self.url.path.rstrip("/") + "x/api/event"
+        cases = (
+            ("403 адрес", 403, {"path": "api/event", "headers": {"Host": "evil.example"}}),
+            ("403 источник", 403, {"path": "api/event", "headers": {"Origin": "https://evil.example"}}),
+            ("403 сессия", 403, {"path": "", "target": wrong_session}),
+            ("404 маршрут", 404, {"path": "api/nothing"}),
+            ("415 тип", 415, {"path": "api/event", "headers": {"Content-Type": "text/plain"}}),
+            ("413 размер", 413, {"path": "api/answer", "length": MAX_ANSWER_BYTES + 1}),
+        )
+        for name, code, case in cases:
+            with self.subTest(name):
+                length = case.get("length", len(body))
+                parts = [body[:5], body[5:]] if length == len(body) else [b"x" * 100, b"x" * (length - 100)]
+                status, headers, answer, _ = self.raw_post(case["path"], length, parts, headers=case.get("headers"),
+                                                           target=case.get("target"))
+                self.assertEqual(status, code)
+                self.assertEqual(headers["connection"], "close")
+                self.assertIn("error", json.loads(answer))
+
+    def test_a_body_that_trickles_in_does_not_hold_the_refusal_longer_than_the_drain_timeout(self):
+        # DRAIN_TIMEOUT — общий срок на всё дочитывание, а не на каждое чтение: байт раз в полсекунды не продлевает его
+        from review_page import DRAIN_TIMEOUT, MAX_ANSWER_BYTES
+        started = time.time()
+        status = None
+        with socket.create_connection(("127.0.0.1", self.url.port), timeout=10) as sock:
+            sock.sendall(self.raw_head("api/answer", MAX_ANSWER_BYTES + 1))
+            while time.time() - started < DRAIN_TIMEOUT + 5:
+                if select.select([sock], [], [], 0.5)[0]:
+                    try:
+                        data = sock.recv(65536)
+                    except OSError:
+                        data = b""                       # соединение закрыто с непрочитанным: в Windows это сброс
+                    status = int(data.split()[1]) if data.startswith(b"HTTP/") else None
+                    break
+                try:
+                    sock.sendall(b"x")
+                except OSError:
+                    break
+            seconds = time.time() - started
+        self.assertGreaterEqual(seconds, DRAIN_TIMEOUT - 0.5)
+        self.assertLess(seconds, DRAIN_TIMEOUT + 1.5)             # а не DRAIN_TIMEOUT + 5: сервер перестал ждать
+        self.assertIn(status, (413, None))                        # ответ, если соединение его ещё принимает
+
+    def test_body_over_the_drain_limit_is_refused_at_once_and_not_read(self):
+        from review_page import MAX_DRAIN_BYTES
+        status, headers, _, seconds = self.raw_post("api/answer", MAX_DRAIN_BYTES + 1, [b""])
+        self.assertEqual((status, headers["connection"]), (413, "close"))
+        self.assertLess(seconds, 1.5)                         # тело, которого никто не ждёт, сервер не дожидается
 
     def test_new_routes_enforce_origin_and_version(self):
         payload = json.dumps({"id": "r1", "version": "old", "text": "пример"}).encode()
