@@ -10,6 +10,7 @@
 Только при хранении записей в базе (указание владельца: новое — без файловой записи); в файловом режиме
 пересборка прежняя. Все данные синтетические.
 """
+import contextlib
 import copy
 import unittest
 from pathlib import Path
@@ -150,6 +151,38 @@ class Refusal(Base):
             self.assertIn("«Применить сохранённые ответы»", str(caught.exception))
 
 
+class LockHeld(Base):
+    def test_check_and_write_are_under_the_answers_lock_and_clips_are_cut_outside(self):
+        depth, seen = [0], []
+        real_lock = review_pack._answers_lock
+        real_check, real_write = review_pack.rebuild_check, review_pack._write_answers
+
+        @contextlib.contextmanager
+        def lock(path):
+            with real_lock(path):
+                depth[0] += 1
+                try:
+                    yield
+                finally:
+                    depth[0] -= 1
+
+        def spy(name, fn):
+            def call(*args, **kwargs):
+                seen.append((name, depth[0]))
+                return fn(*args, **kwargs)
+            return call
+
+        with files("sqlite") as (jp, _md, _version):
+            with mock.patch.object(review_pack, "_answers_lock", side_effect=lock), \
+                    mock.patch.object(review_pack, "rebuild_check", side_effect=spy("check", real_check)), \
+                    mock.patch.object(review_pack, "_write_answers", side_effect=spy("write", real_write)), \
+                    mock.patch.object(review_pack, "cut_clip", side_effect=spy("cut", lambda _s, t1, _t2, _o: t1)):
+                self.rebuild(jp)
+        self.assertEqual({name for name, _ in seen}, {"check", "write", "cut"}, seen)
+        self.assertEqual([d for name, d in seen if name in ("check", "write")], [1, 1], seen)
+        self.assertEqual({d for name, d in seen if name == "cut"}, {0}, "клипы режутся под замком ответов")
+
+
 class Allowed(Base):
     def test_applied_answer_does_not_block_and_undo_lost_is_reported(self):
         with files("sqlite") as (jp, md, version):
@@ -178,8 +211,9 @@ class Allowed(Base):
 
     def test_finished_answer_does_not_block(self):
         with files("sqlite") as (jp, md, version):
-            self.save(jp, version, "r4", kind="skip")
-            self.assertEqual(self.outcomes(self.apply(jp, md))["r4"]["outcome"], "skipped")
+            self.applied_r4(jp, md, version)
+            self.save(jp, version, "r4", kind="revert")
+            self.assertEqual(self.outcomes(self.apply(jp, md))["r4"]["outcome"], "reverted")
             rep = self.rebuild(jp)
             self.assertEqual((rep["unapplicable"], rep["undo_lost"]), ([], 0))
 
