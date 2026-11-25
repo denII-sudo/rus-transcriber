@@ -186,6 +186,20 @@ def save_profile(path, prof):
         raise
 
 
+def backup_profile(path):
+    """Точная копия профиля в voice-backups рядом с ним до изменения; старые копии не заменяются. -> путь или None."""
+    import uuid
+    path = Path(path)
+    if not path.exists():
+        return None
+    folder = path.parent / "voice-backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / ("voices-" + uuid.uuid4().hex + ".json")
+    with target.open("xb") as f:
+        f.write(path.read_bytes())
+    return str(target)
+
+
 def voice_vectors(prof, exclude_audio=None):
     """{имя: вектор} по всем учтённым записям, кроме exclude_audio (своя запись не подсказывает сама себе)."""
     ex = str(Path(exclude_audio).resolve()).lower() if exclude_audio else None
@@ -395,6 +409,10 @@ SELECTION_REASONS = {
     "added": "Добавлен вклад записи",
     "no_profile_change": "Изменений вклада нет",
     "processing_error": "Источник пропущен из-за ошибки; изменения этого источника отменены",
+    "sqlite_source_not_supported": "Запись в базе пропущена: база или запись недоступна, либо нужен подтверждённый "
+                                   "просмотр",
+    "legacy_file_in_sqlite_mode": "Старый файл стенограммы пропущен: при работе с базой учитывается её копия",
+    "profile_backup_failed": "Профиль не записан: не удалось сохранить его резервную копию",
 }
 
 
@@ -725,7 +743,7 @@ def _is_sqlite_export(data):
 
 
 def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
-          stop_when=None, allow_replace=False, quality_policy="warn", quality_report=None):
+          stop_when=None, allow_replace=False, quality_policy="warn", quality_report=None, sqlite_mode=False):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
     Вклад каждой записи хранится отдельно (ключ — путь к аудио). До реализации подтверждаемого
     предпросмотра существующий вклад не заменяется и не отзывается автоматически. На одну запись берётся самая
@@ -740,7 +758,11 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     собранный голос этого имени (SAME_MIN, SAME_MARGIN), в профиль не идёт, а ждёт решения человека
     в prof["quarantine"] (resolve_voice: тот же человек или другой).
     quality_policy: warn — только измерить и предупредить; reject_clipping — не учитывать источник
-    с клиппингом. quality_report получает измерение последнего источника и признак отбраковки."""
+    с клиппингом. quality_report получает измерение последнего источника и признак отбраковки.
+    sqlite_mode (автопополнение при recording_backend = sqlite, без only): источники — записи базы, чьё аудио
+    лежит в папке folder (voice_sources.folder_sources), на одно аудио — самая свежая ревизия; старые файлы
+    стенограмм папки пропускаются (legacy_file_in_sqlite_mode). Запись, перенесённая из старого файла, чей ключ
+    уже есть в профиле, автоматически не трогается: учтена или ждёт просмотра."""
     quality_policy = quality_policy if quality_policy in AUDIO_QUALITY_POLICIES else "warn"
     if quality_report is not None:
         quality_report["policy"] = quality_policy
@@ -752,11 +774,25 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     files = sorted(set(Path(folder).glob("*.transcript.json")) | set(Path(folder).glob("*.rus-transcriber/*.transcript.json")))
     if only:
         files = [p if isinstance(p, voice_sources.Source) else Path(p) for p in only]
+    elif sqlite_mode:
+        for jp in files:                     # при работе с базой источник — запись в базе, не файл в папке
+            try:
+                exported = _is_sqlite_export(json.loads(jp.read_text(encoding="utf-8")))
+            except Exception:
+                exported = False
+            if not exported:                 # выгрузка записи базы учитывается самой записью ниже
+                note("legacy_file_in_sqlite_mode")
+        try:
+            files, failed = voice_sources.folder_sources(folder)
+        except voice_sources.SourceError:
+            files, failed = [], 1
+        for _ in range(failed):
+            note("sqlite_source_not_supported")
     best, conf_best = {}, {}
     for jp in files:
         record = isinstance(jp, voice_sources.Source) and jp.kind == "sqlite"
         if record:                           # запись в базе: данные зафиксированной ревизии, не файл выгрузки
-            if not allow_replace:
+            if only and not allow_replace:
                 note("sqlite_source_not_supported")
                 continue
             data = jp.data
@@ -788,7 +824,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         akey = str(src.resolve())
         if record:
             akey = voice_sources.existing_audio_key(prof, akey)
-        mt = 0.0 if record else jp.stat().st_mtime
+        mt = jp.revision_time if record else jp.stat().st_mtime
         if akey not in best or mt > best[akey][1]:
             best[akey] = (jp, mt, data, src)
         if _confirmed(data) and (akey not in conf_best or mt > conf_best[akey][1]):
@@ -819,6 +855,14 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         key = jp.key if record else str(jp.resolve())
         current_fp = jp.fingerprint(src) if record else source_fingerprint(jp, src)
         status = source_fingerprint_status(prof["sources"].get(key), current_fp, mt)
+        if not only and record and status == "absent":
+            linked = voice_sources.linked_profile_keys(prof["sources"], jp)
+            if linked:
+                # перенесена из старого файла, уже учтённого в профиле: автоматически не перевязывается
+                # и исходное состояние не принимается — только подтверждённым обновлением
+                note("already_processed" if all(voice_sources.linked_status(prof["sources"][k], jp) == "unchanged"
+                                                for k in linked) else "source_changed_requires_preview")
+                continue
         if not only:
             if status in ("unchanged", "legacy_unchanged"):
                 if status == "legacy_unchanged":

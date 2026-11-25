@@ -65,7 +65,9 @@ class Source:
         self.payload_hash = extra.get("payload_hash")
         self.legacy_keys = list(extra.get("legacy_keys") or [])
         self.migrated_from = extra.get("migrated_from")
+        self.migration_sha256 = extra.get("migration_sha256")
         self.redirected_from = extra.get("redirected_from")
+        self.revision_time = float(extra.get("revision_time") or 0.0)   # для выбора самой свежей копии аудио
 
     def __str__(self):
         return self.ref
@@ -108,6 +110,18 @@ def _migration_link(store, recording_id):
     return link if isinstance(link.get("path"), str) and link["path"] else {}
 
 
+def _revision_time(store, recording_id, revision):
+    """Время операции, создавшей ревизию стенограммы, в секундах; 0.0 — если не разобрать."""
+    from datetime import datetime
+    row = store.db.execute("SELECT o.created_at FROM transcript_revisions r JOIN operations o "
+                           "ON o.operation_id=r.operation_id WHERE r.recording_id=? AND r.revision=?",
+                           (recording_id, revision)).fetchone()
+    try:
+        return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00")).timestamp() if row else 0.0
+    except (TypeError, ValueError, OverflowError, OSError):
+        return 0.0
+
+
 def _sqlite_source(store, recording_id, redirected_from=None):
     import recordings
     data = recordings.load_recording(store, recording_id)
@@ -121,7 +135,76 @@ def _sqlite_source(store, recording_id, redirected_from=None):
                   f"sqlite:{store_id}:{recording_id}:{revision}:{payload_hash}", RECORDING_PREFIX + recording_id,
                   recording_id=recording_id, store_id=store_id, revision=revision, payload_hash=payload_hash,
                   legacy_keys=legacy_keys, migrated_from=Path(link["path"]).name if link else None,
-                  redirected_from=redirected_from)
+                  migration_sha256=link.get("sha256") if link else None,
+                  revision_time=_revision_time(store, recording_id, revision), redirected_from=redirected_from)
+
+
+def record_source(store, recording_id):
+    """Источник по записи в уже открытой базе (только чтение)."""
+    return _sqlite_source(store, recording_id)
+
+
+def linked_profile_keys(sources, source):
+    """Старые ключи профиля (sources), из которых перенесена эта запись в базе."""
+    return [k for old in source.legacy_keys for k in matching_keys(sources, old)]
+
+
+def linked_status(stored, source):
+    """Состояние старого ключа, связанного с записью в базе: unchanged / legacy_baseline_pending / changed.
+
+    unchanged — старый отпечаток совпал с перенесённым файлом, а запись после переноса не правили (ревизия 1);
+    legacy_baseline_pending — у старого ключа только mtime, а старый файл на месте и не менялся после переноса:
+    исходное состояние можно принять, но только подтверждённым обновлением; всё прочее — changed (нужен просмотр).
+    """
+    if source.revision != 1 or not source.migration_sha256:
+        return "changed"
+    if isinstance(stored, dict):
+        return "unchanged" if stored.get("transcript_sha256") == source.migration_sha256 else "changed"
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool) and source.legacy_keys:
+        return ("legacy_baseline_pending" if file_hash(source.legacy_keys[0]) == source.migration_sha256
+                else "changed")
+    return "changed"
+
+
+def _open_store_readonly():
+    import recordings
+    import storage
+    try:
+        store = recordings.open_store(readonly=True)
+    except storage.StorageError as ex:
+        raise SourceError(f"база недоступна: {ex}") from ex
+    try:
+        store.current_identity()
+    except BaseException:
+        store.close()
+        raise
+    return store
+
+
+def folder_sources(folder):
+    """Записи базы, чьё аудио лежит в папке folder (охват прежнего просмотра папки). -> (источники, не открылись).
+
+    Только чтение. База недоступна — SourceError; запись, которая не открывается, считается во втором числе.
+    """
+    import storage
+    target = os.path.abspath(str(folder))
+    try:
+        store = _open_store_readonly()
+    except storage.StorageError as ex:
+        raise SourceError(f"база недоступна: {ex}") from ex
+    out, failed = [], 0
+    try:
+        rows = store.db.execute("SELECT recording_id, location FROM recordings ORDER BY recording_id").fetchall()
+        for recording_id, location in rows:
+            if not same_path(os.path.dirname(str(location)), target):
+                continue
+            try:
+                out.append(_sqlite_source(store, recording_id))
+            except (KeyError, ValueError, OSError, SourceError, storage.StorageError):
+                failed += 1
+        return out, failed
+    finally:
+        store.close()
 
 
 def migrated_copies(store, legacy_path):
