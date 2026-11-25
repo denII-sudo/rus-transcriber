@@ -3,7 +3,6 @@ import hashlib
 import http.client
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
+import buildinfo
 import core
 import documents
 import quotes
@@ -83,10 +83,7 @@ class P6InstallUpdateTests(unittest.TestCase):
         )
 
     def test_runtime_manifest_and_sandbox_update_preserve_database(self):
-        script = INSTALLER.read_text(encoding="utf-8-sig")
-        match = re.search(r'foreach \(\$f in @\((.*?)\)\) \{', script, re.S)
-        self.assertIsNotNone(match, "runtime copy list not found in installer")
-        package_files = set(re.findall(r'"([^"]+)"', match.group(1)))
+        package_files = set(buildinfo.root_files(PROJECT))
         self.assertTrue(REQUIRED_RUNTIME <= package_files)
 
         db_path = self.data / "state.sqlite3"
@@ -107,6 +104,10 @@ class P6InstallUpdateTests(unittest.TestCase):
                          + installed.stderr.decode("utf-8", "replace"))
 
         self.assertTrue(REQUIRED_RUNTIME <= {p.name for p in self.target.iterdir()})
+        # step 4 really copied every top-level program file buildinfo lists, byte for byte
+        self.assertEqual(set(buildinfo.root_files(self.target)), package_files)
+        for name in package_files:
+            self.assertEqual((self.target / name).read_bytes(), (PROJECT / name).read_bytes(), name)
         self.assertEqual(
             (self.target / "answer_phrases.tsv").read_bytes(),
             (PROJECT / "answer_phrases.tsv").read_bytes(),

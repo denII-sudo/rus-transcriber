@@ -1,4 +1,7 @@
 """Build provenance uses only a synthetic installation and Git repository."""
+import ast
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,8 @@ import unittest
 from unittest.mock import patch
 
 import buildinfo
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 def setUpModule():
@@ -120,12 +125,17 @@ class BuildTests(unittest.TestCase):
         (self.target / "tools/check.py").write_text("changed", encoding="utf-8")
         self.assertEqual(buildinfo.identity(self.target)["source_state"], "dirty")
 
-    def test_installer_copy_list_matches_manifest_payload(self):
-        text = (Path(__file__).resolve().parent.parent / "install.ps1").read_text(
-            encoding="utf-8-sig")
-        root = re.search(r'foreach \(\$f in @\((.*?)\)\) \{', text, re.S)
-        self.assertIsNotNone(root)
-        self.assertEqual(tuple(re.findall(r'"([^"]+)"', root.group(1))), buildinfo.ROOT_FILES)
+    def test_installer_takes_root_list_from_buildinfo(self):
+        text = (REPO / "install.ps1").read_text(encoding="utf-8-sig")
+        step = text[text.index('Step "4/10"'):text.index('Step "5/10"')]
+        self.assertNotRegex(step, r'@\(\s*"[A-Za-z0-9_]+\.py"', "hard-coded root file list is back")
+        listing = step.index('(Join-Path $Source "buildinfo.py") --source $Source --target $Target --list-root')
+        self.assertLess(step.index("$manifestPython = $basePyExe"), listing)
+        checked = step[listing:step.index("foreach ($f in $rootFiles)")]
+        self.assertIn("$LASTEXITCODE -ne 0", checked)
+        self.assertIn("-not $rootFiles.Count", checked)
+        self.assertIn("'^" + buildinfo.ROOT_NAME.pattern + "$'", checked)
+        self.assertIn("Fail ", checked)
         docs = {name.replace("\\", "/") for name in
                 re.findall(r'docs\\[A-Za-z0-9_.\\-]+\.md', text)}
         self.assertEqual(docs, set(buildinfo.DOC_FILES))
@@ -133,6 +143,106 @@ class BuildTests(unittest.TestCase):
         self.assertIsNotNone(support)
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', support.group(1))),
                          buildinfo.SUPPORT_DIRS)
+
+    def test_repository_root_ships_tracked_program_files(self):
+        if not (REPO / ".git").exists() or not shutil.which("git"):
+            self.skipTest("no Git checkout (installed copy)")
+        tracked = subprocess.run(["git", "-C", str(REPO), "ls-files"], check=True,
+                                 capture_output=True, text=True, encoding="utf-8").stdout.split("\n")
+        expected = {n for n in tracked if n and "/" not in n and (
+            n.lower().endswith(buildinfo.PROGRAM_SUFFIXES) or n in buildinfo.FIXED_ROOT_FILES)}
+        # An untracked root file here would be installed too: keep scratch work out of the root.
+        self.assertEqual(set(buildinfo.root_files(REPO)), expected)
+        self.assertLessEqual({"server.py", "worker.py", "buildinfo.py", "cards.html", "workflow.html",
+                              "answer_phrases.tsv", "README.md", "install.ps1"}, expected)
+
+    def test_new_root_module_ships_without_list_entry(self):
+        for name in ("new_module.py", "new_table.tsv", "new_page.html"):
+            (self.source / name).write_text("# synthetic\n", encoding="utf-8")
+            shutil.copy2(self.source / name, self.target / name)
+        data = buildinfo.write_manifest(self.source, self.target)
+        self.assertLessEqual({"new_module.py", "new_table.tsv", "new_page.html"}, set(data["files"]))
+        self.assertEqual(buildinfo.identity(self.target)["manifest_status"], "matched")
+        (self.target / "new_table.tsv").unlink()
+        with self.assertRaises(ValueError):
+            buildinfo.write_manifest(self.source, self.target)
+
+    def test_non_program_root_files_do_not_ship(self):
+        first = buildinfo.root_files(self.source)
+        (self.source / "sub").mkdir()
+        (self.source / "sub/inner.py").write_text("# synthetic", encoding="utf-8")
+        (self.source / "folder.py").mkdir()
+        for name in (".hidden.py", "заметка.html", "meeting.transcript.html", "Meeting.Transcript.tsv",
+                     "notes.md", "config.json", "voices.json", "record.mp3"):
+            (self.source / name).write_text("synthetic private", encoding="utf-8")
+        self.assertEqual(buildinfo.root_files(self.source), first)
+        self.assertEqual(set(buildinfo.root_files(self.source)), {"server.py", "cards.html"})
+        self.assertFalse({n for n in buildinfo.delivery_hashes(self.source)
+                          if "transcript" in n.lower() or n.startswith(("sub/", "."))})
+
+    def test_linked_root_entry_is_refused_before_copy(self):
+        real = buildinfo._link
+        def linked_in(place):
+            return lambda path: (path.name == "cards.html" and path.parent == place) or real(path)
+        with patch.object(buildinfo, "_link", side_effect=linked_in(self.source)):
+            self.assertIn("cards.html", buildinfo.root_files(self.source))
+            with self.assertRaises(ValueError):
+                buildinfo.list_root(self.source)
+            with self.assertRaises(ValueError):
+                buildinfo.delivery_hashes(self.source)
+            code, out = self.list_root_cli("--source", str(self.source))
+        self.assertEqual((code, out), (1, ""))
+        with patch.object(buildinfo, "_link", side_effect=linked_in(self.target)):
+            buildinfo.list_root(self.source)
+            with self.assertRaises(ValueError):
+                buildinfo.list_root(self.source, self.target)
+
+    def list_root_cli(self, *args):
+        stdout = io.StringIO()
+        with patch.object(sys, "argv", ["buildinfo.py", *args, "--list-root"]), \
+                redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            try:
+                buildinfo.main()
+                code = 0
+            except SystemExit as stop:
+                code = stop.code
+        return code, stdout.getvalue()
+
+    def test_list_root_prints_ascii_names_one_per_line(self):
+        (self.source / "new_module.py").write_text("# synthetic", encoding="utf-8")
+        (self.source / "записка.py").write_text("# synthetic", encoding="utf-8")
+        code, out = self.list_root_cli("--source", str(self.source), "--target", str(self.target))
+        self.assertEqual(code, 0)
+        self.assertTrue(out.isascii())
+        self.assertEqual(tuple(out.splitlines()), ("cards.html", "new_module.py", "server.py"))
+        self.assertTrue(all(buildinfo.ROOT_NAME.fullmatch(n) for n in out.splitlines()))
+        empty = Path(self.tmp.name) / "empty"
+        empty.mkdir()
+        self.assertEqual(self.list_root_cli("--source", str(empty)), (1, ""))
+
+    def test_stale_root_file_in_installation_is_kept_and_not_reported(self):
+        stale = self.target / "stale_module.py"
+        stale.write_text("# left by an older version", encoding="utf-8")
+        data = buildinfo.write_manifest(self.source, self.target)
+        self.assertNotIn("stale_module.py", data["files"])
+        self.assertTrue(stale.exists())
+        got = buildinfo.identity(self.target)
+        self.assertEqual(got["manifest_status"], "matched")
+        self.assertEqual(got["payload_sha256"], data["payload_sha256"])
+        (self.target / "cards.html").unlink()
+        self.assertEqual(buildinfo.identity(self.target)["manifest_status"], "modified")
+
+    def test_buildinfo_uses_only_standard_library(self):
+        tree = ast.parse((REPO / "buildinfo.py").read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0)
+                names.add(node.module.split(".")[0])
+        self.assertTrue(names)
+        self.assertLessEqual(names, set(sys.stdlib_module_names), names - set(sys.stdlib_module_names))
 
     def test_uninstalled_docs_do_not_enter_payload(self):
         docs = self.source / "docs"

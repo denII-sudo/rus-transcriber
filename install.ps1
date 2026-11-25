@@ -739,60 +739,21 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 }
 
 Step "4/10" "Копирование файлов программы"
+# Use base Python before dependency installation; buildinfo imports only the standard library.
+$manifestPython = $basePyExe
+if (-not $manifestPython) { $manifestPython = (Get-Command python -ErrorAction Stop).Source }
 if ($Source -ne $Target) {
-    foreach ($f in @(
-        "server.py"
-        "worker.py"
-        "bench.py"
-        "runinfo.py"
-        "benchdb.py"
-        "buildinfo.py"
-        "backends.py"
-        "paths.py"
-        "recordings.py"
-        "storage.py"
-        "documents.py"
-        "workflow.py"
-        "product_policy.py"
-        "model_tasks.py"
-        "llm_provider.py"
-        "download_hint.py"
-        "transcript.py"
-        "diar_fast.py"
-        "vocab.py"
-        "voices.py"
-        "gender.py"
-        "words.py"
-        "hypotheses.py"
-        "hypstore.py"
-        "hotspots.py"
-        "quotes.py"
-        "conspect.py"
-        "review_pack.py"
-        "freeform.py"
-        "answer_phrases.tsv"
-        "jobslots.py"
-        "settings.py"
-        "migrate.py"
-        "data_io.py"
-        "core.py"
-        "core_voices.py"
-        "core_screen.py"
-        "core_conflicts.py"
-        "confirm.py"
-        "tmpfiles.py"
-        "selfcheck.py"
-        "rt.py"
-        "voice_io.py"
-        "voice_review.py"
-        "review_page.py"
-        "workflow_page.py"
-        "cards.html"
-        "workflow.html"
-        "README.md"
-        "install.ps1"
-    )) {
-        Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
+    # Файлы программы в корне — по маске (*.py, *.html, *.tsv, плюс README.md и install.ps1):
+    # правило одно, в buildinfo.py, новый модуль вписывать сюда не нужно. Имена только ASCII,
+    # поэтому разбор вывода не зависит от кодировки консоли. Ссылка с таким именем — отказ до копирования.
+    $rootFiles = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --list-root |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0 -or -not $rootFiles.Count -or
+        @($rootFiles | Where-Object { $_ -notmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' }).Count) {
+        Fail "Не удалось составить список файлов программы в $Source (ссылка вместо файла или файлов нет). Файлы программы не скопированы."
+    }
+    foreach ($f in $rootFiles) {
+        Copy-Item -LiteralPath (Join-Path $Source $f) -Destination (Join-Path $Target $f) -Force
     }
     $docsTarget = Join-Path $Target "docs"
     New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
@@ -847,9 +808,6 @@ if ($Source -ne $Target) {
     # старые profiles\, config.json, jobs\ из папки программы переносит явная команда migrate_data (или migrate.py)
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
 # Generate provenance from the checked source, not from a nonexistent .git in the installation.
-# Use base Python before dependency installation; buildinfo imports only the standard library.
-$manifestPython = $basePyExe
-if (-not $manifestPython) { $manifestPython = (Get-Command python -ErrorAction Stop).Source }
 $buildSummary = & $manifestPython -B (Join-Path $Target "buildinfo.py") --source $Source --target $Target
 if ($LASTEXITCODE -ne 0) { Fail "Не удалось проверить состав установленной сборки" }
 Write-Host "  сборка: $buildSummary"
