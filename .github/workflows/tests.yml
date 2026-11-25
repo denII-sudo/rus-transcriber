@@ -5,14 +5,17 @@ on:
     branches: [main]
     # No ready_for_review: the commit is already tested, automerge.yml reuses that result.
     types: [opened, synchronize, reopened]
-  # Every push to main (a merge) and a schedule run the full suite sequentially, in one process, as a control for
-  # the parallel run in pull requests: a hidden dependency between modules would show as "green in parallel,
-  # red in sequence". It also fills the dependency cache that every PR can read (GitHub drops a cache unused for
-  # 7 days, hence the schedule). automerge.yml ignores these runs: it queues only pull_request ones.
+  # A push to main, a daily schedule and a manual run (workflow_dispatch) run the full suite sequentially, in one
+  # process, as a control for the parallel run in pull requests: a hidden dependency between modules would show as
+  # "green in parallel, red in sequence". A merge by automerge.yml (GITHUB_TOKEN) starts no push run, so for such
+  # merges the daily schedule or a manual run is the control. The control also fills the dependency cache that
+  # every PR can read (GitHub drops a cache unused for 7 days). automerge.yml ignores these runs: it queues only
+  # pull_request ones.
   push:
     branches: [main]
   schedule:
-    - cron: "41 1 */5 * *"
+    - cron: "41 1 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
