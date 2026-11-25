@@ -8,6 +8,7 @@
 ключа, отказ при изменении записи, повтор без изменений; (4) прежнее поведение `voices.learn` на файлах.
 """
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -257,12 +258,17 @@ class ManualSqlitePath(SyntheticStore):
         counts = {name: self.store.db.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0] for name in tables}
         heads = [tuple(row) for row in self.store.db.execute(
             "SELECT recording_id, source_revision, review_revision FROM recordings ORDER BY recording_id")]
-        return counts, heads
+        # data_version этого соединения меняется при любой фиксации из другого соединения, даже без новых строк
+        version = self.store.db.execute("PRAGMA data_version").fetchone()[0]
+        content = hashlib.sha256("\n".join(self.store.db.iterdump()).encode("utf-8")).hexdigest()
+        return counts, heads, version, content
 
     def test_preview_and_prepare_read_revision_without_writing_store_or_files(self):
         before = (self.store_state(), self.export.read_bytes(), self.profile_path.read_bytes())
-        # черновик ответов и файл выгрузки в обучение не идут: transcript.load не вызывается
-        with patch.object(transcript, "load", side_effect=AssertionError("transcript.load в обучении")):
+        # черновик ответов и файл выгрузки в обучение не идут: transcript.load не вызывается;
+        # база открывается только на чтение: соединение на запись — отказ теста
+        with patch.object(transcript, "load", side_effect=AssertionError("transcript.load в обучении")), \
+                patch.object(storage, "open_store", side_effect=AssertionError("база открыта на запись")):
             report = core.preview_voice_learning(self.ref)
             snapshot = core.prepare_voice_action(self.ref)
         self.assertEqual(before, (self.store_state(), self.export.read_bytes(), self.profile_path.read_bytes()))
@@ -422,6 +428,21 @@ class ManualSqlitePath(SyntheticStore):
         self.assertEqual(profile["speakers"]["Анна"]["parts"][self.audio_key]["from"], export.name)
         # ключ старого файла первого варианта не снимается: вторая копия перенесена из другого файла
         self.assertEqual(sorted(profile["sources"]), sorted([self.legacy_key, "recording:" + rid]))
+
+    def test_revoke_by_second_variant_warns_that_other_variant_contribution_goes_too(self):
+        second = legacy_data(self.audio)
+        second["segments"][0]["text"] = "второй вариант"
+        rid, _, _ = self.migrate(second, self.root / "meeting.v2.transcript.json", tag="v2")
+        snapshot = core.prepare_voice_action(voice_sources.RECORDING_PREFIX + rid)
+        lines = core.voice_action_lines(snapshot, revoke=True)
+        # вклад хранится по ключу аудио: отзыв второго варианта снимает и вклад, обученный по первому
+        self.assertIn(f"Снимет и вклад другого варианта стенограммы: {self.legacy_path.name}.", lines)
+        self.assertIn("Удалить перечисленные вклады этого аудио; другие записи не меняются.", lines)
+        self.assertFalse(any("другие источники не меняются" in line for line in lines))
+        self.assertLessEqual(len("\n".join(lines)), core_voices.VOICE_ACTION_TEXT_LIMIT)
+        result = core.revoke_voice_source(snapshot)
+        self.assertEqual(result["revoked"], ["Анна"])
+        self.assertEqual(voices.load_profile(self.profile_path)["speakers"]["Анна"]["parts"], {})
 
     def test_old_job_id_redirects_only_to_single_unchanged_copy(self):
         with patch.object(settings, "recording_backend", return_value="sqlite"), \

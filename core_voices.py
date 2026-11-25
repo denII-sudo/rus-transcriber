@@ -77,6 +77,21 @@ def _open_voice_source(ref):
         raise core.CoreError(f"источник для голосового профиля недоступен: {type(ex).__name__}: {ex}") from ex
 
 
+def _voice_job_source_ref(job_id):
+    """Ссылка на источник по номеру задачи или `recording:<id>`.
+
+    `recording:<id>` идёт в voice_sources напрямую: там база открывается только на чтение, а общий
+    core.job_json открыл бы её на запись.
+    """
+    import voice_sources
+    if isinstance(job_id, str) and job_id.startswith(voice_sources.RECORDING_PREFIX):
+        return job_id
+    jp, _ = core.job_json(job_id)
+    if not jp:
+        raise core.CoreError("готовая расшифровка не найдена")
+    return jp
+
+
 def _source_contributions(profile, source, key):
     """Пометки с переноса, которые заменит обновление, и вклады из других вариантов стенограммы."""
     confirmation, other = [], set()
@@ -97,10 +112,7 @@ def preview_voice_learning(job_id, group_override=None):
     import voices
     import vocab
     import voice_sources
-    jp, _ = core.job_json(job_id)
-    if not jp:
-        raise core.CoreError("готовая расшифровка не найдена")
-    source = _open_voice_source(jp)
+    source = _open_voice_source(_voice_job_source_ref(job_id))
     try:
         data = source.data
         if data.get("no_profile"):
@@ -190,9 +202,7 @@ def _voice_hash(path):
 
 def prepare_voice_action(job_id, group_override=None):
     """Снимок предварительного плана для привязки подтверждения к конкретным файлам."""
-    jp, _ = core.job_json(job_id)
-    if not jp:
-        raise core.CoreError("готовая расшифровка не найдена")
+    jp = _voice_job_source_ref(job_id)
     try:
         before = _open_voice_source(jp).token
         report = preview_voice_learning(job_id, group_override)
@@ -251,9 +261,12 @@ def voice_action_lines(snapshot, revoke=False):
         lines.append(line + ".")
     lines += ["Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
               "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
-    if report.get("other_variant_contributions") and not revoke:
-        lines.append("Заменит вклад другого варианта стенограммы: " +
-                     ", ".join(_short(name) for name in report["other_variant_contributions"]) + ".")
+    other_variants = report.get("other_variant_contributions") or []
+    if other_variants:
+        # вклад хранится по ключу аудио: отзыв снимает и вклад другой копии стенограммы того же аудио
+        lines.append(("Снимет и вклад другого варианта стенограммы: " if revoke else
+                      "Заменит вклад другого варианта стенограммы: ") +
+                     ", ".join(_short(name) for name in other_variants) + ".")
     if report.get("confirmation_replaced") and not revoke:
         lines.append("Пометка «кем подтверждены голоса» заменится подсчётом секунд (прежняя — в истории): " +
                      ", ".join(report["confirmation_replaced"]) + ".")
@@ -276,7 +289,9 @@ def voice_action_lines(snapshot, revoke=False):
         lines.append("Словарь выбранной группы отсутствует; обновление не запущено.")
     else:
         lines.append("Словарь группы не найден; ограничение участников словарём недоступно.")
-    tail = [("Удалить перечисленные вклады источника; другие источники не меняются." if revoke else
+    revoke_tail = ("Удалить перечисленные вклады этого аудио; другие записи не меняются." if other_variants else
+                   "Удалить перечисленные вклады источника; другие источники не меняются.")
+    tail = [(revoke_tail if revoke else
              "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
             "Будет создана резервная копия профиля. Подтвердите только после проверки."]
     explanation = report.get("selection_explanation") or []

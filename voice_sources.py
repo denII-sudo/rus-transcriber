@@ -6,7 +6,8 @@ SHA-256 файла в подтверждении: изменилась реви�
 
 Связь со старым файлом, перенесённым в базу (`tools/import_legacy.py`), вычисляется при чтении: запись связана
 со старым ключом профиля, если `quality.migration.source.path` её первой ревизии указывает на этот файл. Других
-способов угадать связь нет. Модуль только читает: в базу, профили и рядом с аудио ничего не пишет.
+способов угадать связь нет. Модуль только читает: базу открывает только на чтение (`readonly=True`),
+в профили и рядом с аудио ничего не пишет.
 """
 import hashlib
 import os
@@ -137,7 +138,7 @@ def migrated_copies(store, legacy_path):
 def _redirect(legacy_path):
     """Старая стенограмма при работе с базой: перейти к её единственной копии в базе."""
     import recordings
-    store = recordings.open_store()
+    store = recordings.open_store(readonly=True)
     try:
         store.current_identity()
         copies = migrated_copies(store, legacy_path)
@@ -174,7 +175,7 @@ def open_document(json_path):
     passport = data.get("passport")
     export = isinstance(passport, dict) and passport.get("storage_backend") == "sqlite"
     try:
-        store, binding = recordings.open_for_document(p)
+        store, binding = recordings.open_for_document(p, readonly=True)
     except storage.Conflict:
         if export or settings.recording_backend() != "sqlite":
             raise
@@ -193,7 +194,7 @@ def open_ref(ref):
     import storage
     if isinstance(ref, str) and ref.startswith(RECORDING_PREFIX):
         recording_id = ref[len(RECORDING_PREFIX):]
-        store = recordings.open_store()
+        store = recordings.open_store(readonly=True)
         try:
             store.current_identity()
             return _sqlite_source(store, recording_id)

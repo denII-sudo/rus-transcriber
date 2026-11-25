@@ -71,15 +71,18 @@ def initialize_store(path=None, *, display_name=""):
     return storage.initialize(path, initial_display_name=display_name)
 
 
-def open_store(path=None):
-    """Открыть существующую runtime-БД; не создавать, мигрировать или инициализировать."""
+def open_store(path=None, readonly=False):
+    """Открыть существующую runtime-БД; не создавать, мигрировать или инициализировать.
+
+    readonly=True — соединение только для чтения (storage.open_store_readonly): для тех, кто базу не меняет.
+    """
     if path is None:
         import paths
         path = paths.STATE_DB
-    return storage.open_store(path)
+    return storage.open_store_readonly(path) if readonly else storage.open_store(path)
 
 
-def open_for_document(document_path, path=None):
+def open_for_document(document_path, path=None, readonly=False):
     """Открыть Store только если путь зарегистрирован как текущая цель SQLite-записи."""
     import settings
     sqlite_selected = settings.recording_backend() == "sqlite"
@@ -98,7 +101,7 @@ def open_for_document(document_path, path=None):
             raise storage.StorageError("SQLite database is missing for this recording")
         return None, None
     try:
-        store = open_store(path)
+        store = open_store(path, readonly=readonly)
     except storage.StorageError:
         if hint == "sqlite" or sqlite_selected:
             raise
