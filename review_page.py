@@ -136,17 +136,44 @@ def main():
             self.end_headers()
             self.wfile.write(b)
 
+        def _length(self):
+            """Объявленная длина тела POST или None, если заголовок неверен или тело идёт частями."""
+            length = self.headers.get("Content-Length", "")
+            if len(length) > 12 or not length.isascii() or not length.isdecimal() or self.headers.get("Transfer-Encoding"):
+                return None
+            return int(length)
+
+        def _refuse(self, code, body):
+            """Ранний отказ на POST, пока тело ещё не прочитано. Закрытие соединения с непрочитанным телом в Windows
+            даёт клиенту сброс (WinError 10053) вместо ответа: браузер видит обрыв, а не отказ. Поэтому объявленное
+            тело до MAX_DRAIN_BYTES дочитывается и отбрасывается (не дольше DRAIN_TIMEOUT), потом идёт ответ;
+            больше, без длины или не пришедшее в срок — отвечаем сразу, соединение закрывается."""
+            n = self._length()
+            if n and n <= MAX_DRAIN_BYTES:
+                self.connection.settimeout(DRAIN_TIMEOUT)
+                try:
+                    left = n
+                    while left > 0:
+                        chunk = self.rfile.read(min(65536, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                except OSError:
+                    pass
+            self._send(code, body, close=True)
+
         def _path(self, post=False):
+            refuse = self._refuse if post else self._send
             host = f"127.0.0.1:{self.server.server_port}"
             if self.headers.get("Host") != host:
-                self._send(403, {"error": "недопустимый адрес"})
+                refuse(403, {"error": "недопустимый адрес"})
                 return None
             if post and self.headers.get("Origin") != f"http://{host}":
-                self._send(403, {"error": "недопустимый источник"})
+                refuse(403, {"error": "недопустимый источник"})
                 return None
             u = urlparse(self.path)
             if not u.path.startswith(prefix):
-                self._send(403, {"error": "недействительная сессия"})
+                refuse(403, {"error": "недействительная сессия"})
                 return None
             return u.path[len(prefix):]
 
@@ -186,31 +213,16 @@ def main():
             if u is None:
                 return
             if u not in ("api/answer", "api/voice", "api/apply", "api/preview", "api/event"):
-                return self._send(404, {"error": "не найдено"})
+                return self._refuse(404, {"error": "не найдено"})
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             types = {"audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/wav": "wav"}
             if (u != "api/voice" and ctype != "application/json") or (u == "api/voice" and ctype not in types):
-                return self._send(415, {"error": "недопустимый тип данных"})
-            length = self.headers.get("Content-Length", "")
-            if len(length) > 12 or not length.isascii() or not length.isdecimal() or self.headers.get("Transfer-Encoding"):
-                return self._send(400, {"error": "неверная длина запроса"})
-            n = int(length)
+                return self._refuse(415, {"error": "недопустимый тип данных"})
+            n = self._length()
+            if n is None:
+                return self._refuse(400, {"error": "неверная длина запроса"})
             if n <= 0 or n > (MAX_VOICE_BYTES if u == "api/voice" else MAX_ANSWER_BYTES):
-                # Закрытие соединения с непрочитанным телом в Windows даёт клиенту сброс (WinError 10053) вместо
-                # ответа: браузер видит обрыв, а не 413. Тело до MAX_DRAIN_BYTES дочитываем и отбрасываем,
-                # потом отвечаем; больше — не читаем, отвечаем сразу и закрываем соединение.
-                if 0 < n <= MAX_DRAIN_BYTES:
-                    self.connection.settimeout(DRAIN_TIMEOUT)
-                    try:
-                        left = n
-                        while left > 0:
-                            chunk = self.rfile.read(min(65536, left))
-                            if not chunk:
-                                break
-                            left -= len(chunk)
-                    except OSError:
-                        pass                      # тело не пришло в срок: ответ тот же, соединение закрывается
-                return self._send(413, {"error": "недопустимый размер запроса"}, close=True)
+                return self._refuse(413, {"error": "недопустимый размер запроса"})
             self.connection.settimeout(30)
             try:
                 body = self.rfile.read(n)

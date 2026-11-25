@@ -166,12 +166,15 @@ class ReviewHTTP(unittest.TestCase):
         finally:
             conn.close()
 
-    def raw_post(self, path, length, parts, pause=0.3):
+    def raw_post(self, path, length, parts, pause=0.3, headers=None, target=None):
         """Запрос на сыром сокете: заголовки с Content-Length=length и первая часть тела, после каждой паузы — следующая;
         затем ответ читается до закрытия соединения. -> (статус, заголовки в нижнем регистре, тело, секунд до конца ответа)."""
         port = self.url.port
-        head = (f"POST {self.url.path}{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n"
-                f"Content-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").encode()
+        fields = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}", "Content-Type": "application/json",
+                  "Content-Length": str(length), "Connection": "close"}
+        fields.update(headers or {})
+        head = (f"POST {target or self.url.path + path} HTTP/1.1\r\n"
+                + "".join(f"{k}: {v}\r\n" for k, v in fields.items()) + "\r\n").encode()
         started = time.time()
         with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
             sock.sendall(head + parts[0])
@@ -198,6 +201,30 @@ class ReviewHTTP(unittest.TestCase):
         self.assertEqual(status, 413)
         self.assertEqual(headers["connection"], "close")
         self.assertIn("недопустимый размер", json.loads(body)["error"])
+
+    def test_every_early_refusal_reads_the_body_first_so_the_client_gets_the_answer(self):
+        # Отказы до чтения тела (403 по адресу, источнику и сессии, 404, 415, 413): тело приходит уже после отказа.
+        # Без дочитывания в Windows клиент получал сброс соединения вместо ответа (CI №201: 403 на api/event).
+        from review_page import MAX_ANSWER_BYTES
+        body = b'{"id": "r1", "version": "v", "text": "x"}'
+        wrong_session = self.url.path.rstrip("/") + "x/api/event"
+        cases = (
+            ("403 адрес", 403, {"path": "api/event", "headers": {"Host": "evil.example"}}),
+            ("403 источник", 403, {"path": "api/event", "headers": {"Origin": "https://evil.example"}}),
+            ("403 сессия", 403, {"path": "", "target": wrong_session}),
+            ("404 маршрут", 404, {"path": "api/nothing"}),
+            ("415 тип", 415, {"path": "api/event", "headers": {"Content-Type": "text/plain"}}),
+            ("413 размер", 413, {"path": "api/answer", "length": MAX_ANSWER_BYTES + 1}),
+        )
+        for name, code, case in cases:
+            with self.subTest(name):
+                length = case.get("length", len(body))
+                parts = [body[:5], body[5:]] if length == len(body) else [b"x" * 100, b"x" * (length - 100)]
+                status, headers, answer, _ = self.raw_post(case["path"], length, parts, headers=case.get("headers"),
+                                                           target=case.get("target"))
+                self.assertEqual(status, code)
+                self.assertEqual(headers["connection"], "close")
+                self.assertIn("error", json.loads(answer))
 
     def test_body_over_the_drain_limit_is_refused_at_once_and_not_read(self):
         from review_page import MAX_DRAIN_BYTES
