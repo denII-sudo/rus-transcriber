@@ -223,7 +223,7 @@ def build():
     es = sub.add_parser("edit-span"); es.add_argument("job"); es.add_argument("t1", type=float); es.add_argument("t2", type=float)
     es.add_argument("text"); es.add_argument("--speaker", default=""); es.add_argument("--note", default="")
     es.add_argument("--by", default=None, choices=["human", "claude"], help="автор правки, обязателен")
-    rb = sub.add_parser("review-build"); rb.add_argument("job"); rb.add_argument("--items", help="JSON-файл с вопросами; без него — нейтральные карточки")
+    rb = sub.add_parser("review-build"); rb.add_argument("job"); rb.add_argument("--items", help="JSON-файл с вопросами; без него — нейтральные карточки"); rb.add_argument("--rebuild", action="store_true", help="полная пересборка вместо дописывания порции")
     rp = sub.add_parser("review-page"); rp.add_argument("job"); rp.add_argument("--port", type=int, default=8765)
     ra = sub.add_parser("review-apply"); ra.add_argument("job")
     cc = sub.add_parser("conspect-confirm"); cc.add_argument("job"); cc.add_argument("--name", default="конспект")
@@ -344,7 +344,7 @@ def run(a):
             items = json.loads(Path(a.items).read_text(encoding="utf-8-sig"))
             if not isinstance(items, list):
                 raise core.CoreError("Файл вопросов должен содержать JSON-массив")
-        out(core.build_review_pack(a.job, items))
+        out(core.build_review_pack(a.job, items, a.rebuild))
     elif c == "review-page":
         out(core.start_review_page(a.job, a.port))
     elif c == "review-apply":
