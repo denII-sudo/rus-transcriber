@@ -241,6 +241,83 @@ class Races(Base):
         self.assertEqual(seen, [0, 0])
 
 
+class Risky(Base):
+    """Самые рисковые проверки плана (приёмка №192)."""
+
+    def test_two_concurrent_portions_lose_nothing(self):
+        """Две порции одновременно: клипы режутся параллельно вне замка; обе дописаны, одно место — один раз,
+        pack_rev и имена клипов не повторяются."""
+        import threading
+        with files("sqlite", qs=first()) as (jp, _md, _version):
+            barrier = threading.Barrier(2, timeout=20)
+
+            def cut(_src, t1, _t2, out):
+                Path(out).write_bytes(b"clip")
+                try:
+                    barrier.wait()          # обе порции режут одновременно
+                except threading.BrokenBarrierError:
+                    pass
+                return t1
+
+            reps, errors = [], []
+
+            def run(qs):
+                try:
+                    reps.append(self.append(jp, qs))
+                except Exception as ex:      # noqa: BLE001 — ошибка потока проверяется ниже
+                    errors.append(ex)
+
+            r3, r4 = ([q for q in six.questions() if q["id"] == rid] for rid in ("r3", "r4"))
+            with mock.patch.object(review_pack, "cut_clip", side_effect=cut):
+                threads = [threading.Thread(target=run, args=(qs,)) for qs in (r3 + r4, r4)]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join(30)
+            self.assertEqual(errors, [])
+            man = review_pack.manifest(jp)
+            self.assertEqual(sorted(ids(jp)), ["r1", "r2", "r3", "r4"])
+            self.assertEqual(sorted(r["pack_rev"] for r in reps), [1, 2])
+            self.assertEqual(man["pack_rev"], 2)
+            clips = [i["clip"] for i in man["items"]]
+            self.assertEqual(len(clips), len(set(clips)))
+            for clip in clips[2:]:          # клипы порций (build в fixture режет без файлов)
+                self.assertTrue((review_pack.pack_dir(jp) / clip).is_file(), clip)
+            self.assertEqual(parts(jp), [])
+
+    def test_transcript_md_text_is_unchanged(self):
+        """После порции текст .md прежний байт в байт; меняются только строки сведений шапки (ревизии,
+        время формирования, последнее действие с разбором) — так же, как при любом ответе страницы."""
+        meta = tuple(s.encode() for s in ('Ревизия текста: ', 'Сформирован: ', 'Последнее действие с разбором: '))
+
+        def body(md):
+            return [line for line in Path(md).read_bytes().splitlines() if not line.startswith(meta)]
+
+        with files('sqlite', qs=first()) as (jp, md, version):
+            before = body(md)
+            self.assertTrue(self.append(jp)['written'])
+            self.assertEqual(body(md), before)
+            self.save(jp, version, 'r2', text='вон')       # ответ страницы меняет те же строки шапки
+            self.assertEqual(body(md), before)
+
+    def test_pack_built_before_13a_takes_a_portion(self):
+        """Пакет до 13а: нет pack_rev, clips_dir и source_revision у карточек — порция дописывается."""
+        with files("sqlite", qs=first()) as (jp, _md, version):
+            store = review_pack.answers_state(jp)
+            store["manifest"].pop("pack_rev", None)
+            store["manifest"].pop("clips_dir", None)
+            for item in store["manifest"]["items"]:
+                item.pop("source_revision", None)
+                item.pop("rev", None)
+            review_pack._write_answers(jp, store)
+            old_dir = review_pack._pack_clips_dir(store["manifest"], True)
+            rep = self.append(jp)
+            self.assertEqual((rep["version"], rep["pack_rev"], [r["id"] for r in rep["added"]]),
+                             (version, 1, ["r3", "r4"]))
+            man = review_pack.manifest(jp)
+            self.assertEqual(man["clips_dir"], old_dir, "клипы порции не в папке клипов пакета")
+
+
 class Entry(Base):
     def test_rebuild_true_rebuilds_with_the_guard(self):
         with files("sqlite") as (jp, _md, version):

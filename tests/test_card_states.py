@@ -67,6 +67,46 @@ class CardStates(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_appended_cards_appear_and_old_answers_stay(self):
+        """PR 17а: после дописывания порции (pack_rev + 1, version та же) страница перечитывает manifest —
+        новые карточки видны, ответ и состояние прежней карточки и номера карточек прежние."""
+        html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
+        script = html.split("<script>", 1)[1]
+        prefix = script.split("  // ответы этой версии вопросов")[0]
+        layer = "  // ответы этой версии вопросов" + script.split("  // ответы этой версии вопросов", 1)[1].split(
+            "  async function cloudApi()", 1)[0]
+        reload = "  async function reloadManifest()" + html.split("  async function reloadManifest()", 1)[1].split(
+            "\n  }\n", 1)[0] + "\n  }\n"
+        stubs = r"""
+          global.location = {hostname: "127.0.0.1"};
+          global.document = {getElementById: () => ({})};
+          const r1 = {id: "r1", version: "v", kind: "option", option: 0, ts: "t1", source: "local"};
+          const state = {pack_version: "v", pack_rev: 1, answers: {r1}, applied_answers: {r1: "sig"},
+                         answer_states: {r1: {state: "applied", ts: "t1", source: "local"}}};
+          const fresh = {version: "v", pack_rev: 1, items: [{id: "r1", options: []}, {id: "r2", options: []}]};
+          const seen = [];
+          global.fetch = async url => { seen.push(url);
+            return {ok: true, json: async () => url === "api/answers" ? state : fresh}; };
+        """
+        body = r"""
+          man = {version: "v", pack_rev: 0, items: [{id: "r1", options: []}], answers: {}};
+          const header = () => {};
+          api = localApi();
+          api.load().then(got => {
+            if (!seen.includes("manifest.json")) throw Error("manifest не перечитан");
+            if (man.items.map(i => i.id).join() !== "r1,r2") throw Error("новые карточки не видны: " + man.items.map(i => i.id));
+            if (!got.r1 || got.r1.option !== 0) throw Error("ответ прежней карточки потерян");
+            if (stateOf({id: "r1"}, got.r1) !== "applied") throw Error("состояние прежней карточки: " + stateOf({id: "r1"}, got.r1));
+            if (got.r2) throw Error("у новой карточки ответ");
+            if (man.items.findIndex(i => i.id === "r1") !== 0) throw Error("номер прежней карточки изменился");
+          }).catch(e => { console.error(e); process.exitCode = 1; });
+        })();
+        """
+        source = stubs + prefix + reload + layer + "  let render;\n" + body
+        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
     def test_card_state_comes_from_program(self):
         # Состояние ответа приходит из программы (answer_states) и относится только к тому же ответу.
         html = (Path(__file__).resolve().parent.parent / "cards.html").read_text(encoding="utf-8")
