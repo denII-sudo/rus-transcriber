@@ -20,6 +20,7 @@ if "paths" not in sys.modules:          # временная папка данн
 
 import copy  # noqa: E402
 import unittest  # noqa: E402
+from pathlib import Path  # noqa: E402
 from unittest import mock  # noqa: E402
 
 import test_pause_buttons_short_answers as six  # noqa: E402
@@ -40,6 +41,12 @@ def second():
 
 def ids(jp):
     return [i["id"] for i in review_pack.manifest(jp)["items"]]
+
+
+def cut_file(_src, t1, _t2, out):
+    """Резка клипа без ffmpeg, но с файлом: уборке временных клипов есть что убирать."""
+    Path(out).write_bytes(b"clip")
+    return t1
 
 
 def parts(jp):
@@ -177,7 +184,7 @@ class Races(Base):
                     out[0]["text"] = "изменилось"
                 return out
 
-            with mock.patch.object(review_pack, "_card", side_effect=card):
+            with mock.patch.object(review_pack, "_card", side_effect=card),                     mock.patch.object(review_pack, "cut_clip", side_effect=cut_file):
                 rep = self.append(jp)
             self.assertEqual([r["id"] for r in rep["added"]], ["r3"])
             self.assertEqual(rep["skipped"], [{"id": "r4", "why": "место изменилось во время сборки, повторите порцию"}])
@@ -204,7 +211,7 @@ class Races(Base):
     def test_second_conflict_refuses_and_removes_own_temp_clips(self):
         with files("sqlite", qs=first()) as (jp, _md, version):
             import storage
-            with mock.patch.object(review_pack, "_write_answers", side_effect=storage.Conflict("x")):
+            with mock.patch.object(review_pack, "_write_answers", side_effect=storage.Conflict("x")),                     mock.patch.object(review_pack, "cut_clip", side_effect=cut_file):
                 with self.assertRaises(core.CoreError) as caught:
                     self.append(jp)
             self.assertIn("повторите", str(caught.exception))
