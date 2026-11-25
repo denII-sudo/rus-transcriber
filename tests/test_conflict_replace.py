@@ -159,6 +159,23 @@ class ScreenCase(unittest.TestCase):
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
 
+    def new_database(self):
+        """Своя новая база для следующего случая: прежняя закрывается, `paths.STATE_DB` и `self.database` — на новый файл.
+
+        Сервер экрана открывает базу по `paths.STATE_DB` на каждый запрос, поэтому перезапускать его не нужно.
+        Нужна там, где случаев много и общий список конфликтов базы растёт с каждым: время одного запроса
+        списка пропорционально числу конфликтов в базе, у перебора из n случаев выходит n². Записи и файлы
+        прежних случаев остаются в папке теста, но в новой базе их нет.
+        """
+        self.store.close()
+        self.databases = getattr(self, "databases", 0) + 1
+        self.database = self.base / f"state-{self.databases}.sqlite3"
+        patcher = mock.patch.object(paths, "STATE_DB", self.database)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = storage.initialize(self.database, initial_display_name="Тест")
+        self.addCleanup(self.store.close)
+
     # ---------- HTTP ----------
     def request(self, method, path, body=None, *, origin="screen", prefix=None, host=None,
                 ctype="application/json"):
