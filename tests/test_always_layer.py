@@ -4,15 +4,25 @@
 ключевые пакеты — без текстов и путей, без настройки. Только синтетика: модели подменены (как в
 tests/test_run_words_golden.py), папки данных, кэш моделей и соль стенда — во временной папке.
 """
+import atexit
 import hashlib
 import json
+import os
 import re
+import shutil
+import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
+
+if "paths" not in sys.modules:   # папка данных — временная ДО первого импорта программы (test_data_safety)
+    os.environ["RUS_TRANSCRIBER_DATA"] = tempfile.mkdtemp(prefix="rt-always-data-")
+    atexit.register(shutil.rmtree, os.environ["RUS_TRANSCRIBER_DATA"], ignore_errors=True)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import hypotheses
 import hypstore
