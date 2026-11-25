@@ -77,7 +77,7 @@ class CardStates(unittest.TestCase):
           const one={id:"r1"}, two={id:"r2"};
           if (stateOf(one,a) !== "applied" || stateOf(two,a) !== "saved" || stateOf(one,changed) !== "saved") throw Error("card state");
           if (cardStatus(one,a) !== "применён ответ" || cardStatus(two,a) !== "ответ сохранён") throw Error("status");
-          if (cardStatus(two,{kind:"human"}) !== "требует проверки") throw Error("human");
+          if (cardStatus(two,{kind:"human"}) !== "оставлено человеку — ещё не применено") throw Error("human");   // К-9
           man.answer_states.r1 = {state:"pending_new",ts:"t2",source:"local",why:"ждёт"};
           if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — не применён" || !appliedCard(one,changed)) throw Error("pending");
           man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};

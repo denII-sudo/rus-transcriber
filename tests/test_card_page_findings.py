@@ -75,6 +75,20 @@ class ContradictionNote(cc.Base):
             self.assertTrue(place["contradiction"]["proposals"], "противоречие ждёт выбора")
             self.assertEqual(rep["notes_not_written"], [])
 
+    def test_own_text_left_to_human_note_is_not_written(self):
+        """Свой текст, который программа не поняла как решение и оставила человеку: примечание не записано."""
+        with files("sqlite") as (jp, md, version):
+            self.contradicted(jp, md, version)
+            self.save(jp, version, "r4", rev=self.rev(jp), text="не Анна: тут", human_note=NOTE)
+            rep = core.apply_answers_files(jp, md)
+            row = self.outcomes(rep)["r4"]
+            self.assertEqual(row["outcome"], "not_applied", rep.get("outcomes"))
+            self.assertEqual(self.place_of(jp, "r4")["status"], "human")
+            self.assertIn(review_pack.NOTE_NOT_WRITTEN, row.get("detail", ""))
+            self.assertEqual(rep["notes_not_written"], ["r4"])
+            self.assertNotIn("notes", self.place_of(jp, "r4")["contradiction"])
+            self.assertNotIn(NOTE, str(self.place_of(jp, "r4")["contradiction"].get("history")))
+
     def test_note_on_decided_place_is_not_written(self):
         with files("sqlite") as (jp, md, version):
             self.contradicted(jp, md, version)

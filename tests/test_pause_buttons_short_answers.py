@@ -302,7 +302,7 @@ class PauseButtonsApplyTests(Case):
                     row = self.outcomes(rep)["r1"]
                     self.assertEqual(row["outcome"], want, rep.get("outcomes"))
                     if where == "interval":
-                        self.assertIn("слова в интервале паузы изменились", row.get("detail", ""))
+                        self.assertIn(review_pack.LISTEN_STALE, row.get("detail", ""))   # К-7: без «паузы»
                         self.assertNotIn("listening", self.place_of(jp, "r1"))
 
     def test_agent_cannot_press_a_pause_button(self):
