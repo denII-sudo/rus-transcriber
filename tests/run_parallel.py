@@ -57,6 +57,8 @@ MAX_JOBS = 4
 GROUP_TIMEOUT = 900                   # секунд на группу; предел CI — 20 минут на всё задание
 SUMMARY_RAN = re.compile(r"^Ran (\d+) tests? in ([\d.]+)s\s*$", re.M)
 SUMMARY_STATUS = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
+# класс или модуль, пропущенный целиком (SkipTest в setUpClass/setUpModule): unittest не засчитывает их тесты в «Ran»
+SETUP_SKIPPED = re.compile(r"(setUpClass|setUpModule) \(([\w.]+)\) \.\.\. skipped")
 DURATION_LINE = re.compile(r"(?:^|\s)(\d+\.\d+)s\s+\S+ \(([\w.]+)\)\s*$", re.M)
 DATA_SUBDIR = "data"                  # папка данных группы внутри её TEMP
 SQLITE_COST = 4.5                     # цена варианта в режиме sqlite к варианту legacy_files (К-2 плана: 0,42 против 0,09 с)
@@ -405,23 +407,40 @@ def tree_state(repo):
 
 COUNT_CODE = (
     "import json, unittest\n"
-    "counts = {}\n"
+    "counts, classes = {}, {}\n"
     "def walk(suite):\n"
     "    for t in suite:\n"
     "        if isinstance(t, unittest.TestSuite):\n"
     "            walk(t)\n"
     "        else:\n"
-    "            mod = t._testMethodName if type(t).__name__ == '_FailedTest' else type(t).__module__\n"
+    "            failed = type(t).__name__ == '_FailedTest'\n"
+    "            mod = t._testMethodName if failed else type(t).__module__\n"
     "            counts[mod] = counts.get(mod, 0) + 1\n"
+    "            if not failed:\n"
+    "                cls = mod + '.' + type(t).__qualname__\n"
+    "                classes[cls] = classes.get(cls, 0) + 1\n"
     "walk(unittest.defaultTestLoader.discover('tests'))\n"
-    "print('@@COUNTS@@' + json.dumps(counts))\n")
+    "print('@@COUNTS@@' + json.dumps(counts))\n"
+    "print('@@CLASSES@@' + json.dumps(classes))\n")
 
 
-def read_counts(run):
+def skipped_whole(text):
+    """[(setUpClass|setUpModule, имя)] — классы и модули, пропущенные целиком: из подробного вывода группы."""
+    return SETUP_SKIPPED.findall(text)
+
+
+def shown_output(r, verbose):
+    """Вывод группы для людей: без строк «… ok» подробного режима, который включён ради сверки (иначе — как есть)."""
+    if verbose:
+        return r.output
+    return "\n".join(line for line in r.lines if not line.endswith(" ... ok")) + "\n"
+
+
+def read_counts(run, marker="@@COUNTS@@"):
     for line in run.lines:
-        if line.startswith("@@COUNTS@@"):
+        if line.startswith(marker):
             try:
-                return json.loads(line[len("@@COUNTS@@"):])
+                return json.loads(line[len(marker):])
             except ValueError:
                 return None
     return None
@@ -515,7 +534,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
                             modules, args.verbose, say))
         else:
             for i, g in enumerate(groups, 1):
-                runs.append(Run(f"g{i}", [py, "-B", "-m", "unittest", *extra, *g], repo, tests_dir, root, g,
+                runs.append(Run(f"g{i}", [py, "-B", "-m", "unittest", *([] if args.verbose else ["-v"]), *extra, *g], repo, tests_dir, root, g,
                                 args.verbose, say))
         if not args.sequential and not args.no_count:
             counter = Run("count", [py, "-B", "-c", COUNT_CODE], repo, tests_dir, root, [], False, say)
@@ -561,8 +580,8 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
                     else:
                         say("предупреждение: " + text)
         if counter:
-            counts = read_counts(counter)
-            if counts is None:
+            counts, classes = read_counts(counter), read_counts(counter, "@@CLASSES@@")
+            if counts is None or classes is None:
                 problems.append("не удалось посчитать тесты через discover: " + (counter.output.strip()[-300:] or "нет вывода"))
             else:
                 if sorted(counts) != modules:
@@ -570,8 +589,13 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
                                     f"{sorted(set(counts) - set(modules))}, только у запускателя {sorted(set(modules) - set(counts))}")
                 for r in runs:
                     want = sum(counts.get(m, 0) for m in r.modules)
-                    if r.summary and r.summary["ran"] != want:
-                        problems.append(f"{r.label}: запущено {r.summary['ran']} тестов, по discover у её модулей {want}")
+                    skipped = 0                     # тесты классов и модулей, пропущенных целиком, в «Ran» не входят
+                    for kind, name in skipped_whole(r.output):
+                        skipped += counts.get(name, 0) if kind == "setUpModule" else classes.get(name, 0)
+                    if r.summary and r.summary["ran"] + skipped != want:
+                        problems.append(f"{r.label}: запущено {r.summary['ran']} тестов"
+                                        + (f" и ещё {skipped} в пропущенных целиком классах или модулях" if skipped else "")
+                                        + f", по discover у её модулей {want}")
         tree_after = tree_state(repo)
         if tree_before is not None and tree_after is not None and tree_before != tree_after:
             changed = sorted(set(tree_before) ^ set(tree_after))
@@ -588,7 +612,7 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
             say(f"таблица длительностей записана: {table_path.name}")
         for r in bad:
             say(f"===== {r.label}: полный вывод упавшей группы =====")
-            say(r.output.rstrip("\n"))
+            say(shown_output(r, args.verbose).rstrip("\n"))
             say(f"===== конец вывода {r.label} =====")
         for p in problems:
             say("НАРУШЕНИЕ: " + p)

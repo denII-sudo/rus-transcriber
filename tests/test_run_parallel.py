@@ -333,6 +333,51 @@ class RunTests(Synthetic):
         self.assertEqual(code, 1, text)
         self.assertRegex(text, r"НАРУШЕНИЕ: g\d: запущено 2 тестов, по discover у её модулей 3")
 
+    def test_class_or_module_skipped_as_a_whole_is_not_counted_by_unittest_and_is_not_a_violation(self):
+        # SkipTest в setUpClass/setUpModule: unittest не засчитывает такие тесты в «Ran», discover их находит (как test_text_hygiene без Git)
+        self.module("test_class_skip", OK_MODULE + (
+            "\n\nclass NoGit(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise unittest.SkipTest('нет git')\n\n"
+            "    def test_one(self):\n        pass\n\n    def test_two(self):\n        pass\n"))
+        self.module("test_module_skip", "import unittest\n\n\ndef setUpModule():\n    raise unittest.SkipTest('нет окружения')\n\n\n"
+                                        "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n\n"
+                                        "    def test_b(self):\n        pass\n\n    def test_c(self):\n        pass\n")
+        self.module("test_plain")
+        code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("НАРУШЕНИЕ", text)
+        self.assertRegex(text, r"Ran 4 tests in [\d.]+s")                   # 2 + 2 запущенных; 5 пропущенных целиком не в «Ran»
+        self.assertIn("skipped=2", text)
+
+    def test_skipped_class_does_not_hide_a_test_that_was_really_lost(self):
+        self.module("test_skip_and_lost", OK_MODULE + (
+            "\n\nclass NoGit(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise unittest.SkipTest('нет git')\n\n"
+            "    def test_one(self):\n        pass\n\n"
+            "def load_tests(loader, tests, pattern):\n"
+            "    if pattern is not None:\n"
+            "        class Extra(unittest.TestCase):\n"
+            "            def test_only_in_discover(self):\n"
+            "                pass\n"
+            "        tests.addTests(loader.loadTestsFromTestCase(Extra))\n"
+            "    return tests\n"))
+        self.module("test_plain")
+        code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 1, text)
+        self.assertRegex(text, r"НАРУШЕНИЕ: g\d: запущено 2 тестов и ещё 1 в пропущенных целиком классах или модулях, по discover у её модулей 4")
+
+    def test_group_runs_are_verbose_for_the_check_but_a_failed_group_is_shown_without_ok_lines(self):
+        self.module("test_good")
+        self.module("test_broken", fail_module())
+        code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 1, text)
+        self.assertIn("нарочное падение", text)
+        self.assertNotIn(" ... ok", text)
+
     def test_group_without_summary_line_is_a_failure(self):
         self.module("test_good")
         self.module("test_dies", "import os\nimport unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n"
