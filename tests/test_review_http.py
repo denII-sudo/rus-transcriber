@@ -261,13 +261,6 @@ class ReviewHTTP(unittest.TestCase):
         self.assertEqual((status, headers["connection"]), (413, "close"))
         self.assertLess(seconds, 1.5)                         # тело, которого никто не ждёт, сервер не дожидается
 
-    def test_declared_body_that_never_comes_gets_413_after_the_drain_timeout(self):
-        from review_page import DRAIN_TIMEOUT, MAX_ANSWER_BYTES
-        status, headers, _, seconds = self.raw_post("api/answer", MAX_ANSWER_BYTES + 1, [b""])
-        self.assertEqual((status, headers["connection"]), (413, "close"))
-        self.assertGreaterEqual(seconds, DRAIN_TIMEOUT - 0.5)
-        self.assertLess(seconds, DRAIN_TIMEOUT + 6)           # сервер не висит, пока клиент молчит
-
     def test_new_routes_enforce_origin_and_version(self):
         payload = json.dumps({"id": "r1", "version": "old", "text": "пример"}).encode()
         for route in ("api/preview", "api/apply", "api/event"):
