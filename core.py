@@ -845,7 +845,11 @@ def build_review_pack(job_id, items=None):
         items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
                   "options": [{"label": "Оставить как есть", "decision": {}}]}
                  for it in data.get("review", []) if transcript.place_unresolved(it)]
-    return P.build(jp, items)
+    try:
+        P.check_rebuild(jp)             # быстрый отказ до резки клипов; build повторяет проверку под замком
+        return P.build(jp, items)
+    except P.RebuildRefused as ex:
+        raise CoreError(str(ex)) from ex
 
 
 def start_review_page(job_id, port=8765):

@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 PAD_BEFORE = 3.5     # клип начинается за 3,5 с до места (было 1,5)
@@ -89,6 +89,24 @@ PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом
 LISTEN_STALE = "слова в интервале паузы изменились после создания карточек; пересоберите пакет"
 CONTRADICTION_STALE = ("слова места изменились после показа карточки противоречия; ответ не применён, "
                        "карточка обновлена — выберите заново")
+# PR 17-Б: что пересборка пакета (build) делает с ответом в каждом состоянии. «Ждёт» — пересборка отказывает:
+# она потеряла бы ответ, ещё не применённый к стенограмме. «Применён» и «закончен» не блокируют (применённые
+# после пересборки не отменить со страницы — undo_lost в отчёте). «Неприменим» не блокирует и перечисляется в
+# отчёте. applied_check и listen_mismatch — исходы К-а1 («применён — проверить человеку», «прослушанное не
+# совпало со словами места»). Состояние вне таблицы считается ждущим.
+REBUILD_GROUPS = {
+    "waiting": frozenset({"saved", "revert_pending", "pending_new"}),
+    "applied": frozenset({"applied", "applied_open", "kept_previous", "applied_check"}),
+    "finished": frozenset({"reverted", "skipped", "already_decided", "left_for_human"}),
+    "unapplicable": frozenset({"negative", "hint", "pause_refused", "blocked_preflight", "apply_conflict",
+                               "source_conflict", "not_found", "not_applied", "undo_conflict", "listen_mismatch"}),
+}
+# что сделать человеку с ждущим ответом, чтобы пересборка стала возможной
+REBUILD_EXIT = {
+    "saved": "нажмите «Применить сохранённые ответы»",
+    "revert_pending": "нажмите «Применить сохранённые ответы» или «Не отменять»",
+    "pending_new": "«Подготовить отмену» → «Применить сохранённые ответы»",
+}
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -428,6 +446,53 @@ def _attach_clip(item, times, src, clip, pd, strict):
     return item
 
 
+def rebuild_group(state):
+    """Группа состояния ответа для пересборки пакета (REBUILD_GROUPS); неизвестное — «ждёт»."""
+    return next((name for name, states in REBUILD_GROUPS.items() if state in states), "waiting")
+
+
+class RebuildRefused(RuntimeError):
+    """Пересборка пакета отказала: в нём есть ответы, ждущие «Применить». waiting — [{card, id, state}]."""
+
+    def __init__(self, waiting):
+        self.waiting = waiting
+        rows = "; ".join(f"карточка №{w['card']} ({w['id']}) — {REBUILD_EXIT.get(w['state'], 'примените ответ')}"
+                         for w in waiting)
+        super().__init__("Пакет карточек не пересобран: в нём есть ответы, ждущие «Применить», пересборка "
+                         f"потеряла бы их. {rows}. Потом соберите пакет снова.")
+
+
+def rebuild_check(store, man):
+    """Что пересборка сделает с ответами пакета по его состоянию store и manifest man (только ответы текущей
+    редакции карточек). -> {"waiting", "unapplicable": [{card, id, state}], "undo_lost": N} — N применённых
+    ответов со снимком отмены: после пересборки отменить их со страницы будет нельзя."""
+    snapshots = store.get("undo_snapshots") or {}
+    out = {"waiting": [], "unapplicable": [], "undo_lost": 0}
+    for aid, row in answer_states_of(store, man).items():
+        group = rebuild_group(row["state"])
+        if group == "applied":
+            out["undo_lost"] += aid in snapshots
+        elif group in ("waiting", "unapplicable"):
+            out[group].append({"card": row["card"], "id": aid, "state": row["state"]})
+    for rows in (out["waiting"], out["unapplicable"]):
+        rows.sort(key=lambda r: (r["card"] is None, r["card"] or 0, str(r["id"])))
+    return out
+
+
+def check_rebuild(json_path):
+    """Ранняя проверка перед пересборкой (до резки клипов): RebuildRefused, если есть ждущие ответы.
+    build повторяет её под замком ответов. В файловом режиме проверки нет (указание владельца: новое — только
+    при хранении записей в базе) -> None."""
+    import recordings
+    store = recordings.read_review_pack_state(json_path)
+    if store is None:
+        return None
+    rep = rebuild_check(store, store.get("manifest") or {})
+    if rep["waiting"]:
+        raise RebuildRefused(rep["waiting"])
+    return rep
+
+
 def _card_fp(item, skip=()):
     return json.dumps({k: item.get(k) for k in _CARD_FP_FIELDS if k not in skip}, ensure_ascii=False, sort_keys=True)
 
@@ -445,7 +510,10 @@ def build(json_path, items, base_url_note=None):
     по местам review. answer_mode="speaker" — карточка подтверждения говорящего: свой ответ на ней
     применяется только как решение о говорящем (имя или «Имя: точные слова»), иначе — человеку.
     -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся.
-    Заменить или дописать карточки, не меняя version и не теряя ответов, — upsert_cards."""
+    Заменить или дописать карточки, не меняя version и не теряя ответов, — upsert_cards.
+    При хранении в базе (PR 17-Б): есть ответы, ждущие «Применить», — RebuildRefused; проверка и запись идут под
+    замком ответов, клипы режутся до него в свою папку, при отказе или ошибке она удаляется. В отчёте —
+    unapplicable и undo_lost (rebuild_check). Файловый режим — прежний, без проверки."""
     import transcript as T
     data = T.load(json_path)
     import recordings
@@ -459,6 +527,15 @@ def build(json_path, items, base_url_note=None):
     if sqlite_mode:
         clips_dir = clips_dir / uuid.uuid4().hex
     clips_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _build_pack(json_path, items, T, data, sqlite_mode, src, review, pd, clips_dir)
+    except BaseException:
+        if sqlite_mode:                # папка только этой сборки: клипы открытого пакета лежат в своей
+            shutil.rmtree(clips_dir, ignore_errors=True)
+        raise
+
+
+def _build_pack(json_path, items, T, data, sqlite_mode, src, review, pd, clips_dir):
     out, skipped = [], []
     listed = {q.get("id") for q in items}
     items = list(items) + [{"id": i["id"]} for i in data.get("review") or []
@@ -499,7 +576,17 @@ def build(json_path, items, base_url_note=None):
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(),
            "clips_dir": clips_dir.relative_to(pd).as_posix(), "items": out}
+    # в базе состояние пакета читается, проверяется и пишется под замком ответов: ответ, сохранённый страницей
+    # после ранней проверки, виден здесь (PR 17-Б); порядок замков — ответы, затем запись, как у upsert_cards
+    with _answers_lock(json_path) if sqlite_mode else nullcontext():
+        return _build_write(json_path, data, sqlite_mode, pd, clips_dir, out, skipped, version, man)
+
+
+def _build_write(json_path, data, sqlite_mode, pd, clips_dir, out, skipped, version, man):
     ans = _read_answers(json_path, {})
+    guard = rebuild_check(ans, ans.get("manifest") or {}) if sqlite_mode else None
+    if guard and guard["waiting"]:
+        raise RebuildRefused(guard["waiting"])
     if sqlite_mode and ans.get("_expected_versions") != {
             "source_revision": data.get("source_revision"),
             "review_revision": data.get("review_revision")}:
@@ -519,8 +606,11 @@ def build(json_path, items, base_url_note=None):
     if not sqlite_mode:
         _write(pd / "manifest.json", man)
     shutil.copyfile(HERE / "cards.html", pd / "cards.html")
-    return {"pack": str(pd), "version": version, "items": len(out), "skipped": skipped,
-            "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
+    rep = {"pack": str(pd), "version": version, "items": len(out), "skipped": skipped,
+           "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
+    if guard is not None:
+        rep.update(unapplicable=guard["unapplicable"], undo_lost=guard["undo_lost"])
+    return rep
 
 
 def upsert_cards(json_path, cards, *, why, actor="system", only_if=None):
