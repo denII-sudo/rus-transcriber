@@ -24,7 +24,7 @@ import lab_sandbox
 import lab_summary
 
 ANALYSIS_SCHEMA = "lab-analysis-1"
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3          # 3: раздел work — обычная работа по гипотезам и ответам человека (lab_work)
 BASELINE = "a-current"
 NO_HUMAN = "решений человека нет: звук добавлен из файла вне базы записей"
 # состояния сбойных кусков (words.combine_hypotheses): исключают из голосования свой отрезок
@@ -1160,11 +1160,14 @@ def analyze(sandbox, units_doc, baseline=BASELINE, log=print):
     W = _words_module()
     sandbox = Path(sandbox)
     units = units_doc.get("units") or []
+    import lab_work
+    work, work_examples = lab_work.analyze_work(sandbox, W)
     db_path = sandbox / "results" / "lab.sqlite3"
     if not db_path.is_file():
         analysis = {"schema": ANALYSIS_SCHEMA, "version": ANALYSIS_VERSION,
-                    "not_measured": "нет базы результатов results/lab.sqlite3: прогон не выполнялся"}
-        write_outputs(sandbox, analysis, [], {})
+                    "not_measured": "нет базы результатов results/lab.sqlite3: прогон не выполнялся",
+                    "work": work}
+        write_outputs(sandbox, analysis, [], {"work_examples": work_examples})
         return analysis
     db = open_readonly(db_path)
     try:
@@ -1276,8 +1279,9 @@ def analyze(sandbox, units_doc, baseline=BASELINE, log=print):
         "revote_check": checks,
         "human": human_part,
         "fitness": fitness,
+        "work": work,
     }
-    write_outputs(sandbox, analysis, examples, {"labels": labels})
+    write_outputs(sandbox, analysis, examples, {"labels": labels, "work_examples": work_examples})
     return analysis
 
 
@@ -1293,7 +1297,12 @@ def _atomic(path, text):
 def write_outputs(sandbox, analysis, examples, extra):
     _atomic(sandbox / "export" / "analysis.json", json.dumps(analysis, ensure_ascii=False, indent=1) + "\n")
     _atomic(sandbox / "results" / "report.md", render_report(analysis, extra.get("labels") or {}))
-    _atomic(sandbox / "results" / "examples.md", render_examples(examples))
+    import lab_work
+    text = render_examples(examples)
+    if extra.get("work_examples") is not None and isinstance(analysis.get("work"), dict) \
+            and not analysis["work"].get("not_measured"):
+        text = text.rstrip("\n") + "\n\n" + "\n".join(lab_work.render_examples(extra["work_examples"]))
+    _atomic(sandbox / "results" / "examples.md", text)
 
 
 def _fmt(x, nd=1):
@@ -1323,7 +1332,7 @@ def render_report(a, labels):
          "Отчёт только для этого компьютера. Тексты слов — в соседнем файле `examples.md`. Определения "
          "показателей — `lab/README.md`, раздел «Анализ». «Не измерено» — показатель не считался, а не ноль.", ""]
     if a.get("not_measured"):
-        return "\n".join(L + [f"**Не измерено:** {a['not_measured']}.", ""])
+        return "\n".join(L + [f"**Не измерено:** {a['not_measured']}.", ""] + _work_section(a))
     d = a["data"]
     base = a["baseline"]
     L += ["## Данные", "",
@@ -1443,7 +1452,14 @@ def render_report(a, labels):
     L += _revote_section(a)
     L += _human_section(a)
     L += _fitness_section(a)
+    L += _work_section(a)
     return "\n".join(L)
+
+
+def _work_section(a):
+    import lab_work
+    work = a.get("work")
+    return lab_work.render_section(work) if isinstance(work, dict) else []
 
 
 def _conclusions(a):
