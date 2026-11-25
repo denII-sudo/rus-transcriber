@@ -67,7 +67,7 @@ def _recording_row(store, recording_id):
             raise storage.StorageError("нет текущей ревизии текста")
         if row["has_review"] is None:
             raise storage.StorageError("нет текущей ревизии разбора")
-        source =row["file"] if isinstance(row["file"], str) and row["file"] else row["location"]
+        source = row["file"] if isinstance(row["file"], str) and row["file"] else row["location"]
         item.update(
             name=re.split(r"[\\/]", source)[-1],    # только имя файла: папку и путь к аудио экран не показывает
             title=row["title"] if isinstance(row["title"], str) else None,
