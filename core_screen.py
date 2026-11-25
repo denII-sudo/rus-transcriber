@@ -22,6 +22,162 @@ def workflow_list(limit=20):
         store.close()
 
 
+RECORDING_LIST_LIMIT = 500    # больше строк экран не показывает: говорит «показаны N из M»
+
+# Время последнего изменения записи: наибольшее время операций текущих ревизий текста и разбора.
+_UPDATED_AT = ("MAX(COALESCE((SELECT o.created_at FROM transcript_revisions t JOIN operations o USING(operation_id) "
+               "WHERE t.recording_id=r.recording_id AND t.revision=r.source_revision), ''), "
+               "COALESCE((SELECT o.created_at FROM review_revisions v JOIN operations o USING(operation_id) "
+               "WHERE v.recording_id=r.recording_id AND v.revision=r.review_revision), ''))")
+
+
+def _json_flag(kind):
+    """Значение json_type как логическое: 'true'/'false' или None, если поля нет или оно не логическое."""
+    return {"true": True, "false": False}.get(kind)
+
+
+def _recording_row(store, recording_id):
+    """Строка списка записей: сводка без текста реплик, имён говорящих и путей. Поля стенограммы берутся из JSON
+    в самой базе (json_extract), стенограмма целиком в Python не разбирается и хэш снимка здесь не проверяется —
+    это делает открытие записи. Строку, которую не прочитать, помечает ошибкой, а не роняет весь список."""
+    import json
+    import re
+    import sqlite3
+    import storage
+    import transcript
+    item = {"recording_id": recording_id}
+    try:
+        row = store.db.execute(
+            "SELECT r.location, r.source_revision, r.review_revision, " + _UPDATED_AT + " AS updated_at, "
+            "json_extract(t.payload, '$.file') AS file, json_extract(t.payload, '$.title') AS title, "
+            "json_extract(t.payload, '$.recorded_at') AS recorded_at, "
+            "json_extract(t.payload, '$.duration') AS duration, "
+            "json_type(t.payload, '$.names_confirmed') AS names_confirmed, "
+            "json_type(t.payload, '$.quality.migration') AS migration, "
+            "json_extract(t.payload, '$.quality.migration.variant.tag') AS variant_tag, "
+            "json_type(t.payload, '$.quality.migration.variant.main') AS variant_main, "
+            "json_extract(v.payload, '$.review') AS review, t.revision AS has_text, v.revision AS has_review "
+            "FROM recordings r "
+            "LEFT JOIN transcript_revisions t ON t.recording_id=r.recording_id AND t.revision=r.source_revision "
+            "LEFT JOIN review_revisions v ON v.recording_id=r.recording_id AND v.revision=r.review_revision "
+            "WHERE r.recording_id=?", (recording_id,)).fetchone()
+        if row is None:
+            raise storage.StorageError("записи больше нет в базе")
+        if row["has_text"] is None:
+            raise storage.StorageError("нет текущей ревизии текста")
+        if row["has_review"] is None:
+            raise storage.StorageError("нет текущей ревизии разбора")
+        source =row["file"] if isinstance(row["file"], str) and row["file"] else row["location"]
+        item.update(
+            name=re.split(r"[\\/]", source)[-1],    # только имя файла: папку и путь к аудио экран не показывает
+            title=row["title"] if isinstance(row["title"], str) else None,
+            recorded_at=row["recorded_at"] if isinstance(row["recorded_at"], str) else None,
+            duration=row["duration"] if isinstance(row["duration"], (str, int, float)) else None,
+            updated_at=row["updated_at"] or None,
+            source_revision=row["source_revision"], review_revision=row["review_revision"],
+            names_confirmed=_json_flag(row["names_confirmed"]))
+        if row["migration"] == "object":
+            item["origin"] = "migrated"
+            item["variant"] = {"tag": row["variant_tag"] if isinstance(row["variant_tag"], str) else None,
+                               "main": _json_flag(row["variant_main"])}
+        else:
+            item["origin"] = "program"
+            item["variant"] = None
+        places = json.loads(row["review"]) if isinstance(row["review"], str) else []
+        places = [place for place in places if isinstance(place, dict)] if isinstance(places, list) else []
+        # правило «открыто» и «не решено» — общее для программы (transcript.place_*), без своей копии
+        item["places"] = {"unresolved": sum(1 for place in places if transcript.place_unresolved(place)),
+                          "open": sum(1 for place in places if transcript.place_open(place)),
+                          "total": len(places)}
+        outbox = store.db.execute(
+            "SELECT state FROM document_outbox WHERE recording_id=? ORDER BY document_revision DESC LIMIT 1",
+            (recording_id,)).fetchone()
+        item["document_sync"] = outbox["state"] if outbox else None
+        item["open_conflicts"] = store.db.execute(
+            "SELECT (SELECT COUNT(*) FROM document_conflicts WHERE recording_id=? AND resolution_operation_id IS NULL) "
+            "+ (SELECT COUNT(*) FROM conspect_conflicts k JOIN conspects c USING(conspect_id) "
+            "WHERE c.recording_id=? AND k.resolution_operation_id IS NULL)",
+            (recording_id, recording_id)).fetchone()[0]
+        item["conspects"] = store.db.execute("SELECT COUNT(*) FROM conspects WHERE recording_id=?",
+                                             (recording_id,)).fetchone()[0]
+        request = store.db.execute(
+            "SELECT request_id, state FROM workflow_requests WHERE recording_id=? "
+            "ORDER BY updated_at DESC, request_id LIMIT 1", (recording_id,)).fetchone()
+        item["request"] = dict(request) if request else None
+        item["error"] = None
+    except (sqlite3.Error, storage.StorageError, ValueError, TypeError) as ex:
+        text = str(ex).lower()
+        if isinstance(ex, storage.Busy) or "locked" in text or "busy" in text:
+            raise    # занятая база — отказ всего списка с пояснением «подождите», а не «строка не читается»
+        name = item.get("name")
+        if name is None:    # JSON ревизии не читается: имя — из пути в базе (он хранится в нижнем регистре)
+            location = store.db.execute("SELECT location FROM recordings WHERE recording_id=?",
+                                        (recording_id,)).fetchone()
+            name = re.split(r"[\\/]", location["location"])[-1] if location else None
+        item = {"recording_id": recording_id, "name": name,
+                "error": f"Запись не читается: {core.explain_error(ex)}"}
+    return item
+
+
+def recording_list():
+    """Все записи базы для локального экрана, новые изменения сверху; ничего не пишет и не требует запроса.
+
+    Сводка без текста, имён говорящих и путей к аудио (только имя файла). Не больше RECORDING_LIST_LIMIT строк."""
+    import paths
+    import recordings
+    import settings
+    try:
+        backend = settings.recording_backend()
+    except ValueError:
+        backend = None
+    if not Path(paths.STATE_DB).is_file():
+        reason = "Базы записей ещё нет: показывать нечего."
+        if backend != "sqlite":
+            reason += (" Программа сейчас хранит записи в файлах вне базы: такие записи здесь не видны. "
+                       "Как перенести их в базу — docs/legacy-migration.md.")
+        return {"available": False, "items": [], "total": 0, "truncated": False, "reason": reason,
+                "backend": backend}
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        store.db.execute("BEGIN")    # одна транзакция чтения: строки списка — из одного состояния базы
+        try:
+            total = store.db.execute("SELECT COUNT(*) FROM recordings").fetchone()[0]
+            ids = [row["recording_id"] for row in store.db.execute(
+                "SELECT r.recording_id FROM recordings r ORDER BY " + _UPDATED_AT + " DESC, r.recording_id LIMIT ?",
+                (RECORDING_LIST_LIMIT,))]
+            items = [_recording_row(store, recording_id) for recording_id in ids]
+        finally:
+            if store.db.in_transaction:
+                store.db.execute("ROLLBACK")
+        return {"available": True, "items": items, "total": total, "truncated": total > len(items),
+                "reason": None, "backend": backend}
+    finally:
+        store.close()
+
+
+def recording_view(recording_id):
+    """Одна запись по устойчивому ID для экрана, без запроса: сводка, запросы записи и текущая пара ревизий."""
+    import recordings
+    import storage
+    try:
+        storage._uuid(recording_id)
+    except ValueError:
+        raise core.CoreError("Неверный номер записи.") from None
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        if recordings.recording_head(store, recording_id) is None:
+            raise core.CoreError("Такой записи в базе нет: обновите список.")
+        header = _recording_row(store, recording_id)
+        requests = [dict(row) for row in store.db.execute(
+            "SELECT request_id, state, created_at, updated_at FROM workflow_requests WHERE recording_id=? "
+            "ORDER BY updated_at DESC, request_id", (recording_id,))]
+    finally:
+        store.close()
+    return {"recording": header, "requests": requests, "data": core.read_recording_result(recording_id)}
+
+
 def recording_revisions(recording_id, kind):
     """История ревизий записи (transcript/review) с происхождением; хэши снимков проверяются."""
     import recordings

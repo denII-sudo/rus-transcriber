@@ -54,6 +54,26 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
   <button id="start">Запустить обработку</button>
 </section>
 
+<section id="recordings">
+  <h2>Записи в базе</h2>
+  <p class="muted">Все записи базы программы, в том числе перенесённые из файлов и записи без запроса. Здесь только
+    просмотр: «открыть» показывает стенограмму, конспекты и историю версий и ничего не меняет.</p>
+  <div class="bar">
+    <button id="recordings-refresh">Обновить</button>
+    <input type="search" id="rec-filter" placeholder="поиск по имени файла или названию" style="flex:1;min-width:200px">
+  </div>
+  <div class="bar">
+    <label><input type="checkbox" id="rec-unresolved"> только с нерешёнными местами</label>
+    <label><input type="checkbox" id="rec-main"> скрыть неосновные варианты переноса</label>
+    <label>порядок: <select id="rec-order">
+      <option value="updated">по изменению, новые сверху</option>
+      <option value="name">по имени файла</option>
+      <option value="recorded">по дате записи, новые сверху</option></select></label>
+  </div>
+  <div id="recordings-note" class="muted" role="status"></div>
+  <table id="recordings-table"></table>
+</section>
+
 <section>
   <h2>Запросы</h2>
   <button id="refresh">Обновить</button>
@@ -61,7 +81,11 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
 </section>
 
 <div id="detail" hidden>
-<section>
+<section id="rec-section" hidden>
+  <div id="rec-head"></div>
+</section>
+
+<section id="req-section">
   <h2>Состояние запроса <span id="req-id" class="muted"></span></h2>
   <div id="status"></div>
   <div id="verify-box"></div>
@@ -74,7 +98,7 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
   <div id="conspects"></div>
 </section>
 
-<section>
+<section id="questions-section">
   <h2>Уточнения (добровольные)</h2>
   <div id="questions"></div>
 </section>
@@ -105,6 +129,8 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
 const $ = id => document.getElementById(id);
 const esc = t => String(t ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let requestId = null, recordingId = null, pending = null;
+// readOnly — запись открыта из списка «Записи в базе», без запроса: только просмотр, кнопок записи нет.
+let readOnly = false, detailGen = 0;
 
 function say(text, bad) { $("msg").textContent = text || ""; $("msg").className = bad ? "bad" : "muted"; }
 
@@ -245,7 +271,12 @@ async function loadConspects() {
         note.textContent = `Не найдено в стенограмме цитат: ${c.quote_repair.unlinked} из ${c.quote_repair.total}.`;
         div.appendChild(note);
         const host = document.createElement("div");
-        if (c.quote_repair.available) {
+        if (c.quote_repair.available && readOnly) {
+          const why = document.createElement("p");
+          why.className = "muted";
+          why.textContent = "Исправить цитаты можно из запроса этой свёртки: здесь только просмотр.";
+          div.appendChild(why);
+        } else if (c.quote_repair.available) {
           const opener = document.createElement("button");
           opener.textContent = "Попросить модель исправить цитаты…";
           opener.onclick = () => repairQuotes(c, host, opener);
@@ -291,7 +322,7 @@ async function loadHistory(kind) {
       `<tr><td>${r.revision}${r.restored_from ? ` <span class="muted">(возврат ${r.restored_from})</span>` : ""}</td>
       <td>${esc(fmtTime(r.created_at))}</td><td>${esc(r.actor_kind || "")} ${esc(r.initiated_by || "")}</td>
       <td><button data-rev="${r.revision}" class="view">просмотр</button>
-      ${r.revision !== (d.revisions.at(-1) || {}).revision && restorePair(kind, r)
+      ${!readOnly && r.revision !== (d.revisions.at(-1) || {}).revision && restorePair(kind, r)
         ? `<button data-rev="${r.revision}" data-source="${restorePair(kind, r).source_revision}"
              data-review="${restorePair(kind, r).review_revision}" data-k="${kind}" class="restore">вернуть</button>` : ""}</td></tr>`).join("");
     table.querySelectorAll(".view").forEach(b => b.onclick = () => viewRevision(kind, b.dataset.rev));
@@ -333,6 +364,7 @@ function segmentText(s) {
 }
 
 async function prepareRestore(kind, rev, sourceRevision, reviewRevision) {
+  if (readOnly) return;    // в режиме просмотра записи возврата нет (кнопка и не показывается)
   try {
     const snap = await post("api/restore/prepare", {recording_id: recordingId,
                                                     source_revision: Number(sourceRevision),
@@ -699,13 +731,131 @@ function reportOutcome(c, r, also, closed = false) {
 }
 
 async function loadStatus() {
+  const gen = detailGen;    // ответ, пришедший после открытия другой записи или запроса, не показывается
   try {
     const s = await call(`api/status?request_id=${encodeURIComponent(requestId)}`);
+    if (gen !== detailGen) return;
     $("req-id").textContent = requestId;
     $("status").innerHTML = renderStatus(s);
-    showVerify(); renderResult(await call(`api/result?request_id=${encodeURIComponent(requestId)}`));
+    const result = await call(`api/result?request_id=${encodeURIComponent(requestId)}`);
+    if (gen !== detailGen) return;
+    showVerify(); renderResult(result);
     loadQuestions();
   } catch (ex) { say(ex.message, true); }
+}
+
+// ---------- записи в базе ----------
+let recordingRows = [], recordingsNote = "";
+const SYNC_RU = {synced: "записаны", pending: "ждут записи", writing: "ждут записи", conflict: "конфликт",
+  error: "ошибка записи"};
+
+function originText(r) {
+  if (r.origin !== "migrated") return "обработана программой";
+  const v = r.variant || {};
+  if (!v.tag && v.main !== true && v.main !== false) return "перенесена из файлов · сведений о варианте нет";
+  const main = v.main === true ? "основной" : v.main === false ? "не основной" : "основной ли — не записано";
+  return `перенесена из файлов · вариант${v.tag ? ` «${v.tag}»` : ""}, ${main}`;
+}
+
+function placesText(p) {
+  if (!p || !p.total) return "мест нет";
+  if (!p.unresolved) return "разобрано";
+  const human = p.unresolved - p.open;
+  return `нерешено ${p.unresolved}${human > 0 ? ` (из них оставлено человеку ${human})` : ""}`;
+}
+
+function recordingState(r) {
+  const lines = [
+    [r.request ? `запрос: ${stateRu(r.request.state)}` : "без запроса", ""],
+    [`разбор: ${placesText(r.places)}`, r.places && r.places.unresolved ? "warn" : ""],
+    [`файлы: ${r.document_sync ? (SYNC_RU[r.document_sync] || r.document_sync) : "нет документа"}`,
+      r.document_sync === "synced" ? "" : "warn"],
+    [r.open_conflicts ? `открытых конфликтов: ${r.open_conflicts} — см. раздел наверху` : "конфликтов нет",
+      r.open_conflicts ? "warn" : ""],
+    [`конспектов: ${r.conspects || 0}`, ""],
+    [r.names_confirmed ? "имена подтверждены" : "имена не подтверждены", ""]];
+  return lines.map(([text, cls]) => `<span class="${cls}">${esc(text)}</span>`).join("<br>");
+}
+
+function renderRecordings() {
+  const table = $("recordings-table");
+  const q = $("rec-filter").value.trim().toLowerCase();
+  let rows = recordingRows.filter(r =>
+    (!q || `${r.name || ""} ${r.title || ""}`.toLowerCase().includes(q)) &&
+    (!$("rec-unresolved").checked || (r.places && r.places.unresolved > 0)) &&
+    (!$("rec-main").checked || !(r.origin === "migrated" && r.variant && r.variant.main === false)));
+  const order = $("rec-order").value;
+  if (order === "name") rows = [...rows].sort((a, b) => (a.name || "").localeCompare(b.name || "", "ru"));
+  if (order === "recorded") rows = [...rows].sort((a, b) => (b.recorded_at || "").localeCompare(a.recorded_at || ""));
+  $("recordings-note").textContent = rows.length || !recordingRows.length ? recordingsNote
+    : "Под отбор не подходит ни одна запись.";
+  if (!rows.length) { table.innerHTML = ""; return; }
+  table.innerHTML = "<tr><th>Запись</th><th>Изменена</th><th>Происхождение</th><th>Состояние</th><th></th></tr>" +
+    rows.map((r, i) => r.error
+      ? `<tr><td>${esc(r.name || r.recording_id)}</td><td colspan="3" class="bad">${esc(r.error)}</td>
+         <td><button disabled>открыть</button></td></tr>`
+      : `<tr><td>${esc(r.name)}${r.title ? `<br><span class="muted">${esc(r.title)}</span>` : ""}
+           <br><span class="muted">${r.recorded_at ? `записана ${esc(fmtTime(r.recorded_at))} · ` : ""}${esc(r.duration ?? "")}</span></td>
+         <td>${esc(fmtTime(r.updated_at))}</td><td>${esc(originText(r))}</td><td>${recordingState(r)}</td>
+         <td><button data-rec="${esc(r.recording_id)}">открыть</button>${r.request
+           ? `<button data-req="${esc(r.request.request_id)}">запрос</button>` : ""}</td></tr>`).join("");
+  table.querySelectorAll("button[data-rec]").forEach(b => b.onclick = () => openRecording(b.dataset.rec));
+  table.querySelectorAll("button[data-req]").forEach(b => b.onclick = () => openRequest(b.dataset.req));
+}
+
+async function loadRecordings() {
+  const note = $("recordings-note");
+  try {
+    const d = await call("api/recordings");
+    recordingRows = d.items || [];
+    note.className = "muted";
+    recordingsNote = !d.available ? (d.reason || "Список записей недоступен.")
+      : !recordingRows.length ? "В базе пока нет записей."
+      : d.truncated ? `Показаны ${recordingRows.length} из ${d.total} записей (последние изменённые).`
+      : `Записей в базе: ${d.total}.`;
+    renderRecordings();
+  } catch (ex) { recordingRows = []; recordingsNote = ex.message; renderRecordings(); note.className = "bad"; }
+}
+
+function resetDetail() {
+  // прежняя запись не должна остаться на экране под новой: её история с кнопками относилась бы к другой записи
+  detailGen += 1;
+  for (const id of ["rec-head", "status", "verify-box", "result", "conspects", "questions", "revision-view"]) $(id).innerHTML = "";
+  $("req-id").textContent = "";
+  $("history").innerHTML = "<tr><th>Ревизия</th><th>Когда</th><th>Кто</th><th></th></tr>";
+}
+
+function renderRecordingHead(d) {
+  const r = d.recording || {};
+  const head = $("rec-head");
+  head.innerHTML = `<h2>Запись: ${esc(r.name || r.recording_id)}</h2>
+    ${r.title ? `<p>${esc(r.title)}</p>` : ""}
+    <p>${esc(originText(r))}${r.recorded_at ? ` · записана ${esc(fmtTime(r.recorded_at))}` : ""}</p>
+    ${r.error ? `<p class="bad">${esc(r.error)}</p>` : `<p>${recordingState(r)}</p>`}
+    <p class="muted">Режим просмотра: здесь ничего не меняется. Вернуть прежнюю версию, исправить цитаты и
+      подтвердить проверку можно из запроса записи (если он есть) или через AI-клиент с подтверждением.</p>`;
+  for (const q of d.requests || []) {
+    const b = document.createElement("button");
+    b.textContent = `открыть запрос (${stateRu(q.state)}, ${fmtTime(q.created_at)})`;
+    b.onclick = () => openRequest(q.request_id);
+    head.appendChild(b);
+  }
+}
+
+async function openRecording(id) {
+  requestId = null; recordingId = null; readOnly = true;
+  resetDetail();
+  const gen = detailGen;
+  $("req-section").hidden = true; $("questions-section").hidden = true; $("rec-section").hidden = false;
+  $("detail").hidden = false;
+  try {
+    const d = await call(`api/recording?recording_id=${encodeURIComponent(id)}`);
+    if (gen !== detailGen) return;
+    renderRecordingHead(d);
+    renderResult(d.result);
+  } catch (ex) { if (gen === detailGen) $("rec-head").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
+  loadConflicts();
+  $("detail").scrollIntoView();
 }
 
 async function loadRequests() {
@@ -727,7 +877,9 @@ function stateRu(state) {
 }
 
 function openRequest(id) {
-  requestId = id; recordingId = null;
+  requestId = id; recordingId = null; readOnly = false;
+  resetDetail();
+  $("req-section").hidden = false; $("questions-section").hidden = false; $("rec-section").hidden = true;
   $("detail").hidden = false;
   loadStatus();
   loadConflicts();
@@ -749,6 +901,8 @@ $("start").onclick = async () => {
   } catch (ex) { say(ex.message, true); }
 };
 $("refresh").onclick = loadRequests;
+$("recordings-refresh").onclick = loadRecordings;
+["rec-filter", "rec-unresolved", "rec-main", "rec-order"].forEach(id => $(id).oninput = renderRecordings);
 document.querySelectorAll(".hist").forEach(b => b.onclick = () => loadHistory(b.dataset.kind));
 $("backup").onclick = async () => {
   try {
@@ -763,5 +917,6 @@ $("backup").onclick = async () => {
 };
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
 loadConflicts();
+loadRecordings();
 loadRequests();
 </script>
