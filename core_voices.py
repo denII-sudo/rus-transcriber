@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -306,15 +305,8 @@ def voice_action_lines(snapshot, revoke=False):
 
 def backup_voice_profile(path):
     """Сохранить точную копию биометрического файла до изменения, не заменяя старые копии."""
-    path = Path(path)
-    if not path.exists():
-        return None
-    folder = path.parent / "voice-backups"
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / ("voices-" + uuid.uuid4().hex + ".json")
-    with target.open("xb") as f:
-        f.write(path.read_bytes())
-    return str(target)
+    import voices
+    return voices.backup_profile(path)
 
 
 def backup_voice_profiles(group=""):
@@ -429,6 +421,7 @@ REFRESH_MEANINGS = {
     "transcript_missing": "Файл стенограммы не найден.",
     "transcript_unreadable": "Стенограмма не читается.",
     "audio_missing": "Исходное аудио не найдено или не указано.",
+    "recording_missing": "Запись в базе не найдена или база недоступна.",
 }
 
 
@@ -457,6 +450,92 @@ def voice_refresh_plan(group=""):
         raise core.CoreError("группа не найдена")
     groups = [group] if group else paths.list_groups()
     jobs = _voice_job_map()
+    try:
+        sqlite_mode = settings.recording_backend() == "sqlite"
+    except (ValueError, OSError):
+        sqlite_mode = False
+    store = _refresh_store() if sqlite_mode else None
+    try:
+        return _voice_refresh_groups(groups, jobs, store, sqlite_mode)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _refresh_store():
+    """База только на чтение (только при хранении в базе); недоступна — None."""
+    import voice_sources
+    try:
+        return voice_sources._open_store_readonly()
+    except Exception:   # noqa: BLE001 — план только показывает: без базы записи получают recording_missing
+        return None
+
+
+def _refresh_entry(transcript=None, job_id=None, status="transcript_missing"):
+    return {"transcript": transcript, "recording": None, "job_id": job_id,
+            "status": status, "needs_update": True,
+            "transcript_changed": None, "audio_changed": None,
+            "comparison_basis": "unavailable", "legacy_mtime_changed": None,
+            "needs_review_reasons": [], "migrated_to": None}
+
+
+def _refresh_recording_entry(store, key, stored, profile):
+    """Строка плана для ключа recording:<id>: сравнение с текущей ревизией записи в базе."""
+    import voices
+    import voice_sources
+    entry = _refresh_entry(job_id=key, status="recording_missing")
+    if store is None:
+        return entry, None
+    try:
+        source = voice_sources.record_source(store, key[len(voice_sources.RECORDING_PREFIX):])
+    except Exception:   # noqa: BLE001 — запись удалена или не читается: план это показывает, а не падает
+        return entry, None
+    entry["transcript"] = source.name
+    audio_path = source.data.get("file")
+    if not audio_path:
+        entry["status"] = "audio_missing"
+        return entry, None
+    audio_key = voice_sources.existing_audio_key(profile, str(Path(audio_path).resolve()))
+    entry["recording"] = Path(audio_path).name
+    if not Path(audio_path).is_file():
+        entry["status"] = "audio_missing"
+        return entry, audio_key
+    current = source.fingerprint(audio_path)
+    status = voices.source_fingerprint_status(stored, current, 0.0)
+    entry["status"] = {"unchanged": "unchanged", "absent": "not_recorded"}.get(status, "changed")
+    if isinstance(stored, dict):
+        entry["comparison_basis"] = "fingerprint"
+        transcript_keys = ("store_id", "recording_id", "transcript_revision", "transcript_payload_hash")
+        entry["transcript_changed"] = any(stored.get(k) != current[k] for k in transcript_keys)
+        entry["audio_changed"] = any(stored.get(k) != current[k] for k in ("audio_size", "audio_mtime"))
+    return entry, audio_key
+
+
+def _refresh_migrated_copy(store, key, stored, profile, entry, audio_key):
+    """Старый ключ при работе с базой: статус — по её единственной копии (связь — quality.migration.source)."""
+    import voice_sources
+    try:
+        copies = voice_sources.migrated_copies(store, key)
+        if len(copies) != 1:
+            return audio_key
+        source = voice_sources.record_source(store, copies[0][0])
+    except Exception:   # noqa: BLE001 — копия не читается: остаётся статус по старому файлу
+        return audio_key
+    entry["migrated_to"] = source.name
+    entry["job_id"] = source.ref
+    entry["status"] = voice_sources.linked_status(stored, source)
+    entry["comparison_basis"] = "migrated_copy"
+    entry["transcript_changed"] = entry["audio_changed"] = entry["legacy_mtime_changed"] = None
+    audio_path = source.data.get("file")
+    if audio_path:
+        entry["recording"] = Path(audio_path).name
+        audio_key = voice_sources.existing_audio_key(profile, str(Path(audio_path).resolve()))
+    return audio_key
+
+
+def _voice_refresh_groups(groups, jobs, store, sqlite_mode):
+    import voices
+    import voice_sources
     out = []
     for name in groups:
         path = paths.voices_path(name)
@@ -470,45 +549,47 @@ def voice_refresh_plan(group=""):
             continue
         entries = []
         for key, stored in sorted((data.get("sources") or {}).items()):
-            jp = Path(key)
-            audio_path, audio_key = None, None
-            entry = {"transcript": jp.name, "recording": None, "job_id": jobs.get(str(jp.resolve())),
-                     "status": "transcript_missing", "needs_update": True,
-                     "transcript_changed": None, "audio_changed": None,
-                     "comparison_basis": "unavailable", "legacy_mtime_changed": None,
-                     "needs_review_reasons": []}
-            if jp.is_file():
-                try:
-                    source_data = json.loads(jp.read_text(encoding="utf-8"))
-                    audio_path = source_data.get("file")
-                except (OSError, ValueError, TypeError):
-                    entry["status"] = "transcript_unreadable"
-                else:
-                    if not audio_path:
-                        entry["status"] = "audio_missing"
+            if sqlite_mode and key.startswith(voice_sources.RECORDING_PREFIX):
+                entry, audio_key = _refresh_recording_entry(store, key, stored, data)
+            else:
+                jp = Path(key)
+                audio_path, audio_key = None, None
+                entry = _refresh_entry(jp.name, jobs.get(str(jp.resolve())))
+                if jp.is_file():
+                    try:
+                        source_data = json.loads(jp.read_text(encoding="utf-8"))
+                        audio_path = source_data.get("file")
+                    except (OSError, ValueError, TypeError):
+                        entry["status"] = "transcript_unreadable"
                     else:
-                        audio_key = str(Path(audio_path).resolve())
-                        entry["recording"] = Path(audio_path).name
-                        if not Path(audio_path).is_file():
+                        if not audio_path:
                             entry["status"] = "audio_missing"
                         else:
-                            current = voices.source_fingerprint(jp, audio_path)
-                            status = voices.source_fingerprint_status(stored, current, jp.stat().st_mtime)
-                            entry["status"] = {"unchanged": "unchanged", "changed": "changed",
-                                               "legacy_unchanged": "legacy_baseline_pending",
-                                               "legacy_changed": "changed",
-                                               "absent": "not_recorded"}.get(status, "changed")
-                            if status in ("legacy_changed", "legacy_unchanged"):
-                                entry["comparison_basis"] = "legacy_mtime"
-                                entry["legacy_mtime_changed"] = status == "legacy_changed"
-                            elif isinstance(stored, dict):
-                                entry["comparison_basis"] = "fingerprint"
-                                transcript_keys = ("transcript_sha256", "transcript_size")
-                                audio_keys = ("audio_size", "audio_mtime")
-                                if all(stored.get(k) is not None for k in transcript_keys):
-                                    entry["transcript_changed"] = any(stored[k] != current[k] for k in transcript_keys)
-                                if all(stored.get(k) is not None for k in audio_keys):
-                                    entry["audio_changed"] = any(stored[k] != current[k] for k in audio_keys)
+                            audio_key = str(Path(audio_path).resolve())
+                            entry["recording"] = Path(audio_path).name
+                            if not Path(audio_path).is_file():
+                                entry["status"] = "audio_missing"
+                            else:
+                                current = voices.source_fingerprint(jp, audio_path)
+                                status = voices.source_fingerprint_status(stored, current, jp.stat().st_mtime)
+                                entry["status"] = {"unchanged": "unchanged", "changed": "changed",
+                                                   "legacy_unchanged": "legacy_baseline_pending",
+                                                   "legacy_changed": "changed",
+                                                   "absent": "not_recorded"}.get(status, "changed")
+                                if status in ("legacy_changed", "legacy_unchanged"):
+                                    entry["comparison_basis"] = "legacy_mtime"
+                                    entry["legacy_mtime_changed"] = status == "legacy_changed"
+                                elif isinstance(stored, dict):
+                                    entry["comparison_basis"] = "fingerprint"
+                                    transcript_keys = ("transcript_sha256", "transcript_size")
+                                    audio_keys = ("audio_size", "audio_mtime")
+                                    if all(stored.get(k) is not None for k in transcript_keys):
+                                        entry["transcript_changed"] = any(stored[k] != current[k]
+                                                                          for k in transcript_keys)
+                                    if all(stored.get(k) is not None for k in audio_keys):
+                                        entry["audio_changed"] = any(stored[k] != current[k] for k in audio_keys)
+                if sqlite_mode and store is not None:
+                    audio_key = _refresh_migrated_copy(store, key, stored, data, entry, audio_key)
             versions = []
             if audio_key:
                 for speaker in (data.get("speakers") or {}).values():
@@ -518,7 +599,10 @@ def voice_refresh_plan(group=""):
             current_selection = bool(versions) and all(v == voices.SELECTION_VERSION for v in versions)
             entry["selection_version_current"] = current_selection
             if entry["status"] == "changed":
-                if entry["comparison_basis"] == "legacy_mtime":
+                if entry["comparison_basis"] == "migrated_copy":
+                    entry["needs_review_reasons"].append("запись в базе правили после переноса или старый файл "
+                                                         "отличается от перенесённого")
+                elif entry["comparison_basis"] == "legacy_mtime":
                     entry["needs_review_reasons"].append("время стенограммы отличается от сохранённого старого значения")
                 elif entry["comparison_basis"] == "unavailable":
                     entry["needs_review_reasons"].append("прежние данные источника не позволяют выполнить сравнение")
@@ -526,7 +610,8 @@ def voice_refresh_plan(group=""):
                     entry["needs_review_reasons"].append("отпечаток стенограммы или метаданные аудио отличаются")
             if versions and not current_selection:
                 entry["needs_review_reasons"].append("вклад без текущей версии отбора")
-            if entry["status"] in ("transcript_missing", "transcript_unreadable", "audio_missing"):
+            if entry["status"] in ("transcript_missing", "transcript_unreadable", "audio_missing",
+                                   "recording_missing"):
                 entry["needs_review_reasons"].append(REFRESH_MEANINGS[entry["status"]])
             if entry["status"] == "not_recorded":
                 entry["needs_review_reasons"].append("нет отпечатка источника")
@@ -545,6 +630,17 @@ def voice_refresh_plan(group=""):
                                     "стенограммы и прежнее аудио невозможно. Нужен просмотр.")
             elif entry["status"] == "changed" and entry["comparison_basis"] == "unavailable":
                 entry["meaning"] = "Прежние данные источника не позволяют выполнить сравнение; нужен просмотр."
+            elif (sqlite_mode and entry["comparison_basis"] == "legacy_mtime"
+                  and entry["status"] == "legacy_baseline_pending"):
+                entry["meaning"] = ("Отпечатка нет; при работе с базой старый файл в обучение не идёт: нужна его "
+                                    "единственная копия в базе и подтверждённое обновление.")
+            elif entry["comparison_basis"] == "migrated_copy":
+                entry["meaning"] = {
+                    "unchanged": "Источник учтён; его запись в базе после переноса не менялась.",
+                    "legacy_baseline_pending": "Отпечатка нет; старый файл не менялся после переноса. Исходное "
+                                               "состояние примет подтверждённое обновление записи в базе.",
+                }.get(entry["status"], "Запись в базе правили после переноса или старый файл изменился — нужен "
+                                       "просмотр и подтверждённое обновление.")
             entries.append(entry)
         summary = {}
         for item in entries:

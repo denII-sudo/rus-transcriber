@@ -69,8 +69,9 @@ def asr_run_metadata():
                                                             for t in n.targets))
     except (OSError, SyntaxError, ValueError, StopIteration):
         pass
+    import runinfo
     packages = {}
-    for name in ("onnx-asr", "onnxruntime", "onnxruntime-openvino", "openvino"):
+    for name in runinfo.KEY_PACKAGES:      # те же ключевые пакеты, что в тесте скорости и файле гипотез
         try:
             packages[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
@@ -1056,6 +1057,7 @@ class _HypCapture:
         self.forbid = tuple(n for n in {Path(str(src)).name if src else "",
                                         Path(str(getattr(a, "audio", "") or "")).name} if n)
         self.third, self.trace, self.before = {}, {}, None
+        self.run_id = None      # имя файла заранее: слой «всегда» пишет его в запись до сохранения гипотез
         self.conditions_start = _safe(lambda: runinfo.conditions(paths.JOBS, cfg.get("max_heavy_jobs", 2), 1,
                                                                  load_interval=1.0))
         self.conditions_end = None
@@ -1090,6 +1092,82 @@ def _finish_hypotheses(hyp, quality, timing, vocab, saved):
     if hyp is None:
         return {}
     return hyp.save(quality, timing, vocab, (saved or {}).get("recording_id"))
+
+
+ALWAYS_LAYER = "always-1"
+MODEL_ARTIFACTS_FILE = "model_artifacts.json"   # кэш хэшей весов слоя «всегда» в <папка данных>\bench
+
+
+def pcm_sha256(audio, block=1 << 20):
+    """SHA-256 звука по правилу паспорта теста скорости (моно 16 кГц s16le, hypstore.pcm_bytes), по блокам:
+    без второй полной копии звука в памяти. Тот же результат, что sha256(hypstore.pcm_bytes(audio))."""
+    import hashlib
+    import hypstore
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    h = hashlib.sha256()
+    for i in range(0, len(arr), block):
+        h.update(hypstore.pcm_bytes(arr[i:i + block]))
+    return h.hexdigest(), len(arr)
+
+
+def _always_layer(audio, cfg, vocab, quality, hyp):
+    """Слой «всегда» (план лаборатории, раздел 0.1): в quality.asr_run каждой новой записи, у всех, без
+    настройки — хэш звука, ссылка на файл гипотез, обезличенный стенд, снимок настроек распознавания,
+    хэши файлов весов и ключевые пакеты. Только числа, хэши и имена моделей, без текстов и путей.
+    Сбой любого поля пишется как not_measured и расшифровку не роняет."""
+    import hypotheses as H
+    import hypstore
+    import runinfo
+    run = quality.setdefault("asr_run", {})
+    run["layer"] = ALWAYS_LAYER
+    sound = _safe(lambda: pcm_sha256(audio))
+    if isinstance(sound, tuple):
+        digest, samples = sound
+        run["sound"] = {"pcm_sha256": digest, "pcm_format": f"mono {SR} Hz s16le",
+                        "duration_sec": round(samples / SR, 2)}
+    else:
+        run["sound"] = sound
+    if hyp is None:
+        run["hypotheses"] = {"state": "off", "reason": "save_hypotheses выключена"}
+    else:
+        # имя файла, который будет записан после сохранения результата; запись могла не удаться — файл ищут
+        # по этим полям и проверяют его наличие (сбой виден в статусе задачи, hypotheses_error)
+        hyp.run_id = runinfo.new_run_id()
+        run["hypotheses"] = {"state": "expected",
+                             "sound_id": sound[0][:12] if isinstance(sound, tuple)
+                             else H.not_measured("хэш звука не посчитан"),
+                             "run_id": hyp.run_id}
+    run["testbed_id"] = _safe(lambda: runinfo.testbed_id(paths.BENCH))
+    run["config"] = _safe(lambda: hypstore.config_snapshot(cfg, vocab))
+    full = _safe(runinfo.packages)
+    if isinstance(full, dict) and "key" in full:
+        run["packages_all"] = {"count": full.get("count"), "sha256": full.get("sha256"),
+                               "sources": full.get("sources")}
+    else:
+        run["packages_all"] = full
+    cache_path = paths.BENCH / MODEL_ARTIFACTS_FILE
+    arts = hypstore._read_json(cache_path, {})
+    before = json.dumps(arts, sort_keys=True)
+    for entry in (run.get("models") or {}).values():
+        if isinstance(entry, dict):
+            model_id, backend = entry.get("id"), entry.get("backend")
+            entry["artifact"] = _safe(lambda: hypstore.model_artifact(model_id, paths.CACHE, arts, backend)) \
+                if model_id else H.not_available("модель не названа")
+    if json.dumps(arts, sort_keys=True) != before:
+        try:
+            hypstore._write_json_atomic(cache_path, arts)
+        except OSError:
+            pass
+    return run
+
+
+def _always_layer_guarded(audio, cfg, vocab, quality, hyp):
+    """Слой «всегда» в main: сбой слоя целиком расшифровку не роняет, в записи остаётся вид ошибки."""
+    try:
+        return _always_layer(audio, cfg, vocab, quality, hyp)
+    except Exception as ex:
+        quality.setdefault("asr_run", {})["layer_error"] = type(ex).__name__
+        return None
 
 
 def _safe(fn):
@@ -1129,7 +1207,7 @@ def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
     unit_id = ident.pop("unit_id")
     audio_block = {**ident, "pcm_sha256": ex["pcm_sha256"], "pcm_format": ex["pcm_format"],
                    "duration_sec": ex["duration_sec"]}
-    run_id = runinfo.new_run_id()
+    run_id = cap.run_id or runinfo.new_run_id()
     diag = b["diagnostics"]
     arts = hypstore._read_json(base / hypstore.ARTIFACTS_FILE, {})
 
@@ -1283,6 +1361,10 @@ def load_group_profile_for_recognition(path, quality):
         return voices.empty_profile(), False
 
 
+class _ProfileBackupFailed(Exception):
+    """Резерв профиля перед автозаписью не сохранён; профиль не записывается."""
+
+
 def prepare_group_voice_profile(group, src, embedder, names, quality):
     """Подготовить профиль и безопасно выполнить разрешённое автоматическое пополнение."""
     import voices
@@ -1293,6 +1375,11 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
         quality_report = {}
         learned = []
         if profile_ok:
+            try:
+                sqlite_mode = settings.recording_backend() == "sqlite"
+            except (ValueError, OSError):
+                sqlite_mode = False
+
             def run_learn():
                 try:
                     policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
@@ -1300,10 +1387,27 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
                     policy = "warn"
                 return voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
                                     selection_report=selection_report, quality_policy=policy,
-                                    quality_report=quality_report,
+                                    quality_report=quality_report, sqlite_mode=sqlite_mode,
                                     stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"])
-            learned, quality["voice_auto_learn"] = voices.auto_learn_group(
-                prof, group, names, run_learn, lambda: voices.save_profile(ppath, prof))
+
+            def save():
+                # при работе с базой (решение владельца 25.11.2026) — резерв перед автозаписью; не вышел — не пишем
+                if sqlite_mode:
+                    try:
+                        voices.backup_profile(ppath)
+                    except OSError as ex:
+                        raise _ProfileBackupFailed(str(ex)) from ex
+                voices.save_profile(ppath, prof)
+
+            try:
+                learned, quality["voice_auto_learn"] = voices.auto_learn_group(prof, group, names, run_learn, save)
+            except _ProfileBackupFailed as ex:
+                # профиль на диске не тронут; распознавание идёт по нему, а не по несохранённому пересчёту
+                prof, _ = load_group_profile_for_recognition(ppath, quality)
+                learned = []
+                quality["voice_auto_learn"] = {"enabled": True, "reason": "backup_failed", "error": str(ex)}
+                selection_report.clear()
+                selection_report["profile_backup_failed"] = 1
         quality["voice_selection_report"] = selection_report
         quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
         quality["voice_audio_quality"] = quality_report
@@ -1670,6 +1774,7 @@ def main():
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
             hyp = data.pop("_hyp", None)
+            _always_layer_guarded(audio, cfg, vocab, quality, hyp)
             saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
             hyp_state = _finish_hypotheses(hyp, quality, timing, vocab, saved)
             model = _execute_workflow_model(st)
