@@ -115,8 +115,12 @@ class SyntheticStore(unittest.TestCase):
         self.audio = self.root / "meeting.wav"
         self.audio.write_bytes(b"synthetic audio placeholder")
 
-    def migrate(self, legacy, legacy_path, tag="", recording_id=None):
-        """Записать старую стенограмму в базу как перенос П7; -> (recording_id, путь выгрузки, source)."""
+    def migrate(self, legacy, legacy_path, tag="", recording_id=None, audio=None, link=True):
+        """Записать старую стенограмму в базу как перенос П7; -> (recording_id, путь выгрузки, source).
+
+        link=False — запись без связи со старым файлом (как обработанная уже при работе с базой).
+        """
+        audio = audio or self.audio
         legacy_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
         source = {"path": str(legacy_path), "sha256": IL.sha256_file(legacy_path),
                   "size": legacy_path.stat().st_size}
@@ -124,11 +128,14 @@ class SyntheticStore(unittest.TestCase):
             json.loads(legacy_path.read_text(encoding="utf-8")),
             recording_id=recording_id or IL.recording_id_for(legacy_path, source["sha256"]), metadata={},
             field_sources={}, variant={"tag": tag, "main": True}, source=source)
-        layout = recordings.document_layout(self.audio, tag)
+        if not link:
+            snapshot["quality"].pop("migration")
+            legacy_path.unlink()
+        layout = recordings.document_layout(audio, tag)
         layout["root"].mkdir(exist_ok=True)
         root_id = self.store.get_or_register_root(layout["root"])
         self.store.create_recording_with_document(
-            rid, recordings.normalize_location(self.audio), snapshot, review, str(uuid.uuid4()),
+            rid, recordings.normalize_location(audio), snapshot, review, str(uuid.uuid4()),
             recordings.operation_context(self.store, "system"), root_id=root_id,
             generated_at="2026-11-25T00:00:00+00:00", document_paths=layout["paths"])
         documents.materialize_pending(self.store, root_id, layout["root"])
@@ -484,6 +491,250 @@ class ManualSqlitePath(SyntheticStore):
                 patch.object(core, "launch", side_effect=AssertionError("запуск без подтверждения")):
             self.assertIn("отказ человека", asyncio.run(server.update_voice_profiles(self.ref)))
             self.assertIn("отказ человека", asyncio.run(server.revoke_voice_profiles(self.ref)))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+
+class AutoLearnSqlite(SyntheticStore):
+    """Автопополнение при обработке, когда записи хранятся в базе, и план обновления (Г3)."""
+
+    NAMES = ["Анна", "Борис", "Вера"]
+
+    def setUp(self):
+        super().setUp()
+        self.groups = self.root / "groups"
+        self.group = self.groups / "demo-group"
+        self.group.mkdir(parents=True)
+        (self.group / "vocab.json").write_text(json.dumps(
+            {"group": "demo-group", "participants": [{"name": n} for n in self.NAMES]},
+            ensure_ascii=False), encoding="utf-8")
+        self.profile_path = self.group / "voices.json"
+        self.backend = "sqlite"
+        for item in (patch.object(paths, "STATE_DB", self.db), patch.object(paths, "GROUPS", self.groups),
+                     patch.object(paths, "JOBS", self.root / "jobs"),
+                     patch.object(settings, "recording_backend", side_effect=lambda: self.backend)):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def save(self, profile):
+        voices.save_profile(self.profile_path, profile)
+        return self.profile_path.read_bytes()
+
+    def other_profile(self):
+        """Профиль, где есть только вклад другого аудио: автопополнение ещё нужно."""
+        profile = voices.empty_profile()
+        profile["speakers"]["Анна"] = {"parts": {str(self.root / "elsewhere.wav"): {
+            "vec": np.array([1.0, 0.0]), "sec": 5.0, "human_sec": 0.0, "auto_sec": 5.0, "from": "elsewhere",
+            "confirmed": True, "selection_version": voices.SELECTION_VERSION}}}
+        return profile
+
+    def counted_legacy_profile(self, legacy_path):
+        """Профиль, обученный до переноса по старому файлу: вклад этого аудио и отпечаток старого файла."""
+        audio_key = str(self.audio.resolve())
+        profile = voices.empty_profile()
+        profile["speakers"]["Анна"] = {"parts": {audio_key: {
+            "vec": np.array([1.0, 0.0]), "sec": 9.0, "human_sec": 0.0, "auto_sec": 9.0,
+            "from": legacy_path.name, "confirmed": True, "selection_version": voices.SELECTION_VERSION}}}
+        profile["sources"][str(legacy_path.resolve())] = voices.source_fingerprint(legacy_path, self.audio)
+        profile["source_selection_versions"] = {str(legacy_path.resolve()): voices.SELECTION_VERSION}
+        return profile
+
+    def backups(self):
+        folder = self.group / "voice-backups"
+        return sorted(folder.iterdir()) if folder.is_dir() else []
+
+    def auto(self, src=None):
+        """Шаг автопополнения перед распознаванием записи из той же папки. -> (учтено, quality, профиль)."""
+        quality = {}
+        with patch.object(worker, "load_audio", return_value=np.zeros(16000)):
+            _, prof, learned = worker.prepare_group_voice_profile(
+                "demo-group", src or self.root / "next.wav", FakeEmbedder(), self.NAMES, quality)
+        return learned, quality, prof
+
+    def test_new_record_of_folder_is_added_after_backup_and_repeat_changes_nothing(self):
+        before = self.save(self.other_profile())
+        rid, export, _ = self.migrate(legacy_data(self.audio), self.root / "meeting.transcript.json", link=False)
+        # старый файл в папке при работе с базой в обучение не идёт
+        old_audio = self.root / "old.wav"
+        old_audio.write_bytes(b"other synthetic audio")
+        (self.root / "old.transcript.json").write_text(json.dumps(legacy_data(old_audio), ensure_ascii=False),
+                                                       encoding="utf-8")
+        # запись из другой папки охватом не считается
+        far = self.root / "far"
+        far.mkdir()
+        (far / "far.wav").write_bytes(b"far synthetic audio")
+        self.migrate(legacy_data(far / "far.wav"), far / "far.transcript.json", audio=far / "far.wav", link=False)
+
+        learned, quality, prof = self.auto()
+        self.assertEqual(learned, [export.name])
+        report = quality["voice_selection_report"]
+        self.assertEqual((report.get("added"), report.get("legacy_file_in_sqlite_mode")), (3, 1))
+        self.assertNotIn("sqlite_source_not_supported", report)
+        profile = voices.load_profile(self.profile_path)
+        audio_key = str(self.audio.resolve())
+        self.assertEqual(sorted(n for n, s in profile["speakers"].items() if audio_key in s["parts"]), self.NAMES)
+        ref = voice_sources.RECORDING_PREFIX + rid
+        self.assertEqual(list(profile["sources"]), [ref])
+        self.assertEqual((profile["sources"][ref]["kind"], profile["sources"][ref]["transcript_revision"]),
+                         ("sqlite", 1))
+        self.assertEqual(profile["history"][-1]["source"], ref)
+        self.assertNotIn(str(old_audio.resolve()), json.dumps(list(profile["speakers"]["Анна"]["parts"])))
+        self.assertEqual([path.read_bytes() for path in self.backups()], [before])   # резерв = прежний файл
+        self.assertEqual(sorted(prof["sources"]), [ref])
+
+        after = self.profile_path.read_bytes()
+        learned, quality, _ = self.auto()                  # профиль не меняется — ни записи, ни резерва
+        self.assertEqual(learned, [])
+        self.assertEqual(quality["voice_selection_report"].get("already_processed"), 1)
+        self.assertEqual(self.profile_path.read_bytes(), after)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_freshest_revision_among_variants_of_one_audio_is_taken(self):
+        self.save(self.other_profile())
+        made = []
+        for tag in ("a", "b"):
+            data = legacy_data(self.audio)
+            data["segments"][0]["text"] = "вариант " + tag
+            made.append(self.migrate(data, self.root / f"meeting.{tag}.transcript.json", tag=tag, link=False))
+        # свежее — вариант с бо́льшим recording_id: порядок перебора его не выбрал бы сам
+        (old_rid, _, _), (new_rid, new_export, _) = sorted(made)
+        for rid, at in ((old_rid, "2026-11-25T00:00:00+00:00"), (new_rid, "2026-11-25T02:00:00+00:00")):
+            self.store.db.execute(
+                "UPDATE operations SET created_at=? WHERE operation_id=(SELECT operation_id FROM "
+                "transcript_revisions WHERE recording_id=? AND revision=1)", (at, rid))
+        self.store.db.commit()
+        learned, _, _ = self.auto()
+        self.assertEqual(learned, [new_export.name])
+        self.assertEqual(list(voices.load_profile(self.profile_path)["sources"]),
+                         [voice_sources.RECORDING_PREFIX + new_rid])
+
+    def test_migrated_record_of_counted_old_file_is_left_alone(self):
+        legacy_path = self.root / "meeting.transcript.json"
+        rid, _, _ = self.migrate(legacy_data(self.audio), legacy_path)
+        before = self.save(self.counted_legacy_profile(legacy_path))
+        learned, quality, _ = self.auto()
+        self.assertEqual(learned, [])
+        self.assertEqual(quality["voice_selection_report"],
+                         {"already_processed": 1, "legacy_file_in_sqlite_mode": 1})
+        # правка после переноса: автоматически не пересчитывается
+        data = recordings.load_recording(self.store, rid)
+        data["segments"][0]["text"] = "исправлено человеком после переноса"
+        root_id = self.store.get_or_register_root(recordings.document_layout(self.audio)["root"])
+        recordings.commit_recording_data(
+            self.store, rid, data, {"source_revision": 1, "review_revision": 1}, str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"), root_id, "2026-11-25T01:00:00+00:00")
+        learned, quality, _ = self.auto()
+        self.assertEqual((learned, quality["voice_selection_report"].get("source_changed_requires_preview")),
+                         ([], 1))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_old_key_with_mtime_only_is_not_accepted_automatically(self):
+        legacy_path = self.root / "meeting.transcript.json"
+        self.migrate(legacy_data(self.audio), legacy_path)
+        profile = self.counted_legacy_profile(legacy_path)
+        profile["sources"][str(legacy_path.resolve())] = legacy_path.stat().st_mtime   # отпечатка ещё нет
+        before = self.save(profile)
+        learned, quality, _ = self.auto()
+        self.assertEqual((learned, quality["voice_selection_report"].get("source_changed_requires_preview")),
+                         ([], 1))
+        self.assertNotIn("source_fingerprint_accepted",
+                         [item.get("kind") for item in voices.load_profile(self.profile_path).get("history", [])])
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_existing_contribution_of_audio_is_not_replaced(self):
+        profile = self.other_profile()
+        profile["speakers"]["Анна"]["parts"][str(self.audio.resolve()).swapcase()] = {
+            "vec": np.array([0.0, 1.0]), "sec": 4.0, "human_sec": 0.0, "auto_sec": 4.0, "from": "variant",
+            "confirmed": True, "selection_version": voices.SELECTION_VERSION}
+        before = self.save(profile)
+        self.migrate(legacy_data(self.audio), self.root / "meeting.transcript.json", link=False)
+        learned, quality, _ = self.auto()
+        self.assertEqual((learned, quality["voice_selection_report"].get("existing_requires_preview")), ([], 1))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_backup_failure_writes_nothing_and_recognition_uses_saved_profile(self):
+        before = self.save(self.other_profile())
+        self.migrate(legacy_data(self.audio), self.root / "meeting.transcript.json", link=False)
+        with patch.object(voices, "backup_profile", side_effect=OSError("сбой резерва (проверка)")):
+            learned, quality, prof = self.auto()
+        self.assertEqual(learned, [])
+        self.assertEqual((quality["voice_auto_learn"]["reason"], quality["voice_selection_report"]),
+                         ("backup_failed", {"profile_backup_failed": 1}))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(prof["sources"], {})                       # не несохранённый пересчёт
+        self.assertEqual(self.backups(), [])
+        self.assertEqual([p.name for p in self.group.iterdir() if p.suffix == ".tmp"], [])
+
+    def test_unavailable_store_is_reported_and_nothing_written(self):
+        before = self.save(self.other_profile())
+        with patch.object(paths, "STATE_DB", self.root / "missing.sqlite3"):
+            learned, quality, _ = self.auto()
+        self.assertEqual((learned, quality["voice_selection_report"]), ([], {"sqlite_source_not_supported": 1}))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+
+    def test_legacy_files_mode_learns_files_without_backup_as_before(self):
+        self.backend = "legacy_files"
+        self.save(self.other_profile())
+        source = self.root / "meeting.transcript.json"
+        source.write_text(json.dumps(legacy_data(self.audio), ensure_ascii=False), encoding="utf-8")
+        learned, quality, _ = self.auto()
+        self.assertEqual(learned, [source.name])
+        self.assertNotIn("legacy_file_in_sqlite_mode", quality["voice_selection_report"])
+        self.assertEqual(list(voices.load_profile(self.profile_path)["sources"]), [str(source.resolve())])
+        self.assertEqual(self.backups(), [])
+
+    def test_refresh_plan_reads_records_and_migrated_copies_without_writing(self):
+        legacy_path = self.root / "meeting.transcript.json"
+        rid, export, _ = self.migrate(legacy_data(self.audio), legacy_path)
+        second_audio = self.root / "second.wav"
+        second_audio.write_bytes(b"second synthetic audio")
+        rid2, export2, _ = self.migrate(legacy_data(second_audio), self.root / "second.transcript.json",
+                                        audio=second_audio, link=False)
+        lonely_audio = self.root / "lonely.wav"
+        lonely_audio.write_bytes(b"lonely synthetic audio")
+        lonely = self.root / "lonely.transcript.json"
+        lonely.write_text(json.dumps(legacy_data(lonely_audio), ensure_ascii=False), encoding="utf-8")
+        profile = self.counted_legacy_profile(legacy_path)
+        ref2 = voice_sources.RECORDING_PREFIX + rid2
+        profile["sources"][ref2] = voice_sources.open_ref(ref2).fingerprint(second_audio)
+        profile["sources"][str(lonely.resolve())] = voices.source_fingerprint(lonely, lonely_audio)
+        missing = voice_sources.RECORDING_PREFIX + str(uuid.uuid4())
+        profile["sources"][missing] = {"kind": "sqlite"}
+        before = self.save(profile)
+
+        def rows():
+            plan = core.voice_refresh_plan("demo-group")
+            return {entry["transcript"] or entry["job_id"]: entry for entry in plan["groups"][0]["sources"]}
+
+        entries = rows()
+        linked = entries[legacy_path.name]
+        self.assertEqual((linked["status"], linked["migrated_to"], linked["job_id"], linked["comparison_basis"]),
+                         ("unchanged", export.name, voice_sources.RECORDING_PREFIX + rid, "migrated_copy"))
+        self.assertFalse(linked["needs_update"])
+        record = entries[export2.name]
+        self.assertEqual((record["status"], record["job_id"], record["recording"], record["migrated_to"]),
+                         ("unchanged", ref2, second_audio.name, None))
+        self.assertEqual((record["transcript_changed"], record["audio_changed"]), (False, False))
+        self.assertEqual((entries[lonely.name]["status"], entries[lonely.name]["migrated_to"]), ("unchanged", None))
+        self.assertEqual(entries[missing]["status"], "recording_missing")
+        self.assertTrue(entries[missing]["needs_update"])
+
+        data = recordings.load_recording(self.store, rid)       # правка после переноса — нужен просмотр
+        data["segments"][0]["text"] = "исправлено человеком после переноса"
+        root_id = self.store.get_or_register_root(recordings.document_layout(self.audio)["root"])
+        recordings.commit_recording_data(
+            self.store, rid, data, {"source_revision": 1, "review_revision": 1}, str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"), root_id, "2026-11-25T01:00:00+00:00")
+        state = (self.db.read_bytes(), self.store.db.execute("PRAGMA data_version").fetchone()[0])
+        self.assertEqual((rows()[legacy_path.name]["status"], rows()[legacy_path.name]["needs_update"]),
+                         ("changed", True))
+        self.assertEqual(state, (self.db.read_bytes(), self.store.db.execute("PRAGMA data_version").fetchone()[0]))
+        self.backend = "legacy_files"                             # прежний режим: статус по старому файлу
+        self.assertEqual((rows()[legacy_path.name]["status"], rows()[legacy_path.name]["migrated_to"]),
+                         ("unchanged", None))
         self.assertEqual(self.profile_path.read_bytes(), before)
         self.assertEqual(self.backups(), [])
 

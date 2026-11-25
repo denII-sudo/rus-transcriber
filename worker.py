@@ -1283,6 +1283,10 @@ def load_group_profile_for_recognition(path, quality):
         return voices.empty_profile(), False
 
 
+class _ProfileBackupFailed(Exception):
+    """Резерв профиля перед автозаписью не сохранён; профиль не записывается."""
+
+
 def prepare_group_voice_profile(group, src, embedder, names, quality):
     """Подготовить профиль и безопасно выполнить разрешённое автоматическое пополнение."""
     import voices
@@ -1293,6 +1297,11 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
         quality_report = {}
         learned = []
         if profile_ok:
+            try:
+                sqlite_mode = settings.recording_backend() == "sqlite"
+            except (ValueError, OSError):
+                sqlite_mode = False
+
             def run_learn():
                 try:
                     policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
@@ -1300,10 +1309,27 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
                     policy = "warn"
                 return voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
                                     selection_report=selection_report, quality_policy=policy,
-                                    quality_report=quality_report,
+                                    quality_report=quality_report, sqlite_mode=sqlite_mode,
                                     stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"])
-            learned, quality["voice_auto_learn"] = voices.auto_learn_group(
-                prof, group, names, run_learn, lambda: voices.save_profile(ppath, prof))
+
+            def save():
+                # при работе с базой (решение владельца 25.11.2026) — резерв перед автозаписью; не вышел — не пишем
+                if sqlite_mode:
+                    try:
+                        voices.backup_profile(ppath)
+                    except OSError as ex:
+                        raise _ProfileBackupFailed(str(ex)) from ex
+                voices.save_profile(ppath, prof)
+
+            try:
+                learned, quality["voice_auto_learn"] = voices.auto_learn_group(prof, group, names, run_learn, save)
+            except _ProfileBackupFailed as ex:
+                # профиль на диске не тронут; распознавание идёт по нему, а не по несохранённому пересчёту
+                prof, _ = load_group_profile_for_recognition(ppath, quality)
+                learned = []
+                quality["voice_auto_learn"] = {"enabled": True, "reason": "backup_failed", "error": str(ex)}
+                selection_report.clear()
+                selection_report["profile_backup_failed"] = 1
         quality["voice_selection_report"] = selection_report
         quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
         quality["voice_audio_quality"] = quality_report
