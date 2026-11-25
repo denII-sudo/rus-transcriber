@@ -57,7 +57,7 @@ class Append(Base):
     def test_second_portion_keeps_version_answers_and_events(self):
         with files("sqlite", qs=first()) as (jp, _md, version):
             self.save(jp, version, "r2", text="вон")
-            review_pack.add_interaction_event(jp, "r2", version, "clip_play", "s1")
+            review_pack.add_interaction_event(jp, "r2", version, "audio_play", "session-1")
             before = copy.deepcopy(review_pack.answers_state(jp))
             rep = self.append(jp)
             self.assertEqual((rep["version"], rep["pack_rev"], rep["written"]), (version, 1, True))
@@ -68,6 +68,7 @@ class Append(Base):
             self.assertEqual(after["interaction_events"], before["interaction_events"])
             self.assertEqual(review_pack.answer_states(jp)["r2"]["state"], "saved")
             self.assertEqual(parts(jp), [], "временные клипы остались")
+            self.assertFalse([i["clip"] for i in review_pack.manifest(jp)["items"] if ".part." in (i["clip"] or "")])
             self.assertTrue(all(i.get("source_revision") is not None
                                 for i in review_pack.manifest(jp)["items"][2:]))
 
@@ -108,7 +109,7 @@ class Append(Base):
             self.assertEqual(rep["replaced"], [{"id": "r4", "rev": 2, "clip": True}])
             item = review_pack.manifest(jp)["items"][ids(jp).index("r4")]
             self.assertEqual(item["history"][-1]["rev"], 1)
-            self.assertTrue(item["clip"].endswith("r4.r2.mp3"))
+            self.assertRegex(item["clip"] or "", r"r4.r2(.[0-9a-f]+)?.mp3$", item)
 
     def test_old_listening_card_without_listen_fp_is_not_refreshed(self):
         """Старая карточка «модели расходятся» без listen_fp (до К-5) с неприменимым ответом: тот же вопрос —
@@ -124,6 +125,19 @@ class Append(Base):
                                                                       "r3": {"state": "listen_mismatch", "card": 3}}):
                 rep = self.append(jp, [q for q in six.questions() if q["id"] == "r3"])
             self.assertEqual((rep["unchanged"], rep["replaced"], rep["skipped"]), (["r3"], [], []))
+
+    def test_pending_contradiction_is_appended_by_itself(self):
+        """Противоречие r4 без карточки в пакете (так бывает при card: not_replaced, 13б) дописывается
+        вместе с порцией, хотя агент его не назвал."""
+        with files("sqlite", qs=[q for q in six.questions() if q["id"] == "r4"]) as (jp, md, version):
+            self.press(jp, version, REPLACE, "r4")
+            core.apply_answers_files(jp, md)
+            core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="human")
+            store = review_pack.answers_state(jp)
+            store["manifest"]["items"] = [i for i in store["manifest"]["items"] if i["id"] != "r4"]
+            review_pack._write_answers(jp, store)
+            rep = self.append(jp, [q for q in six.questions() if q["id"] == "r2"])
+            self.assertEqual(sorted(r["id"] for r in rep["added"]), ["r2", "r4"])
 
     def test_limit_200(self):
         with files("sqlite", qs=first()) as (jp, _md, _version):

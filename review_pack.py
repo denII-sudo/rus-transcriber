@@ -673,6 +673,182 @@ def _history_rows(old, answer, applied_sig, conflicts, why):
     return rows + [waiting], True
 
 
+def _put_card(store, items, index, old, new, applied, why, rep):
+    """Записать карточку new в список items (общее для upsert_cards и append_cards). Новая — в конец; заменённая
+    (old) уходит в history с её ответом, ответ, отметка применения и снимок отмены прежней редакции снимаются."""
+    aid = new["id"]
+    if old is None:
+        index[aid] = len(items)
+        items.append(new)
+        rep["added"].append({"id": aid, "rev": 1, "clip": bool(new["clip"])})
+        return
+    answers = store.setdefault("answers", {})
+    conflicts = [c for c in store.get("conflicts") or [] if c.get("id") == aid]
+    rows, not_carried = _history_rows(old, answers.get(aid), applied.get(aid), conflicts, why)
+    new["history"] = list(old.get("history") or []) + rows
+    if not_carried:
+        rep.setdefault("answers_not_carried", []).append({"id": aid, "rev": card_rev(old)})
+    answers.pop(aid, None)
+    if conflicts:
+        store["conflicts"] = [c for c in store["conflicts"] if c.get("id") != aid]
+    if "applied_answers" in store:
+        store["applied_answers"].pop(aid, None)
+    (store.get("undo_snapshots") or {}).pop(aid, None)
+    items[index[aid]] = new
+    rep["replaced"].append({"id": aid, "rev": new["rev"], "clip": bool(new["clip"])})
+
+
+# PR 17а: дописывание порции. Карточка, у которой ответ применить не удалось, получает новую редакцию (В-6);
+# пакет — до APPEND_LIMIT карточек (В-5). Только при хранении записей в базе (указание владельца a1093cd).
+APPEND_LIMIT = 200
+APPEND_REFRESH = frozenset({"apply_conflict", "source_conflict", "not_found", "not_applied", "listen_mismatch"})
+APPEND_FILES_REFUSAL = ("Дописывание карточек доступно только при хранении записей в базе; "
+                        "полная пересборка — rebuild=true")
+APPEND_CHANGED = "место изменилось во время сборки, повторите порцию"
+
+
+def _append_plan(T, data, man, store, cards, only=None):
+    """Какие карточки дописать или обновить. -> ([(вопрос, карточка, (t1, t2))], skipped)."""
+    review = {it["id"]: it for it in data.get("review") or []}
+    in_pack = {it.get("id") for it in man.get("items") or []}
+    states = answer_states_of(store, man)
+    listed = {q.get("id") for q in cards}
+    cards = list(cards) + [{"id": i["id"]} for i in data.get("review") or []
+                           if T.contradiction_pending(i) and i.get("id") not in listed]
+    plan, skipped, seen, room = [], [], set(), APPEND_LIMIT - len(in_pack)
+    for q in cards:
+        aid = q.get("id")
+        if only is not None and aid not in only:
+            continue
+        it = review.get(aid)
+        if not it:
+            skipped.append({"id": aid, "why": "нет такого места"})
+            continue
+        if aid in seen:
+            skipped.append({"id": aid, "why": "карточка повторяется в вызове"})
+            continue
+        seen.add(aid)
+        if aid in in_pack and not (T.contradiction_pending(it) or
+                                   (states.get(aid) or {}).get("state") in APPEND_REFRESH):
+            skipped.append({"id": aid, "why": "уже в пакете"})
+            continue
+        if aid not in in_pack:
+            if room <= 0:
+                skipped.append({"id": aid, "why": f"пакет полон ({APPEND_LIMIT} карточек): когда ответы применены, "
+                                                  "соберите новый пакет (rebuild=true)"})
+                continue
+            room -= 1
+        new, times = _card(T, data, it, q)
+        if new is None:
+            skipped.append({"id": aid, "why": times})
+            continue
+        plan.append((q, new, times))
+    return plan, skipped
+
+
+def append_cards(json_path, cards, *, actor="model"):
+    """Дописать порцию карточек в собранный пакет записи в базе (PR 17а): version прежняя, ответы, отметки
+    применения, снимки отмены и события прежних карточек остаются. Место, у которого карточка уже есть, —
+    skipped «уже в пакете», кроме карточек с неприменимым ответом (APPEND_REFRESH: новая редакция, как в
+    upsert_cards) и ожидающих противоречий (дописываются сами, как в build). Клипы режутся до замка во временные
+    <id>.<uuid>.part.mp3; под замком ответов карточка строится заново и сверяется с заготовкой: не совпала —
+    skipped «место изменилось». Ревизия разбора не сравнивается. storage.Conflict («Применить» записало
+    стенограмму) — фаза под замком повторяется один раз. -> отчёт upsert_cards; None — пакет другой записи."""
+    import recordings
+    import storage
+    import transcript as T
+    if recordings.read_review_pack_state(json_path) is None:
+        raise RuntimeError(APPEND_FILES_REFUSAL)
+    man = manifest(json_path)
+    if not man:
+        raise RuntimeError("пакет разбора не собран: сначала build_review_pack")
+    data = T.load(json_path)
+    if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
+        return None
+    pd = pack_dir(json_path)
+    clips_rel = _pack_clips_dir(man, True)
+    folder = pd / clips_rel
+    src = Path(data.get("file") or "")
+    plan, skipped = _append_plan(T, data, man, answers_state(json_path), cards)
+    parts = []
+    try:
+        for q, new, times in plan:
+            folder.mkdir(parents=True, exist_ok=True)
+            tmp = folder / f"{new['id']}.{uuid.uuid4().hex}.part.mp3"
+            parts.append((q, _attach_clip(new, times, src, tmp, pd, strict=False), times, tmp))
+        with recordings.operation_for_document(json_path, actor):
+            with _answers_lock(json_path):
+                try:
+                    return _append_locked(json_path, parts, skipped, clips_rel, pd)
+                except storage.Conflict:
+                    try:
+                        return _append_locked(json_path, parts, skipped, clips_rel, pd)
+                    except storage.Conflict as ex:
+                        raise RuntimeError("запись изменилась во время дописывания карточек, "
+                                           "повторите порцию") from ex
+    finally:
+        for *_, tmp in parts:          # только свои временные файлы; записанные уже переименованы
+            tmp.unlink(missing_ok=True)
+
+
+def _append_locked(json_path, parts, skipped, clips_rel, pd):
+    import transcript as T
+    man = manifest(json_path)
+    data = T.load(json_path)
+    if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
+        raise RuntimeError("пакет относится к другой стенограмме")
+    store = _read_answers(json_path, {"version": man["version"], "answers": {}, "conflicts": [], "rejected": []})
+    fresh, late = _append_plan(T, data, man, store, [q for q, *_ in parts], only={n["id"] for _, n, *_ in parts})
+    fresh = {new["id"]: (new, times) for _, new, times in fresh}
+    rep = {"added": [], "replaced": [], "unchanged": [], "skipped": list(skipped) + late}
+    late = {r["id"] for r in late}
+    items = list(man.get("items") or [])
+    index = {it.get("id"): n for n, it in enumerate(items)}
+    applied = _applied_map(store)
+    folder = pd / clips_rel
+    moved = []
+    for _q, new, times, tmp in parts:
+        aid = new["id"]
+        if aid in late:
+            continue
+        again = fresh.get(aid)
+        if again is None or (_card_fp(again[0]), again[1]) != (_card_fp(new), times):
+            rep["skipped"].append({"id": aid, "why": APPEND_CHANGED})
+            continue
+        new = copy.deepcopy(new)
+        old = items[index[aid]] if aid in index else None
+        if old is not None and _same_question(old, new):
+            rep["unchanged"].append(aid)
+            continue
+        new["rev"] = card_rev(old) + 1 if old is not None else 1
+        if data.get("source_revision") is not None:
+            new["source_revision"] = data["source_revision"]
+        if new.get("clip"):
+            final = _free_clip_name(folder, aid, new["rev"])
+            if tmp.exists():
+                tmp.replace(final)
+                moved.append((final, tmp))
+            new["clip"] = final.relative_to(pd).as_posix()
+        _put_card(store, items, index, old, new, applied, "дописывание порции", rep)
+    pack_rev = man.get("pack_rev", 0)
+    if not rep["added"] and not rep["replaced"]:
+        _undo_moves(moved)
+        return {"version": man["version"], "pack_rev": pack_rev, "written": False, **rep}
+    store["manifest"] = dict(man, items=items, pack_rev=pack_rev + 1, clips_dir=clips_rel, updated=_now())
+    try:
+        _write_answers(json_path, store)
+    except BaseException:
+        _undo_moves(moved)             # состояние не записано: клипы снова временные, их уберёт append_cards
+        raise
+    return {"version": man["version"], "pack_rev": pack_rev + 1, "written": True, **rep}
+
+
+def _undo_moves(moved):
+    for final, tmp in moved:
+        if final.exists():
+            final.replace(tmp)
+
+
 def _upsert_cards_locked(json_path, cards, why, only_if=None):
     import transcript as T
     man = manifest(json_path)
@@ -724,25 +900,7 @@ def _upsert_cards_locked(json_path, cards, why, only_if=None):
         folder = pd / clips_rel
         folder.mkdir(parents=True, exist_ok=True)
         _attach_clip(new, times, src, _free_clip_name(folder, aid, new["rev"]), pd, strict=False)
-        if old is None:
-            index[aid] = len(items)
-            items.append(new)
-            rep["added"].append({"id": aid, "rev": 1, "clip": bool(new["clip"])})
-            continue
-        answers = store.setdefault("answers", {})
-        conflicts = [c for c in store.get("conflicts") or [] if c.get("id") == aid]
-        rows, not_carried = _history_rows(old, answers.get(aid), applied.get(aid), conflicts, why)
-        new["history"] = list(old.get("history") or []) + rows
-        if not_carried:
-            rep.setdefault("answers_not_carried", []).append({"id": aid, "rev": card_rev(old)})
-        answers.pop(aid, None)
-        if conflicts:
-            store["conflicts"] = [c for c in store["conflicts"] if c.get("id") != aid]
-        if "applied_answers" in store:
-            store["applied_answers"].pop(aid, None)
-        (store.get("undo_snapshots") or {}).pop(aid, None)
-        items[index[aid]] = new
-        rep["replaced"].append({"id": aid, "rev": new["rev"], "clip": bool(new["clip"])})
+        _put_card(store, items, index, old, new, applied, why, rep)
     pack_rev = man.get("pack_rev", 0)
     if not rep["added"] and not rep["replaced"]:
         return {"version": man["version"], "pack_rev": pack_rev, "written": False, **rep}

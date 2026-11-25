@@ -132,7 +132,7 @@ class Refusal(Base):
             with mock.patch.object(review_pack, "cut_clip", side_effect=cut), \
                     mock.patch.object(core, "_done_json", return_value={"json": str(jp)}):
                 with self.assertRaises(core.CoreError) as caught:
-                    core.build_review_pack("demo", new_questions())
+                    core.build_review_pack("demo", new_questions(), rebuild=True)
             self.assertTrue(saved)
             self.assertIn("№4 (r4)", str(caught.exception))
             self.assertEqual(review_pack.answer_states(jp)["r4"]["state"], "saved")
@@ -145,7 +145,7 @@ class Refusal(Base):
             with mock.patch.object(review_pack, "cut_clip") as cut, \
                     mock.patch.object(core, "_done_json", return_value={"json": str(jp)}):
                 with self.assertRaises(core.CoreError) as caught:
-                    core.build_review_pack("demo", new_questions())
+                    core.build_review_pack("demo", new_questions(), rebuild=True)
             cut.assert_not_called()
             self.assertIn("№4 (r4)", str(caught.exception))
             self.assertIn("«Применить сохранённые ответы»", str(caught.exception))

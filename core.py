@@ -835,8 +835,10 @@ def conversation_hotspots(job_id, limit=20, min_score=0.0):
             "note": hotspots.NOTE}
 
 
-def build_review_pack(job_id, items=None):
-    """Подготовка карточек без зависимости от MCP или конкретной модели."""
+def build_review_pack(job_id, items=None, rebuild=False):
+    """Подготовка карточек без зависимости от MCP или конкретной модели. Пакет уже собран и rebuild не задан —
+    порция дописывается в него (PR 17а, только запись в базе; в файлах — отказ). rebuild — полная пересборка
+    с проверкой ждущих ответов (17-Б). Пакет другой записи собирается заново."""
     import review_pack as P
     import transcript
     jp = _done_json(job_id)["json"]
@@ -845,11 +847,23 @@ def build_review_pack(job_id, items=None):
         items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
                   "options": [{"label": "Оставить как есть", "decision": {}}]}
                  for it in data.get("review", []) if transcript.place_unresolved(it)]
+    other = None
+    if not rebuild and P.manifest(jp):
+        try:
+            rep = P.append_cards(jp, items)
+        except RuntimeError as ex:
+            raise CoreError(str(ex)) from ex
+        if rep is not None:
+            return rep
+        other = "открытый пакет относился к другой записи: собран новый, его ответы ушли в архив"
     try:
         P.check_rebuild(jp)             # быстрый отказ до резки клипов; build повторяет проверку под замком
-        return P.build(jp, items)
+        rep = P.build(jp, items)
     except P.RebuildRefused as ex:
         raise CoreError(str(ex)) from ex
+    if other:
+        rep["other_recording"] = other
+    return rep
 
 
 def start_review_page(job_id, port=8765):
