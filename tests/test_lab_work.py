@@ -78,6 +78,17 @@ def result_data(audio, sha):
             "review_done": False, "edits": []}
 
 
+def tree_state(root, skip=()):
+    """{путь: (sha256, размер, mtime_ns)} всех файлов под root, кроме верхних папок skip."""
+    out = {}
+    for f in sorted(Path(root).rglob("*")):
+        rel = f.relative_to(root)
+        if f.is_file() and rel.parts[0] not in skip:
+            st = f.stat()
+            out[rel.as_posix()] = (hashlib.sha256(f.read_bytes()).hexdigest(), st.st_size, st.st_mtime_ns)
+    return out
+
+
 def hyp_record(recording_id, sha, heard=True, primary=None):
     _main, _q, trace = fused()
     chunk = {"index": 0, "audio_span": [0.0, 2.0], "own_span": [0.0, 2.0], "state": "ok"}
@@ -131,8 +142,9 @@ class Source:
             pack = review_pack.build(jp, copy.deepcopy(QUESTIONS))
             for k, (aid, row) in enumerate(answers.items()):
                 actor = row.pop("_actor", "human")
+                where = row.pop("_source", "local")
                 review_pack.add_answers(jp, [{"id": aid, "version": pack["version"],
-                                              "ts": f"2026-11-25T10:00:{k:02d}", **row}], "local",
+                                              "ts": f"2026-11-25T10:00:{k:02d}", **row}], where,
                                         trusted_actor=actor)
             try:
                 core.apply_answers_files(jp, md)
@@ -230,6 +242,38 @@ class WorkAnalysis(unittest.TestCase):
         rows = work["places"]["rows"]
         self.assertEqual((rows["saved_not_applied"], rows["unanswered"], rows["eligible"]), (1, 1, 0), rows)
         self.assertEqual(sum(work["m1"]["cards"].values()), 0)
+
+    def test_cloud_answers_by_author(self):
+        """Облачный ответ: автор «человек» — применён и в счёте; автор не известен — не применён, вне счёта.
+        Записи разные: ответ неизвестного автора не даёт применить ни один ответ своей записи."""
+        self.src.recording({"r1": {"option": 0, "_source": "cloud"}})
+        self.src.recording({"r2": {"option": 0, "_source": "cloud", "_actor": "unknown"}})
+        work = self.analyze()[0]["work"]
+        self.assertEqual(work["recordings"]["states"]["ok"], 2, work["recordings"])
+        rows = work["places"]["rows"]
+        self.assertEqual((rows["eligible"], rows["saved_not_applied"], rows["unanswered"]), (1, 1, 2), rows)
+        self.assertEqual(work["m1"]["cards"]["agree_corrected"], 1, work["m1"])
+        self.assertEqual(sum(work["m1"]["cards"].values()), 1)
+
+    def test_analysis_changes_only_results_and_export(self):
+        """Анализ только читает: копия базы и гипотез (source/), маркер песочницы и папка данных не меняются —
+        ни содержимое, ни время, ни новые файлы (в том числе -wal/-shm); пишется только results/ и export/."""
+        self.src.recording({"r1": {"option": 0}, "r2": {"option": 1}}, edit=(1.2, 1.5, "иное"))
+        self.src.store.close()
+        sandbox = self.base / "sandbox-ro"
+        lab_sandbox.prepare(sandbox, self.src.data, self.program, "skip", env={}, log=lambda *_: None, work=True)
+        s, _marker, units = lab_sandbox.load_sandbox(sandbox, env={})
+        data_before = tree_state(self.src.data)
+        sandbox_before = tree_state(s, skip=("results", "export"))
+        self.assertTrue(any(k.startswith("source/hypotheses/") for k in sandbox_before), sandbox_before)
+        self.assertIn("source/state.sqlite3", sandbox_before)
+        for _ in range(2):                       # повторный анализ той же песочницы — тоже без изменений
+            analysis = lab_analyze.analyze(s, units, log=lambda *_: None)
+            self.assertEqual(analysis["work"]["recordings"]["states"]["ok"], 1)
+            self.assertEqual(tree_state(s, skip=("results", "export")), sandbox_before)
+            self.assertEqual(tree_state(self.src.data), data_before)
+        self.assertTrue((s / "export" / "analysis.json").is_file())
+        self.assertTrue((s / "results" / "report.md").is_file())
 
     def test_skip_and_left_for_human(self):
         self.src.recording({"r1": {"kind": "human"}, "r2": {"kind": "skip", "text": "пропуск"}})
