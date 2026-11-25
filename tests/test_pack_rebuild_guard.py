@@ -221,11 +221,16 @@ class Allowed(Base):
         """Ответ прежней редакции карточки (история 13а) к новому вопросу не применяется — он не ждёт."""
         with files("sqlite") as (jp, _md, version):
             self.press(jp, version, REPLACE, "r4")
+            old = copy.deepcopy(review_pack.answers_state(jp)["answers"]["r4"])
             card = dict(next(q for q in six.questions() if q["id"] == "r4"), question="Другой вопрос")
             self.assertEqual([r["id"] for r in review_pack.upsert_cards(jp, [card], why="тест")["replaced"]],
                              ["r4"])
+            # ответ прежней редакции остался в состоянии (так бывает при сбое между записями, см. upsert_cards)
+            state = review_pack.answers_state(jp)
+            state["answers"]["r4"] = old
+            review_pack._write_answers(jp, state)
             self.assertNotIn("r4", review_pack.answer_states(jp))
-            self.rebuild(jp)
+            self.assertEqual(self.rebuild(jp)["unapplicable"], [])
 
     def test_fresh_pack_report_has_the_new_fields(self):
         with files("sqlite") as (jp, _md, _version):
