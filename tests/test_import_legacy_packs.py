@@ -269,6 +269,36 @@ class TransferTests(PackFixture):
         self.assertEqual(review["undo"]["review_pack"]["applied_answers"], {})
         self.assertEqual(stats["pack_state"]["applied_marks"]["dropped"], 1)
 
+    def test_applied_at_rule_compares_fractions_of_second(self):
+        """Ф207-4: правило «не позже applied_at» — по исходным секундам с долями, как review_pack._applied_map:
+        ответ в ту же секунду, но позже применения, ждёт; ответ раньше в ту же секунду — применён."""
+        answers = self.answers()
+        answers["r-ok"]["ts"], answers["r-time"]["ts"] = APPLIED_AT + 0.1, APPLIED_AT + 0.7
+        for aid in ("r-ambig", "r-edited"):
+            answers.pop(aid)
+        self.write_pack(answers=answers, applied_at=APPLIED_AT + 0.2)
+        packs, manifests = IL._read_pack_files([self.pack])
+        packs[0]["raw"].pop("applied_answers")
+        self.assertEqual(IL._utc_text(APPLIED_AT + 0.7), IL._utc_text(APPLIED_AT + 0.2))   # строки равны
+        legacy = json.loads(self.tj.read_text(encoding="utf-8"))
+        _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "s"), metadata={},
+                                                 field_sources={}, variant={}, source={}, answers_packs=packs,
+                                                 manifests=manifests)
+        self.assertEqual(set(review["undo"]["review_pack"]["applied_answers"]), {"r-ok"})
+        self.assertEqual((stats["pack_state"]["applied_marks"]["from_applied_at"], stats["pack_state"]["waiting"]),
+                         (1, 1))
+
+    def test_new_import_of_archived_pack_is_not_a_repair_candidate(self):
+        """Ф207-6: запись, которую новый перенос сразу положил в архив, ремонт считает исправленной."""
+        self.write_pack(version="другая")
+        self.init_db()
+        entry = self.apply()
+        self.assertEqual(entry["status"], "imported")
+        self.assertEqual(IL.repair_packs(db_only=True)["records"][0]["status"], "already_repaired")
+        rec = IL.repair_packs(IL.load_plan(self.write_plan()))["records"][0]
+        self.assertEqual(rec["status"], "already_repaired")
+        self.assertIn("новым переносом", rec["why"])
+
     def test_mismatched_versions_archive_answers(self):
         self.write_pack(version="другая")
         packs, manifests = IL._read_pack_files([self.pack])
@@ -406,6 +436,44 @@ class RepairTests(PackFixture):
         report = json.loads((out / "repair-report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["backup_damaged_copies"], damaged)
         self.assertEqual(report["records"][0]["status"], "repaired")
+
+    def test_repeat_repair_of_archived_pack_is_already_repaired(self):
+        """Ф207-6: ремонт пакета, ушедшего в архив целиком (версии не совпали), повтором — «уже исправлено», код 0."""
+        self.write_pack(version="другая")
+        plan = self.write_plan()
+        report = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(report["records"][0]["status"], "repaired")
+        self.assertEqual(report["records"][0]["pack_state"]["state"], "archived_only")
+        db_after = self.db_hashes()
+        again = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(again["records"][0]["status"], "already_repaired")
+        self.assertEqual(self.db_hashes(), db_after)
+        self.assertEqual(self.run_main("--plan", str(plan), "--apply", "--data-dir", str(self.db.parent)), 0)
+
+    def test_documents_failure_after_db_write_is_reported_and_repeat_writes_them(self):
+        """Ф207-2: сбой записи файлов после записи в базу — не «ошибка», а «в базе исправлено, документы не
+        записаны» (код 1); повтор --apply дописывает документы без новой ревизии."""
+        plan = self.write_plan()
+        with mock.patch.object(recordings, "materialize_recording", side_effect=OSError("диск занят")):
+            report = IL.repair_packs(IL.load_plan(plan), apply=True)
+        rec = report["records"][0]
+        self.assertEqual(rec["status"], "repaired_documents_pending", rec)
+        self.assertIn("диск занят", rec["error"])
+        self.assertEqual(self.current(self.rid)["review"]["revision"], 2)
+        self.assertNotIn(VERSION, Path(self.entry["documents"]["json"]).read_text(encoding="utf-8"))
+        self.assertEqual(IL.repair_packs(db_only=True)["records"][0]["status"], "repaired_documents_pending")
+        self.assertEqual(self.run_main("--plan", str(plan)), 1)                     # сухой прогон: нужен повтор
+        again = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(again["records"][0]["status"], "documents_written", again)
+        self.assertIsNone(again["backup"])
+        self.assertEqual(self.current(self.rid)["review"]["revision"], 2)
+        self.assertIn(VERSION, Path(self.entry["documents"]["json"]).read_text(encoding="utf-8"))
+        store = recordings.open_store(self.db)
+        try:
+            self.assertEqual(IL._document_state(store, self.rid), "synced")
+        finally:
+            store.close()
+        self.assertEqual(IL.repair_packs(IL.load_plan(plan), apply=True)["records"][0]["status"], "already_repaired")
 
     def test_not_migrated_and_nothing_to_repair(self):
         plan = self.plan()

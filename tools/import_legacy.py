@@ -409,13 +409,23 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
         review["rejected"] = copy.deepcopy(raw.get("rejected") or [])
         applied_at = _utc_text(raw.get("applied_at"))
         applied, marks = {}, {"kept": 0, "from_true": 0, "dropped": 0, "from_applied_at": 0}
+
+        def not_later(aid, answer):
+            # правило review_pack._applied_map «ответ не позже applied_at» — по исходным значениям файла (Ф207-4):
+            # секунды сравниваются числами, с долями; строки без долей секунды дали бы «применён» ответу,
+            # сохранённому в ту же секунду после применения
+            ts, at = (mine.get(aid) or {}).get("ts"), raw.get("applied_at")
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (ts, at)):
+                return ts <= at
+            return (answer.get("ts") or "") <= applied_at
+
         if "applied_answers" in raw:
             for aid, sig in (raw.get("applied_answers") or {}).items():
                 answer = answers.get(aid)
                 if answer is not None and isinstance(sig, list):
                     applied[aid] = sig
                     marks["kept"] += 1
-                elif answer is not None and sig is True and applied_at and (answer.get("ts") or "") <= applied_at:
+                elif answer is not None and sig is True and applied_at and not_later(aid, answer):
                     # старая отметка «применён» без подписи: подпись ответа, который был до применения пакета
                     applied[aid] = RP._sig(answer)
                     marks["from_true"] += 1
@@ -425,7 +435,7 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
             # пакет до записи отметок: применёнными считались ответы не позже applied_at (review_pack._applied_map);
             # в базе состояние всегда с applied_answers, поэтому правило переносится явными подписями
             for aid, answer in answers.items():
-                if (answer.get("ts") or "") <= applied_at:
+                if not_later(aid, answer):
                     applied[aid] = RP._sig(answer)
                     marks["from_applied_at"] += 1
         events = copy.deepcopy(raw.get("application_events") or [])
@@ -827,7 +837,8 @@ def write_artifacts(out_dir, plan, report, mode, verification=None):
 # ---------------------------------------------------------------- ремонт: пакет карточек (М-1)
 
 # Состояния записи в отчёте ремонта. Отказы дают код 1; остальное — штатный исход.
-REPAIR_REFUSALS = frozenset(("not_migrated", "changed_after_import", "pack_files_changed", "error"))
+REPAIR_REFUSALS = frozenset(("not_migrated", "changed_after_import", "pack_files_changed", "error",
+                             "repaired_documents_pending", "documents_conflict", "unknown_pack_keys"))
 
 
 class RepairBackupError(RuntimeError):
@@ -865,8 +876,20 @@ def _db_check(store, rid):
     import_op = _import_operation(rid)
     untouched = (current["transcript"]["revision"] == 1 and current["review"]["revision"] == 1 and
                  current["transcript"]["operation_id"] == import_op and current["review"]["operation_id"] == import_op)
-    if not pack_state_missing(review):
+    repaired = bool((review.get("undo") or {}).get("legacy_pack_repair"))
+    # pack_state с итогом пишет только новый перенос (В-1); прежний перенос этого поля не писал (Ф207-6)
+    new_import = (mig.get("pack_state") or {}).get("state") in ("full", "archived_only")
+    if repaired and _document_state(store, rid) != "synced":
+        # Ф207-2: ревизия ремонта в базе, а файлы документа не дописаны — повтор с --apply их допишет
+        out["status"] = ("documents_conflict" if _document_state(store, rid) == "conflict"
+                         else "repaired_documents_pending")
+        out["why"] = ("в базе исправлено, документы рядом с аудио в конфликте — решите конфликт штатно "
+                      "(resolve_document_conflict или экран)" if out["status"] == "documents_conflict"
+                      else "в базе исправлено, документы рядом с аудио не записаны — повторите с --apply")
+    elif not pack_state_missing(review) or repaired or new_import:
         out["status"] = "already_repaired"
+        if new_import and not repaired:
+            out["why"] = "перенесено новым переносом вместе с состоянием пакета"
     elif not untouched:
         out["status"] = "changed_after_import"
         out["why"] = "запись менялась после переноса — ремонт не выполняется, нужен человек"
@@ -929,6 +952,17 @@ def _binding(store, rid):
     return recordings.document_binding(store, rid)
 
 
+def _document_state(store, rid):
+    """Состояние очереди последней ревизии документа записи (document_outbox): synced, pending, conflict…"""
+    row = store.db.execute("SELECT state FROM document_outbox WHERE recording_id=? "
+                           "ORDER BY document_revision DESC LIMIT 1", (rid,)).fetchone()
+    return row[0] if row else None
+
+
+class RepairDocumentsPending(RuntimeError):
+    """Ревизия ремонта записана в базу, а файлы документа — нет (Ф207-2): повтор с --apply их допишет."""
+
+
 def _repair_backup(store):
     """Резерв базы перед первой записью ремонта: <папка данных>/db-backups.
 
@@ -959,9 +993,22 @@ def _repair_write(store, rid, review, digest):
     result = store.commit_change_with_document(
         rid, {"source_revision": 1, "review_revision": 1}, operation_id, context, review=review,
         root_id=binding["root_id"], generated_at=datetime.now(timezone.utc).isoformat())
-    completed = recordings.materialize_recording(store, rid)
-    documents.require_written(store, rid, result["document_revision"], completed)
+    try:
+        _repair_documents(store, rid, result["document_revision"])
+    except Exception as ex:
+        raise RepairDocumentsPending(f"{type(ex).__name__}: {ex}") from ex
     return result
+
+
+def _repair_documents(store, rid, revision=None):
+    """Дописать файлы документа записи из очереди штатно (без новой ревизии): после записи в базу или повтором."""
+    import documents
+    import recordings
+    if revision is None:
+        revision = store.db.execute("SELECT MAX(document_revision) FROM document_outbox WHERE recording_id=?",
+                                    (rid,)).fetchone()[0]
+    completed = recordings.materialize_recording(store, rid)
+    documents.require_written(store, rid, revision, completed)
 
 
 def repair_packs(plan=None, *, apply=False, db_only=False):
@@ -1018,6 +1065,11 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
                 **({"error": "несколько записей с этим источником"} if rids else {})}
     rid = rids[0]
     check, transcript, review_db, mig = _db_check(store, rid)
+    if check["status"] == "repaired_documents_pending" and apply:
+        import documents
+        documents.guard_before_write(store, rid)
+        _repair_documents(store, rid)
+        return {**check, "status": "documents_written", "why": "в базе было исправлено; документы дописаны"}
     if check["status"] != "candidate":
         return check
     packs, manifests = _read_pack_files(variant.get("review_packs", []))
@@ -1032,7 +1084,12 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
         report["backup"], damaged = _repair_backup(store)
         if damaged:
             report["backup_damaged_copies"] = damaged
-    result = _repair_write(store, rid, review, _pack_digest(packs, manifests))
+    try:
+        result = _repair_write(store, rid, review, _pack_digest(packs, manifests))
+    except RepairDocumentsPending as ex:
+        out.update(status="repaired_documents_pending", review_revision=2, error=str(ex),
+                   why="в базе исправлено, документы рядом с аудио не записаны — повторите с --apply")
+        return out
     out.update(status="repaired", review_revision=result.get("review_revision", 2))
     return out
 
