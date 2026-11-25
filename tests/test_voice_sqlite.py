@@ -141,7 +141,7 @@ class MigratedRecordingParity(SyntheticStore):
                 _, report = selection(legacy)
                 self.assertEqual(report.get("accepted_human"), 1)
                 self.assertEqual(report.get("accepted_auto", 0), 3 if confirmed else 0)
-                self.assertIn("foreign_overlap", report)
+                self.assertEqual("foreign_overlap" in report, confirmed)   # без подтверждения слов модели нет
                 self.assertIn("unknown_speaker", report)
                 for check in (voices._confirmed, voices.has_human_edits, voices._human_pairs, voices.group_of):
                     self.assertEqual(check(loaded), check(legacy), check.__name__)
