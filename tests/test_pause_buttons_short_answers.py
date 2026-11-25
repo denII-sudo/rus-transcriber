@@ -313,7 +313,7 @@ class PauseButtonsApplyTests(Case):
 
     def test_interjections_mark_in_both_renderers(self):
         """Тест 7 (оба): пометка на месте паузы, слов не добавилось."""
-        self.assertEqual(documents.RENDERER_VERSION, 2)
+        self.assertEqual(documents.RENDERER_VERSION, 3)
         data = two_replies()
         for backend in BACKENDS:
             with self.subTest(backend=backend), files(backend, data) as (jp, md, version):

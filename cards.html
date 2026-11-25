@@ -103,7 +103,8 @@ audio{width:100%;height:36px}
   "use strict";
   const LOCAL = /^(127\.0\.0\.1|localhost)$/.test(location.hostname);
   const REASONS = {asr: "модели расходятся", conf: "модель не уверена", voice: "голоса похожи",
-                   overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь"};
+                   overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь",
+                   contradiction: "противоречие"};
   const NUM = ["1", "2", "3", "4"];
   let man = null, answers = {}, live = {}, showAll = false, api = null;
   const pageSession = typeof window !== "undefined" && window.crypto && window.crypto.randomUUID ?
@@ -153,8 +154,9 @@ audio{width:100%;height:36px}
   // undo_conflict: отмена не выполнилась — прежняя правка на месте, кнопки «Изменить» и «Отмена» нужны
   // revert_pending: отмена подготовлена, но не применена — правка тоже ещё на месте
   // cloud_keep: отмена снята в облаке — применённая правка на месте
-  const holdsApplied = (it, a) => ["applied", "pending_new", "kept_previous", "undo_conflict", "revert_pending",
-                                   "cloud_keep"].includes(stateOf(it, a));
+  // applied_open: ответ применён, место осталось открытым (PR 7) — правка на месте, отмена доступна
+  const holdsApplied = (it, a) => ["applied", "applied_open", "pending_new", "kept_previous", "undo_conflict",
+                                   "revert_pending", "cloud_keep"].includes(stateOf(it, a));
   // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
   const revertButton = (it, a) => stateOf(it, a) === "revert_pending" ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
@@ -194,6 +196,7 @@ audio{width:100%;height:36px}
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
   // Неуспешные исходы — «не применён — …» с краткой причиной; полная причина — строкой под ответом.
   const STATUS = {saved: "ответ сохранён", applied: "применён ответ", pending_new: "новый ответ — не применён",
+                  applied_open: "применён ответ, место открыто — нужно прослушивание",
                   revert_pending: "отмена подготовлена — нажмите «Применить»; прежний ответ на месте",
                   kept_previous: "применён прежний ответ", reverted: "ответ отменён", skipped: "пропущено",
                   negative: "не применён — место открыто", left_for_human: "требует проверки",
@@ -364,11 +367,17 @@ audio{width:100%;height:36px}
     const v = speechSynthesis.getVoices().find(v => /^ru/i.test(v.lang)); if (v) u.voice = v;
     speechSynthesis.speak(u);
   }
+  // примечание человека — только на карточке противоречия (PR 13б, В-3); ответом оно не разбирается
+  function humanNote(it, stateEl) {
+    const el = it.seen_fp && stateEl.parentElement && stateEl.parentElement.querySelector(".human-note");
+    return el ? el.value.trim() : "";
+  }
   async function send(it, a, stateEl) {
     stateEl.textContent = "Сохраняю…";
     editing.delete(it.id);
     try {
-      const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a});
+      const note = humanNote(it, stateEl);
+      const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a, ...(note ? {human_note: note} : {})});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
       render();
@@ -540,7 +549,14 @@ audio{width:100%;height:36px}
       free.append(preview);
     }
     free.onsubmit = (e) => { e.preventDefault(); if (inp.value.trim()) send(it, {text: inp.value.trim()}, state); };
-    c.append(free, state);
+    c.append(free);
+    if (it.seen_fp) {
+      const noteRow = document.createElement("div"); noteRow.className = "free";
+      const note = document.createElement("input"); note.className = "human-note";
+      note.placeholder = "Примечание (необязательно): остаётся в истории записи, в стенограмму не попадает";
+      noteRow.append(note); c.append(noteRow);
+    }
+    c.append(state);
     return c;
   }
 

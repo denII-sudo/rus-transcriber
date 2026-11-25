@@ -364,7 +364,12 @@ def run(a):
         lines = core.selected_conspect_confirmation_lines(a.job, a.name, snapshot, report, selections)
         return gated("Выбор места цитаты", lines, lambda: core.save_selected_conspect(snapshot, text, selections))
     elif c == "edit-span":
-        out(core.edit_span(a.job, a.t1, a.t2, a.text, a.speaker, a.note, a.by))
+        rep = core.edit_span(a.job, a.t1, a.t2, a.text, a.speaker, a.note, a.by)
+        if rep.get("written") is False:          # противоречие решению человека: не записано, карточка (PR 13б)
+            print(rep["text"])
+            out(rep)
+            return 3
+        out(rep)
     elif c == "reopen":
         out(core.reopen_review(a.job, a.ids))
     elif c == "cancel":

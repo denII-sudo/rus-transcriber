@@ -217,7 +217,7 @@ class HumanTexts(unittest.TestCase):
         return [x for x in self.md(timing).splitlines() if "«тело»" in x][0]
 
     def test_default_lines_byte_for_byte(self):
-        expected = "- 00:00:05 Анна: «дело» — модели распознали по-разному; CTC: «тело»; Whisper: «дали»"
+        expected = "- 00:00:05 Анна: «дело» — модели распознали по-разному; открыто; CTC: «тело»; Whisper: «дали»"
         for timing in (None, {}, {"asr2_model": "v3_e2e_ctc", "asr3_model": WHISPER,
                                   "asr3_device": "whisper-ct2:CPU:int8"},
                        {"asr2_model": "v3_e2e_ctc", "asr3_model": WHISPER, "asr3_device": "onnx-cpu:CPU:int8"}):

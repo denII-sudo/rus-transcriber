@@ -5,12 +5,12 @@ on:
     branches: [main]
     # No ready_for_review: the commit is already tested, automerge.yml reuses that result.
     types: [opened, synchronize, reopened]
-  # A merge is not tested again (branch protection requires an up-to-date, tested branch).
-  # main runs only to fill the dependency cache that every PR can read: when this file
-  # changes and every few days, because GitHub drops a cache unused for 7 days.
+  # Every push to main (a merge) and a schedule run the full suite sequentially, in one process, as a control for
+  # the parallel run in pull requests: a hidden dependency between modules would show as "green in parallel,
+  # red in sequence". It also fills the dependency cache that every PR can read (GitHub drops a cache unused for
+  # 7 days, hence the schedule). automerge.yml ignores these runs: it queues only pull_request ones.
   push:
     branches: [main]
-    paths: [".github/workflows/tests.yml"]
   schedule:
     - cron: "41 1 */5 * *"
 
@@ -108,9 +108,19 @@ jobs:
         with:
           path: ${{ runner.temp }}/test-venv
           key: ${{ steps.deps.outputs.cache-primary-key }}
-      # Набор идёт один раз, с подробным выводом (при падении в журнале виден полный разбор).
-      - name: Run unit tests
-        if: steps.scope.outputs.scope != 'docs'
+      # В PR набор идёт параллельно: tests/run_parallel.py делит модули на 4 группы (по процессу unittest, у
+      # каждой своя песочница). Состав групп детерминирован (по tests/parallel_durations.json), --shuffle меняет только порядок
+      # модулей внутри групп; его seed печатается в журнале (повтор — --shuffle SEED).
+      # Число тестов и состав модулей запускатель сверяет с discover; при падении печатает полный вывод группы.
+      # --durations: секунды по тестам остаются в журнале, из него таблица раскладки пересчитывается одной командой:
+      # python tests/run_parallel.py --table-from журнал.log
+      - name: Run unit tests (parallel groups)
+        if: steps.scope.outputs.scope != 'docs' && github.event_name == 'pull_request'
+        run: python -B tests/run_parallel.py -v --shuffle --durations
+      # Контроль по расписанию и на каждый push в main (слияние) — прежний последовательный прогон одним
+      # процессом: «параллельно зелёно, последовательно красно» показало бы скрытую зависимость модулей.
+      - name: Run unit tests (sequential control)
+        if: steps.scope.outputs.scope != 'docs' && github.event_name != 'pull_request'
         run: python -B -m unittest discover -s tests -v
       - name: Run text tests for a documentation-only change
         if: steps.scope.outputs.scope == 'docs'

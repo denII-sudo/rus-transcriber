@@ -362,7 +362,7 @@ class ThirdModelTranscriptLabelTests(unittest.TestCase):
         return [x for x in md.splitlines() if "CTC:" in x][0]
 
     def test_whisper_run_is_unchanged(self):
-        expected = "- 00:00:05 Анна: «дело» — модели распознали по-разному; CTC: «тело»; Whisper: «дали»"
+        expected = "- 00:00:05 Анна: «дело» — модели распознали по-разному; открыто; CTC: «тело»; Whisper: «дали»"
         self.assertEqual(self.line({"asr3_model": "onnx-community/whisper-large-v3-turbo",
                                     "asr3_device": "whisper-ov:GPU:fp16"}), expected)
         self.assertEqual(self.line(None), expected)

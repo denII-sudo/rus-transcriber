@@ -170,8 +170,12 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
             "кнопка → рекомендация": ({"option": 1}, {"kind": "recommended"}),
             "кнопка → оставить человеку": ({"option": 0}, {"kind": "human"}),
         }
+        # Файловый режим (legacy_files) уходит: в нём остаются два случая (кнопка и текст поверх применённого); sqlite — все шесть.
+        files_cases = ("кнопка → кнопка", "текст → текст")
         for backend in BACKENDS:
             for name, (first, second) in cases.items():
+                if backend == "legacy_files" and name not in files_cases:
+                    continue
                 with self.subTest(backend=backend, case=name), answer_files(backend) as (jp, md, version):
                     applied_words = self.first(jp, md, version, first)
                     self.assertNotEqual(applied_words[0], "тест")
@@ -241,6 +245,8 @@ class SkipAnswer(AnswerOutcomeCase):
     def test_skip_does_not_replace_applied_answer(self):
         for backend in BACKENDS:
             for first in ({"option": 0}, {"text": "пятое"}):
+                if backend == "legacy_files" and "text" in first:      # файловый режим уходит: остаётся кнопка; sqlite — оба
+                    continue
                 with self.subTest(backend=backend, first=first), answer_files(backend) as (jp, md, version):
                     self.save(jp, version, **first)
                     self.apply(jp, md)
@@ -298,8 +304,12 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                  "оставить человеку": ({"kind": "human"}, "left_for_human"),
                  "пропуск": ({"kind": "skip", "text": "пропущено"}, "skipped"),
                  "отмена без применённого": ({"kind": "revert"}, "skipped")}
+        # Файловый режим (legacy_files) уходит: в нём остаются три вида (кнопка, отрицание, «оставить человеку»); sqlite — все семь.
+        files_kinds = ("кнопка", "отрицание", "оставить человеку")
         for backend in BACKENDS:
             for name, (row, expected) in kinds.items():
+                if backend == "legacy_files" and name not in files_kinds:
+                    continue
                 with self.subTest(backend=backend, kind=name), answer_files(backend) as (jp, md, version):
                     self.save(jp, version, **row)
                     self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "saved"

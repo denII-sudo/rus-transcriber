@@ -357,6 +357,7 @@ def workflow_status(request_id):
     import product_policy
     import recordings
     import storage
+    import transcript
     import workflow
     store = recordings.open_store()
     try:
@@ -373,8 +374,7 @@ def workflow_status(request_id):
             if workflow.verification_is_current(store, request_id, recording_id, current):
                 human_verification = "confirmed"
             review = current["review"]["payload"]
-            unresolved = sum(1 for item in (review.get("review") or [])
-                             if item.get("status", "open") in ("open", "human"))
+            unresolved = sum(1 for item in (review.get("review") or []) if transcript.place_unresolved(item))
             quality = current["transcript"]["payload"].get("quality") or {}
             diagnostics = quality.get("asr_diagnostics")
             incomplete = bool(quality.get("asr_incomplete_chunks")) or not isinstance(diagnostics, dict) or not diagnostics
@@ -563,6 +563,7 @@ def workflow_questions(request_id):
     """Показать ограниченный пакет добровольных уточнений без автоматического ответа."""
     import recordings
     import storage
+    import transcript
     import workflow
     store = recordings.open_store()
     try:
@@ -572,7 +573,7 @@ def workflow_questions(request_id):
             return {"questions": [], "budget": budget, "recording_id": request["recording_id"]}
         current = store.get_current(request["recording_id"])
         items = [item for item in (current["review"]["payload"].get("review") or [])
-                 if item.get("status", "open") in ("open", "human") and isinstance(item.get("id"), str)]
+                 if transcript.place_unresolved(item) and isinstance(item.get("id"), str)]
         with store._transaction():
             store.current_identity()
             head = recordings.recording_head(store, request["recording_id"])
@@ -843,7 +844,7 @@ def build_review_pack(job_id, items=None):
         data = transcript.load(jp)
         items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
                   "options": [{"label": "Оставить как есть", "decision": {}}]}
-                 for it in data.get("review", []) if it.get("status", "open") in ("open", "human")]
+                 for it in data.get("review", []) if transcript.place_unresolved(it)]
     return P.build(jp, items)
 
 
@@ -1109,7 +1110,53 @@ def apply_answers(job_id):
 
 
 def apply_answers_files(jp, md):
-    """Применить ответы к указанной паре файлов готовой задачи."""
+    """Применить ответы к указанной паре файлов готовой задачи.
+
+    После применения (и после фиксации в sqlite) карточки ответов с исходом applied_open получают новую
+    редакцию (PR 13б): ответ применён, место осталось открытым — следующий вопрос человеку. Замена идёт
+    снаружи `conspect.write_lock`: применение держит её и внутри берёт блокировку ответов пакета, а
+    `review_pack.upsert_cards` сам берёт операцию документа и ту же блокировку ответов — без вложения."""
+    report = _apply_answers_files_once(jp, md)
+    return _replace_open_cards(jp, report)
+
+
+def _card_errors():
+    """Сбои постановки карточки в открытый пакет после записи стенограммы (PR 13б): не отменяют записанное,
+    а попадают в отчёт (`cards_not_replaced`). storage.Conflict — запись сменилась между фиксацией и заменой."""
+    import storage
+    return OSError, RuntimeError, ValueError, storage.StorageError
+
+
+def _replace_open_cards(jp, report):
+    """Новая редакция карточек с исходом applied_open. Сбой замены не отменяет применённые ответы: он в
+    отчёте (`cards_not_replaced`), и следующее «Применить» снова даёт этому ответу applied_open и замену."""
+    import review_pack
+    import transcript
+    outcomes = report.get("outcomes") or []
+    # слова места противоречия изменились после показа: карточка — новая редакция с текущими словами
+    stale = [row["id"] for row in outcomes if row.get("outcome") == "source_conflict"]
+    if stale:
+        places = {i.get("id"): i for i in transcript.load(jp).get("review") or []}
+        stale = [aid for aid in stale if transcript.contradiction_pending(places.get(aid) or {})]
+        try:
+            cards = review_pack.contradiction_cards(jp, stale)
+            report["replaced_cards"] = [aid for aid, state in cards.items() if state == "updated"]
+        except _card_errors() as ex:
+            report["cards_not_replaced"] = [{"id": aid, "why": str(ex)} for aid in stale]
+    ids = [row["id"] for row in outcomes if row.get("outcome") == "applied_open"]
+    if not ids:
+        return report
+    try:
+        replaced = review_pack.open_after_answer_cards(jp, ids)
+    except _card_errors() as ex:
+        report["cards_not_replaced"] = (report.get("cards_not_replaced") or []) + \
+            [{"id": aid, "why": str(ex)} for aid in ids]
+        return report
+    report["replaced_cards"] = (report.get("replaced_cards") or []) + replaced
+    return report
+
+
+def _apply_answers_files_once(jp, md):
     import conspect
     import recordings
     store, binding = recordings.open_for_document(jp)
@@ -1468,6 +1515,13 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "pending_new"
         elif aid in undo_conflict_ids:
             outcomes[aid] = "undo_conflict"
+    # Итог — после всех ответов: ответ применён, а его место открыто (нужно прослушивание, или слова интервала
+    # изменил другой ответ или правка) — исход applied_open, не applied (PR 7). Ответ остаётся применённым:
+    # подпись и снимок для отмены не снимаются; повтор «Применить» такое место сам не закроет.
+    places_now = {r.get("id"): r for r in transcript.load(jp).get("review") or []}
+    for aid, outcome in outcomes.items():
+        if outcome == "applied" and aid in places_now and transcript.place_unresolved(places_now[aid]):
+            outcomes[aid] = "applied_open"
     failed_outcomes = {aid: outcome for aid, outcome in outcomes.items()
                        if outcome not in ("applied", "reverted")}
     if failed_outcomes:
@@ -1492,6 +1546,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             add_detail(aid, "с карточкой " + ", ".join(str(x) for x in others) if others else conflict.get("why"))
     for aid, why in revision_conflicts.items():
         add_detail(aid, why)
+    for aid in stored:
+        if outcomes[aid] == "applied_open":
+            note = (places_now.get(aid) or {}).get("note") or ""
+            add_detail(aid, "слова интервала изменились после ответа" if "нужна новая проверка" in note else
+                       "ответ не исправил слова, в которых модели расходятся, или место требует прослушивания")
     for row in free_report.get("left_to_human") or []:
         add_detail(row.get("id"), row.get("why"))
     for aid, why in (free_report.get("failed") or {}).items():
@@ -1531,10 +1590,45 @@ def edit_span(job_id, t1, t2, text, speaker="", note="", by=None):
     except ValueError as ex:
         raise CoreError(str(ex))
     s = _done_json(job_id)
+    return edit_span_files(s["json"], s["markdown"], t1, t2, text, speaker or None, note or None, by)
+
+
+def edit_span_files(jp, md, t1, t2, text, speaker=None, note=None, by=None):
+    """Правка отрезка пары файлов. Противоречие решению человека (PR 13б) — не ошибка, а результат
+    {"written": false, "contradiction": "rN", "card": "added|updated|unchanged|pending|not_replaced",
+    "text": «не записано: …»}: слова не меняются, карточка места встаёт в открытый пакет. Сбой постановки
+    карточки — card: not_replaced и `cards_not_replaced`; повтор той же правки её ставит."""
+    import review_pack
+    import transcript
     try:
-        _, rep = transcript.edit_span(s["json"], s["markdown"], t1, t2, text, speaker or None, note or None, by)
+        _, rep = transcript.edit_span(jp, md, t1, t2, text, speaker, note, by)
     except ValueError as ex:
         raise CoreError(str(ex))
+    rid = rep.get("contradiction")
+    if rid:
+        try:
+            rep["card"] = review_pack.contradiction_cards(jp, [rid]).get(rid, "pending")
+        except _card_errors() as ex:
+            rep["card"] = "not_replaced"
+            rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)}]
+    return rep
+
+
+def apply_review_files(jp, md, decisions, by="claude"):
+    """Решения по местам разбора (transcript.apply_review); предложения агента по словам или месту человека
+    становятся карточками противоречия в открытом пакете (PR 13б): `contradictions`, `cards`."""
+    import review_pack
+    import transcript
+    _, rep = transcript.apply_review(jp, md, decisions, by=by)
+    ids = list(dict.fromkeys(rep.get("contradictions") or []))
+    if ids:
+        rep["contradictions"] = ids
+        try:
+            rep["cards"] = review_pack.contradiction_cards(jp, ids)
+        except _card_errors() as ex:
+            # решения уже записаны: сбой постановки карточек — в отчёт; повтор решения или сборка их поставят
+            rep["cards"] = {rid: "not_replaced" for rid in ids}
+            rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)} for rid in ids]
     return rep
 
 

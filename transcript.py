@@ -34,7 +34,8 @@ def recording_locked(func):
 
 REASON_RU = {"asr": "модели распознали по-разному", "conf": "модель не уверена в слове",
              "voice": "голоса близки — говорящий под вопросом", "overlap": "говорят одновременно",
-             "gender": "род глагола не совпадает с полом говорящего"}
+             "gender": "род глагола не совпадает с полом говорящего",
+             "contradiction": "противоречие: предложение расходится с решением человека"}
 
 
 def hms(t):
@@ -61,9 +62,35 @@ DOUBT_LEGEND = ("_⟦…⟧ — сомнительное место, ещё не
                 "(подробно — review_items). В цитаты конспекта такие места не брать без проверки._")
 
 
+def place_open(item):
+    """Место разбора открыто: его ещё никто не решал и не оставил человеку. Правило одно на программу (PR 7)."""
+    return item.get("status", "open") == "open"
+
+
+def place_unresolved(item):
+    """Место разбора не решено: открыто или оставлено человеку."""
+    return item.get("status", "open") in ("open", "human")
+
+
+PLACE_STATUS_RU = {"open": "открыто", "resolved": "решено", "human": "оставлено человеку"}
+
+
+def place_status_ru(item):
+    return PLACE_STATUS_RU.get(item.get("status", "open"), "состояние неизвестно")
+
+
 def unresolved(data):
     """Места разбора, ещё не решённые: открытые и оставленные человеку."""
-    return [i for i in data.get("review") or [] if i.get("status", "open") in ("open", "human")]
+    return [i for i in data.get("review") or [] if place_unresolved(i)]
+
+
+def review_finished(data):
+    """Разбор закончен: открытых мест нет (оставленные человеку не мешают)."""
+    return not any(place_open(i) for i in data.get("review") or [])
+
+
+def open_count(data):
+    return sum(1 for i in data.get("review") or [] if place_open(i))
 
 
 def doubt_marks(data):
@@ -210,9 +237,24 @@ def _second_name(data):
     return (model_label(model) or "CTC") if model else "CTC"
 
 
-def _item_line(it, third_name="Whisper", second_name="CTC"):
+def place_current_text(data, item):
+    """Слова места в стенограмме сейчас: по word_ids, а если какого-то уже нет — по времени места.
+    У пропуска и места без слов — текст места. Одна функция для обоих отрисовщиков «Сомнений» (PR 7)."""
+    if data and not is_gap_place(item):
+        by_id = {w.get("word_id"): w for seg in data.get("segments") or [] for w in seg.get("words") or []}
+        for place in (item, {k: v for k, v in item.items() if k != "word_ids"}):
+            found = place_words(data, place)
+            words = [str(by_id[i].get("w", "")) for i in (found[0] if found else None) or [] if i in by_id]
+            if words:
+                return " ".join(words)
+    return str(item.get("text") or "")
+
+
+def _item_line(it, third_name="Whisper", second_name="CTC", data=None, status=False):
     why = ", ".join(REASON_RU.get(r, r) for r in it.get("reasons", []))
-    s = f"- {hms(it['t'])} {it['speaker']}: «{it['text']}» — {why}"
+    s = f"- {hms(it['t'])} {it['speaker']}: «{place_current_text(data, it)}» — {why}"
+    if status:
+        s += f"; {place_status_ru(it)}"
     if it.get("alt_ctc"):
         s += f"; {second_name}: «{it['alt_ctc']}»"
     if it.get("alt_whisper"):
@@ -255,7 +297,7 @@ def render_md(data, text_only=False):
         lines.append("_Имена подписаны автоматически по голосовым профилям; подтвердить или исправить — "
                      "rename_speakers._\n")
     if data.get("review") is not None:
-        open_items = [i for i in data["review"] if i.get("status", "open") == "open"]
+        open_items = [i for i in data["review"] if place_open(i)]
         human = [i for i in data["review"] if i.get("status") == "human"]
         if data.get("review_done"):
             lines.append(f"_Сомнительные места разобраны: правок {len(data.get('edits', []))}, "
@@ -316,7 +358,7 @@ def render_md(data, text_only=False):
                                  + (f" — {e['note']}" if e.get("note") else ""))
                 lines.append("")
         else:
-            lines += ["## Сомнительные места", ""] + [_item_line(i, third_name, second_name)
+            lines += ["## Сомнительные места", ""] + [_item_line(i, third_name, second_name, data, status=True)
                                                       for i in data["review"]] + [""]
     return "\n".join(lines)
 
@@ -353,10 +395,10 @@ def _interval_words(data, start, end):
             if w.get("s", end) < end and w.get("e", w.get("s", end)) > start]
 
 
-def _save_locked(data, json_path, md_path):
-    # Идентификаторы не зависят от времени слова или его позиции в отображении.
-    # Старые файлы получают их при первом сохранении; дубликаты после разрезания
-    # реплик получают новые ID. Это не межпроцессная блокировка.
+def _ensure_ids(data):
+    """ID записи, реплик и слов. Не зависят от времени слова или его позиции в отображении.
+    Старые файлы получают их при первом сохранении; дубликаты после разрезания реплик получают новые ID.
+    Отпечаток прослушивания берётся по ID, поэтому его ставят после этой функции (PR 7)."""
     data.setdefault("recording_id", uuid.uuid4().hex)
     for field, objects in (("segment_id", data.get("segments") or []),
                            ("word_id", [w for seg in data.get("segments") or []
@@ -368,9 +410,53 @@ def _save_locked(data, json_path, md_path):
                 ident = uuid.uuid4().hex
                 obj[field] = ident
             seen.add(ident)
+
+
+def disagreement_words(data, item):
+    """ID слов расхождения места «модели расходятся» (asr_problem.state == "disagreement"): слово с вариантом
+    другой модели и следующие за ним по alt_span, слово со вставкой другой модели (alt_ins). У результатов без
+    этих полей — все слова места. [] — место не такое или его слова не найти. Чистая функция."""
+    if (item.get("asr_problem") or {}).get("state") != "disagreement" or is_gap_place(item):
+        return []
+    found = place_words(data, item)
+    ids = [wid for wid in (found[0] if found else None) or [] if wid]
+    flat = [w for seg in data.get("segments") or [] for w in seg.get("words") or []]
+    position = {w.get("word_id"): k for k, w in enumerate(flat)}
+    inside, marked = set(ids), []
+    for wid in ids:
+        k = position.get(wid)
+        if k is None:
+            continue
+        span = flat[k].get("alt_span")
+        if type(span) is int and span > 0:
+            marked += [w.get("word_id") for w in flat[k:k + span] if w.get("word_id") in inside]
+        elif flat[k].get("alt_ins"):
+            marked.append(wid)
+    return list(dict.fromkeys(marked)) or ids
+
+
+def _mark_listened_by_card(data, item):
+    """Отметка «человек прослушал» по своему ответу на карточку. Отпечаток — по словам интервала с ID: зовите
+    после _ensure_ids, иначе первое же сохранение выдаст новые ID и снимет отметку («дыра 1»)."""
+    interval = gap_interval(item)
+    if interval is None:
+        return False
+    item["listening"] = {"by": "human", "result": "words", "via": "card",
+                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                         "fingerprint": _listening_fingerprint(_interval_words(data, *interval))}
+    return True
+
+
+def _save_locked(data, json_path, md_path):
+    # Это не межпроцессная блокировка.
+    _ensure_ids(data)
     for item in data.get("review") or []:
         listening = item.get("listening")
         if item.get("asr_problem") and not listening and item.get("status") == "resolved":
+            item["status"] = "open"
+            data["review_done"] = False
+        if contradiction_pending(item) and item.get("status") == "resolved":
+            # противоречие закрывает только выбор на его карточке (PR 13б)
             item["status"] = "open"
             data["review_done"] = False
         if not listening or not item.get("gap"):
@@ -527,7 +613,7 @@ def undo_answer(json_path, md_path, aid, snapshot):
     # Подсказки словаря, возникшие из отменённого ответа, больше не предлагаем.
     data["vocab_suggestions"] = [v for v in data.get("vocab_suggestions") or []
                                  if v.get("card") != aid]
-    data["review_done"] = not any(i.get("status", "open") == "open" for i in data["review"])
+    data["review_done"] = review_finished(data)
     save(data, json_path, md_path)
     return {"id": aid, "reverted": True, "conspects": _refresh_conspects(json_path)}
 
@@ -911,6 +997,18 @@ def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None,
     if not has_words and not speaker:
         raise ValueError("на отрезке нет слов: для вставки укажите speaker")
     card = f"span@{t1:.2f}"
+    pairs = [(w, sg["speaker"]) for sg in data["segments"] for w in sg.get("words") or []
+             if t1 - 0.01 <= w["s"] <= t2 + 0.01]
+    confirmed = _span_contradiction(data, pairs, (text or "").strip(), speaker, by, card) if pairs else None
+    if confirmed is not None:
+        _ensure_ids(data)
+        rid, new = propose_contradiction(data, [w for w, _ in pairs], {
+            "text": (text or "").strip(), "speaker": speaker, "by": by, "via": "edit_span",
+            "speaker_now": pairs[0][1]}, confirmed)
+        if new:
+            save(data, json_path, md_path)
+        return data, {"written": False, "contradiction": rid, "new": new,
+                      "text": CONTRADICTION_NOT_WRITTEN.format(rid=rid)}
     e = {"op": "place_text", "t1": t1, "t2": t2, "text": (text or "").strip(), "card": card}
     if speaker:
         e["speaker"] = speaker
@@ -953,10 +1051,10 @@ def reopen(json_path, md_path, ids, by="unknown"):
         it.pop("note", None)
         it.pop("listening", None)
         done.append(rid)
-    data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
+    data["review_done"] = review_finished(data)
     save(data, json_path, md_path)
     return data, {"reopened": done, "unknown": unknown,
-                  "open_left": sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")}
+                  "open_left": open_count(data)}
 
 
 def _wkey(s):
@@ -1092,6 +1190,8 @@ def overwrite_refusal(word, data, writer, card):
         return None
     if writer == "human" and prior["by"] != "human":
         return None
+    if writer == "human" and _contradiction_covers(data, card, word):
+        return None             # выбор человека на карточке противоречия этого слова (PR 13б)
     span = prior["via"] == "edit_span"
     if prior["by"] == "human":
         how = "правкой отрезка человека" if span else "ответом человека на карточку"
@@ -1100,6 +1200,142 @@ def overwrite_refusal(word, data, writer, card):
     else:
         how = "прежней правкой без автора"
     return f"слово «{word.get('w')}» уже исправлено {how} ({prior['id']})"
+
+
+CONTRADICTION = "contradiction"
+CONTRADICTION_NOT_WRITTEN = ("не записано: противоречие, карточка {rid} — слова не изменены; "
+                             "выберите вариант на карточке этого места")
+CONTRADICTION_VIA_RU = {"edit_span": "правкой отрезка", "apply_review": "решением агента", "card": "карточкой"}
+
+
+def contradiction_pending(item):
+    """У места противоречие, которое ждёт выбора человека на его карточке (PR 13б)."""
+    return bool((item.get("contradiction") or {}).get("proposals"))
+
+
+def _contradiction_covers(data, card, word):
+    """Карточка card — место с ожидающим противоречием, в слова которого входит word."""
+    item = next((i for i in data.get("review") or [] if i.get("id") == card), None)
+    return bool(item and contradiction_pending(item) and word.get("word_id")
+                and word["word_id"] in item["contradiction"].get("words", []))
+
+
+def human_confirmation(word, data=None):
+    """Как человек решил слово: правкой (карточкой или правкой отрезка) или «как есть» на карточке.
+    -> {"card", "via"} или None. «Как есть» — `provenance` человека без `edited` (prior_edit его не видит:
+    до PR 13б правка отрезка человека такое слово молча перезаписывала)."""
+    prior = prior_edit(word, data)
+    if prior is not None:
+        return {"card": prior["id"], "via": prior["via"]} if prior["by"] == "human" else None
+    for dimension in ("text", "speaker"):
+        mark = (word.get("provenance") or {}).get(dimension)
+        if isinstance(mark, dict) and mark.get("by") == "human" and mark.get("edit"):
+            return {"card": mark["edit"], "via": mark.get("via") or "card"}
+    return None
+
+
+def _next_place_id(data):
+    numbers = [int(m.group(1)) for i in data.get("review") or [] for m in [re.fullmatch(r"r(\d+)", str(i.get("id")))]
+               if m]
+    return f"r{max(numbers, default=0) + 1}"
+
+
+def propose_contradiction(data, words, proposal, confirmed=None):
+    """Записать предложение, противоречащее решению человека, на место этих слов (или на новое место).
+    words — слова стенограммы (с word_id), proposal — {text, speaker?, by, via}; confirmed — что решил
+    человек (по умолчанию текст слов сейчас). Слова не меняются; место открыто до выбора на карточке.
+    Повтор того же предложения (слова, текст, говорящий, автор) ничего не меняет. -> (id места, новое?)"""
+    ids = [w["word_id"] for w in words]
+    places = data.setdefault("review", [])
+    preferred = (confirmed or {}).get("card")       # место той карточки, которой человек решил слово
+    item = next((i for i in places if i.get("id") == preferred and set(ids) <= set(i.get("word_ids") or [])),
+                None) or next((i for i in places if set(ids) <= set(i.get("word_ids") or [])), None) or \
+        next((i for i in places if set(ids) & set(i.get("word_ids") or [])), None)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    current = " ".join(w["w"] for w in words)
+    if item is None:
+        item = {"id": _next_place_id(data), "status": "open", "t": words[0]["s"], "t1": words[0]["s"],
+                "t2": words[-1]["s"], "speaker": proposal.get("speaker_now"), "reasons": [CONTRADICTION],
+                "text": current, "word_ids": ids}
+        places.append(item)
+        places.sort(key=lambda i: i.get("t", 0))
+    record = item.setdefault(CONTRADICTION, {"words": ids, "proposals": [], "history": []})
+    key = hashlib.sha1(json.dumps([sorted(ids), proposal.get("text"), proposal.get("speaker"), proposal.get("by")],
+                                  ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    if any(p.get("key") == key for p in record["proposals"]):
+        return item["id"], False
+    if not record["proposals"]:
+        record["words"] = ids
+        record["confirmed"] = {"text": current, "by": "human", "at": now, **(confirmed or {})}
+    record["proposals"].append({"text": proposal.get("text", ""), "by": proposal.get("by"),
+                                "via": proposal.get("via"), "at": now, "key": key,
+                                **({"speaker": proposal["speaker"]} if proposal.get("speaker") else {})})
+    if CONTRADICTION not in (item.get("reasons") or []):
+        item["reasons"] = list(item.get("reasons") or []) + [CONTRADICTION]
+    if item.get("status", "open") == "resolved":
+        item["status"] = "open"
+    data["review_done"] = False
+    return item["id"], True
+
+
+def settle_contradiction(item, choice, by, proposal=None, note=None):
+    """Выбор человека на карточке противоречия: итог — в историю, предложений больше нет.
+    note — примечание человека (human_note): только здесь, в ответе и в журнале правок."""
+    record = item.get(CONTRADICTION) or {}
+    if not record.get("proposals"):
+        return
+    record.setdefault("history", []).append({
+        "choice": choice, "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "confirmed": record.get("confirmed"), "proposals": record["proposals"],
+        **({"proposal": proposal} if proposal else {}), **({"human_note": note} if note else {})})
+    record["proposals"] = []
+
+
+def _propose_from_review(data, item, decision, by, report, confirmed=None):
+    """Решение агента (apply_review) по словам или месту человека: вместо одного отказа — предложение на
+    карточку противоречия этого места (PR 13б). Слова не меняются."""
+    if not (decision.get("text") or decision.get("speaker")):
+        return
+    loc = _find_span(data, {**item, **({"word_ids": decision["word_ids"]} if "word_ids" in decision else {})})
+    if loc is None:
+        return
+    seg = data["segments"][loc[0]]
+    words = seg["words"][loc[1]:loc[2]]
+    if not words:
+        return
+    _ensure_ids(data)
+    if confirmed is None:
+        confirmed = dict(next((m for m in map(lambda w: human_confirmation(w, data), words) if m), None) or {})
+    rid, _ = propose_contradiction(data, words, {
+        "text": decision.get("text") or " ".join(w["w"] for w in words), "speaker": decision.get("speaker"),
+        "by": by, "via": "apply_review", "speaker_now": seg["speaker"]}, confirmed)
+    report.setdefault("contradictions", []).append(rid)
+
+
+def _span_contradiction(data, pairs, text, speaker, by, card):
+    """Правка отрезка противоречит решению человека? pairs — (слово, говорящий) отрезка.
+    -> что решил человек ({card?, via?}) или None. Агент: на отрезке есть слово, тронутое человеком
+    (прежде — отказ). Человек: правка меняет текст или говорящего слова, которое он решил карточкой (правкой
+    или «как есть») или другой правкой отрезка (прежде — отказ или, у «как есть», молчаливая запись)."""
+    import difflib
+
+    def decided(w):
+        mark = human_confirmation(w, data)
+        return mark if mark and mark["card"] != card else None      # в том числе своя правка отрезка (В-1)
+    words = [w for w, _ in pairs]
+    if by != "human":
+        touched = [w for w in words if human_touched(w)]
+        if not touched:
+            return None
+        mark = next((m for m in map(decided, touched) if m), None)
+        return dict(mark) if mark else {}
+    sm = difflib.SequenceMatcher(None, [_wkey(w["w"]) for w in words], [_wkey(x) for x in text.split()],
+                                 autojunk=False)
+    changed = [w for op, i1, i2, _, _ in sm.get_opcodes() if op != "equal" for w in words[i1:i2]]
+    if speaker:
+        changed += [w for w, spk in pairs if spk != speaker and w not in changed]
+    mark = next((m for m in map(decided, changed) if m), None)
+    return dict(mark) if mark else None
 
 
 def _held_places(data):
@@ -1246,7 +1482,7 @@ def vocab_candidate(word, data=None):
 
 @recording_locked
 def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False,
-                     via=None, close_note=None, close_held=False):
+                     via=None, close_note=None, close_held=False, listened_by=None):
     """Правки по словам, а не по местам (свободные ответы человека, freeform.py; правка отрезка edit_span).
     edits: [{"op": "relabel", "t", "speaker"} | {"op": "replace", "t", "text"} |
             {"op": "insert", "s", "e", "text", "speaker", "after_t"?, "before_t"?} |
@@ -1264,7 +1500,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     `provenance`): слово не становится подтверждённым. Правка, изменившая слово, отметку снимает; у агента такие
     слова идут в `seen_changed` отчёта и журнала.
     close_note — заметка закрытых мест (по умолчанию «решено человеком (через карточку)»; «{counts}» заменяется
-    числами правки отрезка); close_held — закрывать и места, оставленные человеку. -> (data, отчёт)"""
+    числами правки отрезка); close_held — закрывать и места, оставленные человеку.
+    listened_by="human" — правки пришли ответом человека на свою карточку (review_pack): место «модели
+    расходятся» этой карточки закрывается с отметкой прослушивания, если правка задела слово расхождения.
+    Правка отрезка (via) и агент отметку не ставят. -> (data, отчёт)"""
     data = load(json_path)
     original = copy.deepcopy(data)
     answers = answers or {}
@@ -1399,6 +1638,18 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         flat.insert(k, item)
         return k
 
+    # Слова расхождения мест «модели расходятся» — до правки: после неё удалённых слов уже нет (PR 7).
+    listen = {}
+    if listened_by == "human" and by == "human" and not via:
+        places_before = {i.get("id"): i for i in data.get("review") or []}
+        for card in groups:
+            ids = set(disagreement_words(data, places_before[card])) if card in places_before else set()
+            if ids:
+                # слова, которые человек вписал своим ответом (в том числе тем же текстом): он их слышал
+                aimed = {wid for e in groups[card] if e["op"] in ("place_text", "replace", "delete")
+                         for wid in list(e.get("word_ids") or []) + [e.get("word_id")] if wid}
+                listen[card] = ({f["w"]["word_id"]: f["w"]["w"] for f in flat if f["w"].get("word_id") in ids},
+                                bool(aimed & ids))
     for card, eds in groups.items():
         why = check(eds)
         if why:
@@ -1593,6 +1844,21 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
         rg.update(before=bt, after=at)
     # места: закрытые ответом на другую карточку и сами карточки
     items = {i["id"]: i for i in data.get("review") or []}
+    to_mark = []
+
+    def touched(card, item):
+        """Правка карточки задела слово расхождения: вписала его (и тем же текстом), заменила, удалила, слила
+        или вставила слово внутри места."""
+        before, aimed = listen[card]
+        if aimed:
+            return True
+        now = {w.get("word_id"): w["w"] for sg in segs for w in sg["words"] if w.get("word_id") in before}
+        if any(now.get(wid) != text for wid, text in before.items()):
+            return True
+        times = gap_interval(item) or _place_time(item)
+        return bool(times) and any(not w.get("word_id") and w.get("edited") == card
+                                   and times[0] - 0.01 <= w["s"] <= times[1] + 0.01
+                                   for sg in segs for w in sg["words"])
     for rid, card_via in (closed or {}).items():
         if any(card_via == c for c in rep["failed"]):
             continue
@@ -1611,6 +1877,10 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 it["note"] = (it.get("note") + "; " if it.get("note") else "") + why
         else:
             it["status"] = "resolved"
+            if card in listen and touched(card, it):
+                to_mark.append(it)
+            if by == "human" and not via:
+                settle_contradiction(it, "own", by)
     for d in rep["proposed_delete"]:
         it = items.get(d["card"])
         if it:
@@ -1630,10 +1900,15 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                 seen.add(c)
                 data.setdefault("vocab_suggestions", []).append({"to": c, "from": None, "card": e.get("card"),
                                                                  "add": {"terms": [c]}})
-    data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
+    to_mark = [it for it in to_mark if it.get("status") == "resolved"]
+    if to_mark:
+        _ensure_ids(data)          # новые слова получают ID до отпечатка
+        for it in to_mark:
+            _mark_listened_by_card(data, it)
+    data["review_done"] = review_finished(data)
     if not dry_run and data != original:     # без изменений — без новой ревизии и перезаписи файлов
         save(data, json_path, md_path)
-    rep["open_left"] = sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")
+    rep["open_left"] = open_count(data)
     rep["conspects"] = None if dry_run else _refresh_conspects(json_path)
     return data, rep
 
@@ -1675,6 +1950,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             continue
         if by != "human" and it.get("status") == "human":
             report.setdefault("conflicts", []).append({"id": it["id"], "why": HELD_FOR_HUMAN})
+            _propose_from_review(data, it, d, by, report, {"via": "held"})
             continue
         if it.get("asr_problem") and "listened" not in d:
             report.setdefault("conflicts", []).append({"id": it["id"], "why": "нужно отдельное подтверждение прослушивания"})
@@ -1697,7 +1973,9 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                 refuse("неверный интервал")
                 continue
             start, end = interval
-            # отпечаток — по словам, перекрывающим интервал: его пересверяет _save_locked
+            # отпечаток — по словам, перекрывающим интервал, уже с ID (их выдаёт и _save_locked): его пересверяет
+            # _save_locked; без ID у старого результата первое же сохранение сняло бы отметку («дыра 1», PR 7)
+            _ensure_ids(data)
             heard_words = _interval_words(data, start, end)
             # у пропуска проверка — по словам, начатым в паузе: хвост слова до паузы ей не принадлежит (6а)
             checked = [w for _, _, w in pause_words(data, start, end)] if gap_place else heard_words
@@ -1708,6 +1986,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                 refuse("выбранный ответ противоречит словам стенограммы; сначала исправьте стенограмму")
                 continue
             it["listening"] = {"by": "human", "result": d["listened"],
+                               **({"via": "card"} if d.get("via") == "card" else {}),
                                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                "fingerprint": _listening_fingerprint(heard_words)}
             it["status"] = "resolved"
@@ -1744,6 +2023,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                               (d.get("speaker") and d["speaker"] != before["speaker"])):
             if any(human_touched(w) for w in ws[w1:w2]):
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": ["human"]})
+                _propose_from_review(data, it, d, by, report)
                 continue
         if (not d.get("text") or d["text"] == before["text"]) and d.get("speaker") in (None, seg["speaker"]):
             it["status"] = "resolved"
@@ -1766,7 +2046,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             original_text = {w.get("word_id"): w["w"] for w in ws[w1:w2] if w.get("word_id")}
             for w in new_ws:
                 if not w.get("word_id") or original_text.get(w["word_id"]) != w["w"]:
-                    _mark_provenance(w, "text", by, it["id"])
+                    _mark_provenance(w, "text", by, it["id"], CONTRADICTION if d.get(CONTRADICTION) else None)
             ws[w1:w2] = new_ws
             w2 = w1 + len(new_ws)
             # одиночная замена слова на имя собственное — подсказка для словаря
@@ -1813,6 +2093,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                       "after": {"text": " ".join(w["w"] for w in (data["segments"][si]["words"] if new_spk == seg["speaker"]
                                                                    else ws)[w1:w2]) if new_text else before["text"],
                                 "speaker": new_spk}, "note": d.get("note"),
+                      **({"human_note": d["human_note"]} if d.get("human_note") else {}),
                       **({"seen_changed": seen_changed} if seen_changed and by != "human" else {})})
         it["status"] = "resolved"
         report["applied"] += 1
@@ -1831,6 +2112,11 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         else:
             merged.append(seg)
     data["segments"] = merged
+    # выбор человека на карточке противоречия (PR 13б): итог — в историю места
+    for d in decisions:
+        it = items.get(d.get("id"))
+        if by == "human" and it and d.get(CONTRADICTION) and it["id"] in report["successful_ids"]:
+            settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"), d.get("human_note"))
     # решение применено, но место ещё раз показать человеку (например, ответы двух режимов разошлись)
     for d in decisions:
         it = items.get(d.get("id"))
@@ -1840,10 +2126,10 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         elif it and d.get("reopen"):                 # ответ отменён — место снова ждёт разбора
             it["status"] = "open"
             it.pop("note", None)
-    data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
+    data["review_done"] = review_finished(data)
     if data != original:                     # без изменений — без новой ревизии и перезаписи файлов
         save(data, json_path, md_path)
-    report["open_left"] = sum(1 for i in data.get("review") or [] if i.get("status", "open") == "open")
+    report["open_left"] = open_count(data)
     report["vocab_suggestions"] = data.get("vocab_suggestions", [])
     report["conspects"] = _refresh_conspects(json_path)
     return data, report

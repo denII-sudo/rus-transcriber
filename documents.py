@@ -13,7 +13,8 @@ from pathlib import Path
 import storage
 
 FORMAT_VERSION = 2
-RENDERER_VERSION = 2   # 2 — пометка «[междометия, не расшифровано]» в разделе «Текст» (PR 6б)
+RENDERER_VERSION = 3   # 2 — пометка «[междометия, не расшифровано]» в разделе «Текст» (PR 6б);
+#                        3 — «Сомнения»: текущие слова места, статус по-русски, время ЧЧ:ММ:СС (PR 7)
 MAX_CONFLICT_BYTES = 8 * 1024 * 1024
 # Порядок записи трёх файлов одной версии (текущий комплект, архив и восстановление): manifest последним,
 # он описывает md и json. Порядок не берётся из паспорта: ключи путей в сохранённом JSON отсортированы.
@@ -1222,19 +1223,25 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
     for mark in marks_tail:
         lines += [mark, ""]
     for item in review.get("review", []):
-        if "gap" in item:
-            lines.append(f"_Возможный пропуск речи: {_md(item['gap'][0])}–{_md(item['gap'][1])}; "
-                         f"место {_md(item['id'])}._")
+        gap = transcript_rules.gap_interval(item) if transcript_rules.is_gap_place(item) else None
+        if gap:
+            lines.append(f"_Возможный пропуск речи: {_md(transcript_rules.hms(gap[0]))}–"
+                         f"{_md(transcript_rules.hms(gap[1]))}; место {_md(item['id'])}._")
             lines.append("")
     lines += ["## Сомнения", ""]
     items = review.get("review", [])
     if not items:
         lines.append("Не указаны.")
     for item in items:
-        lines.append(f"- {_md(item['id'])}: {_md(item.get('status', 'open'))}; "
-                     f"{_md(item.get('text', 'описание не указано'))}")
-        if "gap" in item:
-            lines.append(f"  Возможный пропуск речи: {_md(item['gap'][0])}–{_md(item['gap'][1])}.")
+        when = transcript_rules._place_time(item)
+        words = transcript_rules.place_current_text(transcript, item)
+        lines.append(f"- {_md(item['id'])}" + (f" ({_md(transcript_rules.hms(when[0]))})" if when else "")
+                     + f": {_md(transcript_rules.place_status_ru(item))}; "
+                     + (f"«{_md(words)}»" if words else "слова не указаны"))
+        gap = transcript_rules.gap_interval(item) if transcript_rules.is_gap_place(item) else None
+        if gap:
+            lines.append(f"  Возможный пропуск речи: {_md(transcript_rules.hms(gap[0]))}–"
+                         f"{_md(transcript_rules.hms(gap[1]))}.")
     md = ("\n".join(lines) + "\n").encode("utf-8")
     data = _json_bytes(payload)
     manifest = {"passport": passport, "source_action": source_context,

@@ -150,7 +150,9 @@ class HumanAnswerOverPriorEdit(base.AnswerOutcomeCase):
             inserted = next(w["word_id"] for s in data["segments"] for w in s["words"] if w["w"] == "ну")
             data["review"][0]["word_ids"] = ["w1", inserted]
             transcript.save(data, jp, md)
-        for backend in BACKENDS:
+        # Файловый режим (legacy_files) уходит: итог тот же в обоих режимах, файловый путь «ответ поверх правки агента»
+        # остаётся в test_partial_match_keeps_untouched_word.
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend, agent) as (jp, md, version):
                 self.save(jp, version, option=0)
                 rep = self.apply(jp, md)
@@ -205,7 +207,8 @@ class HumanAnswerOverPriorEdit(base.AnswerOutcomeCase):
                 self.assertEqual(self.words(jp), ["другое", "слово"])
 
     def test_human_speaker_choice_only_marks_speaker(self):
-        for backend in BACKENDS:
+        # Файловый режим (legacy_files) уходит: отметка голоса в слове одна для обоих режимов (voices._word_human).
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend) as (jp, md, version):
                 self.save(jp, version, option=0)                 # только текст
                 self.save(jp, version, aid="r2", option=0)
@@ -233,7 +236,9 @@ class LeaveToHuman(base.AnswerOutcomeCase):
     def test_comment_reaches_note_of_place_already_left_to_human(self):
         def held(jp, md):
             transcript.apply_review(jp, md, [{"id": "r1", "status": "human", "note": "раньше"}], by="human")
-        for backend in BACKENDS:
+        # Файловый режим (legacy_files) уходит: заметка места «человеку» одна для обоих режимов; файловый путь
+        # «оставить человеку» остаётся в test_leave_to_human_confirms_nothing.
+        for backend in ("sqlite",):
             with self.subTest(backend=backend), files(backend, held) as (jp, md, version):
                 self.save(jp, version, kind="human", text="тут шум")
                 rep = self.apply(jp, md)               # повтор: ни событий, ни ревизий, заметка та же
@@ -298,6 +303,10 @@ class AgentKeepsOffHumanPlace(unittest.TestCase):
         for backend in BACKENDS:
             for decision in ({"id": "r1", "text": "тесть"}, {"id": "r1"}, {"id": "r1", "speaker": "Вера"},
                              {"id": "r1", "status": "resolved"}):
+                # Файловый режим (legacy_files) уходит: остаются «текст» и «закрыть место»; sqlite — все четыре решения.
+                if backend == "legacy_files" and decision not in ({"id": "r1", "text": "тесть"},
+                                                                   {"id": "r1", "status": "resolved"}):
+                    continue
                 with self.subTest(backend=backend, decision=decision), self.held(backend) as (jp, md):
                     _, rep = transcript.apply_review(jp, md, [decision], by="claude")
                     self.assertEqual([c.get("why") for c in rep.get("conflicts") or []],
@@ -311,6 +320,9 @@ class AgentKeepsOffHumanPlace(unittest.TestCase):
                          {"op": "delete", "t": 0.2, "w": "тест", "word_id": "w1"},
                          {"op": "place_text", "t1": 0.2, "t2": 0.5, "text": "тесть", "word_ids": ["w1"]},
                          {"op": "insert", "s": 0.45, "e": 0.5, "text": "ну", "speaker": "Глеб", "after_id": "w1"}):
+                # Файловый режим (legacy_files) уходит: остаются replace и insert; sqlite — все пять операций.
+                if backend == "legacy_files" and edit["op"] not in ("replace", "insert"):
+                    continue
                 with self.subTest(backend=backend, op=edit["op"]), self.held(backend) as (jp, md):
                     _, rep = transcript.apply_word_edits(jp, md, [{**edit, "card": "a1"}], by="claude",
                                                          closed={"r1": "a1"})

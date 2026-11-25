@@ -123,9 +123,16 @@ class ReportNamesOnlyPlacesReallyClosed(unittest.TestCase):
             with self.subTest(backend=backend), seen.files(backend) as (jp, md):
                 transcript.apply_review(jp, md, [{"id": "r1"}], by="human")
                 before = self.resolved_ids(jp)
-                _, rep = transcript.edit_span(jp, md, 0.2, 1.5, "тесто слово дальше", by="human")
+                # PR 13б: правка слова, подтверждённого «как есть» (r1), — противоречие, а не запись;
+                # поэтому правка здесь меняет другое слово отрезка
+                _, rep = transcript.edit_span(jp, md, 0.2, 1.5, "тест слово далее", by="human")
                 self.assertNotIn("r1", rep["resolved"])
                 self.assert_honest(jp, before, rep)
+            with self.subTest(backend=backend, how="as-is word"), seen.files(backend) as (jp, md):
+                transcript.apply_review(jp, md, [{"id": "r1"}], by="human")
+                _, rep = transcript.edit_span(jp, md, 0.2, 1.5, "тесто слово дальше", by="human")
+                self.assertIs(rep["written"], False)
+                self.assertEqual(rep["contradiction"], "r1")
 
     def test_place_left_to_human_is_closed_only_by_human(self):
         for backend in BACKENDS:
