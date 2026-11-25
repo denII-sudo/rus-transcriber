@@ -81,6 +81,12 @@ OUTCOME_REASONS = {
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
+# К-18: снимок есть, но отмена отказана — после ответа стенограмма менялась
+UNDO_LATER_EDIT = "после этого ответа стенограмма менялась — отмена станет возможной, если отменить более позднюю правку"
+# К-12: голос «повтори» и такой же текст из облака
+REPEAT_NOT_STORED = "просьба повторить вопрос не сохраняется как ответ"
+# К-2: примечание на карточке противоречия, когда ответ не применился
+NOTE_NOT_WRITTEN = "примечание не записано: ответ не применён"
 # ответ совпал со словами места (паузы) или подтвердил их, но вложенное «как есть» человека отказало
 # (например, нужно прослушивание)
 PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом, но место не закрылось: {why}; "
@@ -1083,6 +1089,11 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         if ans["kind"] == "option" and not 0 <= ans["option"] < len(it["options"]):
             rep["rejected"].append({"id": aid, "why": "нет такого варианта"})
             continue
+        if ans["kind"] == "repeat":
+            # К-12: просьба повторить вопрос — не ответ: не сохраняется и с текстом (голос, облако), применённый
+            # ответ остаётся
+            rep["accepted"].append({"id": aid, "kind": "repeat", "stored": False, "note": REPEAT_NOT_STORED})
+            continue
         if ans["kind"] in ("repeat", "skip") and not ans.get("text"):
             rep["accepted"].append({"id": aid, "kind": ans["kind"], "stored": False})
             continue
@@ -1278,6 +1289,8 @@ def decisions(json_path):
                  + (f" («{a['text']}»)" if a.get("text") else "")}
             if a.get("text"):
                 d["comment"] = a["text"]            # комментарий человека — и к месту, уже оставленному ему
+            if a.get("human_note"):
+                d["human_note"] = a["human_note"]   # К-2: в историю противоречия, если статус записан
             if it.get("answer_mode") != "speaker":
                 d["if_open"] = True
             rep["human"].append(aid)
@@ -1375,9 +1388,11 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
     edits = [e for e in edits if e.get("card") not in blocked]
     closed = {rid: via for rid, via in closed.items() if via not in blocked}
     if edits or closed:
+        # К-2: примечание человека на карточке противоречия — в историю места и в журнал правок
+        notes = {k: v["human_note"] for k, v in valid_free.items() if v.get("human_note")}
         result_data, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
                                     answers={k: v.get("text") for k, v in valid_free.items()}, dry_run=dry_run,
-                                    listened_by="human")
+                                    listened_by="human", human_notes=notes)
     else:
         result_data = data
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
@@ -1438,6 +1453,7 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids
                                and not r.get("human")
                                and not any(d["card"] == r["id"] for d in rep["proposed_delete"])],
+            "notes_written": [c for c in rep.get("notes_written") or [] if c not in rep["failed"]],
             "proposed_delete": rep["proposed_delete"], "not_found": rep["not_found"] + missing,
             "failed": rep["failed"],
             "counts": {k: rep[k] for k in ("relabel", "replace", "insert")},
@@ -1703,6 +1719,8 @@ def answer_states_of(store, man, outcome_details=True):
         no_snapshot = aid in applied and aid not in snapshots
         if no_snapshot and state in ("applied", "pending_new", "kept_previous") and UNDO_UNAVAILABLE not in details:
             details.append(UNDO_UNAVAILABLE)
+        if no_snapshot:
+            out[aid]["undo"] = False          # К-18: страница показывает неактивную «Отменить нельзя»
         # Последний обработанный запрос «Не отменять»: по нему страница узнаёт, что её запрос принят или отклонён.
         accepted, rejected = answer.get("keep_request"), rejected_keeps.get(aid)
         if rejected and (not accepted or rejected["ts"] > accepted.get("ts", "")):

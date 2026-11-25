@@ -142,7 +142,10 @@ audio{width:100%;height:36px}
     const st = (man.answer_states || {})[it.id];
     if (st && st.ts === a.ts && st.source === a.source) return st.state;
     if (LOCAL) return "saved";
-    return kindOf(a) === "keep" ? "cloud_keep" : "cloud_saved";
+    if (kindOf(a) === "keep") return "cloud_keep";
+    // К-16: отмена из облака у применённого ответа — до переноса на ноутбук правка на месте
+    if (kindOf(a) === "revert" && (man.applied_answers || {})[it.id]) return "cloud_revert";
+    return "cloud_saved";
   };
   // «Не отменять» из облака, который ноутбук уже обработал (принял или отклонил): страница показывает
   // ответ программы, а не свой запрос.
@@ -158,8 +161,24 @@ audio{width:100%;height:36px}
   // cloud_keep: отмена снята в облаке — применённая правка на месте
   // applied_open: ответ применён, место осталось открытым (PR 7) — правка на месте, отмена доступна
   // applied_check: применён более поздний из расходившихся ответов ноутбука и облака (К-23) — проверить
+  // cloud_revert: отмена сохранена в облаке (К-16) — применённая правка на месте
   const holdsApplied = (it, a) => ["applied", "applied_open", "applied_check", "pending_new", "kept_previous",
-                                   "undo_conflict", "revert_pending", "cloud_keep"].includes(stateOf(it, a));
+                                   "undo_conflict", "revert_pending", "cloud_keep", "cloud_revert"].includes(stateOf(it, a));
+  // К-13: отвечено — ответ сохранён и не требует действия; эти исходы ждут нового ответа или проверки.
+  // В облаке состояния до переноса на ноутбук неизвестны: там отвечено всё, на что есть ответ.
+  const NEEDS_ANSWER = ["negative", "hint", "pause_refused", "listen_mismatch", "apply_conflict", "blocked_preflight",
+                        "source_conflict", "not_found", "not_applied", "reverted", "applied_open", "applied_check"];
+  const needsAnswer = (it) => {
+    const a = answers[it.id];
+    return !a || (LOCAL && NEEDS_ANSWER.includes(stateOf(it, a)));
+  };
+  // Пустой список «без ответа»: есть ли что применять
+  const emptyText = () => {
+    if (!LOCAL) return "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами.";
+    const waiting = man.items.some(it => answers[it.id] && ["saved", "pending_new", "revert_pending"].includes(stateOf(it, answers[it.id])));
+    return waiting ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки."
+      : "Все места разобраны, применять нечего. Нажмите «все», чтобы увидеть карточки.";
+  };
   // «Ответ верен — оставить» (К-23): тот же применённый ответ ещё раз от человека на ноутбуке закрывает место
   const confirmAnswer = (it) => {
     const sig = (man.applied_answers || {})[it.id];
@@ -172,16 +191,22 @@ audio{width:100%;height:36px}
   };
   const hasConflict = (it) => (man.conflicts || []).some(c => c.id === it.id);
   // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
-  const revertButton = (it, a) => stateOf(it, a) === "revert_pending" ?
+  // К-18: без снимка (answer_states.undo === false) — неактивная «Отменить нельзя». К-16: отмена из облака —
+  // «Не отменять».
+  const revertButton = (it, a) => ["revert_pending", "cloud_revert"].includes(stateOf(it, a)) ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
+    ((man.answer_states || {})[it.id] || {}).undo === false ?
+    {label: "Отменить нельзя", kind: "revert", disabled: true,
+     title: "нет снимка для отмены: исправьте ответом на эту карточку или правкой отрезка"} :
     {label: "Подготовить отмену", kind: "revert",
      title: "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось."};
   const pending = (it, a) => stateOf(it, a) === "pending_new";
   // Что сказано об ответе под заголовком. Ответ «отменить» описывается по состоянию: пока отмена не прошла,
   // прежний ответ на месте, и строка не должна говорить «ответ отменён».
   const REVERT_TEXT = {revert_pending: "отмена подготовлена — прежний ответ пока на месте",
-                       undo_conflict: "отмена не выполнена — прежний ответ на месте",
-                       reverted: "ответ отменён — место снова открыто"};
+                       undo_conflict: "отмена ответа не выполнена",
+                       reverted: "ответ отменён — место снова открыто",
+                       cloud_revert: "отмена ответа — перенесётся на ноутбук"};
   function answerText(a, it) {
     const kind = kindOf(a);
     if (kind === "revert") return REVERT_TEXT[stateOf(it, a)] || "отмена ответа";
@@ -191,7 +216,17 @@ audio{width:100%;height:36px}
     if (kind === "human" && a.text) what += ` («${a.text}»)`;
     if (a.option != null && it.options && it.options[a.option] && (kind === "option" || kind === "recommended"))
       what = `${a.option + 1} — ${it.options[a.option].label}`;
+    // К-2: примечание человека на карточке противоречия видно только на ноутбуке (в облако оно не уходит)
+    if (LOCAL && a.human_note) what += ` · примечание: «${a.human_note}»`;
     return what;
+  }
+  // К-12: что предложил голос — словами человека, не служебными именами; «повтори» — озвучить вопрос заново
+  const VOICE_KINDS = {free: "свой ответ", human: "оставить человеку", skip: "пропустить", repeat: "повторить вопрос"};
+  const REPEAT_TEXT = "Повторяю вопрос — ответьте ещё раз";
+  function voiceProposal(r, it) {
+    const p = (r && r.match) || {};
+    const selected = p.option != null && it.options && it.options[p.option];
+    return {text: selected ? selected.label : VOICE_KINDS[p.kind] || "не распознан", repeat: p.kind === "repeat"};
   }
   // Откуда и когда ответ. Ответ, собранный заново по «Не отменять» в старом пакете, времени прежнего ответа не знает.
   function answerMeta(a) {
@@ -203,7 +238,7 @@ audio{width:100%;height:36px}
   // Причина и уточнение программы под ответом. У ответа из облака, которого ноутбук ещё не видел, их нет:
   // то, что знает программа, относится к прежнему ответу.
   function programNote(it, a) {
-    const state = stateOf(it, a), cloud = ["cloud_saved", "cloud_keep"].includes(state);
+    const state = stateOf(it, a), cloud = ["cloud_saved", "cloud_keep", "cloud_revert"].includes(state);
     const reason = cloud || ["applied", "saved"].includes(state) ? "" : whyOf(it);
     return [reason, cloud ? "" : detailOf(it)].filter(Boolean).join(" — ");
   }
@@ -222,7 +257,8 @@ audio{width:100%;height:36px}
                   applied_check: "применён — проверьте: ответы ноутбука и облака расходились",
                   listen_mismatch: "не применён — ответ не совпадает со словами",
                   hint: "не применён — см. подсказку", cloud_saved: "сохранён в облаке — не применён",
-                  cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте"};
+                  cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте",
+                  cloud_revert: "отмена сохранена в облаке — применённый ответ пока на месте"};
   // Заголовок — состояние ответа; расхождение ответов ноутбука и облака — отдельной строкой под ответом (К-23).
   const cardStatus = (it, a) =>
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "требует проверки" : STATUS[stateOf(it, a)] || "не применён";
@@ -389,6 +425,20 @@ audio{width:100%;height:36px}
     const v = speechSynthesis.getVoices().find(v => /^ru/i.test(v.lang)); if (v) u.voice = v;
     speechSynthesis.speak(u);
   }
+  // Результат голосового ответа (api/voice): «повтори» — вопрос звучит заново, ответ не сохраняется (К-12);
+  // иначе — услышанное, предполагаемый ответ и «Подтвердить».
+  function voiceResult(it, r, state) {
+    const p = voiceProposal(r, it);
+    if (p.repeat) { speak(it); state.textContent = REPEAT_TEXT; return p; }
+    state.replaceChildren(document.createTextNode(`Услышано: «${r.heard || ""}». Предполагаемый ответ: ${p.text}. `));
+    const edit = document.createElement("input"); edit.value = r.heard || ""; edit.setAttribute("aria-label", "Исправить распознанный текст");
+    const confirm = document.createElement("button"); confirm.type = "button"; confirm.textContent = "Подтвердить";
+    confirm.onclick = () => { if (edit.value.trim()) send(it, {text: edit.value.trim(), heard: true}, state); };
+    const repeat = document.createElement("button"); repeat.type = "button"; repeat.textContent = "Повторить";
+    repeat.onclick = () => { state.textContent = "Запишите ответ заново."; };
+    state.append(edit, confirm, repeat);
+    return p;
+  }
   // примечание человека — только на карточке противоречия (PR 13б, В-3); ответом оно не разбирается
   function humanNote(it, stateEl) {
     const el = it.seen_fp && stateEl.parentElement && stateEl.parentElement.querySelector(".human-note");
@@ -398,13 +448,15 @@ audio{width:100%;height:36px}
     stateEl.textContent = "Сохраняю…";
     editing.delete(it.id);
     try {
-      const note = humanNote(it, stateEl);
+      // К-2: «Пропустить» примечание не отправляет — оно сохраняется с вариантом, своим ответом или «Оставить человеку»
+      const typed = humanNote(it, stateEl), skip = a.kind === "skip", note = skip ? "" : typed;
       const r = await api.answer({id: it.id, version: man.version, rev: revOf(it), ...a, ...(note ? {human_note: note} : {})});
       const acc = (r.accepted || [])[0];
       const rejected = r.rejected && r.rejected.length;
       render();
       if (rejected && r.rejected[0].why === STALE) flash(it.id, STALE_TEXT);
       else if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
+      else if (skip && typed) flash(it.id, SKIP_NOTE_TEXT);
       else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
       else if (a.kind === "keep") flash(it.id, "Отмена снята: применённый ответ остаётся");
       else if (a.kind === "revert") flash(it.id, "Отмена подготовлена: нажмите «Применить сохранённые ответы»");
@@ -412,6 +464,7 @@ audio{width:100%;height:36px}
     } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
   }
   const STALE_TEXT = "Не принято: вопрос обновлён — карточка показана заново, ваш текст остался в поле";
+  const SKIP_NOTE_TEXT = "Пропущено. Примечание не записано: оно сохраняется с выбором варианта, своим ответом или «Оставить человеку»";
   // Отказ «вопрос обновлён» на голос или предпросмотр: забрать новую редакцию и показать её.
   async function staleShown(e, it) {
     if (!e || e.message !== STALE) return false;
@@ -451,7 +504,7 @@ audio{width:100%;height:36px}
   function card(it) {
     const a = answers[it.id];
     const c = document.createElement("article");
-    c.className = "card"; c.dataset.id = it.id; c.dataset.rev = String(revOf(it)); c.dataset.done = a ? "1" : "0"; c.dataset.applied = appliedCard(it, a) ? "1" : "0";
+    c.className = "card"; c.dataset.id = it.id; c.dataset.rev = String(revOf(it)); c.dataset.done = needsAnswer(it) ? "0" : "1"; c.dataset.applied = appliedCard(it, a) ? "1" : "0";
     const head = document.createElement("div"); head.className = "head";
     head.innerHTML = `<span class="tc"></span><span class="who"></span><span class="reasons"></span>`;
     head.querySelector(".tc").textContent = it.t;
@@ -493,7 +546,8 @@ audio{width:100%;height:36px}
       const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
       const second = revertButton(it, a);
       rb.textContent = second.label; rb.title = second.title;
-      rb.onclick = () => send(it, {kind: second.kind}, state);
+      if (second.disabled) rb.disabled = true;
+      else rb.onclick = () => send(it, {kind: second.kind}, state);
       const ok = LOCAL && stateOf(it, a) === "applied_check" ? confirmAnswer(it) : null;
       if (ok) {
         const cb = document.createElement("button"); cb.className = "btn"; cb.type = "button"; cb.textContent = "Ответ верен — оставить";
@@ -536,15 +590,7 @@ audio{width:100%;height:36px}
             stream.getTracks().forEach(t => t.stop()); b.classList.remove("rec-on"); b.textContent = "Ответить голосом";
             const blob = new Blob(chunks, {type: rec.mimeType || "audio/webm"}); rec = null;
             state.textContent = "Распознаю ответ…";
-            try { const r = await api.voice(it, blob);
-                  const proposed = r.match || {}; const selected = proposed.option != null && it.options[proposed.option];
-                  state.replaceChildren(document.createTextNode(`Услышано: «${r.heard || ""}». Предполагаемый ответ: ${selected ? selected.label : proposed.kind || "не распознан"}. `));
-                  const edit = document.createElement("input"); edit.value = r.heard || ""; edit.setAttribute("aria-label", "Исправить распознанный текст");
-                  const confirm = document.createElement("button"); confirm.type = "button"; confirm.textContent = "Подтвердить";
-                  confirm.onclick = () => { if (edit.value.trim()) send(it, {text: edit.value.trim(), heard: true}, state); };
-                  const repeat = document.createElement("button"); repeat.type = "button"; repeat.textContent = "Повторить";
-                  repeat.onclick = () => { state.textContent = "Запишите ответ заново."; };
-                  state.append(edit, confirm, repeat); }
+            try { voiceResult(it, await api.voice(it, blob), state); }
             catch (e) { if (!(await staleShown(e, it))) state.textContent = "Не получилось: " + e.message; }
           };
           rec.start(); b.classList.add("rec-on"); b.textContent = "Стоп";
@@ -582,7 +628,7 @@ audio{width:100%;height:36px}
     if (it.seen_fp) {
       const noteRow = document.createElement("div"); noteRow.className = "free";
       const note = document.createElement("input"); note.className = "human-note";
-      note.placeholder = "Примечание (необязательно): остаётся в истории записи, в стенограмму не попадает";
+      note.placeholder = "Примечание (необязательно): записывается в историю места, когда ответ применён; в стенограмму не попадает";
       noteRow.append(note); c.append(noteRow);
     }
     c.append(state);
@@ -592,13 +638,13 @@ audio{width:100%;height:36px}
   function render() {
     if (!man) return;
     const list = $("list");
-    const done = man.items.filter(it => answers[it.id]).length;
+    const done = man.items.filter(it => !needsAnswer(it)).length;
     $("count").textContent = `${done} / ${man.items.length}`;
     $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
-    const show = man.items.filter(it => showAll || !answers[it.id]);
+    const show = man.items.filter(it => showAll || needsAnswer(it));
     const active = document.activeElement && document.activeElement.id;
     list.replaceChildren(...(show.length ? show.map(cardFor) : [Object.assign(document.createElement("div"),
-      {className: "empty", textContent: LOCAL ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки." : "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами."})]));
+      {className: "empty", textContent: emptyText()})]));
     if (cardObserver) list.querySelectorAll(".card").forEach(c => cardObserver.observe(c));
     else list.querySelectorAll(".card").forEach(c => {
       const id = c.dataset.id, key = `${id}#${c.dataset.rev}`;

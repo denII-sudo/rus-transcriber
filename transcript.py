@@ -1300,15 +1300,27 @@ def propose_contradiction(data, words, proposal, confirmed=None):
 
 def settle_contradiction(item, choice, by, proposal=None, note=None):
     """Выбор человека на карточке противоречия: итог — в историю, предложений больше нет.
-    note — примечание человека (human_note): только здесь, в ответе и в журнале правок."""
+    note — примечание человека (human_note): только здесь, в ответе и в журнале правок. -> записан ли итог"""
     record = item.get(CONTRADICTION) or {}
     if not record.get("proposals"):
-        return
+        return False
     record.setdefault("history", []).append({
         "choice": choice, "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "confirmed": record.get("confirmed"), "proposals": record["proposals"],
         **({"proposal": proposal} if proposal else {}), **({"human_note": note} if note else {})})
     record["proposals"] = []
+    return True
+
+
+def note_contradiction(item, by, note):
+    """К-2: «Оставить человеку» на карточке противоречия с примечанием — примечание в историю места. Предложения
+    не снимаются: противоречие ждёт выбора. -> записано ли"""
+    record = item.get(CONTRADICTION) or {}
+    if by != "human" or not note or not record.get("proposals"):
+        return False
+    record.setdefault("notes", []).append({"choice": "human", "by": by, "human_note": note,
+                                           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return True
 
 
 def _propose_from_review(data, item, decision, by, report, confirmed=None):
@@ -1502,7 +1514,7 @@ def vocab_candidate(word, data=None):
 
 @recording_locked
 def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False,
-                     via=None, close_note=None, close_held=False, listened_by=None):
+                     via=None, close_note=None, close_held=False, listened_by=None, human_notes=None):
     """Правки по словам, а не по местам (свободные ответы человека, freeform.py; правка отрезка edit_span).
     edits: [{"op": "relabel", "t", "speaker"} | {"op": "replace", "t", "text"} |
             {"op": "insert", "s", "e", "text", "speaker", "after_t"?, "before_t"?} |
@@ -1523,10 +1535,13 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     числами правки отрезка); close_held — закрывать и места, оставленные человеку.
     listened_by="human" — правки пришли ответом человека на свою карточку (review_pack): место «модели
     расходятся» этой карточки закрывается с отметкой прослушивания, если правка задела слово расхождения.
-    Правка отрезка (via) и агент отметку не ставят. -> (data, отчёт)"""
+    Правка отрезка (via) и агент отметку не ставят. human_notes — {карточка: примечание человека} на карточке
+    противоречия (К-2): в историю места и в журнал правок этой карточки; записанные — в отчёте notes_written.
+    -> (data, отчёт)"""
     data = load(json_path)
     original = copy.deepcopy(data)
     answers = answers or {}
+    human_notes = human_notes or {}
     name_to_label = {v: k for k, v in (data.get("speaker_names") or {}).items()}
     flat = []
     for si, seg in enumerate(data["segments"]):
@@ -1860,6 +1875,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     **({"seen_changed": card_seen} if card_seen else {}),
                     "before": {"text": bt, "speaker": who(brows)}, "after": {"text": at, "speaker": who(arows)},
                     "answer": answers.get(card), "note": log_note or "ответ человека в карточке",
+                    **({"human_note": human_notes[card]} if human_notes.get(card) else {}),
                     "pairs": sorted({tuple(p) for p in pairs.get(card, [])})})
         rg.update(before=bt, after=at)
     # места: закрытые ответом на другую карточку и сами карточки
@@ -1900,7 +1916,8 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             if card in listen and touched(card, it):
                 to_mark.append(it)
             if by == "human" and not via:
-                settle_contradiction(it, "own", by)
+                if settle_contradiction(it, "own", by, note=human_notes.get(card)) and human_notes.get(card):
+                    rep.setdefault("notes_written", []).append(card)
     for d in rep["proposed_delete"]:
         it = items.get(d["card"])
         if it:
@@ -1978,6 +1995,8 @@ def apply_review(json_path, md_path, decisions, by="claude"):
                 continue
             it["status"], it["note"] = "human", d.get("note") or it.get("note")
             report["human"] += 1
+            if note_contradiction(it, by, d.get("human_note")):
+                report.setdefault("notes_written", []).append(it["id"])
             continue
         if by != "human" and it.get("status") == "human":
             report.setdefault("conflicts", []).append({"id": it["id"], "why": HELD_FOR_HUMAN})
@@ -2150,7 +2169,9 @@ def apply_review(json_path, md_path, decisions, by="claude"):
     for d in decisions:
         it = items.get(d.get("id"))
         if by == "human" and it and d.get(CONTRADICTION) and it["id"] in report["successful_ids"]:
-            settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"), d.get("human_note"))
+            if settle_contradiction(it, d[CONTRADICTION], by, d.get("proposal"), d.get("human_note")) \
+                    and d.get("human_note"):
+                report.setdefault("notes_written", []).append(it["id"])
     # решение применено, но место ещё раз показать человеку (например, ответы двух режимов разошлись)
     for d in decisions:
         it = items.get(d.get("id"))
