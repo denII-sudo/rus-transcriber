@@ -14,8 +14,12 @@
   * аудиофайлы записей из базы только читаются (контрольная сумма); внешние файлы (--audio,
     add-audio) копируются в audio/ песочницы.
 
+Режим обычной работы (prepare --work): копируются только база записей и файлы прогонов гипотез
+(source/hypotheses/, опись со сверкой SHA-256 до и после — source/hypotheses-manifest.json); аудио,
+настройки, словари и профили не копируются и не читаются, единиц опыта нет.
+
 Настоящая папка данных не меняется ни при каких условиях: в неё ничего не пишется.
-Модуль не импортирует paths.py (у его импорта побочные эффекты), только storage и runinfo.
+Модуль не импортирует paths.py (у его импорта побочные эффекты), только storage, runinfo и hypstore.
 """
 import json
 import os
@@ -416,16 +420,102 @@ def copy_database(src_db, dest, staging):
     return report, "bytes"
 
 
+HYP_DIR = "hypotheses"                       # папка гипотез в папке данных и в source/ песочницы
+HYP_MANIFEST = "hypotheses-manifest.json"    # опись копии гипотез: source/hypotheses-manifest.json
+HYP_MANIFEST_SCHEMA = "lab-hyp-manifest-1"
+HYP_COPIED = "copied"
+HYP_RESULTS = (HYP_COPIED, "copy_mismatch", "changed_during_copy", "deleted_during_copy")
+
+
+def describe_hypotheses(src_dir):
+    """Опись файлов прогонов гипотез: {относительное имя: {bytes, mtime_ns, sha256}}.
+
+    Только файлы прогонов по маскам hypstore (UNIT_RE/RUN_RE): кэши _artifacts.json, _testbed.json и прочее
+    не берутся; ссылкам (symlink, junction) обход не следует — тем же правилом, что hypstore._run_files.
+    Папка только читается; если её нет, она не создаётся."""
+    hypstore = _import_repo_module("hypstore")
+    runinfo = _import_repo_module("runinfo")
+    src_dir = Path(src_dir)
+    out = {}
+    for p in hypstore._run_files(src_dir):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        digest = runinfo.sha256_file(p)
+        if digest is None:
+            continue
+        out[p.relative_to(src_dir).as_posix()] = {"bytes": st.st_size, "mtime_ns": st.st_mtime_ns,
+                                                  "sha256": digest}
+    return out
+
+
+def _copy_file(src, dst):
+    """Побайтная копия: источник открывается только на чтение, существующий файл не заменяется."""
+    with open(src, "rb") as f_in, open(dst, "xb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+
+def copy_hypotheses(src_dir, dest_dir, manifest_path):
+    """Копия файлов гипотез со сверкой SHA-256 до и после. -> опись (она же пишется в manifest_path).
+
+    1. Опись источника до копирования (размер, время изменения, SHA-256 каждого файла прогона).
+    2. Копия каждого файла сверяется с суммой описи; не сошлась — копия выбрасывается (copy_mismatch).
+    3. Опись источника после копирования: файл изменился (размер, время или сумма) — копия выбрасывается
+       (changed_during_copy); исчез — тоже (deleted_during_copy). Файлы гипотез пишутся один раз, поэтому
+       любое изменение — повод не брать файл. Файлы, появившиеся за время копирования, не берутся.
+    В описи только относительные имена внутри hypotheses/, путей настоящей папки данных нет."""
+    runinfo = _import_repo_module("runinfo")
+    src_dir, dest_dir = Path(src_dir), Path(dest_dir)
+    before = describe_hypotheses(src_dir)
+    results = {}
+    for rel, info in sorted(before.items()):
+        target = dest_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _copy_file(src_dir / rel, target)
+        except FileNotFoundError:
+            results[rel] = "deleted_during_copy"
+            continue
+        results[rel] = HYP_COPIED if runinfo.sha256_file(target) == info["sha256"] else "copy_mismatch"
+    after = describe_hypotheses(src_dir)
+    for rel, info in before.items():
+        if results[rel] != HYP_COPIED:
+            continue
+        if rel not in after:
+            results[rel] = "deleted_during_copy"
+        elif after[rel] != info:
+            results[rel] = "changed_during_copy"
+    for rel, result in results.items():
+        target = dest_dir / rel
+        if result != HYP_COPIED and target.exists():
+            target.unlink()
+    files = [{"relative": rel, "bytes": before[rel]["bytes"], "sha256": before[rel]["sha256"],
+              "result": results[rel]} for rel in sorted(before)]
+    manifest = {"schema": HYP_MANIFEST_SCHEMA, "created_utc": utc_now(), "files": files,
+                "appeared_during_copy": len(set(after) - set(before)),
+                "counts": {k: sum(1 for f in files if f["result"] == k) for k in HYP_RESULTS}}
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return manifest
+
+
 def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=print, audio=(), group=None,
-            only_audio=False):
+            only_audio=False, work=False):
     """Создать песочницу. -> отчёт (что скопировано, сколько единиц, каких записей нет).
 
     audio — файлы для единиц вне базы записей; only_audio — только они: база записей не копируется
-    и не нужна (пробный запуск на отрывке)."""
+    и не нужна (пробный запуск на отрывке). work — песочница обычной работы (анализ по сохранённым
+    гипотезам и ответам человека, без прогона моделей): копируются только база записей и файлы гипотез;
+    аудио, голосовые профили, словари и настройки не копируются и не читаются, единиц опыта нет."""
     if voice_profiles not in ("copy", "skip"):
         raise SandboxError("--voice-profiles: copy или skip")
     if only_audio and not audio:
         raise SandboxError("--only-audio: укажите хотя бы один --audio")
+    if work and (audio or only_audio or group):
+        raise SandboxError("--work: без --audio, --only-audio и --group — модели в этом режиме не запускаются")
+    if work and voice_profiles != "skip":
+        raise SandboxError("--work: голосовые профили не нужны, укажите --voice-profiles skip")
     if group:
         _valid_group(group)
     source_data = real(source_data)
@@ -462,17 +552,27 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
             raise
         copied.append({"what": "база записей (резервная копия, неактивная)", "relative": "source/state.sqlite3",
                        "bytes": (s / "source" / "state.sqlite3").stat().st_size, "method": copy_method})
+    hyp = None
+    if work:
+        # после базы: файл гипотез пишется после записи, поэтому гипотеза без записи в копии базы возможна —
+        # это отметка анализа «записи нет в копии», а не ошибка
+        hyp = copy_hypotheses(source_data / HYP_DIR, s / "source" / HYP_DIR, s / "source" / HYP_MANIFEST)
+        kept = [f for f in hyp["files"] if f["result"] == HYP_COPIED]
+        copied.append({"what": "гипотезы моделей (полный текст записей; только на этом компьютере)",
+                       "relative": f"source/{HYP_DIR}", "bytes": sum(f["bytes"] for f in kept), "files": len(kept),
+                       "sha256": runinfo.sha256_file(s / "source" / HYP_MANIFEST), "method": "sha256"})
     s.mkdir(parents=True, exist_ok=True)
     data = s / "data"
     data.mkdir(exist_ok=True)
-    if (source_data / "config.json").is_file():
+    # в режиме work настройки, соль стенда, словари и профили не копируются: анализу обычной работы не нужны
+    if not work and (source_data / "config.json").is_file():
         _copy(source_data / "config.json", data / "config.json", copied, "настройки config.json", s)
-    if (source_data / "bench" / "testbed.json").is_file():
+    if not work and (source_data / "bench" / "testbed.json").is_file():
         _copy(source_data / "bench" / "testbed.json", data / "bench" / "testbed.json", copied,
               "соль обезличенного идентификатора стенда", s)
     groups = source_data / "groups"
     names = GROUP_FILES_ALWAYS + (GROUP_FILES_VOICES if voice_profiles == "copy" else ())
-    if groups.is_dir():
+    if not work and groups.is_dir():
         for g in sorted(groups.iterdir()):
             if not g.is_dir():
                 continue
@@ -482,8 +582,8 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
                     _copy(g / name, data / "groups" / g.name / name, copied, what, s)
 
     units, missing = [], []
-    if not only_audio:
-        # единицы — по копии базы (записи прочитаны из неё выше)
+    if not only_audio and not work:
+        # единицы — по копии базы (записи прочитаны из неё выше); в режиме work аудио не читается
         units, missing = build_units(recordings, runinfo.sha256_file)
     (s / UNITS_FILE).write_text(json.dumps({"schema": "lab-units-1", "units": units,
                                             "missing_audio_recordings": missing},
@@ -494,6 +594,8 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
               "program_dir": str(real(program_dir)), "repo_dir": str(REPO_DIR),
               "voice_profiles": voice_profiles, "copied": copied, "only_audio": bool(only_audio),
               "backup_report": report if isinstance(report, (dict, list)) else None}
+    if work:
+        marker["work"] = True       # нет поля — обычная песочница (старые песочницы читаются как раньше)
     (s / MARKER).write_text(json.dumps(marker, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     if audio:
         add_audio_units(s, audio, group, env=env, log=log, _marker=marker)
@@ -502,12 +604,26 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
            "recordings": sum(len(u["recordings"]) for u in units),
            "audio_hours": round(sum(u["duration_sec"] or 0 for u in units) / 3600, 2),
            "missing_audio_recordings": len(missing), "voice_profiles": voice_profiles}
+    if work:
+        out["hypotheses"] = dict(hyp["counts"], appeared_during_copy=hyp["appeared_during_copy"])
+        out["recordings"] = len(recordings)          # записей в копии базы; единиц опыта в этом режиме нет
     log("Песочница подготовлена: " + str(s))
     log("Скопировано (только на этом компьютере, наружу ничего не передаётся):")
     for item in copied:
         how = {"readonly": "; штатное чтение только на чтение",
                "bytes": "; база была занята или с журналом — прочитана побайтно"}.get(item.get("method"), "")
         log(f"  - {item['what']}: {item['relative']} ({item['bytes']} байт{how})")
+    if work:
+        c = hyp["counts"]
+        log(f"  Гипотезы моделей: скопировано файлов {c[HYP_COPIED]}, каждый сверен по SHA-256 до и после; "
+            f"не взяты — изменились при копировании: {c['changed_during_copy']}, удалены при копировании: "
+            f"{c['deleted_during_copy']}, копия не сошлась: {c['copy_mismatch']}; появились за время "
+            f"копирования и не взяты: {hyp['appeared_during_copy']}. Опись — source/{HYP_MANIFEST}.")
+        log("  Режим обычной работы (--work): аудио не читалось и не копировалось; настройки, словари и "
+            "голосовые профили не копировались; модели не запускаются, единиц опыта нет. Копия гипотез — "
+            "полный текст записей: удалите песочницу после опыта.")
+        log(f"Записей в базе: {len(recordings)}.")
+        return out
     if voice_profiles == "copy":
         log("  ВНИМАНИЕ: скопированы голосовые профили — это биометрия участников. Они лежат только "
             "в песочнице; удалить их можно вместе с папкой песочницы.")
