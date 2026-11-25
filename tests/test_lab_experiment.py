@@ -759,6 +759,294 @@ class CaptureWithRealPipeline(unittest.TestCase):
         self.assertIs(backends.TorchASR, original)
 
 
+# ── числа опытов для базы теста скорости: выгрузка, копирование, загрузка ────────────────────────────
+
+MARK = "МеткаТекстаЛабы"            # попадать в базу теста скорости не должна нигде
+PASS_PATH = "C:\\Users\\Иван\\Секретная папка\\python.exe"
+COND = {"power_source": "ac", "cpu_load_percent": 1.0, "memory": {"free_mb": 8000}, "other_heavy_jobs": 0}
+PASSPORT = {
+    "schema_version": 1, "lab_method": "lab-run-1", "testbed_id": "0123456789abcdef",
+    "hardware": {"status": "ok", "cpu": {"model": "Synthetic CPU 9000", "cores": 6, "threads": 12,
+                                         "features": ["avx2"]},
+                 "devices": [{"name": "Synthetic GPU", "driver_version": "1.2.3"}]},
+    "environment": {"os": {"system": "Windows", "build": "26100", "ubr": 1},
+                    "python": {"version": "3.12.0", "implementation": "CPython", "executable": PASS_PATH},
+                    "packages": {"key": {"onnxruntime": "1.20.0"}, "count": 80, "sha256": "ab" * 32},
+                    "program_version": "2026.11.25.1",
+                    "code": {"files_sha256": "cd" * 8, "git_revision": "e" * 40, "git_dirty": False}},
+    "models_cache": {"hf": [{"repo": "onnx-community/whisper-large-v3-turbo", "ref_main": "r" * 40,
+                             "snapshots": ["r" * 40], "files": 3, "size_mb": 100.0}],
+                     "local": [{"file": "gigaam/v3_e2e_rnnt.onnx", "size_bytes": 5_000_000,
+                                "modified_utc": "2026-11-01T00:00:00Z"}]},
+    "offline": {"HF_HUB_OFFLINE": "1"}, "settings_base": {"asr_model": SECRET, "note": MARK},
+}
+
+
+class BenchEngine(FakeEngine):
+    """FakeEngine, у которого общий этап даёт хэш звука (как настоящий, с №179)."""
+
+    def prepare_unit(self, unit, cfg):
+        self.prepared.append(unit["unit_id"])
+        pcm = hashlib.sha256(("pcm|" + unit["audio_sha256"]).encode()).hexdigest()
+        return SimpleNamespace(unit=unit, duration=60.0, diarization_sha256="d" * 64,
+                               shared_record={"label_name": {"Спикер 1": NAME}, "pcm_sha256": pcm,
+                                              "duration_sec": 60.0, "voices": {"profile_names": [NAME]}})
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class BenchExport(unittest.TestCase):
+    """export-bench: числа опытов лаборатории -> файлы -> bench\\lab папки данных -> база теста скорости."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-bench-")
+        self.base = Path(self.tmp.name)
+        self.data, self.audio = make_source(self.base)
+        self.program = self.base / "program"
+        self.program.mkdir()
+        self.sandbox = self.base / "sandbox"
+        self.log = []
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append)
+        sandbox, self.marker, self.units = lab_sandbox.load_sandbox(self.sandbox, env={})
+        self.s = sandbox
+        self.spec, self.sha = lab_spec.load(EXPERIMENT)
+        self.out = self.s / "export" / "bench"
+        self.target = self.base / "data2"                 # «настоящая» папка данных для проверки копирования
+        self.target.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_lab(self, engine=None, **kw):
+        return lab_run.run(self.s, self.spec, self.sha, self.units, engine or BenchEngine(),
+                           log=self.log.append, passport_fn=lambda: PASSPORT, conditions_fn=lambda: COND, **kw)
+
+    def results_db(self):
+        return lab_run.open_results(self.s / "results" / "lab.sqlite3")
+
+    def export(self):
+        db = self.results_db()
+        try:
+            return lab_summary.export_bench(db, self.units["units"], self.out)
+        finally:
+            db.close()
+
+    def load(self, bench_dir):
+        import benchdb
+        return benchdb.apply_load(bench_dir)
+
+    def rows(self, sql, *args):
+        import benchdb
+        con = sqlite3.connect(benchdb.db_path(self.target / "bench"))
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, args)]
+        finally:
+            con.close()
+
+    def dump(self):
+        import benchdb
+        con = sqlite3.connect(benchdb.db_path(self.target / "bench"))
+        try:
+            return "\n".join(con.iterdump())
+        finally:
+            con.close()
+
+    def full_flow(self, **kw):
+        res = self.run_lab(BenchEngine(**kw))
+        rep = self.export()
+        cp = lab_summary.copy_bench_files(self.out, self.target, apply=True)
+        return res, rep, cp, self.load(self.target / "bench")
+
+    def test_numbers_reach_the_speed_database_as_lab_rows(self):
+        import benchdb
+        n_conf = len(self.spec["configurations"])
+        res, rep, cp, loaded = self.full_flow(fail={"b-ml3"})
+        name = f"lab-{res['run_id']}.json"
+        self.assertEqual(rep["written"], [name])
+        self.assertEqual(cp["new"], [name])
+        self.assertEqual(loaded["counts"], {"loaded": 1})
+        self.assertTrue((self.target / "bench" / "lab" / name).is_file())
+        self.assertFalse((self.target / "bench" / "runs").exists(), "замеры скорости лаборатория не трогает")
+        run = self.rows("SELECT * FROM run")[0]
+        self.assertEqual((run["kind"], run["method_version"], run["run_id"]), ("lab", "lab-1", "lab-" + res["run_id"]))
+        self.assertEqual((run["status"], run["valid"]), ("done", "yes"))
+        ms = self.rows("SELECT * FROM measurement ORDER BY measurement_id")
+        self.assertEqual(len(ms), 2 * n_conf)
+        self.assertEqual({m["mode"] for m in ms}, {"pipeline"})
+        self.assertEqual(sum(1 for m in ms if m["status"] == "error"), 2)
+        self.assertEqual({m["status_reason"] for m in ms if m["status"] == "error"}, {"RuntimeError"})
+        for m in ms:
+            for col in ("load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "total_10min"):
+                self.assertIsNone(m[col], f"{col}: у опыта лаборатории столбец скорости замера пуст")
+            self.assertEqual(set(json.loads(m["not_measured_json"])),
+                             {"load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "total_10min"})
+            self.assertEqual((m["family"], m["unit_pk"] != ""), ("lab", True))
+        # числа в extra_json.lab — те же, что в metrics_json базы лаборатории, по списку разрешённых полей
+        db = self.results_db()
+        try:
+            expected = sorted(json.dumps(benchdb.lab_numbers(json.loads(r["metrics_json"])), sort_keys=True)
+                              for r in db.execute("SELECT metrics_json FROM pairs WHERE state='done'"))
+        finally:
+            db.close()
+        got = sorted(json.dumps(json.loads(m["extra_json"])["lab"], sort_keys=True)
+                     for m in ms if m["status"] == "done")
+        self.assertEqual(got, expected)
+        first = json.loads([m for m in ms if m["status"] == "done"][0]["extra_json"])["lab"]
+        self.assertEqual((first["timing"]["pair_sec"], first["review"]["total"], first["review"]["by_reason"]["conf"]),
+                         (4.0, 2, 1))
+        self.assertEqual(first["asr3_errors"], ["whisper-ct2:CPU: RuntimeError"])
+        # единица — хэш звука; хэш файла записи при этом сохранён
+        units = self.rows("SELECT * FROM test_unit")
+        self.assertEqual(len(units), 2)
+        by_audio = {u["audio_sha256"]: u for u in self.units["units"]}
+        for u in units:
+            self.assertEqual(u["unit_id"], u["unit_pk"][:12])
+            self.assertIn(u["audio_sha256"], by_audio)
+            self.assertEqual(u["unit_pk"], hashlib.sha256(("pcm|" + u["audio_sha256"]).encode()).hexdigest())
+            self.assertNotEqual(u["unit_id"], by_audio[u["audio_sha256"]]["unit_id"], "unit_id лаборатории — хэш файла")
+        self.assertEqual(self.rows("SELECT testbed_id FROM testbed"), [{"testbed_id": "0123456789abcdef"}])
+        self.assertEqual(len(self.rows("SELECT * FROM model_artifact")), 2)
+        self.assertEqual(len(self.rows("SELECT * FROM exec_config WHERE family='lab'")), n_conf)
+
+    def test_repeat_changes_nothing(self):
+        res, rep, cp, loaded = self.full_flow()
+        name = f"lab-{res['run_id']}.json"
+        first_bytes = (self.out / name).read_bytes()
+        before = self.dump()
+        rep2 = self.export()
+        self.assertEqual((rep2["written"], rep2["unchanged"]), ([], [name]))
+        self.assertEqual((self.out / name).read_bytes(), first_bytes, "повторная выгрузка даёт те же байты")
+        cp2 = lab_summary.copy_bench_files(self.out, self.target, apply=True)
+        self.assertEqual((cp2["new"], cp2["same"], cp2["conflict"]), ([], [name], []))
+        self.assertEqual(self.load(self.target / "bench")["counts"], {"known": 1})
+        self.assertEqual(self.dump(), before, "повторные выгрузка, копирование и загрузка ничего не дописывают")
+
+    def test_dry_copy_writes_nothing_and_foreign_content_is_not_overwritten(self):
+        res = self.run_lab()
+        self.export()
+        name = f"lab-{res['run_id']}.json"
+        plan = lab_summary.copy_bench_files(self.out, self.target, apply=False)
+        self.assertEqual(plan["new"], [name])
+        self.assertFalse((self.target / "bench").exists(), "без apply в папку данных ничего не пишется")
+        dest = self.target / "bench" / "lab"
+        dest.mkdir(parents=True)
+        (dest / name).write_bytes(b"{}")
+        cp = lab_summary.copy_bench_files(self.out, self.target, apply=True)
+        self.assertEqual((cp["new"], cp["conflict"]), ([], [name]))
+        self.assertEqual((dest / name).read_bytes(), b"{}", "чужое содержимое под тем же именем не перезаписано")
+        self.assertEqual([p.name for p in dest.iterdir()], [name], "временных файлов не осталось")
+        with self.assertRaises(ValueError):
+            lab_summary.copy_bench_files(self.out, self.base / "нет-такой-папки", apply=True)
+
+    def test_running_run_is_not_exported(self):
+        self.run_lab()
+        db = self.results_db()
+        try:
+            db.execute("INSERT INTO runs (run_id, started_utc, state, experiment_name) VALUES "
+                       "('20261125-000000-ffffff', '2026-11-25T00:00:00Z', 'running', 'x')")
+            db.commit()
+        finally:
+            db.close()
+        rep = self.export()
+        self.assertEqual(rep["running"], 1)
+        self.assertEqual(len(rep["written"]), 1)
+        self.assertFalse(any("ffffff" in p.name for p in self.out.iterdir()))
+
+    def test_interrupted_run_is_exported_with_reservation(self):
+        self.run_lab()
+        db = self.results_db()
+        try:
+            db.execute("UPDATE runs SET state='interrupted'")
+            db.commit()
+        finally:
+            db.close()
+        self.export()
+        cp = lab_summary.copy_bench_files(self.out, self.target, apply=True)
+        self.assertEqual(self.load(self.target / "bench")["counts"], {"loaded": 1})
+        run = self.rows("SELECT status, valid, valid_reason FROM run")[0]
+        self.assertEqual((run["status"], run["valid"], run["valid_reason"]), ("interrupted", "with_reservations",
+                                                                              "interrupted"))
+        self.assertEqual(len(cp["new"]), 1)
+
+    def test_no_texts_names_or_paths_anywhere(self):
+        """Метки расставлены во всех текстовых местах базы лаборатории; в файле и в базе теста скорости их нет."""
+        self.run_lab()
+        db = self.results_db()
+        try:
+            row = db.execute("SELECT pair_id, metrics_json FROM pairs WHERE state='done' LIMIT 1").fetchone()
+            m = json.loads(row["metrics_json"])
+            m["transcript_text"] = MARK                                   # новое текстовое поле лаборатории
+            m["timing"]["note"] = MARK
+            m["timing"]["asr_model"] = f"{MARK} with spaces"              # не название из кода
+            m["make_asr"][0]["requested"]["initial_prompt"] = MARK
+            m["vote3_skipped"] = MARK + " слова"
+            m["asr3_errors"].append(f"RuntimeError: {MARK} {self.audio}")
+            m["asr2_error"] = f"ValueError: {MARK} слова"
+            m["review"]["items_text"] = [MARK]
+            db.execute("UPDATE pairs SET metrics_json=? WHERE pair_id=?", (json.dumps(m, ensure_ascii=False),
+                                                                           row["pair_id"]))
+            db.execute("UPDATE unit_runs SET shared_json=json_set(shared_json, '$.note', ?)", (MARK,))
+            db.commit()
+        finally:
+            db.close()
+        rep = self.export()
+        self.assertEqual(rep["refused"], [])
+        cp = lab_summary.copy_bench_files(self.out, self.target, apply=True)
+        self.assertEqual(self.load(self.target / "bench")["counts"], {"loaded": 1})
+        files = sorted(self.out.glob("*.json"))
+        text = files[0].read_text(encoding="utf-8")
+        scan = text + "\n" + self.dump()
+        forbidden = (MARK, SECRET, NAME, "one.wav", "two.wav", str(self.audio), str(self.base), "grp",
+                     "Иван", "Секретная", "Как сейчас", "real-data", "\\Users\\")
+        for f in forbidden:
+            self.assertNotIn(f, scan, f)
+            self.assertNotIn(f.replace("\\", "\\\\"), scan, f)
+        self.assertIn("<путь>", text, "путь из паспорта заменён, а не оставлен")
+        self.assertEqual(cp["rejected"], [])
+        # разрешённое осталось: тип ошибки без сообщения
+        self.assertIn("RuntimeError", scan)
+
+    def test_path_that_scrub_missed_refuses_the_file(self):
+        """Вторая линия защиты: строка, похожая на путь, не доходит до файла, даже если очистка её пропустила."""
+        import runinfo
+        self.run_lab()
+        with mock.patch.object(runinfo, "scrub", lambda value: value):
+            rep = self.export()
+        self.assertEqual(len(rep["refused"]), 1)
+        self.assertIn("absolute_path", rep["refused"][0]["problems"])
+        self.assertFalse(self.out.exists() and list(self.out.glob("*.json")), "файл с путём не записан")
+
+    def test_testbed_id_of_sandbox_equals_the_data_folder_one(self):
+        import runinfo
+        (self.data / "bench").mkdir(exist_ok=True)
+        (self.data / "bench" / "testbed.json").write_text('{"schema": 1, "salt": "соль-стенда"}', encoding="utf-8")
+        second = self.base / "sandbox2"
+        lab_sandbox.prepare(second, self.data, self.program, "skip", env={}, log=self.log.append)
+        a = runinfo.testbed_id(self.data / "bench", machine="m")
+        b = runinfo.testbed_id(lab_sandbox.real(second) / "data" / "bench", machine="m")
+        self.assertEqual(a, b)
+
+    def test_pcm_hash_is_the_speed_test_rule(self):
+        """Хэш звука лаборатории (lab_run.pcm_sha256) = хэш звука hypstore одного и того же звука."""
+        import numpy as np
+        import hypstore
+        audio = np.linspace(-1.0, 1.0, 8000, dtype=np.float32)
+        self.assertEqual(lab_run.pcm_sha256(audio), hashlib.sha256(hypstore.pcm_bytes(audio)).hexdigest())
+
+    def test_cli_export_bench(self):
+        import experiment
+        self.run_lab()
+        base_args = ["export-bench", "--sandbox", str(self.sandbox)]
+        self.assertEqual(experiment.main(base_args), 0)
+        self.assertEqual(len(list(self.out.glob("lab-*.json"))), 1)
+        self.assertEqual(experiment.main(base_args + ["--to-data", str(self.target)]), 0)
+        self.assertFalse((self.target / "bench").exists(), "без --apply папка данных не меняется")
+        self.assertEqual(experiment.main(base_args + ["--apply"]), 2, "--apply без --to-data — отказ")
+        self.assertEqual(experiment.main(base_args + ["--to-data", str(self.target), "--apply"]), 0)
+        self.assertEqual(len(list((self.target / "bench" / "lab").glob("lab-*.json"))), 1)
+        self.assertEqual(experiment.main(base_args + ["--to-data", str(self.target / "нет"), "--apply"]), 2)
+
+
 UNIT_A, UNIT_B = "aaaaaaaaaaaa", "bbbbbbbbbbbb"
 RUN_1, RUN_2, RUN_3 = "20261125-100000-aaaaaa.json", "20261125-100001-bbbbbb.json", "20261125-100002-cccccc.json"
 

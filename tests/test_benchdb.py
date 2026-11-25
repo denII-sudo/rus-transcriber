@@ -1053,6 +1053,284 @@ class UncoveredBeforeTests(unittest.TestCase):
             self.assertEqual(benchdb.plural(n, ("прогон", "прогона", "прогонов")), word, n)
 
 
+# ── опыты лаборатории: второй вид файла, bench\lab ───────────────────────────────────────────────────
+
+LAB_ID = "20261125-010203-aabbcc"
+LAB_MARK = "МеткаТекстаЛабы"
+PCM_A, PCM_B = "a1" * 32, "b2" * 32
+FILE_A, FILE_B = "f1" * 32, "f2" * 32
+
+
+def lab_numbers(**extra):
+    m = {"schema": "lab-metrics-1", "duration_sec": 60.0, "words": 120, "flagged_words": 7,
+         "review": {"total": 5, "by_reason": {"asr": 1, "conf": 2, "voice": 1, "missed": 1, "overlap": 0,
+                                              "gender": 0}, "other_reasons": 0, "multi_reason_items": 1,
+                    "asr_problem_items": 1},
+         "review_per_hour": 300.0, "vote": {"agree3": 90, "agree2": 20, "replaced": 5, "inserted": 1, "disputed": 4},
+         "asr_diagnostics": {"primary": {"backend": "cpu", "chunks": 3, "states": {"ok": 3}}},
+         "asr3_errors": ["whisper-ct2:CPU: RuntimeError"], "missed_speech": 2, "overlaps_sec": 1.5,
+         "timing": {"total_sec": 100, "pair_sec": 40.0, "asr_sec": 25, "asr3_sec": 8.0, "realtime_factor": 0.6,
+                    "asr_model": "v3_e2e_rnnt", "asr_backend": "onnx-cpu", "asr3_device": "CPU"},
+         "fallbacks": {"asr3": []},
+         "make_asr": [{"requested": {"asr_model": "v3_e2e_rnnt", "asr_batch": 8}, "actual": "onnx-cpu",
+                       "providers": ["CPUExecutionProvider"], "fallbacks": []}],
+         "hypotheses": {"primary": 120, "third": 118}}
+    m.update(extra)
+    return m
+
+
+def lab_pair(cid="a-current", state="done", pcm=PCM_A, audio=FILE_A, numbers=None, preflight_ok=True, **extra):
+    p = {"config_id": cid, "config_sha256": "c" * 64, "state": state, "audio_sha256": audio, "pcm_sha256": pcm,
+         "duration_sec": 60.0, "started_utc": "2026-11-25T01:00:00Z", "finished_utc": "2026-11-25T01:05:00Z",
+         "conditions": {"power_source": "ac", "preflight": {"ok": preflight_ok, "reasons": [] if preflight_ok
+                                                             else ["battery"]}}}
+    if state == "done":
+        p["lab"] = numbers if numbers is not None else lab_numbers()
+    else:
+        p.update(error_kind="RuntimeError", conditions=None)
+    p.update(extra)
+    return p
+
+
+def lab_doc(lab_run_id=LAB_ID, pairs=None, **extra):
+    base = record("20261124-100000-cccccc")                  # паспорт — как у замера: стенд, окружение, модели
+    doc = {"kind": "lab", "lab_format": 1, "method_version": "lab-1", "run_id": "lab-" + lab_run_id,
+           "lab_run_id": lab_run_id, "started_utc": "2026-11-25T01:00:00Z", "finished_utc": "2026-11-25T02:00:00Z",
+           "status": "done", "experiment": {"name": "models-arbitration-2026-11", "sha256": "e" * 64},
+           "testbed": base["testbed"], "environment": base["environment"], "models": base["models"],
+           "configs": [{"config_id": "a-current", "config_sha256": "c" * 64,
+                        "roles": {"primary": {"model": "v3_e2e_rnnt"}, "second": {"model": "v3_e2e_ctc"},
+                                  "third": {"engine": "whisper-ct2", "mode": "all", "max_repeat": 3}},
+                        "settings": {}}],
+         "pairs": pairs if pairs is not None else [lab_pair(), lab_pair(pcm=PCM_B, audio=FILE_B),
+                                                    lab_pair(state="error", pcm=PCM_B, audio=FILE_B, cid="b-ml3")]}
+    doc.update(extra)
+    return doc
+
+
+def write_lab(bench, doc, name=None, folder="lab"):
+    d = Path(bench) / folder
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / (name or f"{doc['run_id']}.json")
+    path.write_bytes((json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=1) + "\n").encode("utf-8"))
+    return path
+
+
+class LabFileTests(unittest.TestCase):
+
+    def test_lab_file_becomes_lab_rows_not_speed_rows(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc())
+        plan = benchdb.plan_load(bench)
+        self.assertEqual(plan["counts"], {"new": 1})
+        self.assertFalse(benchdb.db_path(bench).exists(), "показ ничего не создаёт")
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+        (run,) = rows(bench, "SELECT run_id, kind, method_version, status, valid, run_schema_version, "
+                             "loader_version, unit_pk FROM run")
+        self.assertEqual(run, ("lab-" + LAB_ID, "lab", "lab-1", "done", "yes", 1, "benchdb-3", ""))
+        ms = rows(bench, "SELECT variant_id, mode, unit_pk, status, status_reason, load_sec, first_chunk_sec, "
+                         "asr_sec, rtfx, wall_sec, total_10min, family, not_measured_json FROM measurement "
+                         "ORDER BY measurement_id")
+        self.assertEqual(len(ms), 3)
+        self.assertEqual([(m[0], m[1], m[2], m[3], m[4]) for m in ms],
+                         [("a-current", "pipeline", PCM_A, "done", None),
+                          ("a-current", "pipeline", PCM_B, "done", None),
+                          ("b-ml3", "pipeline", PCM_B, "error", "RuntimeError")])
+        for m in ms:
+            self.assertEqual(m[5:11], (None,) * 6, "столбцы скорости замера у опыта пусты")
+            self.assertEqual(m[11], "lab")
+            nm = json.loads(m[12])
+            self.assertEqual(set(nm), {"load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "total_10min"})
+            self.assertTrue(all("другая методика" in v for v in nm.values()))
+        extra = json.loads(rows(bench, "SELECT extra_json FROM measurement WHERE status='done' "
+                                       "ORDER BY measurement_id")[0][0])
+        self.assertEqual(extra["lab"], lab_numbers())
+        self.assertEqual(extra["pair"]["audio_sha256"], FILE_A)
+        self.assertEqual(extra["lab"]["timing"]["realtime_factor"], 0.6)
+
+    def test_unit_is_the_sound_hash_and_the_file_hash_is_kept(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc())
+        benchdb.apply_load(bench)
+        got = rows(bench, "SELECT unit_pk, unit_id, audio_sha256, offset_sec, duration_sec, pcm_format "
+                          "FROM test_unit ORDER BY unit_pk")
+        self.assertEqual(got, [(PCM_A, PCM_A[:12], FILE_A, 0.0, 60.0, "mono 16000 Hz s16le"),
+                               (PCM_B, PCM_B[:12], FILE_B, 0.0, 60.0, "mono 16000 Hz s16le")])
+        self.assertNotEqual(got[0][1], FILE_A[:12], "unit_id — первые знаки хэша звука, не хэша файла")
+
+    def test_same_file_is_recognised_in_a_speed_measurement_and_a_lab_run(self):
+        """Один файл: у замера отрывка и у опыта лаборатории одинаковый audio_sha256; отрывок — свой хэш звука."""
+        bench = new_bench()
+        rec = record("20261124-100000-cccccc", seed=b"a")
+        write(bench, rec)
+        file_hash = rec["audio"]["audio_sha256"]
+        write_lab(bench, lab_doc(pairs=[lab_pair(audio=file_hash, pcm="9" * 64)]))
+        benchdb.apply_load(bench)
+        got = rows(bench, "SELECT audio_sha256, count(*), count(DISTINCT unit_pk) FROM test_unit GROUP BY 1")
+        self.assertEqual(got, [(file_hash, 2, 2)])
+        self.assertEqual(rows(bench, "SELECT count(*) FROM testbed"), [(1,)], "стенд один: тот же паспорт")
+        self.assertEqual(rows(bench, "SELECT count(*) FROM env_snapshot"), [(1,)])
+
+    def test_pairs_without_sound_hash_keep_unknown_unit_and_do_not_collide(self):
+        bench = new_bench()
+        pairs = [lab_pair(pcm=None, audio=FILE_A), lab_pair(pcm=None, audio=FILE_B)]
+        write_lab(bench, lab_doc(pairs=pairs))
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+        self.assertEqual(rows(bench, "SELECT unit_pk, repeat_no FROM measurement ORDER BY measurement_id"),
+                         [("", 0), ("", 1)])
+        self.assertEqual(rows(bench, "SELECT count(*) FROM test_unit"), [(0,)], "хэш звука не подменён хэшем файла")
+        axes = json.loads(rows(bench, "SELECT axes_json FROM measurement")[0][0])
+        self.assertFalse(axes["unit"]["known"])
+        extra = [json.loads(r[0])["pair"]["audio_sha256"] for r in rows(bench, "SELECT extra_json FROM measurement "
+                                                                            "ORDER BY measurement_id")]
+        self.assertEqual(extra, [FILE_A, FILE_B], "хэш файла сохранён у каждой пары")
+
+    def test_repeated_load_adds_nothing_and_both_kinds_live_together(self):
+        bench = new_bench()
+        write(bench, record("20261120-100000-bbbbbb"))
+        write_lab(bench, lab_doc())
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 2})
+        before = dump(bench)
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"known": 2})
+        self.assertEqual(dump(bench), before)
+        st = benchdb.status(bench)
+        self.assertEqual(st["by_method"], {"bench-2": 1, "lab-1": 1})
+
+    def test_lab_row_and_speed_row_are_not_comparable_by_method(self):
+        bench = new_bench()
+        write(bench, record("20261124-100000-cccccc"))
+        write_lab(bench, lab_doc())
+        benchdb.apply_load(bench)
+        res = benchdb.compare(bench, "20261124-100000-cccccc:onnx-cpu", f"lab-{LAB_ID}:a-current")
+        self.assertEqual(res["verdict"], "incomparable")
+        self.assertIn("методика bench-2 и lab-1", res["text"])
+
+    def test_two_lab_pairs_are_comparable_on_the_same_sound_only_by_config(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc(pairs=[lab_pair(cid="a-current"), lab_pair(cid="a-current", pcm=PCM_B,
+                                                                            audio=FILE_B)]))
+        benchdb.apply_load(bench)
+        res = benchdb.compare(bench, f"lab-{LAB_ID}:a-current", f"lab-{LAB_ID}:a-current")
+        self.assertEqual(res["verdict"], "comparable")
+
+    def test_status_and_report_show_the_lab_method_separately(self):
+        bench = new_bench()
+        write(bench, record("20261120-100000-bbbbbb"))
+        write_lab(bench, lab_doc())
+        benchdb.apply_load(bench)
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = benchdb.cli(mock.Mock(bench_cmd="status"), bench)
+        self.assertEqual(rc, 0)
+        self.assertIn("методика lab-1: 1 прогон", buf.getvalue())
+        self.assertIn("методика bench-2: 1 прогон", buf.getvalue())
+        write_lab(bench, lab_doc("20261125-020304-ddeeff"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            benchdb.cli(mock.Mock(bench_cmd="load", apply=False, historical=None), bench)
+        self.assertIn("из них опытов лаборатории (bench\\lab): уже учтено 1, новых 1", buf.getvalue())
+
+    def test_old_base_built_by_the_previous_loader_is_read_and_appended(self):
+        bench = new_bench()
+        write(bench, record("20261120-100000-bbbbbb"))
+        with mock.patch.object(benchdb, "LOADER_VERSION", "benchdb-2"):
+            benchdb.apply_load(bench)
+        old = rows(bench, "SELECT run_id, method_version FROM run")
+        write_lab(bench, lab_doc())
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"known": 1, "loaded": 1})
+        self.assertEqual(rows(bench, "SELECT run_id, method_version FROM run ORDER BY run_id"),
+                         sorted(old + [("lab-" + LAB_ID, "lab-1")]))
+        self.assertEqual(rows(bench, "SELECT loader_version FROM import_log ORDER BY log_id"),
+                         [("benchdb-2",), ("benchdb-3",)])
+
+    def test_run_id_needs_the_lab_prefix_and_the_file_name_must_match(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc(run_id=LAB_ID))                       # без приставки: столкнулся бы с замером
+        write_lab(bench, lab_doc(), name="lab-20261125-999999-000000.json")
+        rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"rejected": 2})
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(0,)])
+
+    def test_kind_must_match_the_folder(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc(), folder="runs")                     # опыт в папке замеров
+        rec = record("20261120-100000-bbbbbb")
+        write_lab(bench, rec, name="20261120-100000-bbbbbb.json")       # замер в папке опытов
+        rep = benchdb.apply_load(bench)
+        self.assertEqual(rep["counts"], {"rejected": 2})
+        self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(0,)])
+
+    def test_wrong_method_format_status_or_pair_is_rejected(self):
+        for change in ({"method_version": "bench-2"}, {"lab_format": 2}, {"status": "running"},
+                       {"pairs": [lab_pair(cid="Плохой id")]}, {"pairs": [lab_pair(state="running")]},
+                       {"pairs": "нет"}):
+            bench = new_bench()
+            write_lab(bench, lab_doc(**change))
+            self.assertEqual(benchdb.apply_load(bench)["counts"], {"rejected": 1}, change)
+            self.assertEqual(rows(bench, "SELECT count(*) FROM run"), [(0,)], change)
+
+    def test_a_path_in_the_file_rejects_it(self):
+        for text in ("C:\\Users\\Иван\\секрет\\a.wav", "\\\\server\\share\\a.wav", "/home/user/a.wav"):
+            bench = new_bench()
+            doc = lab_doc()
+            doc["experiment"]["name"] = text
+            write_lab(bench, doc)
+            rep = benchdb.apply_load(bench)
+            self.assertEqual(rep["counts"], {"rejected": 1}, text)
+            self.assertIn("путь", rep["files"][0]["reason"])
+            self.assertNotIn("Иван", json.dumps(rep, ensure_ascii=False))
+
+    def test_only_allowed_fields_get_into_the_base(self):
+        """Список разрешённых полей: чужие поля и текст на месте названия отбрасываются, а не переносятся."""
+        bench = new_bench()
+        numbers = lab_numbers(transcript_text=LAB_MARK, vote3_skipped=f"{LAB_MARK} слова",
+                              asr2_error=f"ValueError: {LAB_MARK} слова")
+        numbers["timing"]["note"] = LAB_MARK
+        numbers["timing"]["asr_model"] = f"{LAB_MARK} слова"
+        numbers["make_asr"][0]["requested"]["initial_prompt"] = LAB_MARK
+        numbers["asr3_errors"].append(f"RuntimeError: {LAB_MARK} слова")
+        numbers["review"]["items"] = [LAB_MARK]
+        doc = lab_doc(pairs=[lab_pair(numbers=numbers, words=LAB_MARK, label_name={"Спикер 1": LAB_MARK})],
+                      description=LAB_MARK, units=[{"location": LAB_MARK}])
+        doc["configs"][0]["label"] = LAB_MARK
+        doc["configs"][0]["settings"] = {"note": LAB_MARK + " слова", "asr_batch": 8}
+        write_lab(bench, doc)
+        self.assertEqual(benchdb.apply_load(bench)["counts"], {"loaded": 1})
+        text = "\n".join(sqlite3.connect(benchdb.db_path(bench)).iterdump())
+        self.assertNotIn(LAB_MARK, text)
+        extra = json.loads(rows(bench, "SELECT extra_json FROM measurement")[0][0])["lab"]
+        self.assertNotIn("transcript_text", extra)
+        self.assertNotIn("vote3_skipped", extra)
+        self.assertEqual(extra["asr3_errors"], ["whisper-ct2:CPU: RuntimeError"])
+        self.assertEqual(extra["timing"]["pair_sec"], 40.0)
+        cfg = json.loads(rows(bench, "SELECT config_json FROM exec_config")[0][0])
+        self.assertEqual(cfg["settings"], {"asr_batch": 8})
+
+    def test_lab_numbers_is_idempotent_and_keeps_only_the_listed_shape(self):
+        once = benchdb.lab_numbers(lab_numbers(extra_field="x" * 3, hypotheses={"primary": 1, "bad key!": 2}))
+        self.assertEqual(benchdb.lab_numbers(once), once)
+        self.assertNotIn("extra_field", once)
+        self.assertEqual(once["hypotheses"], {"primary": 1})
+        self.assertEqual(benchdb.lab_numbers(lab_numbers()), lab_numbers())
+        self.assertIsNone(benchdb.lab_numbers("текст"))
+
+    def test_bool_is_not_a_number_and_huge_numbers_do_not_pass(self):
+        got = benchdb.lab_numbers({"words": True, "flagged_words": 2 ** 70, "duration_sec": 5})
+        self.assertEqual(got, {"duration_sec": 5})
+
+    def test_error_pair_does_not_make_the_whole_run_reserved(self):
+        bench = new_bench()
+        write_lab(bench, lab_doc(pairs=[lab_pair(), lab_pair(state="error", cid="b-ml3")]))
+        benchdb.apply_load(bench)
+        self.assertEqual(rows(bench, "SELECT valid, valid_reason FROM run"), [("yes", None)])
+        bench2 = new_bench()
+        write_lab(bench2, lab_doc(pairs=[lab_pair(preflight_ok=False)]))
+        benchdb.apply_load(bench2)
+        self.assertEqual(rows(bench2, "SELECT valid, valid_reason FROM run"), [("with_reservations", "battery")])
+
+
 class FilesTests(unittest.TestCase):
 
     def test_module_is_utf8_without_bom_and_lf(self):
