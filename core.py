@@ -1114,8 +1114,14 @@ def apply_answers_files(jp, md):
 
     После применения (и после фиксации в sqlite) карточки ответов с исходом applied_open получают новую
     редакцию (PR 13б): ответ применён, место осталось открытым — следующий вопрос человеку. Замена идёт
-    снаружи `conspect.write_lock`: применение держит её и внутри берёт блокировку ответов пакета, а
-    `review_pack.upsert_cards` сам берёт операцию документа и ту же блокировку ответов — без вложения."""
+    после применения, когда его замки отпущены: `review_pack.upsert_cards` сам берёт операцию документа и
+    замок ответов пакета — без вложения.
+
+    Замки применения. Файловый режим: замок ответов пакета (`review_pack._answers_lock`), внутри него
+    `conspect.write_lock` — на всё чтение, применение и запись состояния пакета (PR 17-0). Тот же порядок
+    «ответы, затем запись» у `upsert_cards`: под замком ответов `transcript.load` берёт `write_lock`; обратный
+    порядок дал бы взаимную блокировку. Режим базы: только `write_lock`; потерю ловят ожидаемые ревизии
+    (проигравший получает `storage.Conflict`)."""
     report = _apply_answers_files_once(jp, md)
     return _replace_open_cards(jp, report)
 
@@ -1214,7 +1220,9 @@ def _apply_answers_files_once(jp, md):
                 return _answers_refreshed(store, binding["recording_id"], jp, report)
         finally:
             store.close()
-    with conspect.write_lock(jp):
+    # файловый режим: состояние пакета пишут и дописывание карточек, и страница — под замком ответов; без него
+    # дописывание, прочитавшее состояние до «Применить», стирало бы отметки применения и снимки отмены (PR 17-0)
+    with review_pack._answers_lock(jp), conspect.write_lock(jp):
         import transcript
         manifest = review_pack.manifest(jp) or {}
         state = review_pack.answers_state(jp, {"answers": {}})
