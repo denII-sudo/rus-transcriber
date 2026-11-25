@@ -91,6 +91,24 @@ class ExclusiveHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+def answers_payload(json_path):
+    """Ответ api/answers: состояние пакета и то, что по нему считает Python для страницы."""
+    store = P.answers_state(json_path, {"answers": {}})
+    store["applied_answers"] = store.get("applied_answers") or {}
+    man = P.manifest(json_path) or {}
+    # Состояние каждого ответа считает Python; страница его только показывает.
+    store["answer_states"] = P.answer_states_of(store, man)
+    # места, уже прослушанные целиком (раздел 10): их кнопки прослушивания доступны сразу
+    store["heard_ids"] = P.heard_ids(store, man)
+    # По ним страница узнаёт, что карточки заменены или дописаны, и перечитывает manifest.json.
+    store["pack_version"], store["pack_rev"] = man.get("version"), man.get("pack_rev", 0)
+    if "_expected_versions" in store:
+        # SQLite (Х1): события карточек странице не нужны, а у таблицы событий нет предела 2000
+        store.pop("interaction_events", None)
+        store.pop("interaction_events_dropped", None)
+    return store
+
+
 def bind_free_port(start, handler, attempts=20):
     """Первый свободный порт начиная с start -> (сервер, порт) или (None, None)."""
     for port in range(start, start + attempts):
@@ -154,16 +172,7 @@ def main():
                 html = (HERE / "cards.html").read_text(encoding="utf-8")
                 return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"), "text/html; charset=utf-8")
             if u == "api/answers":
-                store = P.answers_state(a.json_path, {"answers": {}})
-                store["applied_answers"] = store.get("applied_answers") or {}
-                man = P.manifest(a.json_path) or {}
-                # Состояние каждого ответа считает Python; страница его только показывает.
-                store["answer_states"] = P.answer_states_of(store, man)
-                # места, уже прослушанные целиком (раздел 10): их кнопки прослушивания доступны сразу
-                store["heard_ids"] = P.heard_ids(store, man)
-                # По ним страница узнаёт, что карточки заменены или дописаны, и перечитывает manifest.json.
-                store["pack_version"], store["pack_rev"] = man.get("version"), man.get("pack_rev", 0)
-                return self._send(200, store)
+                return self._send(200, answers_payload(a.json_path))
             if u == "manifest.json":
                 manifest = P.manifest(a.json_path)
                 if manifest is None:

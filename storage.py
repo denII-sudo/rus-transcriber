@@ -22,6 +22,22 @@ REVIEW_FIELDS = frozenset(("review", "review_done", "questions", "answers",
 ACTOR_KINDS = frozenset(("human", "model", "system", "unknown"))
 KEEP_ANNOTATION = object()
 MAX_INTERACTION_EVENTS = 2000
+# События карточек (показ, проигрывание, прослушивание места) — отдельная таблица только для добавления (Х1):
+# событие не создаёт ревизию разбора. Разбор прежнего формата хранит их списком interaction_events; такой список
+# только читается, новые события в него не пишутся. Таблицы нет в базе, созданной до Х1, — её создаёт шаг
+# обновления базы или страховка recordings.ensure_review_events (резерв, потом пустая таблица).
+REVIEW_EVENTS_DDL = """CREATE TABLE review_events (
+            recording_id TEXT NOT NULL REFERENCES recordings(recording_id),
+            seq INTEGER NOT NULL CHECK(seq >= 1),
+            event_json TEXT NOT NULL,
+            review_revision INTEGER NOT NULL CHECK(review_revision >= 1),
+            origin TEXT NOT NULL CHECK(origin IN ('page', 'migrated')),
+            operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(recording_id, seq))"""
+REVIEW_EVENTS_COLUMNS = frozenset(("recording_id", "seq", "event_json", "review_revision", "origin",
+                                   "operation_id", "created_at"))
+MAX_REVIEW_EVENT_BYTES = 16384
 
 
 class StorageError(Exception):
@@ -38,6 +54,10 @@ class UnsupportedSchema(StorageError):
 
 class Busy(Conflict):
     pass
+
+
+class ReviewEventsMissing(StorageError):
+    """В базе нет таблицы событий карточек: база создана до Х1 и ещё не обновлена."""
 
 
 def _is_busy(exc):
@@ -473,7 +493,7 @@ def _initialize_at(path, initial_display_name=None):
             kind TEXT NOT NULL, state TEXT NOT NULL, result_json TEXT,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(run_id, kind));
-        """)
+        """ + REVIEW_EVENTS_DDL + ";")
         db.execute("INSERT INTO store_meta VALUES (?, ?)", (str(uuid.uuid4()), SCHEMA_VERSION))
         if initial_display_name is not None:
             user_id, installation_id = str(uuid.uuid4()), str(uuid.uuid4())
@@ -528,6 +548,10 @@ def _release_wal_files(path):
         db.close()
 
 
+def _has_table(db, name):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
 def _check_schema(db):
     required = {"store_meta", "local_users", "installations", "recordings", "operations",
                 "transcript_revisions", "review_revisions", "document_versions", "allowed_roots",
@@ -574,6 +598,9 @@ def _check_schema(db):
             "workflow_runs": {"run_id", "request_id", "kind", "state", "executor", "created_at", "updated_at"},
             "workflow_steps": {"step_id", "run_id", "kind", "state", "result_json", "created_at", "updated_at"},
         }
+        # таблица событий карточек необязательна: базы до Х1 её не имеют (номер схемы тот же, 4)
+        if "review_events" in names:
+            columns["review_events"] = REVIEW_EVENTS_COLUMNS
         for table, expected in columns.items():
             if not expected <= {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
                 raise UnsupportedSchema("required columns missing")
@@ -653,6 +680,17 @@ def validate_copy(path, *, allow_damaged_copies=False):
                     context["initiated_by"]["user_id"] != row["initiator_user_id"] or
                     context["origin_installation_id"] != row["installation_id"]):
                 raise StorageError("operation author reference mismatch")
+        if _has_table(db, "review_events"):
+            joined = 0
+            for row in db.execute("SELECT e.event_json, e.origin, o.kind AS operation_kind FROM review_events e "
+                                  "JOIN operations o ON o.operation_id=e.operation_id"):
+                joined += 1
+                if not isinstance(_loads(row["event_json"]), dict):
+                    raise StorageError("review event must be an object")
+                if row["origin"] == "page" and row["operation_kind"] != "review_event":
+                    raise StorageError("review event operation mismatch")
+            if joined != db.execute("SELECT count(*) FROM review_events").fetchone()[0]:
+                raise StorageError("review event without operation")
         for row in db.execute("SELECT r.payload AS review, t.payload AS transcript FROM review_revisions r "
                               "JOIN transcript_revisions t ON t.recording_id=r.recording_id "
                               "AND t.revision=r.source_revision"):
@@ -1384,7 +1422,10 @@ class Store:
             _restore_from=(source_revision, review_revision))
 
     def commit_player_event(self, recording_id, expected_versions, operation_id, context, event_type):
-        """Сохранить событие плеера без текстовой и документной ревизии."""
+        """Прототип П1: событие плеера списком в новой ревизии разбора (прежний формат).
+
+        Рабочий код его не вызывает: события карточек пишет append_review_event в таблицу событий (Х1).
+        Остаётся для испытаний, которым нужна ревизия разбора без изменения содержания."""
         _uuid(recording_id)
         _uuid(operation_id)
         _context(context)
@@ -1433,6 +1474,65 @@ class Store:
             self.db.execute("UPDATE recordings SET review_revision=? WHERE recording_id=?",
                             (result["review_revision"], recording_id))
             return result
+
+    def has_review_events(self):
+        """Есть ли в базе таблица событий карточек (Х1)."""
+        return _has_table(self.db, "review_events")
+
+    def create_review_events_table(self):
+        """Создать пустую таблицу событий в базе до Х1. Ничего не переносит и не переписывает; резерв перед этим
+        делает вызывающий (recordings.ensure_review_events). Повторный вызов ничего не меняет."""
+        with self._transaction():
+            if not self.has_review_events():
+                self.db.execute(REVIEW_EVENTS_DDL)
+
+    def append_review_event(self, recording_id, event, operation_id, context, *,
+                            expected_versions=None, review=None):
+        """Добавить событие карточки в таблицу событий без ревизии разбора.
+
+        review — новый снимок разбора, когда событие меняет прослушанные отрезки (heard): тогда в той же
+        транзакции пишется ревизия разбора (как commit_change, с проверкой expected_versions)."""
+        _uuid(recording_id)
+        _uuid(operation_id)
+        _context(context)
+        if not isinstance(event, dict):
+            raise ValueError("review event must be an object")
+        encoded = _json(event)
+        if len(encoded.encode("utf-8")) > MAX_REVIEW_EVENT_BYTES:
+            raise ValueError("review event is too large")
+        if review is not None and expected_versions is None:
+            raise ValueError("expected source and review revisions required")
+        digest = _hash({"recording_id": recording_id, "event": event, "context": context,
+                        "expected_versions": expected_versions, "review": review})
+        with self._transaction():
+            if not self.has_review_events():
+                raise ReviewEventsMissing("review events table missing")
+            replay = self._replay(operation_id, "review_event", digest)
+            if replay is not None:
+                return replay
+            self._check_context_refs(context)
+            if review is not None:
+                # ревизия разбора — своей операцией, ключ выводится из ключа события: повтор события её не удвоит
+                self.commit_change(recording_id, expected_versions,
+                                   str(uuid.uuid5(uuid.UUID(operation_id), "review-change")), context, review=review)
+            row = self.db.execute("SELECT review_revision FROM recordings WHERE recording_id=?",
+                                  (recording_id,)).fetchone()
+            if row is None:
+                raise KeyError(recording_id)
+            seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_events WHERE recording_id=?",
+                                  (recording_id,)).fetchone()[0]
+            result = {"recording_id": recording_id, "seq": seq, "review_revision": row["review_revision"]}
+            self._insert_operation(operation_id, "review_event", digest, context, result)
+            self.db.execute("INSERT INTO review_events VALUES (?, ?, ?, ?, 'page', ?, ?)",
+                            (recording_id, seq, encoded, row["review_revision"], operation_id, _now()))
+            return result
+
+    def review_events(self, recording_id):
+        """События карточек записи из таблицы, по порядку записи; в базе до Х1 — пустой список."""
+        if not self.has_review_events():
+            return []
+        return [_loads(row["event_json"]) for row in self.db.execute(
+            "SELECT event_json FROM review_events WHERE recording_id=? ORDER BY seq", (recording_id,))]
 
     def save_conspect(self, recording_id, conspect_id, name, source_revision, expected_revision,
                       payload, json_bytes, md_bytes, json_relative, md_relative, root_id,

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +34,21 @@ transcript = six.transcript
 PROJECT = six.PROJECT
 SHA = "a" * 64
 SESSION = "page-session-1"
+
+
+def old_format_events(jp, events):
+    """Разбор прежнего формата (до Х1): события карточек списком interaction_events в ревизии разбора."""
+    store, binding = recordings.open_for_document(jp)
+    try:
+        current = store.get_current(binding["recording_id"])
+        review = copy.deepcopy(current["review"]["payload"])
+        review["interaction_events"] = copy.deepcopy(events)
+        store.commit_change(binding["recording_id"],
+                            {"source_revision": current["transcript"]["revision"],
+                             "review_revision": current["review"]["revision"]},
+                            str(uuid.uuid4()), recordings.operation_context(store, "system"), review=review)
+    finally:
+        store.close()
 
 
 def place(t1=1.0, t2=2.0, aid="r1"):
@@ -176,9 +192,10 @@ class Apply(six.Case):
             state = recordings.read_review_pack_state(jp)
             self.assertNotIn("heard", state)
             state["manifest"].pop("audio_sha256", None)
-            state["interaction_events"] = [{"id": "r1", "version": version, "type": "audio_ended",
-                                            "session": SESSION, "source": "local", "ts": "2026-11-20T10:00:00"}]
             review_pack._write_answers(jp, state)
+            # база до Х1: события лежат списком в разборе; состояние пакета их больше не пишет — прямо в снимок
+            old_format_events(jp, [{"id": "r1", "version": version, "type": "audio_ended",
+                                    "session": SESSION, "source": "local", "ts": "2026-11-20T10:00:00"}])
             raw = recordings.read_review_pack_state(jp)
             self.assertNotIn("heard", raw)
             self.listen(jp, version, played=False)

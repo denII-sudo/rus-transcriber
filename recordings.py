@@ -7,6 +7,7 @@ import copy
 import contextvars
 import json
 import os
+import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -59,8 +60,7 @@ def merge_answer_draft(data, state):
     if heard is not None:
         undo["review_pack"]["heard"] = copy.deepcopy(heard)
     result["undo"] = undo
-    result["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
-    result["interaction_events_evicted"] = state.get("interaction_events_dropped", 0)
+    # события карточек (Х1) черновик не меняет: прежний список разбора переходит как есть, новые — в таблице
     result["applications"] = copy.deepcopy(state.get("application_events") or [])
     # Как при записи в БД: исчезнувшие слова не остаются в карточках документа (manifest не трогаем).
     _prune_missing_word_ids(result, result)
@@ -270,15 +270,93 @@ def read_review_pack_state(document_path):
             "undo_snapshots": copy.deepcopy(pack.get("undo_snapshots") or {}),
             "application_events": copy.deepcopy(pack.get("application_events") or []),
             "application_events_dropped": pack.get("application_events_dropped", 0),
-            "interaction_events": copy.deepcopy(review.get("interaction_events") or []),
+            # события карточек: прежний список разбора (базы до переноса Х1у), потом таблица событий (Х1)
+            "interaction_events": (copy.deepcopy(review.get("interaction_events") or []) +
+                                   store.review_events(binding["recording_id"])),
             "interaction_events_dropped": review.get("interaction_events_evicted", 0),
         }
     finally:
         store.close()
 
 
+# Поля состояния пакета, изменение которых не меняет документ: пишутся ревизией разбора без пересборки документа.
+_EVENT_FIELDS = frozenset(("application_events", "application_events_dropped", "outcome_details", "heard"))
+# События карточек пишет только append_review_event (таблица событий, Х1): запись состояния пакета их не трогает.
+_INTERACTION_FIELDS = frozenset(("interaction_events", "interaction_events_dropped"))
+REVIEW_EVENTS_NOT_UPGRADED = ("база не обновлена: отметки о просмотре и прослушивании не записываются — не удалось "
+                              "сделать резерв базы перед обновлением. Проверьте место на диске, закройте и снова "
+                              "откройте программу")
+_REVIEW_EVENTS_BACKUP_FAILED = set()
+
+
+def _review_from_state(store, binding, state):
+    """Снимок разбора из состояния пакета: (expected_versions, review, изменённые поля)."""
+    current = store.get_current(binding["recording_id"])
+    expected = state.get("_expected_versions")
+    actual = {"source_revision": current["transcript"]["revision"],
+              "review_revision": current["review"]["revision"]}
+    if expected != actual:
+        raise storage.Conflict("stale review pack state")
+    review = copy.deepcopy(current["review"]["payload"])
+    previous_state = {
+        "version": review.get("question_version"),
+        "manifest": copy.deepcopy((review.get("undo") or {}).get("review_pack", {}).get("manifest")),
+        "answers": copy.deepcopy(review.get("answers") or {}),
+        "conflicts": copy.deepcopy(review.get("conflicts") or []),
+        "rejected": copy.deepcopy(review.get("rejected") or []),
+        "applied_answers": copy.deepcopy((review.get("undo") or {}).get(
+            "review_pack", {}).get("applied_answers") or {}),
+        "applied_at": (review.get("undo") or {}).get("review_pack", {}).get("applied_at"),
+        "undo_snapshots": copy.deepcopy((review.get("undo") or {}).get(
+            "review_pack", {}).get("undo_snapshots") or {}),
+        "application_events": copy.deepcopy((review.get("undo") or {}).get(
+            "review_pack", {}).get("application_events") or []),
+        "application_events_dropped": (review.get("undo") or {}).get(
+            "review_pack", {}).get("application_events_dropped", 0),
+        "outcome_details": copy.deepcopy((review.get("undo") or {}).get(
+            "review_pack", {}).get("outcome_details")) or None,
+        "heard": copy.deepcopy((review.get("undo") or {}).get("review_pack", {}).get("heard")),
+    }
+    review["question_version"] = state.get("version")
+    if "manifest" in state:
+        manifest = copy.deepcopy(state["manifest"])
+        review["questions"] = copy.deepcopy(manifest.get("items") or []) if manifest else []
+    _prune_missing_word_ids(current["transcript"]["payload"], review)
+    for field in ("answers", "conflicts", "rejected"):
+        if field in state:
+            review[field] = copy.deepcopy(state[field])
+    undo = copy.deepcopy(review.get("undo") or {})
+    pack = copy.deepcopy(undo.get("review_pack") or {})
+    pack["manifest"] = copy.deepcopy(state.get("manifest"))
+    pack["applied_answers"] = copy.deepcopy(state.get("applied_answers") or {})
+    pack["applied_at"] = state.get("applied_at")
+    pack["undo_snapshots"] = copy.deepcopy(state.get("undo_snapshots") or {})
+    pack["application_events"] = copy.deepcopy(state.get("application_events") or [])
+    pack["application_events_dropped"] = state.get("application_events_dropped", 0)
+    if state.get("outcome_details"):
+        pack["outcome_details"] = copy.deepcopy(state["outcome_details"])
+    else:
+        pack.pop("outcome_details", None)
+    if state.get("heard") is not None:         # состояние без поля прослушанное не снимает
+        pack["heard"] = copy.deepcopy(state["heard"])
+    undo["review_pack"] = pack
+    review["undo"] = undo
+    if review.get("applications") is None:
+        review["applications"] = []
+    if not isinstance(review.get("applications"), list):
+        raise ValueError("stored applications must be a list")
+    if "application_events" in state:
+        review["applications"] = copy.deepcopy(state["application_events"])
+    # уточнения к ответам (К-22) документ не меняют: как события, пишутся без пересборки документа
+    changed = {key for key in (set(previous_state) | set(state)) - {"_expected_versions"} - _INTERACTION_FIELDS
+               if previous_state.get(key) != state.get(key)}
+    return expected, review, changed
+
+
 def write_review_pack_state(document_path, state):
-    """Сохранить ответный пакет в review-снимок и обновить пользовательский документ."""
+    """Сохранить ответный пакет в review-снимок и обновить пользовательский документ.
+
+    События карточек (interaction_events) здесь не пишутся: их добавляет append_review_event (Х1)."""
     draft = answer_draft_for(document_path)
     if draft is not None:
         draft["state"] = copy.deepcopy(state)
@@ -287,73 +365,9 @@ def write_review_pack_state(document_path, state):
     if store is None:
         return None
     try:
-        current = store.get_current(binding["recording_id"])
-        expected = state.get("_expected_versions")
-        actual = {"source_revision": current["transcript"]["revision"],
-                  "review_revision": current["review"]["revision"]}
-        if expected != actual:
-            raise storage.Conflict("stale review pack state")
-        review = copy.deepcopy(current["review"]["payload"])
-        previous_state = {
-            "version": review.get("question_version"),
-            "manifest": copy.deepcopy((review.get("undo") or {}).get("review_pack", {}).get("manifest")),
-            "answers": copy.deepcopy(review.get("answers") or {}),
-            "conflicts": copy.deepcopy(review.get("conflicts") or []),
-            "rejected": copy.deepcopy(review.get("rejected") or []),
-            "applied_answers": copy.deepcopy((review.get("undo") or {}).get(
-                "review_pack", {}).get("applied_answers") or {}),
-            "applied_at": (review.get("undo") or {}).get("review_pack", {}).get("applied_at"),
-            "undo_snapshots": copy.deepcopy((review.get("undo") or {}).get(
-                "review_pack", {}).get("undo_snapshots") or {}),
-            "application_events": copy.deepcopy((review.get("undo") or {}).get(
-                "review_pack", {}).get("application_events") or []),
-            "application_events_dropped": (review.get("undo") or {}).get(
-                "review_pack", {}).get("application_events_dropped", 0),
-            "interaction_events": copy.deepcopy(review.get("interaction_events") or []),
-            "interaction_events_dropped": review.get("interaction_events_evicted", 0),
-            "outcome_details": copy.deepcopy((review.get("undo") or {}).get(
-                "review_pack", {}).get("outcome_details")) or None,
-            "heard": copy.deepcopy((review.get("undo") or {}).get("review_pack", {}).get("heard")),
-        }
-        review["question_version"] = state.get("version")
-        if "manifest" in state:
-            manifest = copy.deepcopy(state["manifest"])
-            review["questions"] = copy.deepcopy(manifest.get("items") or []) if manifest else []
-        _prune_missing_word_ids(current["transcript"]["payload"], review)
-        for field in ("answers", "conflicts", "rejected"):
-            if field in state:
-                review[field] = copy.deepcopy(state[field])
-        undo = copy.deepcopy(review.get("undo") or {})
-        pack = copy.deepcopy(undo.get("review_pack") or {})
-        pack["manifest"] = copy.deepcopy(state.get("manifest"))
-        pack["applied_answers"] = copy.deepcopy(state.get("applied_answers") or {})
-        pack["applied_at"] = state.get("applied_at")
-        pack["undo_snapshots"] = copy.deepcopy(state.get("undo_snapshots") or {})
-        pack["application_events"] = copy.deepcopy(state.get("application_events") or [])
-        pack["application_events_dropped"] = state.get("application_events_dropped", 0)
-        if state.get("outcome_details"):
-            pack["outcome_details"] = copy.deepcopy(state["outcome_details"])
-        else:
-            pack.pop("outcome_details", None)
-        if state.get("heard") is not None:         # состояние без поля прослушанное не снимает
-            pack["heard"] = copy.deepcopy(state["heard"])
-        undo["review_pack"] = pack
-        review["undo"] = undo
-        review["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
-        review["interaction_events_evicted"] = state.get("interaction_events_dropped", 0)
-        if review.get("applications") is None:
-            review["applications"] = []
-        if not isinstance(review.get("applications"), list):
-            raise ValueError("stored applications must be a list")
-        if "application_events" in state:
-            review["applications"] = copy.deepcopy(state["application_events"])
-        # уточнения к ответам (К-22) документ не меняют: как события, пишутся без пересборки документа
-        event_fields = {"interaction_events", "interaction_events_dropped",
-                         "application_events", "application_events_dropped", "outcome_details", "heard"}
-        changed = {key for key in (set(previous_state) | set(state)) - {"_expected_versions"}
-                   if previous_state.get(key) != state.get(key)}
+        expected, review, changed = _review_from_state(store, binding, state)
         context = current_operation_context(store)
-        if changed and changed <= event_fields:
+        if changed and changed <= _EVENT_FIELDS:
             result = store.commit_change(
                 binding["recording_id"], expected, str(uuid.uuid4()), context, review=review)
             return result
@@ -364,6 +378,71 @@ def write_review_pack_state(document_path, state):
         completed = materialize_recording(store, binding["recording_id"])
         documents.require_written(store, binding["recording_id"], result["document_revision"], completed)
         return result
+    finally:
+        store.close()
+
+
+def review_events_backup_dir(store):
+    """Папка резервов базы: <папка данных>/db-backups рядом с базой."""
+    return Path(store.path).parent / "db-backups"
+
+
+def ensure_review_events(store):
+    """Страховка Х1 для базы, где обновление базы не прошло: резерв, потом пустая таблица событий.
+
+    Ничего не переносит, не переписывает и не удаляет: это делает только обновление базы (Х1у). True — таблица
+    есть. False — резерв не удался: таблица не создана, и до перезапуска процесса резерв больше не пробуем
+    (иначе полная копия базы на каждое событие). Занятость базы (Busy) — не отказ: следующее событие попробует снова."""
+    if store.has_review_events():
+        return True
+    key = os.path.normcase(str(store.path))
+    if key in _REVIEW_EVENTS_BACKUP_FAILED:
+        return False
+    try:
+        folder = review_events_backup_dir(store)
+        folder.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = folder / f"state-before-review-events-{stamp}.sqlite3"
+        if target.exists():
+            target = folder / f"state-before-review-events-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
+        store.backup(target, allow_damaged_copies=True)
+    except storage.Busy:
+        raise
+    except (OSError, storage.StorageError, sqlite3.Error):
+        _REVIEW_EVENTS_BACKUP_FAILED.add(key)
+        return False
+    store.create_review_events_table()
+    return True
+
+
+def append_review_event(document_path, event, state=None):
+    """Записать событие карточки в таблицу событий (Х1): без ревизии разбора и без пересборки документа.
+
+    state — состояние пакета, когда событие меняет прослушанные отрезки (heard): тогда в той же транзакции
+    пишется ревизия разбора. Если таблицы нет и резерв перед её созданием не удался — событие не записывается,
+    прослушанные отрезки записываются ревизией разбора, ответ несёт предупреждение. None — запись не в SQLite."""
+    if answer_draft_for(document_path) is not None:
+        raise RuntimeError("card events are not written inside an answer draft")
+    store, binding = open_for_document(document_path)
+    if store is None:
+        return None
+    try:
+        recording_id = binding["recording_id"]
+        context = current_operation_context(store)
+        expected = review = None
+        if state is not None:
+            expected, review, changed = _review_from_state(store, binding, state)
+            if not changed <= _EVENT_FIELDS:
+                raise ValueError("card event may change only heard spans")
+            if not changed:
+                expected = review = None
+        if not ensure_review_events(store):
+            if review is not None:
+                store.commit_change(recording_id, expected, str(uuid.uuid4()), context, review=review)
+            return {"stored": False, "warning": REVIEW_EVENTS_NOT_UPGRADED, "heard_saved": review is not None}
+        result = store.append_review_event(recording_id, event, str(uuid.uuid4()), context,
+                                           expected_versions=expected, review=review)
+        return {"stored": True, **result}
     finally:
         store.close()
 

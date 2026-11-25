@@ -1054,6 +1054,7 @@ def add_interaction_event(json_path, aid, version, event_type, session, rev=None
         raise ValueError(stale)
     with _answers_lock(json_path):
         store = _read_answers(json_path, {"version": man["version"], "answers": {}})
+        heard_before = copy.deepcopy(store.get("heard"))
         # первое событие после обновления переносит прежние audio_ended в heard (10.6): дальше доигрывание
         # клипа до конца (с перемоткой) прослушиванием не считается
         _heard_store(store, man)
@@ -1069,6 +1070,15 @@ def add_interaction_event(json_path, aid, version, event_type, session, rev=None
                  "type": event_type, "session": session, "source": "local", "ts": _now()}
         if card_rev(item) != 1:
             event["rev"] = card_rev(item)
+        if "_expected_versions" in store:
+            # SQLite (Х1): событие — строка таблицы событий, без ревизии разбора; ревизия — только если изменились
+            # прослушанные отрезки (heard), в той же транзакции
+            import recordings
+            rep = recordings.append_review_event(
+                json_path, event, store if store.get("heard") != heard_before else None)
+            if not rep.get("stored"):
+                return {"stored": False, "warning": rep["warning"]}
+            return {"stored": True, "event": event}
         events.append(event)
         if len(events) > MAX_INTERACTION_EVENTS:
             removed = len(events) - MAX_INTERACTION_EVENTS

@@ -946,7 +946,8 @@ class WorkerSnapshotTests(unittest.TestCase):
                 def cut_with_concurrent_change(_source, t1, _t2, _out):
                     Path(_out).write_bytes(b"new clip")
                     state = recordings.read_review_pack_state(json_path)
-                    state["interaction_events"].append({"type": "synthetic"})
+                    # параллельная ревизия разбора без документа; событие карточки её больше не создаёт (Х1)
+                    state["heard"] = {"": [[0.0, 0.1]]}
                     recordings.write_review_pack_state(json_path, state)
                     return t1
 
@@ -1025,7 +1026,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     self.assertEqual(review_pack.answers_state(json_path)["answers"]["r1"]["option"], 0)
                     stale = review_pack.answers_state(json_path)
                     fresh = review_pack.answers_state(json_path)
-                    fresh["interaction_events"].append({"type": "test"})
+                    fresh["heard"] = {"": [[0.0, 0.1]]}     # ревизия разбора без документа (Х1: не событие)
                     recordings.write_review_pack_state(json_path, fresh)
                     stale["answers"] = {}
                     with self.assertRaises(storage.Conflict):

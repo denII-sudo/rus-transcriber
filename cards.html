@@ -120,9 +120,12 @@ audio{width:100%;height:36px}
   // И4: отметки просмотра и прослушивания — диагностика, на ответы не влияют; отказ записи — одно предупреждение
   // на сессию страницы. Отказ «вопрос обновлён» — без предупреждения: карточку заменяют.
   const EVENTS_FAILED = "Часть отметок о просмотре и прослушивании не записана; на ответы это не влияет";
-  let eventsFailed = 0;
+  let eventsFailed = 0, eventsWarned = false;
   const sendInteraction = (it, type) => {
-    if (api && api.event) api.event({id: it.id, version: man.version, rev: revOf(it), type, session: pageSession}).catch(e => {
+    if (api && api.event) api.event({id: it.id, version: man.version, rev: revOf(it), type, session: pageSession}).then(j => {
+      // база не обновлена (Х1): отметка не записана, программа объясняет почему — одно предупреждение на сессию
+      if (j && j.warning && !eventsWarned) { eventsWarned = true; note(j.warning, "warn"); }
+    }).catch(e => {
       if (e && e.message === STALE) return;
       if (++eventsFailed === 1) note(EVENTS_FAILED, "warn");
     });
