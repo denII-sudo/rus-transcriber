@@ -389,6 +389,24 @@ class RepairTests(PackFixture):
         self.assertEqual(self.current(self.rid)["review"]["revision"], 1)
         self.assertEqual(self.db_hashes(), before_db)
 
+    def test_damaged_edit_copy_does_not_block_backup(self):
+        """Ф207-3: повреждённая копия правки — строка отчёта, не отказ резерва (как у других штатных резервов);
+        копия проверяется один раз, незаконченного файла в db-backups не остаётся."""
+        damaged = [{"scope": "document", "conflict_id": "c-1", "relative_path": "v4/x.transcript.md"}]
+        out = self.root / "repair-out"
+        with mock.patch.object(storage, "damaged_conflict_copies", return_value=damaged), \
+                mock.patch.object(storage, "validate_copy", wraps=storage.validate_copy) as checks:
+            code = self.run_main("--plan", str(self.write_plan()), "--apply", "--data-dir", str(self.db.parent),
+                                 "--out", str(out))
+        self.assertEqual(code, 0)
+        self.assertEqual(checks.call_count, 1)
+        self.assertEqual(self.current(self.rid)["review"]["revision"], 2)
+        folder = self.db.parent / "db-backups"
+        self.assertEqual([p.suffix for p in folder.iterdir()], [".sqlite3"])
+        report = json.loads((out / "repair-report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["backup_damaged_copies"], damaged)
+        self.assertEqual(report["records"][0]["status"], "repaired")
+
     def test_not_migrated_and_nothing_to_repair(self):
         plan = self.plan()
         other = self.side / "другая.transcript.json"

@@ -930,9 +930,12 @@ def _binding(store, rid):
 
 
 def _repair_backup(store):
-    """Резерв базы перед первой записью ремонта: <папка данных>/db-backups, проверка копии."""
+    """Резерв базы перед первой записью ремонта: <папка данных>/db-backups.
+
+    Как у других штатных резервов (core.backup_store, recordings.ensure_review_events): повреждённая копия
+    правки — не отказ, а список в отчёте (решение владельца 23.11.2026, storage.validate_copy). Store.backup
+    сам проверяет копию через validate_copy, второй проверки нет. -> (путь резерва, повреждённые копии правок)"""
     import recordings
-    import storage
     try:
         folder = recordings.review_events_backup_dir(store)
         folder.mkdir(exist_ok=True)
@@ -940,11 +943,10 @@ def _repair_backup(store):
         target = folder / f"state-before-pack-repair-{stamp}.sqlite3"
         if target.exists():
             target = folder / f"state-before-pack-repair-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
-        store.backup(target)
-        storage.validate_copy(target)
+        checked = store.backup(target, allow_damaged_copies=True)
     except Exception as ex:
         raise RepairBackupError(f"резерв базы перед ремонтом не создан: {type(ex).__name__}: {ex}") from ex
-    return str(target)
+    return str(target), list(checked.get("damaged_copies") or [])
 
 
 def _repair_write(store, rid, review, digest):
@@ -1027,7 +1029,9 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
         out["status"] = "would_repair"
         return out
     if report["backup"] is None:
-        report["backup"] = _repair_backup(store)
+        report["backup"], damaged = _repair_backup(store)
+        if damaged:
+            report["backup_damaged_copies"] = damaged
     result = _repair_write(store, rid, review, _pack_digest(packs, manifests))
     out.update(status="repaired", review_revision=result.get("review_revision", 2))
     return out
@@ -1045,6 +1049,9 @@ def _repair_summary(report):
                      f"снимков отмены не перенесено {ps.get('undo_snapshots_dropped', '-')}"
                      + (f"; {e['why']}" if e.get("why") else "") + (f"; ошибка: {e['error']}" if e.get("error") else ""))
     lines.append(f"итог: {report['summary']}" + (f"; резерв: {report['backup']}" if report.get("backup") else ""))
+    if report.get("backup_damaged_copies"):
+        lines.append(f"в резерве повреждённых копий правок: {len(report['backup_damaged_copies'])} "
+                     "(не отказ, как у других резервов; список — в repair-report.json)")
     return "\n".join(lines)
 
 
