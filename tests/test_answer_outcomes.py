@@ -478,7 +478,7 @@ def run_page(test, body, host="127.0.0.1"):
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
 class PageLabels(unittest.TestCase):
     # Состояния, которые знает только страница: ответ из облака, которого ноутбук ещё не видел.
-    PAGE_ONLY = {"cloud_saved", "cloud_keep"}
+    PAGE_ONLY = {"cloud_saved", "cloud_keep", "cloud_revert"}
 
     def test_every_outcome_has_its_own_label(self):
         out = run_page(self, "console.log(JSON.stringify(Object.keys(STATUS)));")
@@ -700,7 +700,7 @@ class RevertAnswerText(unittest.TestCase):
     def test_revert_text_follows_state(self):
         run_page(self, r'''
           const a={kind:"revert",ts:"t2",source:"local"}, one={id:"r1", options: []};
-          const cases = {revert_pending: "отмена подготовлена", undo_conflict: "отмена не выполнена", reverted: "ответ отменён"};
+          const cases = {revert_pending: "отмена подготовлена", undo_conflict: "отмена ответа не выполнена", reverted: "ответ отменён"};
           for (const [state, start] of Object.entries(cases)) {
             man = {answer_states:{r1:{state, ts:"t2", source:"local"}}};
             const text = answerText(a, one);

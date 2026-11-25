@@ -894,7 +894,7 @@ def _merge_free_reports(parts):
         return {}
     merged = dict(parts[0])
     for key in ("successful_ids", "not_found", "cards", "conflicts", "left_to_human",
-                "proposed_delete", "vocab_suggestions", "hints"):
+                "proposed_delete", "vocab_suggestions", "hints", "notes_written"):
         merged[key] = [x for part in parts for x in part.get(key) or []]
     for key in ("closed_via", "failed", "conspects"):
         merged[key] = {k: v for part in parts for k, v in (part.get(key) or {}).items()}
@@ -1432,6 +1432,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             rep["reverted"].append(d["id"])
             P.mark_applied(jp, {d["id"]}, outcomes={d["id"]: "reverted"})
         else:
+            if d["_undo_snapshot"] and str(result.get("conflict", "")).startswith("нет снимка или после ответа"):
+                result["why"] = P.UNDO_LATER_EDIT      # К-18: снимок есть, стенограмма менялась после ответа
             rep.setdefault("undo_conflicts", []).append(result)
             undo_failed.add(d["id"])
     snapshots, report = {}, {}
@@ -1626,6 +1628,13 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                                                       if row.get("kept_edits") else None))
     for aid in rep.get("source_conflict_ids") or []:
         add_detail(aid, (rep.get("source_conflict_why") or {}).get(aid) or rep.get("source_conflict"))
+    # К-2: примечание на карточке противоречия записывается, только когда ответ применён
+    noted = {aid for aid, a in stored.items() if a.get("human_note") and a.get("kind") != "skip"}
+    written = set(report.get("notes_written") or []) | set(free_report.get("notes_written") or [])
+    asked = {d.get("id") for d in decisions} | set(free) | set(blocked_free) | set(rep.get("source_conflict_ids") or [])
+    rep["notes_not_written"] = sorted(aid for aid in noted & asked if aid not in written)
+    for aid in rep["notes_not_written"]:
+        add_detail(aid, P.NOTE_NOT_WRITTEN)
 
     def row(aid):
         out = {"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
