@@ -283,9 +283,9 @@ def read_review_pack_state(document_path):
 _EVENT_FIELDS = frozenset(("application_events", "application_events_dropped", "outcome_details", "heard"))
 # События карточек пишет только append_review_event (таблица событий, Х1): запись состояния пакета их не трогает.
 _INTERACTION_FIELDS = frozenset(("interaction_events", "interaction_events_dropped"))
-REVIEW_EVENTS_NOT_UPGRADED = ("база не обновлена: отметки о просмотре и прослушивании не записываются — не удалось "
-                              "сделать резерв базы перед обновлением. Проверьте место на диске, закройте и снова "
-                              "откройте программу")
+REVIEW_EVENTS_NOT_UPGRADED = ("база не обновлена: показы карточек и проигрывания не записываются, отметки "
+                              "«прослушано» записываются — не удалось сделать резерв базы перед обновлением. "
+                              "Проверьте место на диске, закройте и снова откройте программу")
 _REVIEW_EVENTS_BACKUP_FAILED = set()
 
 

@@ -1077,7 +1077,9 @@ def add_interaction_event(json_path, aid, version, event_type, session, rev=None
             rep = recordings.append_review_event(
                 json_path, event, store if store.get("heard") != heard_before else None)
             if not rep.get("stored"):
-                return {"stored": False, "warning": rep["warning"]}
+                # событие не записано (резерв перед обновлением базы не удался); heard_saved — записаны ли
+                # прослушанные отрезки этого события
+                return {"stored": False, "warning": rep["warning"], "heard_saved": bool(rep.get("heard_saved"))}
             return {"stored": True, "event": event}
         events.append(event)
         if len(events) > MAX_INTERACTION_EVENTS:

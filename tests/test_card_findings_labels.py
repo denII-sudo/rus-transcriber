@@ -223,6 +223,23 @@ class PageLabels(unittest.TestCase):
           if (modeNote.textContent) throw Error("предупреждение повторилось");
         ''')
 
+    def test_events_not_upgraded_warning_shown_once(self):
+        """Х1: база не обновлена — предупреждение программы из ответа события показывается один раз за сессию."""
+        import recordings
+        warning = recordings.REVIEW_EVENTS_NOT_UPGRADED
+        self.run_page(r'''
+          man = {version: "v1"}; let calls = 0;
+          const it = {id: "r1"}, tick = () => new Promise(r => setTimeout(r, 0));
+          api = {event: async () => { calls++; return {stored: true}; }};
+          sendInteraction(it, "audio_play"); await tick();
+          if (modeNote.textContent) throw Error("предупреждение при записанном событии");
+          api = {event: async () => { calls++; return {stored: false, warning: %s, heard_saved: false}; }};
+          sendInteraction(it, "card_visible"); sendInteraction(it, "place_heard"); await tick();
+          if (calls !== 3 || modeNote.textContent !== %s || modeNote.dataset.kind !== "warn") throw Error(modeNote.textContent);
+          note(""); sendInteraction(it, "audio_play"); await tick();
+          if (modeNote.textContent) throw Error("предупреждение повторилось");
+        ''' % (json.dumps(warning, ensure_ascii=False), json.dumps(warning, ensure_ascii=False)))
+
 
 if __name__ == "__main__":
     unittest.main()
