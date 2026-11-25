@@ -69,6 +69,17 @@ def result(inside=False, r2_word="вот", gap_key=True, extra_review=()):
         "review": review}
 
 
+def played_for_listen(jp, aid, row):
+    """Раздел 10: кнопка «Я прослушал…» принимается после прослушивания места. Тесты прежних правил отвечают, как
+    страница после проигрывания всего отрезка места (played); явное played в ответе не трогается."""
+    if row.get("option") is None or "played" in row:
+        return row
+    item = next((i for i in (review_pack.manifest(jp) or {}).get("items") or [] if i["id"] == aid), None)
+    opts = (item or {}).get("options") or []
+    listen = 0 <= row["option"] < len(opts) and (opts[row["option"]].get("decision") or {}).get("listened")
+    return dict(row, played=True) if listen else row
+
+
 def two_replies():
     """Те же слова двумя репликами: «начало» до паузы, остальное — после неё."""
     data = result()
@@ -149,7 +160,7 @@ class Case(unittest.TestCase):
     def save(self, jp, version, aid="r1", **row):
         Case._ts += 1
         answer = {"id": aid, "version": version, "ts": f"2026-11-24T10:{Case._ts // 60:02d}:"
-                  f"{Case._ts % 60:02d}", **row}
+                  f"{Case._ts % 60:02d}", **played_for_listen(jp, aid, row)}
         return review_pack.add_answers(jp, [answer], "local", trusted_actor="human")
 
     def press(self, jp, version, label, aid="r1"):

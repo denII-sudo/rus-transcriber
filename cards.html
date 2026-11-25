@@ -46,6 +46,7 @@ mark{background:var(--mark);color:var(--mark-ink);padding:0 2px;border-radius:2p
 audio{width:100%;height:36px}
 .q{font-weight:600;margin:0}
 .opts{display:grid;gap:6px}
+.opt:disabled{opacity:.55;cursor:not-allowed}
 .opt{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:flex-start;text-align:left;width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);font:inherit;cursor:pointer}
 .opt:hover{border-color:var(--accent)}
 .opt .n{font:500 .85rem var(--f-mono);color:var(--muted);min-width:1.2em}
@@ -139,6 +140,31 @@ audio{width:100%;height:36px}
     });
     }, {threshold: 0.5}) : null;
   const editing = new Set();          // карточки с применённым ответом, которые сейчас меняют
+  // Раздел 10: кнопка «Я прослушал…» доступна, когда весь отрезок места (clip_t1…clip_t2) хотя бы раз проигран:
+  // можно частями, перемотка не в счёт (audio.played). Прослушанное раньше сообщает программа (heard_ids).
+  const HEARD_TOL = 0.2;
+  const LISTEN_FIRST = "Сначала прослушайте место целиком — кнопки прослушивания станут доступны (можно частями, перемотка не в счёт)";
+  const NO_CLIP_LISTEN = "Звук места недоступен — ответьте своим текстом";
+  const playedSpans = {};          // «id#редакция» → слитые проигранные куски клипа в этой сессии страницы
+  const heardHere = new Set();     // «id#редакция»: отрезок места проигран целиком в этой сессии
+  const isListen = (o) => !!(o && o.decision && o.decision.listened);
+  const heardOf = (it) => heardHere.has(`${it.id}#${revOf(it)}`) || (man.heard_ids || []).includes(it.id);
+  const mergeSpans = (spans) => spans.slice().sort((x, y) => x[0] - y[0]).reduce((out, [x, y]) => {
+    const last = out[out.length - 1];
+    if (last && x <= last[1] + HEARD_TOL) last[1] = Math.max(last[1], y); else out.push([x, y]);
+    return out;
+  }, []);
+  const spansCover = (spans, a, b) => mergeSpans(spans).some(([x, y]) => x <= a + HEARD_TOL && y >= b - HEARD_TOL);
+  function trackPlayed(it, au, c) {
+    const key = `${it.id}#${revOf(it)}`, r = au.played, add = [];
+    for (let i = 0; i < r.length; i++) add.push([r.start(i), r.end(i)]);
+    playedSpans[key] = mergeSpans((playedSpans[key] || []).concat(add));
+    if (heardHere.has(key) || !spansCover(playedSpans[key], Number(it.clip_t1), Number(it.clip_t2))) return;
+    heardHere.add(key);
+    sendInteraction(it, "place_heard");     // программа запишет отрезок места из карточки, а не со страницы
+    c.querySelectorAll("button.opt[data-listen]").forEach(b => { b.disabled = false; b.title = ""; });
+    const h = c.querySelector(".listen-hint"); if (h) h.remove();
+  }
   // вид ответа: страница в облаке пишет свободный текст без kind — тогда это свой ответ
   const kindOf = (a) => a.kind || (a.option != null ? "option" : (a.text ? "free" : ""));
   // Состояние ответа считает программа на ноутбуке (answer_states): страница его только показывает.
@@ -174,7 +200,8 @@ audio{width:100%;height:36px}
   // К-13: отвечено — ответ сохранён и не требует действия; эти исходы ждут нового ответа или проверки.
   // В облаке состояния до переноса на ноутбук неизвестны: там отвечено всё, на что есть ответ.
   const NEEDS_ANSWER = ["negative", "hint", "pause_refused", "listen_mismatch", "apply_conflict", "blocked_preflight",
-                        "source_conflict", "not_found", "not_applied", "reverted", "applied_open", "applied_check"];
+                        "source_conflict", "not_found", "not_applied", "reverted", "applied_open", "applied_check",
+                        "not_heard"];
   const needsAnswer = (it) => {
     const a = answers[it.id];
     return !a || (LOCAL && NEEDS_ANSWER.includes(stateOf(it, a)));
@@ -275,6 +302,7 @@ audio{width:100%;height:36px}
                   not_applied: "не применён", pause_refused: "не применён — нужна кнопка паузы",
                   applied_check: "применён — проверьте: ответы ноутбука и облака расходились",
                   listen_mismatch: "не применён — ответ не совпадает со словами",
+                  not_heard: "не применён — место не прослушано целиком",
                   hint: "не применён — см. подсказку", cloud_saved: "сохранён в облаке — не применён",
                   cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте",
                   cloud_revert: "отмена сохранена в облаке — применённый ответ пока на месте"};
@@ -326,7 +354,7 @@ audio{width:100%;height:36px}
       async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json();
         // карточки заменены или дописаны (pack_rev) или пакет пересобран (version): перечитать manifest.json
         if (s.pack_version !== undefined && (s.pack_version !== man.version || (s.pack_rev || 0) !== (man.pack_rev || 0))) await reloadManifest();
-        man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; live = pick(Object.values(s.answers || {})); return merge(); },
+        man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; man.heard_ids = s.heard_ids || []; live = pick(Object.values(s.answers || {})); return merge(); },
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
@@ -544,7 +572,7 @@ audio{width:100%;height:36px}
   const showsAskedText = (it, a) => !!a && (holdsApplied(it, a) || stateOf(it, a) === "reverted");
   const cardCache = new Map();
   const cardSig = (it) => JSON.stringify([man.version, revOf(it), answers[it.id] || null, (man.answer_states || {})[it.id] || null,
-    editing.has(it.id), (man.conflicts || []).some(c => c.id === it.id), !!man.clips_removed, api && api.voiceMode]);
+    editing.has(it.id), (man.conflicts || []).some(c => c.id === it.id), !!man.clips_removed, api && api.voiceMode, heardOf(it)]);
   function cardFor(it) {
     const sig = cardSig(it), hit = cardCache.get(it.id);
     if (hit && hit.sig === sig) return hit.el;
@@ -573,6 +601,7 @@ audio{width:100%;height:36px}
       const au = document.createElement("audio"); au.controls = true; au.preload = "none"; au.src = it.clip;
       au.addEventListener("play", () => sendInteraction(it, "audio_play"));
       au.addEventListener("ended", () => sendInteraction(it, "audio_ended"));
+      ["timeupdate", "pause", "ended"].forEach(t => au.addEventListener(t, () => trackPlayed(it, au, c)));
       c.append(au);
     }
 
@@ -618,17 +647,30 @@ audio{width:100%;height:36px}
     }
 
     const opts = document.createElement("div"); opts.className = "opts";
+    // нет звука места и оно не прослушано раньше — кнопок прослушивания нет (раздел 10)
+    const canHear = !man.clips_removed && !!it.clip, heardNow = heardOf(it);
+    const listenKey = `${it.id}#${revOf(it)}`;
     it.options.forEach((o, k) => {
+      if (isListen(o) && !canHear && !heardNow) return;
       const b = document.createElement("button"); b.className = "opt"; b.type = "button";
         b.setAttribute("aria-pressed", String(!!a && a.option === k && (a.kind === "option" || a.kind === "recommended" || !a.kind)));
       b.innerHTML = `<span class="n"></span><span class="lbl"></span>`;
       b.querySelector(".n").textContent = NUM[k]; b.querySelector(".lbl").textContent = o.label;
       if (it.recommended === k) { const r = document.createElement("span"); r.className = "rec"; r.textContent = "рекомендую"; b.append(r); }
       const preview = document.createElement("small"); preview.textContent = "Изменение: " + optionPreview(o.decision); b.append(preview);
-      b.onclick = () => send(it, {option: k}, state);
+      if (isListen(o)) {
+        b.dataset.listen = "1";
+        if (!heardNow) { b.disabled = true; b.title = LISTEN_FIRST; }
+      }
+      // played — отрезок места проигран целиком здесь: облачный ответ несёт это на ноутбук (10.5)
+      b.onclick = () => send(it, isListen(o) && heardHere.has(listenKey) ? {option: k, played: true} : {option: k}, state);
       opts.append(b);
     });
     c.append(opts);
+    if (!heardNow && it.options.some(isListen)) {
+      const h = document.createElement("p"); h.className = "note listen-hint";
+      h.textContent = canHear ? LISTEN_FIRST : NO_CLIP_LISTEN; c.append(h);
+    }
 
     const row = document.createElement("div"); row.className = "row";
     const mk = (label, fn, pressed) => { const b = document.createElement("button"); b.className = "btn"; b.type = "button"; b.textContent = label; b.onclick = fn; if (pressed) b.setAttribute("aria-pressed", "true"); row.append(b); return b; };

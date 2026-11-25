@@ -31,7 +31,7 @@ class Base(six.Case):
         """Ответ со страницы в облаке: перенесён import_answers (источник cloud, автор не подтверждён)."""
         six.Case._ts += 1
         answer = {"id": aid, "version": version, "ts": f"2026-11-24T10:{six.Case._ts // 60:02d}:"
-                  f"{six.Case._ts % 60:02d}", **row}
+                  f"{six.Case._ts % 60:02d}", **six.played_for_listen(jp, aid, row)}
         rep = review_pack.add_answers(jp, [answer], "cloud")
         # ответ облака применяется после отдельного подтверждения человека — как confirm_review_answers
         with recordings.operation_for_document(jp, "human"):

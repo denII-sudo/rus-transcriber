@@ -49,11 +49,15 @@ def merge_answer_draft(data, state):
     for field in ("answers", "conflicts", "rejected"):
         result[field] = copy.deepcopy(state.get(field) or ({} if field == "answers" else []))
     undo = copy.deepcopy(result.get("undo") or {})
+    # прослушанные отрезки записи (раздел 10): состояние без поля прежние не снимает
+    heard = state.get("heard") if state.get("heard") is not None else (undo.get("review_pack") or {}).get("heard")
     undo["review_pack"] = {field: copy.deepcopy(state.get(field)) for field in (
         "manifest", "applied_answers", "applied_at", "undo_snapshots",
         "application_events", "application_events_dropped")}
     if state.get("outcome_details"):          # уточнения последнего «Применить» к ответам (К-22)
         undo["review_pack"]["outcome_details"] = copy.deepcopy(state["outcome_details"])
+    if heard is not None:
+        undo["review_pack"]["heard"] = copy.deepcopy(heard)
     result["undo"] = undo
     result["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
     result["interaction_events_evicted"] = state.get("interaction_events_dropped", 0)
@@ -249,6 +253,9 @@ def read_review_pack_state(document_path):
         applications = review.get("applications") or []
         # уточнения последнего «Применить» к ответам (К-22) — только если есть: прежние записи без поля не меняются
         details = {"outcome_details": copy.deepcopy(pack["outcome_details"])} if pack.get("outcome_details") else {}
+        # прослушанные отрезки записи (раздел 10) — только если есть: без поля действует переход 10.6
+        if pack.get("heard") is not None:
+            details["heard"] = copy.deepcopy(pack["heard"])
         return {
             **details,
             "_expected_versions": {"source_revision": current["transcript"]["revision"],
@@ -306,6 +313,7 @@ def write_review_pack_state(document_path, state):
             "interaction_events_dropped": review.get("interaction_events_evicted", 0),
             "outcome_details": copy.deepcopy((review.get("undo") or {}).get(
                 "review_pack", {}).get("outcome_details")) or None,
+            "heard": copy.deepcopy((review.get("undo") or {}).get("review_pack", {}).get("heard")),
         }
         review["question_version"] = state.get("version")
         if "manifest" in state:
@@ -327,6 +335,8 @@ def write_review_pack_state(document_path, state):
             pack["outcome_details"] = copy.deepcopy(state["outcome_details"])
         else:
             pack.pop("outcome_details", None)
+        if state.get("heard") is not None:         # состояние без поля прослушанное не снимает
+            pack["heard"] = copy.deepcopy(state["heard"])
         undo["review_pack"] = pack
         review["undo"] = undo
         review["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
@@ -339,7 +349,7 @@ def write_review_pack_state(document_path, state):
             review["applications"] = copy.deepcopy(state["application_events"])
         # уточнения к ответам (К-22) документ не меняют: как события, пишутся без пересборки документа
         event_fields = {"interaction_events", "interaction_events_dropped",
-                         "application_events", "application_events_dropped", "outcome_details"}
+                         "application_events", "application_events_dropped", "outcome_details", "heard"}
         changed = {key for key in (set(previous_state) | set(state)) - {"_expected_versions"}
                    if previous_state.get(key) != state.get(key)}
         context = current_operation_context(store)

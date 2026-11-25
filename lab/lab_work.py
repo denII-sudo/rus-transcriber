@@ -30,6 +30,8 @@ OUTCOME_ROW = {
     "apply_conflict": "not_applied", "blocked_preflight": "not_applied", "source_conflict": "not_applied",
     "not_found": "not_applied", "not_applied": "not_applied", "pause_refused": "not_applied", "hint": "not_applied",
     "listen_mismatch": "not_applied",
+    # раздел 10: кнопка прослушивания, а место не прослушано целиком — ответ не применён
+    "not_heard": "not_applied",
     # К-23: применён, но на место был другой ответ и человек его ещё не проверил — в основной счёт не идёт
     "applied_check": "applied_unchecked",
 }

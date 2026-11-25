@@ -1560,6 +1560,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     for aid in stored:
         if aid in rep.get("source_conflict_ids", []):
             outcomes[aid] = "source_conflict"
+        elif aid in rep.get("not_heard", []):
+            # раздел 10: кнопка «Я прослушал…», а весь отрезок места ни разу не проигран — ответ не применён
+            outcomes[aid] = "not_heard"
         elif aid in outcomes:
             continue
         elif aid in rep.get("unchanged", []):

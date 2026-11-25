@@ -251,7 +251,8 @@ class ReplaceTests(Case):
         with files("sqlite", data, [question("r1", "вон"), question("r2", "дальнейшем")]) as (jp, md, version):
             self.save(jp, version, "r1", option=1)
             core.apply_answers_files(jp, md)                  # ревизия стенограммы выросла
-            self.save(jp, version, "r2", option=0)            # «Я прослушал: слова в стенограмме верны»
+            # «Я прослушал: слова в стенограмме верны»; played — место прослушано на странице (раздел 10)
+            self.save(jp, version, "r2", option=0, played=True)
 
             def card_revision(revision):
                 state = review_pack.answers_state(jp)

@@ -89,6 +89,10 @@ class ReviewHTTP(unittest.TestCase):
                 self.assertEqual(self.request(name)[0], 200)
                 self.assertEqual(self.request("/" + name, absolute=True)[0], 403)
 
+    def test_answers_name_heard_places(self):
+        """Раздел 10: ответ api/answers называет места, уже прослушанные целиком (heard_ids), — список."""
+        self.assertIsInstance(json.loads(self.request("api/answers")[1])["heard_ids"], list)
+
     def test_host_origin_token_and_content_type(self):
         payload = json.dumps({"id": "r1", "version": "v1", "option": 0}).encode()
         origin = f"http://127.0.0.1:{self.url.port}"

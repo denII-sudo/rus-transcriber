@@ -43,6 +43,7 @@ PAD_AFTER = 1.5
 SR = 16000
 HERE = Path(__file__).resolve().parent
 MAX_INTERACTION_EVENTS = 2000
+HEARD_TOLERANCE = 0.2   # с: допуск покрытия отрезка места прослушанными кусками (раздел 10)
 
 # Исход каждого сохранённого ответа после «Применить» — он же состояние, которое видит человек на странице.
 # Один словарь для отчёта применения, журнала и страницы карточек.
@@ -78,6 +79,9 @@ OUTCOME_REASONS = {
     # К-3/К-4: кнопка прослушивания противоречит словам стенограммы в интервале
     "listen_mismatch": ("не применён: выбранный ответ прослушивания не совпадает со словами стенограммы "
                         "в интервале — исправьте слова или выберите другой ответ"),
+    # раздел 10: кнопка «Я прослушал…» — только после того, как весь отрезок места хотя бы раз проигран
+    "not_heard": ("не применён: место не прослушано целиком — проиграйте отрезок места до конца (можно частями, "
+                  "перемотка не в счёт) и выберите кнопку прослушивания снова"),
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
@@ -105,7 +109,8 @@ REBUILD_GROUPS = {
     "applied": frozenset({"applied", "applied_open", "kept_previous", "applied_check"}),
     "finished": frozenset({"reverted", "skipped", "already_decided", "left_for_human"}),
     "unapplicable": frozenset({"negative", "hint", "pause_refused", "blocked_preflight", "apply_conflict",
-                               "source_conflict", "not_found", "not_applied", "undo_conflict", "listen_mismatch"}),
+                               "source_conflict", "not_found", "not_applied", "undo_conflict", "listen_mismatch",
+                               "not_heard"}),
 }
 # что сделать человеку с ждущим ответом, чтобы пересборка стала возможной
 REBUILD_EXIT = {
@@ -579,6 +584,7 @@ def _build_pack(json_path, items, T, data, sqlite_mode, src, review, pd, clips_d
             if f.name not in keep:
                 f.unlink()
     man = {"version": version, "pack_rev": 0, "job_json": str(json_path), "audio": src.name,
+           "audio_sha256": data.get("audio_sha256"),
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(),
            "clips_dir": clips_dir.relative_to(pd).as_posix(), "items": out}
@@ -603,7 +609,9 @@ def _build_write(json_path, data, sqlite_mode, pd, clips_dir, out, skipped, vers
                 (ans.get("answers") or ans.get("interaction_events") or ans.get("application_events"))):
             _write(pd / f"answers.{ans.get('version', 'old')}.json", ans)
         expected_versions = ans.get("_expected_versions")
-        ans = {"version": version, "answers": {}, "conflicts": [], "rejected": []}
+        # прослушанные отрезки — факт о звуке записи, не о вопросах: переходят в новый пакет (раздел 10)
+        heard = _heard_carried(ans, man)
+        ans = {"version": version, "answers": {}, "conflicts": [], "rejected": [], "heard": heard}
         if expected_versions is not None:
             ans["_expected_versions"] = expected_versions
     ans["version"] = version
@@ -1029,7 +1037,7 @@ def _write_answers(json_path, state):
 
 def add_interaction_event(json_path, aid, version, event_type, session, rev=None):
     """Сохраняет локальный факт показа карточки или действия с её клипом (rev — редакция карточки на странице)."""
-    allowed = {"card_visible", "card_rendered", "audio_play", "audio_ended"}
+    allowed = {"card_visible", "card_rendered", "audio_play", "audio_ended", "place_heard"}
     if event_type not in allowed:
         raise ValueError("неизвестное событие карточки")
     if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", session):
@@ -1046,6 +1054,12 @@ def add_interaction_event(json_path, aid, version, event_type, session, rev=None
         raise ValueError(stale)
     with _answers_lock(json_path):
         store = _read_answers(json_path, {"version": man["version"], "answers": {}})
+        # первое событие после обновления переносит прежние audio_ended в heard (10.6): дальше доигрывание
+        # клипа до конца (с перемоткой) прослушиванием не считается
+        _heard_store(store, man)
+        if event_type == "place_heard":
+            # отрезок берётся из карточки (manifest), не со страницы: страница только сообщает, что он проигран
+            _note_heard(store, man, item)
         events = store.setdefault("interaction_events", [])
         if event_type == "card_visible" and any(
                 row.get("id") == aid and row.get("version") == version and row.get("rev", 1) == card_rev(item) and
@@ -1062,6 +1076,78 @@ def add_interaction_event(json_path, aid, version, event_type, session, rev=None
             store["interaction_events_dropped"] = store.get("interaction_events_dropped", 0) + removed
         _write_answers(json_path, store)
     return {"stored": True, "event": event}
+
+
+# ---------- прослушанные отрезки записи (раздел 10) ----------
+# heard = {audio_sha256 записи или "": [[s, e], …]} — слитые отрезки исходной записи (секунды), проигранные
+# человеком хотя бы раз. Хранится в состоянии пакета, переживает пересборку и замену карточек; другой звук
+# (другой audio_sha256) не засчитывается.
+def _audio_key(man):
+    return (man or {}).get("audio_sha256") or ""
+
+
+def _merge_spans(spans, tol=0.0):
+    out = []
+    for s, e in sorted((float(s), float(e)) for s, e in spans if float(e) >= float(s)):
+        if out and s <= out[-1][1] + tol:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _legacy_heard(store, man):
+    """10.6: до раздела 10 прослушивание отмечалось событием audio_ended текущего пакета — оно засчитывает место
+    карточки (её отрезок лежит внутри клипа)."""
+    items = {it.get("id"): it for it in (man or {}).get("items") or []}
+    spans = []
+    for e in store.get("interaction_events") or []:
+        it = items.get(e.get("id"))
+        if it and "t1" in it and e.get("type") == "audio_ended" and e.get("version") == man.get("version") \
+                and e.get("rev", 1) == card_rev(it):
+            spans.append([it["t1"], it["t2"]])
+    return spans
+
+
+def _heard_store(store, man):
+    """heard состояния; при первом обращении — из прежних audio_ended (10.6), один раз."""
+    if not isinstance(store.get("heard"), dict):
+        store["heard"] = {_audio_key(man): _merge_spans(_legacy_heard(store, man))}
+    return store["heard"]
+
+
+def _note_heard(store, man, it):
+    heard = _heard_store(store, man)
+    key = _audio_key(man)
+    heard[key] = [[round(s, 2), round(e, 2)] for s, e in
+                  _merge_spans((heard.get(key) or []) + [[it["t1"], it["t2"]]])]
+
+
+def _heard_carried(old_store, new_man):
+    """heard для пересобранного пакета: прежнее, с переходом 10.6 по прежнему пакету. Пакет до раздела 10 не
+    знал отпечатка звука (ключ ""): это та же запись, поэтому его отрезки переходят под отпечаток нового пакета."""
+    old_man = old_store.get("manifest") or {}
+    heard = {k: copy.deepcopy(v) for k, v in _heard_store(dict(old_store), old_man).items() if v}
+    key = _audio_key(new_man)
+    if key and "audio_sha256" not in old_man and heard.get(""):
+        heard[key] = _merge_spans((heard.get(key) or []) + heard.pop(""))
+    heard.setdefault(key, [])
+    return heard
+
+
+def place_heard(store, man, it):
+    """Весь отрезок места карточки [t1, t2] покрыт прослушанными отрезками той же записи (допуск HEARD_TOLERANCE).
+    Без heard в состоянии (пакет до раздела 10, событий после обновления не было) — по audio_ended (10.6)."""
+    heard = store.get("heard")
+    spans = (heard.get(_audio_key(man)) or []) if isinstance(heard, dict) else _legacy_heard(store, man)
+    t1, t2 = float(it["t1"]), float(it["t2"])
+    return any(s <= t1 + HEARD_TOLERANCE and e >= t2 - HEARD_TOLERANCE
+               for s, e in _merge_spans(spans, HEARD_TOLERANCE))
+
+
+def heard_ids(store, man):
+    """Карточки пакета, место которых уже прослушано: страница сразу открывает их кнопки прослушивания."""
+    return [it["id"] for it in (man or {}).get("items") or [] if "t1" in it and place_heard(store, man, it)]
 
 
 # ---------- сопоставление голосового/текстового ответа с вариантами ----------
@@ -1187,6 +1273,9 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
             rep["rejected"].append(rej)
             store.setdefault("rejected", []).append({**rej, "source": source, "ts": a.get("ts") or _now()})
             continue
+        if a.get("played") is True:
+            # страница (ноутбук или облако) проиграла весь отрезок места: ему доверяем, как самому ответу (10.5)
+            _note_heard(store, man, it)
         ans = {"id": aid, "version": a["version"], "source": source, "ts": a.get("ts") or _now()}
         if card_rev(it) != 1:
             ans["rev"] = card_rev(it)        # ответ без rev — к первой редакции (answer_is_current)
@@ -1419,6 +1508,10 @@ def decisions(json_path):
             elif d.get("listened") and card_source_revision(it, man) != data.get("source_revision"):
                 rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
                 rep["source_conflict_ids"].append(aid)
+                continue
+            if d.get("listened") and not place_heard(store, man, it):
+                # раздел 10: «Я прослушал» принимается, только если весь отрезок места хотя бы раз проигран
+                rep.setdefault("not_heard", []).append(aid)
                 continue
             if "word_ids" in it and not T.is_gap_place(it):     # у пропуска старый пакет нёс ID соседа
                 d["word_ids"] = it["word_ids"]
@@ -1696,8 +1789,10 @@ def cloud_bundle(json_path, artifact_url=None):
                answer_states=answer_states_of(store, man, outcome_details=False),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
-               clips_removed=not have, artifact_url=meta.get("artifact_url"))
+               clips_removed=not have, artifact_url=meta.get("artifact_url"),
+               heard_ids=heard_ids(store, man))
     out.pop("job_json", None)                        # пути ноутбука в облако не нужны
+    out.pop("audio_sha256", None)                    # отпечаток звука нужен только ноутбуку
     cd = pd / "cloud"
     cd.mkdir(exist_ok=True)
     _write(cd / "manifest.json", out)
