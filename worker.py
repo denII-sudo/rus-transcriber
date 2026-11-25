@@ -442,10 +442,6 @@ def apply_gender(segments, seg_embs, refs, label_of, genders_by_name, fixes, rev
                                      f"вероятно, ошибка окончания или чужая речь"})
 
 
-class _SkipSegmentSteps(Exception):
-    """Пословной обработке шаги разрезания и перепроверки сегментов не нужны."""
-
-
 def link_missed_diagnostics(items, trace):
     """Связать review-предупреждения с точными кандидатами трассы по округлённым границам."""
     warning_ids = {}
@@ -1680,12 +1676,24 @@ def main():
         label_name, label_of, refs, emb, t_voice = {}, {}, {}, None, 0.0
         voice_ctx = {}
         pipeline = cfg.get("pipeline", "words")
+        if pipeline == "words":
+            # пословной обработке отпечатки нужны всегда (опорные голоса, голос каждого слова): сбой создания
+            # модели — ошибка задачи, а не «голоса отключены»; создаём один раз, до блока голосов
+            import voices
+            emb = voices.Embedder(pipe)
         if not a.no_voices and cfg.get("voices", True):
             tv = time.time()
+            # Блок голосов — всё или ничего: результат собирается во временных переменных (рабочие копии реплик,
+            # свои словари меток) и применяется одним шагом в конце, где только присваивания. Сбой на любом шаге
+            # оставляет состояние «без голосов»: метки pyannote, имён нет, отчёта о сопоставлении нет, и пишет
+            # quality["voices_error"]. На диске профиль и настройки группы меняет prepare_group_voice_profile
+            # (автопополнение из прежних записей, под блокировкой группы, файл заменяется целиком): это не зависит
+            # от шагов ниже, поэтому его результат (learned_from) записывается сразу, а не вместе с отчётом.
             try:
                 import voices
                 st.set(stage="голоса: профили участников", progress=30)
-                emb = voices.Embedder(pipe)
+                if emb is None:        # прежний режим segments: без отпечатков он идёт дальше без голосов
+                    emb = voices.Embedder(pipe)
                 if no_profile:
                     group, ppath, learned = None, None, 0
                     prof = voices.empty_profile()     # пустой, не сохраняется
@@ -1694,63 +1702,68 @@ def main():
                 else:
                     group = vgroup or "default"
                     ppath, prof, learned = prepare_group_voice_profile(group, src, emb, all_names, quality)
+                quality["learned_from"] = learned     # уже записанное на диск: фиксируем, даже если ниже будет сбой
                 st.set(stage="голоса: проверка реплик", progress=33)
-                embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
+                work = [dict(t) for t in turns]       # рабочие копии: turns меняются только при применении
+                embs = emb.spans(audio, [(t["s"], t["e"]) for t in work])
                 if cfg.get("voices_debug"):   # отпечатки реплик для подбора порогов (биометрия: только локально)
                     dbg = paths.JOBS / f"{stem}.voices_debug.json"
                     dbg.write_text(json.dumps({"turns": [{**t, "vec": None if v is None else [round(float(x), 4) for x in v]}
-                                                         for t, v in zip(turns, embs)]}, ensure_ascii=False), encoding="utf-8")
-                cents = voices.centroids(turns, embs)
+                                                         for t, v in zip(work, embs)]}, ensure_ascii=False), encoding="utf-8")
+                cents = voices.centroids(work, embs)
                 pvecs = voices.voice_vectors(prof, exclude_audio=src)
                 mapping = voices.match(cents, pvecs, allowed or None)
-                refs, label_of = voices.references(cents, turns, mapping)
+                new_refs, new_label_of = voices.references(cents, work, mapping)
                 # кластеры одного человека сводим к одной метке
-                for t in turns:
+                for t in work:
                     nm = mapping.get(t["label"], (None,))[0]
-                    if nm and label_of.get(nm) != t["label"]:
-                        t["label"] = label_of[nm]
-                label_name = {lbl: nm for nm, lbl in label_of.items()}
-                voice_ctx.update(pvecs=pvecs, cents=cents, mapping=mapping,
-                                 confusions=voices.confusions(prof, exclude_audio=src))
+                    if nm and new_label_of.get(nm) != t["label"]:
+                        t["label"] = new_label_of[nm]
+                new_label_name = {lbl: nm for nm, lbl in new_label_of.items()}
+                new_ctx = dict(pvecs=pvecs, cents=cents, mapping=mapping,
+                               confusions=voices.confusions(prof, exclude_audio=src))
+                report = {}
                 # голоса записи почти не похожи на группу — возможно, это другая группа с тем же словарём
                 dur = {}
-                for tt in turns:
+                for tt in work:
                     dur[tt["label"]] = dur.get(tt["label"], 0) + tt["e"] - tt["s"]
                 tot = sum(dur.values()) or 1.0
                 share = sum(d for l, d in dur.items() if l in mapping) / tot
                 if len(pvecs) >= 2 and share < 0.5:
-                    quality["group_doubt"] = {
+                    report["group_doubt"] = {
                         "group": group, "matched_share": round(share, 2),
                         "note": f"голоса записи почти не совпадают с профилями группы «{group}» (узнано "
                                 f"{share:.0%} речи) — возможно, другая группа: нужен её словарь с другим group"}
-                quality.update(voice_profile=ppath.name if ppath else None, profile_names=sorted(pvecs), learned_from=learned,
-                               match={lbl: {"name": nm, "sim": sim} for lbl, (nm, sim) in mapping.items()},
-                               unmatched=[l for l in cents if l not in mapping],
-                               cluster_sims={l: {n: round(float(cents[l] @ v), 3) for n, v in pvecs.items()}
-                                             for l in cents})
-                if pipeline == "words":
-                    raise _SkipSegmentSteps
-                turns = voices.scan_split(audio, turns, refs, label_name, label_of, emb, quality["speaker_fixes"])
-                embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
-                debug = []
-                used = {t["label"] for t in turns}
+                report.update(voice_profile=ppath.name if ppath else None, profile_names=sorted(pvecs),
+                             match={lbl: {"name": nm, "sim": sim} for lbl, (nm, sim) in mapping.items()},
+                             unmatched=[l for l in cents if l not in mapping],
+                             cluster_sims={l: {n: round(float(cents[l] @ v), 3) for n, v in pvecs.items()}
+                                           for l in cents})
+                new_fixes = []
+                if pipeline != "words":
+                    work = voices.scan_split(audio, work, new_refs, new_label_name, new_label_of, emb, new_fixes)
+                    embs = emb.spans(audio, [(t["s"], t["e"]) for t in work])
+                    debug = []
+                    used = {t["label"] for t in work}
 
-                def new_label(name):
-                    k = 1
-                    while f"Спикер {k}" in used:
-                        k += 1
-                    lbl = f"Спикер {k}"
-                    used.add(lbl)
-                    label_of[name], label_name[lbl] = lbl, name
-                    refs.setdefault(name, pvecs[name])
-                    return lbl
+                    def new_label(name):
+                        k = 1
+                        while f"Спикер {k}" in used:
+                            k += 1
+                        lbl = f"Спикер {k}"
+                        used.add(lbl)
+                        new_label_of[name], new_label_name[lbl] = lbl, name
+                        new_refs.setdefault(name, pvecs[name])
+                        return lbl
 
-                pv = {n: v for n, v in pvecs.items() if not allowed or n in allowed}
-                turns = voices.reassign(turns, embs, pv, label_name, label_of, quality["speaker_fixes"], debug,
-                                        new_label=new_label)
-                quality["debug_sims"] = debug
-            except _SkipSegmentSteps:
-                pass
+                    pv = {n: v for n, v in pvecs.items() if not allowed or n in allowed}
+                    work = voices.reassign(work, embs, pv, new_label_name, new_label_of, new_fixes, debug,
+                                           new_label=new_label)
+                    report["debug_sims"] = debug
+                # применение одним шагом: только присваивания и обновление словарей, сбоя здесь быть не может
+                turns, label_name, label_of, refs, voice_ctx = work, new_label_name, new_label_of, new_refs, new_ctx
+                quality["speaker_fixes"].extend(new_fixes)
+                quality.update(report)
             except Exception as ex:
                 quality["voices_error"] = f"{type(ex).__name__}: {ex}"[:300]
                 print(f"[voices] проверка голосов отключена: {ex}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
@@ -1758,9 +1771,6 @@ def main():
         turns = [t for t in turns if t["e"] - t["s"] >= MIN_SEG]
 
         if pipeline == "words":
-            if emb is None:
-                import voices
-                emb = voices.Embedder(pipe)
             data = run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of,
                              voice_ctx, allowed, genders_by_name, vocab, quality, make_asr, a)
             timing = {"total_sec": round(time.time() - t0), "diarization_sec": round(t_diar),

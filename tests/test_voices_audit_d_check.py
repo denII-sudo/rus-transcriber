@@ -2,7 +2,8 @@
 
 Д4 — блок голосов в worker.main перехватывает любое исключение и продолжает с quality["voices_error"]:
 сбой искусственно вносится в каждую точку блока, смотрим, остаётся ли состояние согласованным и видит
-ли человек предупреждение (статус, стенограмма, чтение записи). Д2 — одно имя на несколько кластеров:
+ли человек предупреждение (статус, стенограмма, чтение записи). Исправлено в PR «Д4, пункты 1–4»: блок
+применяется одним шагом, предупреждение — в шапке стенограммы и в read_transcript, профиль проверяет confusions. Д2 — одно имя на несколько кластеров:
 метки сливаются; видит ли человек слияние. Д5 — автор реплики переназначается по роду глагола и сходству
 голоса: на чём основано и помечается ли сомнением.
 
@@ -48,15 +49,18 @@ RAW = [(0.0, 20.0, "S0"), (20.0, 30.0, "S1"), (30.0, 50.0, "S2"), (50.0, 60.0, "
 CLUSTER_VEC = {"S0": VEC["Анна"], "S1": SIMILAR, "S2": VEC["Борис"]}
 BEFORE_LABELS = ["Спикер 1", "Спикер 2", "Спикер 3", "Спикер 1"]   # метки pyannote по порядку появления
 FAIL = "синтетический сбой"
+WARNING = "проверка голосов не выполнена или выполнена не полностью"   # шапка Markdown (transcript.render_md)
 
 
 class FakeEmbedder:
     """Вместо модели отпечатков: вектор реплики определяется её кластером в RAW."""
     seconds = 0.0
     fail_on_spans = False
+    created = 0          # сколько раз создавали (проверка «Embedder создаётся один раз»)
+    failed_calls = 0     # сколько раз пытались создать при искусственном сбое создания
 
     def __init__(self, _pipe):
-        pass
+        FakeEmbedder.created += 1
 
     def spans(self, audio, spans, **_kwargs):
         if FakeEmbedder.fail_on_spans:
@@ -93,8 +97,10 @@ class Run:
     """Результат одного прогона worker.main: состояние, переданное пословной обработке, статус и стенограмма."""
 
 
-def run_main(fault=None):
+def run_main(fault=None, pipeline="words", probe=None):
     """worker.main на синтетике. fault — точка искусственного сбоя в блоке голосов (None — без сбоя).
+    pipeline="segments" — прежняя обработка: после блока голосов вызывается подменённый backends.make_asr,
+    который кладёт quality из кадра main в probe и завершает задачу ошибкой (остальное в этом режиме не нужно).
     Песочница — новая на каждый прогон: свои папки данных, TEMP и TMP; убирается после прогона."""
     root = Path(tempfile.mkdtemp(prefix="rt-voices-d-"))
     out = Run()
@@ -131,6 +137,8 @@ def run_main(fault=None):
 
         def failing(_name):
             def inner(*_a, **_k):
+                if _name == "embedder":
+                    FakeEmbedder.failed_calls += 1
                 raise RuntimeError(FAIL)
             return inner
 
@@ -142,13 +150,13 @@ def run_main(fault=None):
                                          "TMP": str(root / "tmp")}),
             mock.patch.object(worker, "wait_slot"),
             mock.patch.object(worker.tmpfiles, "sweep_stale"),
-            mock.patch.object(worker, "load_config", return_value={"pipeline": "words", "voices": True}),
+            mock.patch.object(worker, "load_config", return_value={"pipeline": pipeline, "voices": True}),
             mock.patch.object(worker, "resolve_vocab_details", return_value={
                 "path": None, "vocab": {"participants": [{"name": "Анна"}, {"name": "Борис"}]},
                 "group": None, "report": {}}),
             mock.patch.object(worker, "load_audio", return_value=np.zeros(60 * SR, dtype=np.float32)),
             mock.patch.object(worker, "diarize", return_value=(list(RAW), {}, None, None)),
-            mock.patch.object(worker, "prepare_group_voice_profile", return_value=(ppath, prof, [])),
+            mock.patch.object(worker, "prepare_group_voice_profile", return_value=(ppath, prof, ["earlier.wav"])),
             mock.patch.object(worker, "run_words", fake_run_words),
             mock.patch.object(voices, "Embedder", failing("embedder") if fault == "embedder" else FakeEmbedder),
         ]
@@ -156,6 +164,20 @@ def run_main(fault=None):
             patches.append(mock.patch.object(worker, "prepare_group_voice_profile", failing("profile")))
         if fault in ("centroids", "voice_vectors", "match", "references"):
             patches.append(mock.patch.object(voices, fault, failing(fault)))
+        if fault == "reassign":     # прежний режим: reassign дописывает поправку и падает на следующей реплике
+            def reassign_then_fail(turns, embs, pvecs, name_of, label_of, fixes, debug=None, new_label=None):
+                fixes.append({"t": 0.0, "kind": "voice", "from": "Борис", "to": "Анна", "sim": [0.5, 0.6]})
+                raise RuntimeError(FAIL)
+            patches.append(mock.patch.object(voices, "reassign", reassign_then_fail))
+        if pipeline == "segments":
+            def probe_asr(_cfg):
+                frame = sys._getframe(1).f_locals
+                probe.update(quality=frame["quality"], turns=[dict(t) for t in frame["turns"]],
+                             label_name=dict(frame["label_name"]), label_of=dict(frame["label_of"]),
+                             voice_ctx=dict(frame["voice_ctx"]))
+                raise RuntimeError("пробный выход после блока голосов")
+            import backends
+            patches.append(mock.patch.object(backends, "make_asr", probe_asr))
         FakeEmbedder.fail_on_spans = fault == "spans"
         for p in patches:
             p.start()
@@ -204,7 +226,7 @@ def is_complete(cap):
 
 
 class FaultTests(unittest.TestCase):
-    """Д4: искусственный сбой в каждой точке блока voices в worker.main (worker.py:1683–1757)."""
+    """Д4: искусственный сбой в каждой точке блока voices в worker.main."""
 
     def run_fault(self, fault):
         out = run_main(fault)
@@ -217,46 +239,65 @@ class FaultTests(unittest.TestCase):
         self.assertTrue(is_complete(out.captured), out.captured)
         self.assertEqual(out.captured["label_name"], {"Спикер 1": "Анна", "Спикер 3": "Борис"})
         self.assertIsNone(out.status["quality"]["voices_error"])
+        self.assertEqual(out.captured["quality"]["learned_from"], ["earlier.wav"])
+        self.assertNotIn(WARNING, out.md)                   # без сбоя предупреждения в шапке нет
+        self.assertNotIn("voices_error", out.read_json)
 
-    def test_faults_before_any_state_change_leave_state_untouched_and_run_continues(self):
-        # точки, где ещё ничего не изменено: эти сбои не оставляют полусостояния (подтверждено прогоном)
-        for fault in ("profile", "spans", "centroids", "voice_vectors", "match", "references"):
+    def test_fault_at_any_step_leaves_the_state_as_without_voices_and_run_continues(self):
+        """Д4 исправлено: блок голосов применяется одним шагом. Сбой в любой точке, в том числе поздней
+        (confusions — после слияния кластеров, отчёт о сопоставлении — после сбора имён), оставляет
+        метки pyannote, пустые имена и связи и пишет voices_error; прежде эти две точки оставляли
+        половину: слитые метки и имена без сопоставления с профилем."""
+        for fault in ("profile", "spans", "centroids", "voice_vectors", "match", "references",
+                      "confusions", "report"):
             with self.subTest(fault=fault):
                 out = self.run_fault(fault)
                 self.assertEqual(out.status["state"], "done", out.status)    # работа продолжается
-                self.assertIn(FAIL, out.captured["quality"]["voices_error"])
+                self.assertTrue(out.captured["quality"]["voices_error"])
                 self.assertTrue(is_unchanged(out.captured), out.captured)
+                for key in ("match", "unmatched", "cluster_sims", "profile_names", "voice_profile", "group_doubt"):
+                    self.assertNotIn(key, out.captured["quality"])
+                self.assertNotIn("names_source", out.data)             # имён «по голосам» в стенограмме нет
 
-    def test_embedder_fault_is_recorded_but_then_stops_the_whole_job(self):
-        """Д4, подтверждено прогоном: если не создаётся Embedder, блок голосов записывает voices_error, но
-        пословная обработка создаёт Embedder заново вне try (worker.py:1760–1763) и задача завершается
-        ошибкой, а не «продолжается без голосов». Сбой виден (state=error), а не тих."""
+    def test_disk_effect_of_profile_learning_is_recorded_even_when_a_later_step_fails(self):
+        """prepare_group_voice_profile уже изменил профиль на диске (автопополнение из прежних записей, файл
+        заменяется целиком под блокировкой группы) — результат фиксируется сразу, до шагов, которые могут упасть."""
+        for fault in ("spans", "confusions", "report"):
+            with self.subTest(fault=fault):
+                out = self.run_fault(fault)
+                self.assertEqual(out.captured["quality"]["learned_from"], ["earlier.wav"])
+
+    def test_embedder_fault_is_the_job_error_and_embedder_is_created_once(self):
+        """Embedder нужен пословной обработке всегда (опорные голоса, голос каждого слова): сбой создания —
+        ошибка задачи с причиной, а не «голоса отключены»; повторного создания вне блока голосов больше нет."""
+        FakeEmbedder.failed_calls = 0
         out = self.run_fault("embedder")
+        self.assertEqual(FakeEmbedder.failed_calls, 1)       # прежде: один раз в блоке голосов и снова после него
         self.assertEqual(out.status["state"], "error", out.status)
         self.assertEqual(out.exit_code, 1)
         self.assertIn(FAIL, out.status["error"])
+        self.assertNotIn("voices_error", (out.status.get("quality") or {}))
+        FakeEmbedder.created = 0
+        run_main(None).cleanup()
+        self.assertEqual(FakeEmbedder.created, 1)
 
-    @unittest.expectedFailure
-    def test_fault_after_labels_merged_leaves_a_half_applied_state(self):
-        """Д4 (подтверждено прогоном): подпорченная запись confusions в профиле — профиль её принимает
-        (voices.validate_profile не проверяет confusions), а voices.confusions падает на разборе ключа
-        уже ПОСЛЕ слияния кластеров и записи label_name/label_of (worker.py:1708–1714). Дальше идёт
-        пословная обработка с именами, но без связи кластеров с профилями (voice_ctx пуст), без
-        quality.match; метки в turns уже слиты. Ожидание: либо ничего не применено, либо всё."""
-        out = self.run_fault("confusions")
-        self.assertEqual(out.status["state"], "done", out.status)
-        self.assertIn("voices_error", out.captured["quality"])
-        self.assertTrue(is_unchanged(out.captured) or is_complete(out.captured), out.captured)
+    def test_segments_pipeline_failure_after_fixes_discards_them_with_the_rest(self):
+        """Прежний pipeline="segments": voices.reassign дописал поправку и упал — в quality.speaker_fixes
+        поправок нет (прежде оставалось «исправление», которого в тексте нет), состояние «без голосов»."""
+        probe = {}
+        out = run_main("reassign", pipeline="segments", probe=probe)
+        self.addCleanup(out.cleanup)
+        self.assertEqual(probe["quality"]["speaker_fixes"], [])
+        self.assertIn(FAIL, probe["quality"]["voices_error"])
+        self.assertTrue(is_unchanged(probe), probe)
 
-    @unittest.expectedFailure
-    def test_fault_in_quality_report_leaves_names_without_match_record(self):
-        """Д4 (подтверждено прогоном): сбой при составлении отчёта о сопоставлении (worker.py:1726–1730,
-        здесь — искусственный, путь профиля не Path) оставляет применённые имена и слитые метки, а
-        quality.match/profile_names/unmatched/cluster_sims не записаны: имена «по голосовым профилям»
-        есть, а доказательств, какой кластер кому сопоставлен, в стенограмме нет."""
-        out = self.run_fault("report")
-        self.assertEqual(out.status["state"], "done", out.status)
-        self.assertTrue(is_unchanged(out.captured) or is_complete(out.captured), out.captured)
+    def test_segments_pipeline_without_fault_applies_split_and_reassign_results(self):
+        probe = {}
+        out = run_main(None, pipeline="segments", probe=probe)
+        self.addCleanup(out.cleanup)
+        self.assertNotIn("voices_error", probe["quality"])
+        self.assertEqual(probe["label_name"], {"Спикер 1": "Анна", "Спикер 3": "Борис"})
+        self.assertIn("debug_sims", probe["quality"])
 
     def test_error_is_in_status_and_saved_json_quality_and_recording_result(self):
         out = self.run_fault("spans")
@@ -269,22 +310,66 @@ class FaultTests(unittest.TestCase):
             shown = json.loads(server.read_recording_result(out.status["recording_id"]))
         self.assertIn(FAIL, shown["quality"]["voices_error"])                  # MCP read_recording_result
 
-    @unittest.expectedFailure
     def test_error_is_visible_in_the_transcript_text_a_human_reads(self):
-        """Д4 (подтверждено прогоном): в Markdown стенограммы нет ни слова о том, что проверка голосов
-        отключена (transcript.render_md показывает group_doubt, names_outside_vocab и ошибки ASR, но не
-        voices_error). Ожидание: в шапке — предупреждение, как у остальных «Внимание»."""
+        """Д4 исправлено: шапка Markdown (как у group_doubt) сообщает, что проверка голосов не выполнена;
+        текст сбоя в Markdown не выводится (там может быть путь) — он в статусе и JSON."""
         out = self.run_fault("spans")
-        header = out.md.split("**[", 1)[0].lower()
-        self.assertIn("голос", header)
+        header = out.md.split("**[", 1)[0]
+        self.assertIn(WARNING, header)
+        self.assertNotIn(FAIL, out.md)
 
-    @unittest.expectedFailure
     def test_error_is_visible_in_default_read_transcript(self):
-        """Д4 (подтверждено прогоном): обычное чтение стенограммы агентом (core.read_transcript, режим по
-        умолчанию) отбрасывает quality целиком и переносит в asr_summary только пять ключей ASR;
-        в Markdown-режиме служебные разделы свёрнуты. voices_error не доходит."""
+        """Д4 исправлено: обычный read_transcript — в Markdown та же шапка (служебные разделы свёрнуты, шапка
+        остаётся), в JSON — ключ voices_error рядом с asr_summary; остальной quality по-прежнему отброшен."""
         out = self.run_fault("spans")
-        self.assertTrue("голос" in out.read_md.split("**[", 1)[0].lower() or "voices_error" in out.read_json)
+        self.assertIn(WARNING, out.read_md.split("**[", 1)[0])
+        shown = json.loads(out.read_json)
+        self.assertIn(FAIL, shown["voices_error"])
+        self.assertNotIn("quality", shown)
+
+
+class ProfileConfusionsTests(unittest.TestCase):
+    """Д4 исправлено: voices.validate_profile проверяет спутанные пары: ключ «а|б» и целые значения."""
+
+    @staticmethod
+    def with_confusions(confusions):
+        prof = profile()
+        prof["speakers"] = {n: {"parts": {"earlier.wav": {"sec": 100.0, "vec": [float(x) for x in v]}}}
+                            for n, v in VEC.items()}
+        prof["confusions"] = confusions
+        return prof
+
+    def test_valid_pairs_and_missing_or_empty_section_are_accepted(self):
+        for confusions in ({}, {"earlier.wav": {}}, {"earlier.wav": {"Борис|Анна": 1, "Анна|Борис": 0}}):
+            with self.subTest(confusions=confusions):
+                self.assertEqual(voices.validate_profile(self.with_confusions(confusions))["confusions"], confusions)
+        prof = self.with_confusions({})
+        del prof["confusions"]
+        voices.validate_profile(prof)
+
+    def test_broken_pairs_are_refused_like_other_corrupt_profiles(self):
+        bad = ([], {"earlier.wav": []}, {1: {"а|б": 1}}, {"earlier.wav": {"нет-разделителя": 1}},
+               {"earlier.wav": {"|Анна": 1}}, {"earlier.wav": {"Борис|": 1}}, {"earlier.wav": {1: 1}},
+               {"earlier.wav": {"Борис|Анна": 1.5}}, {"earlier.wav": {"Борис|Анна": True}},
+               {"earlier.wav": {"Борис|Анна": "1"}}, {"earlier.wav": {"Борис|Анна": -1}})
+        for confusions in bad:
+            with self.subTest(confusions=confusions), self.assertRaises(voices.VoiceProfileError):
+                voices.validate_profile(self.with_confusions(confusions))
+
+    def test_recognition_continues_without_a_profile_with_broken_pairs(self):
+        """Файл профиля с подпорченной записью читается как повреждённый: распознавание идёт без профиля,
+        причина — в quality.voices_error, файл на диске не тронут."""
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "voices.json"
+            prof = self.with_confusions({"earlier.wav": {"нет-разделителя": 1}})
+            target.write_text(json.dumps(prof, default=lambda o: o.tolist()), encoding="utf-8")
+            before = target.read_bytes()
+            quality = {}
+            loaded, ok = worker.load_group_profile_for_recognition(target, quality)
+            self.assertFalse(ok)
+            self.assertFalse(loaded["speakers"])
+            self.assertIn("сохранение запрещено", quality["voices_error"])
+            self.assertEqual(target.read_bytes(), before)
 
 
 class MergeTests(unittest.TestCase):
@@ -384,20 +469,6 @@ class ReassignTests(unittest.TestCase):
                 self.assertEqual(out[0]["label"] == "Спикер 1", moved)
                 self.assertEqual(len(fixes), int(moved))
                 self.assertEqual("fix" in out[0], moved)
-
-    @unittest.expectedFailure
-    def test_reassign_failure_leaves_recorded_fixes_for_turns_that_are_thrown_away(self):
-        """Д4, прежний pipeline="segments" (worker.py:1749): voices.reassign дописывает поправки в общий
-        список по ходу и не откатывает их, если позже падает на другой реплике; worker при этом оставляет
-        прежние turns, а quality.speaker_fixes уже содержит «исправления», которых в тексте нет.
-        Подтверждено на функции; прогон main в этом режиме не делался."""
-        pv = {n: VEC[n][:2] for n in ("Анна", "Борис")}
-        turns = [{"s": 0.0, "e": 5.0, "label": "Спикер 2"}, {"s": 6.0, "e": 11.0, "label": "Спикер 2"}]
-        embs = [np.array([0.60, 0.50]), np.array([1.0, 2.0, 3.0])]     # у второй неверная размерность
-        fixes = []
-        with self.assertRaises(ValueError):
-            voices.reassign(turns, embs, pv, {"Спикер 1": "Анна", "Спикер 2": "Борис"}, dict(LABEL_OF), fixes)
-        self.assertEqual(fixes, [])    # ожидание: ничего не записано; сейчас пишется поправка к 1-й реплике
 
 
 if __name__ == "__main__":
