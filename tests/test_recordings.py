@@ -1453,9 +1453,10 @@ class BackendSelectionTests(unittest.TestCase):
                 store.close()
 
     def test_installer_includes_recordings_dependencies(self):
-        installer = (Path(__file__).resolve().parent.parent / "install.ps1").read_text(encoding="utf-8-sig")
+        import buildinfo
+        shipped = buildinfo.root_files(Path(__file__).resolve().parent.parent)
         for filename in ("recordings.py", "storage.py", "documents.py"):
-            self.assertIn(f'"{filename}"', installer)
+            self.assertIn(filename, shipped)
 
     def test_sqlite_backend_requires_explicit_initialized_store(self):
         with tempfile.TemporaryDirectory() as temp:
