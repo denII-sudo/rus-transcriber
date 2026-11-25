@@ -473,6 +473,8 @@ class PromiseTests(fixtures.ScreenCase):
                         for neighbour in (None, "decided", "decided damaged"):
                             with self.subTest(scope=scope, kind=kind, state=state, damaged=damaged,
                                               neighbour=neighbour):
+                                # своя база на случай: общий список конфликтов иначе растёт с каждым случаем (n²)
+                                self.new_database()
                                 case = self.prepare(scope, kind, state, neighbour)
                                 self.resolve_directly(case)
                                 if damaged:
