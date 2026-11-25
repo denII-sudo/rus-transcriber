@@ -1035,6 +1035,9 @@ if ($SkipSelfCheck) {
             if ([int]$t.unexpected_successes -gt 0) { $line += ", неожиданных успехов {0} (имена — запуск тестов с -v)" -f $t.unexpected_successes }
             if ($selfCheckOk) { Write-Host $line -ForegroundColor Green } else { Write-Host $line -ForegroundColor Yellow }
             foreach ($f in @($t.failed)) { if ($f) { Write-Host "    $($f.kind): $($f.test)" -ForegroundColor Yellow } }
+            # параллельный запуск тестов (RT_SELFCHECK_JOBS=1 — по-старому, одним процессом): нарушения самого запуска и откат
+            foreach ($rp in @($t.run_problems)) { if ($rp) { Write-Host "    запуск тестов: $rp" -ForegroundColor Yellow } }
+            if ($t.fallback) { Write-Host "  параллельный запуск тестов не удался, тесты прошли одним процессом: $($t.fallback)" -ForegroundColor DarkGray }
         }
         if ($sc.check_repo -and $sc.check_repo.partial) { Write-Host "  проверка файлов частичная: $($sc.check_repo.note)" -ForegroundColor DarkGray }
     }
