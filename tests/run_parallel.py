@@ -12,7 +12,8 @@
   * каждый модуль набора попал ровно в одну группу (сверка до запуска);
   * список модулей и число тестов в каждой группе совпали с тем, что находит `discover` (отдельный процесс);
   * у каждой группы есть итоговая строка unittest (убитая, зависшая или вылетевшая группа — отказ);
-  * дерево репозитория после запуска то же, что до него (`git status --porcelain --ignored`).
+  * дерево репозитория после запуска то же, что до него (`git status --porcelain --ignored`); без Git (установленная
+    копия) эту сверку выполнить нельзя: об этом печатается одна строка «предупреждение: …», код выхода не меняется.
 Остаток файлов во временной папке группы — предупреждение (`--strict-tmp` делает его отказом).
 
 У каждой группы свои каталоги `data` и `tmp` в новой песочнице: `RUS_TRANSCRIBER_DATA`, `TEMP`, `TMP`, а также кэши
@@ -597,7 +598,9 @@ def run(argv=None, *, repo=REPO, out=None, mutate=None):
                                         + (f" и ещё {skipped} в пропущенных целиком классах или модулях" if skipped else "")
                                         + f", по discover у её модулей {want}")
         tree_after = tree_state(repo)
-        if tree_before is not None and tree_after is not None and tree_before != tree_after:
+        if tree_before is None or tree_after is None:
+            say("предупреждение: сверка «дерево репозитория не изменилось» не выполнена (нет Git или это не его копия)")
+        elif tree_before != tree_after:
             changed = sorted(set(tree_before) ^ set(tree_after))
             problems.append("дерево репозитория изменилось за время запуска: " + "; ".join(changed[:5]))
 
