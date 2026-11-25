@@ -1,6 +1,7 @@
 import copy
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import http.client
@@ -935,8 +936,10 @@ class WorkerSnapshotTests(unittest.TestCase):
                 self.assertEqual(profile["speakers"], {})
                 with mock.patch.object(settings.paths, "STATE_DB", base / "state.sqlite3"), \
                         mock.patch.object(core, "job_json", return_value=(json_path, None)):
-                    with self.assertRaisesRegex(core.CoreError, "пока не поддерживается"):
-                        core.preview_voice_learning("synthetic-job")
+                    # файл выгрузки — не источник обучения (выше), а предпросмотр берёт ревизию записи из базы
+                    report = core.preview_voice_learning("synthetic-job")
+                    self.assertEqual((report["source"]["kind"], report["source"]["recording"]),
+                                     ("sqlite", "recording:" + draft_id))
                 item = {"id": "r1", "question": "Проверьте", "options": [
                     {"label": "Оставить", "decision": {}},
                     {"label": "Другое", "decision": {"text": "другое"}}]}
@@ -1248,6 +1251,9 @@ class BackendSelectionTests(unittest.TestCase):
             with mock.patch.object(settings.paths, "STATE_DB", db), \
                     mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
                 jp, md = result["json"], result["markdown"]
+                saved = transcript.load(jp)     # сведения о файле, как у записей после переноса
+                self.assertTrue(saved["audio_available"])
+                self.assertEqual(saved["audio_sha256"], hashlib.sha256(b"synthetic placeholder").hexdigest())
                 transcript.rename(jp, md, {"speaker-1": "Тестовый"})
                 transcript.apply_review(jp, md, [{"id": "r1", "status": "human"}])
                 checked = recordings.open_store(db)

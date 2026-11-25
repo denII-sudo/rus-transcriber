@@ -65,23 +65,59 @@ def _voice_vocab_context(data, json_path, group_override=None):
         raise core.CoreError(f"не удалось безопасно разрешить группу и словарь: {ex}") from ex
 
 
+def _open_voice_source(ref):
+    """Источник обучения (файл или запись в базе) с отказом, понятным человеку."""
+    import storage
+    import voice_sources
+    try:
+        return voice_sources.open_ref(str(ref))
+    except voice_sources.SourceError as ex:
+        raise core.CoreError(str(ex)) from ex
+    except (storage.StorageError, OSError, KeyError, ValueError) as ex:
+        raise core.CoreError(f"источник для голосового профиля недоступен: {type(ex).__name__}: {ex}") from ex
+
+
+def _voice_job_source_ref(job_id):
+    """Ссылка на источник по номеру задачи или `recording:<id>`.
+
+    `recording:<id>` идёт в voice_sources напрямую: там база открывается только на чтение, а общий
+    core.job_json открыл бы её на запись.
+    """
+    import voice_sources
+    if isinstance(job_id, str) and job_id.startswith(voice_sources.RECORDING_PREFIX):
+        return job_id
+    jp, _ = core.job_json(job_id)
+    if not jp:
+        raise core.CoreError("готовая расшифровка не найдена")
+    return jp
+
+
+def _source_contributions(profile, source, key):
+    """Пометки с переноса, которые заменит обновление, и вклады из других вариантов стенограммы."""
+    confirmation, other = [], set()
+    same = {source.name, source.migrated_from} - {None}
+    for name, speaker in sorted((profile.get("speakers") or {}).items()):
+        part = (speaker.get("parts") or {}).get(key)
+        if not part:
+            continue
+        if part.get("confirmation") is not None:
+            confirmation.append(name)
+        if part.get("from") and part["from"] not in same:
+            other.add(part["from"])
+    return confirmation, sorted(other)
+
+
 def preview_voice_learning(job_id, group_override=None):
     """Предварительная оценка по разметке, без моделей, биометрических векторов и изменения файлов."""
     import voices
     import vocab
-    jp, _ = core.job_json(job_id)
-    if not jp:
-        raise core.CoreError("готовая расшифровка не найдена")
-    import recordings
-    store, binding = recordings.open_for_document(jp)
-    if store is not None:
-        store.close()
-        raise core.CoreError("Обновление голосового профиля по SQLite-записи пока не поддерживается")
+    import voice_sources
+    source = _open_voice_source(_voice_job_source_ref(job_id))
     try:
-        data = json.loads(Path(jp).read_text(encoding="utf-8"))
+        data = source.data
         if data.get("no_profile"):
             raise core.CoreError("для этой расшифровки профили групп отключены")
-        context = _voice_vocab_context(data, jp, group_override)
+        context = _voice_vocab_context(data, source.json_path, group_override)
         group = context["group"]
         group_vocab = context["vocab"]
         path = paths.voices_path(group)
@@ -94,8 +130,11 @@ def preview_voice_learning(job_id, group_override=None):
         if not audio:
             raise core.CoreError("в расшифровке не указан исходный аудиофайл")
         key = str(Path(audio).resolve())
+        if source.kind == "sqlite":
+            key = voice_sources.existing_audio_key(profile, key)
         existing = sorted(name for name, speaker in profile.get("speakers", {}).items()
                           if key in speaker.get("parts", {}))
+        confirmation_replaced, other_variants = _source_contributions(profile, source, key)
         report = {}
         eligible = voices._confirmed(data) or voices.has_human_edits(data)
         spans = voices._spans(data, voices._confirmed(data), report) if eligible else []
@@ -140,6 +179,9 @@ def preview_voice_learning(job_id, group_override=None):
                           "sha256": _voice_hash(context["path"]) if context["path"] else "absent"},
                 "vocab_resolution": context["resolution"],
                 "names_outside_vocab": outside_vocab,
+                "source": source.describe(),
+                "confirmation_replaced": confirmation_replaced,
+                "other_variant_contributions": other_variants,
                 "replacement_available": True,
                 "note": "Только разметка; модель, качество голоса и карантин не проверялись. "
                         "Окончательный результат обновления зависит от модели и карантина."}
@@ -160,11 +202,9 @@ def _voice_hash(path):
 
 def prepare_voice_action(job_id, group_override=None):
     """Снимок предварительного плана для привязки подтверждения к конкретным файлам."""
-    jp, _ = core.job_json(job_id)
-    if not jp:
-        raise core.CoreError("готовая расшифровка не найдена")
+    jp = _voice_job_source_ref(job_id)
     try:
-        before = _voice_hash(jp)
+        before = _open_voice_source(jp).token
         report = preview_voice_learning(job_id, group_override)
         group = report["group"]
         if paths.safe_group(group) != group:
@@ -172,36 +212,64 @@ def prepare_voice_action(job_id, group_override=None):
         with settings.group_voice_lock(group):
             profile = paths.voices_path(group)
             profile_hash = _voice_hash(profile)
-            source_data = json.loads(Path(jp).read_text(encoding="utf-8"))
-            audio = source_data.get("file")
+            source = _open_voice_source(jp)
+            audio = source.data.get("file")
             audio_hash = _voice_hash(audio) if audio else "absent"
             report = preview_voice_learning(job_id, group_override)
             vocab_path = report["vocab"]["path"]
             vocab_hash = report["vocab"]["sha256"]
-            if (before != _voice_hash(jp) or report["group"] != group or
+            if (before != source.token or before != _open_voice_source(jp).token or report["group"] != group or
                     profile_hash != _voice_hash(profile) or
                     (vocab_path and _voice_hash(vocab_path) != vocab_hash) or
                     (audio and audio_hash != _voice_hash(audio))):
                 raise core.CoreError("исходные файлы изменились; повторите предварительный просмотр")
-        snapshot = {"job_id": job_id, "json": str(Path(jp).resolve()), "group": group,
+        snapshot = {"job_id": job_id, "json": str(source.json_path.resolve()), "group": group,
+                    "source_ref": source.ref, "source_kind": source.kind,
                     "group_override": group_override or None,
                     "manual_group_override": report["group_selection"]["method"] == "manual_override",
                     "vocab_path": vocab_path, "vocab_hash": vocab_hash,
                     "source_hash": before, "profile_hash": profile_hash, "audio_hash": audio_hash,
                     "report": report}
-        if any(len(line) > 200 for line in voice_action_lines(snapshot)) or len("\n".join(voice_action_lines(snapshot))) > 1100:
+        lines = voice_action_lines(snapshot)
+        if any(len(line) > VOICE_ACTION_LINE_LIMIT for line in lines) or len("\n".join(lines)) > VOICE_ACTION_TEXT_LIMIT:
             raise core.CoreError("список участников слишком длинный для безопасного подтверждения; действие не запущено")
         return snapshot
     except (OSError, ValueError) as ex:
         raise core.CoreError(f"не удалось подготовить подтверждение: {ex}") from ex
 
 
+VOICE_ACTION_LINE_LIMIT = 200    # пределы окна подтверждения: confirm.py показывает текст целиком
+VOICE_ACTION_TEXT_LIMIT = 1100
+
+
+def _short(name, limit=60):
+    name = str(name)
+    return name if len(name) <= limit else name[:limit - 1] + "…"
+
+
 def voice_action_lines(snapshot, revoke=False):
     report = snapshot["report"]
     candidates = report["candidates"]
-    lines = [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
-             "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
-             "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
+    lines = [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}"]
+    source = report.get("source") or {}
+    if source.get("kind") == "sqlite":
+        line = f"Источник: запись в базе, ревизия {source.get('revision')}"
+        if source.get("migrated_from"):
+            line += f", перенесена из {_short(source['migrated_from'])}; её старый ключ в профиле снимается"
+        if source.get("redirected_from"):
+            line += "; найдена по старому номеру задачи"
+        lines.append(line + ".")
+    lines += ["Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
+              "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
+    other_variants = report.get("other_variant_contributions") or []
+    if other_variants:
+        # вклад хранится по ключу аудио: отзыв снимает и вклад другой копии стенограммы того же аудио
+        lines.append(("Снимет и вклад другого варианта стенограммы: " if revoke else
+                      "Заменит вклад другого варианта стенограммы: ") +
+                     ", ".join(_short(name) for name in other_variants) + ".")
+    if report.get("confirmation_replaced") and not revoke:
+        lines.append("Пометка «кем подтверждены голоса» заменится подсчётом секунд (прежняя — в истории): " +
+                     ", ".join(report["confirmation_replaced"]) + ".")
     change = report.get("human_seconds_change") or {}
     if change:
         lines.append("Подтверждено человеком, с: " +
@@ -221,13 +289,19 @@ def voice_action_lines(snapshot, revoke=False):
         lines.append("Словарь выбранной группы отсутствует; обновление не запущено.")
     else:
         lines.append("Словарь группы не найден; ограничение участников словарём недоступно.")
-    if report.get("selection_explanation"):
-        lines.append("Предварительный отбор (результат модели может отличаться):")
-        lines.extend(f"{item['description']}: {item['count']}" for item in report["selection_explanation"])
-    lines.extend([("Удалить перечисленные вклады источника; другие источники не меняются." if revoke else
-                   "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
-                  "Будет создана резервная копия профиля. Подтвердите только после проверки."])
-    return lines
+    revoke_tail = ("Удалить перечисленные вклады этого аудио; другие записи не меняются." if other_variants else
+                   "Удалить перечисленные вклады источника; другие источники не меняются.")
+    tail = [(revoke_tail if revoke else
+             "Новый отпечаток может заменить вклад или попасть в карантин; без подходящего отпечатка вклад сохраняется."),
+            "Будет создана резервная копия профиля. Подтвердите только после проверки."]
+    explanation = report.get("selection_explanation") or []
+    detail = (["Предварительный отбор (результат модели может отличаться):"] +
+              [f"{item['description']}: {item['count']}" for item in explanation]) if explanation else []
+    if detail and len("\n".join(lines + detail + tail)) > VOICE_ACTION_TEXT_LIMIT:
+        # обязательные строки важнее подробностей отбора: подробности остаются в предпросмотре
+        detail = [f"Предварительный отбор: причин {len(explanation)}, подробно — в предпросмотре "
+                  "(результат модели может отличаться)."]
+    return lines + detail + tail
 
 
 def backup_voice_profile(path):
@@ -484,24 +558,31 @@ def voice_refresh_plan(group=""):
                     "обновляйте через preview_voice_profiles и update_voice_profiles отдельной задачи."}
 
 
+def _snapshot_source(snapshot):
+    """Источник подтверждённого снимка, открытый заново (запись в базе — по recording:<id>)."""
+    return _open_voice_source(snapshot.get("source_ref") or snapshot["json"])
+
+
 def start_voice_update(snapshot):
-    group, jp = snapshot["group"], Path(snapshot["json"])
+    group = snapshot["group"]
     with settings.group_voice_lock(group):
-        if _voice_hash(jp) != snapshot["source_hash"] or _voice_hash(paths.voices_path(group)) != snapshot["profile_hash"]:
+        source = _snapshot_source(snapshot)
+        if source.token != snapshot["source_hash"] or _voice_hash(paths.voices_path(group)) != snapshot["profile_hash"]:
             raise core.CoreError("стенограмма или профиль изменились; повторите просмотр и подтверждение")
-        data = json.loads(jp.read_text(encoding="utf-8"))
+        data = source.data
         audio = data.get("file")
         if not audio or not Path(audio).is_file():
             raise core.CoreError("аудиофайл недоступен")
         if _voice_hash(audio) != snapshot["audio_hash"]:
             raise core.CoreError("аудиофайл изменился; повторите просмотр и подтверждение")
-        current = _voice_vocab_context(data, jp, snapshot.get("group_override"))
+        current = _voice_vocab_context(data, source.json_path, snapshot.get("group_override"))
         current_path = str(current["path"]) if current["path"] else None
         current_vocab_hash = _voice_hash(current["path"]) if current["path"] else "absent"
         if (current["group"] != group or current_path != snapshot.get("vocab_path") or
                 current_vocab_hash != snapshot.get("vocab_hash")):
             raise core.CoreError("словарь или привязка группы изменились; повторите просмотр и подтверждение")
-        args = ["--learn-only", str(jp), "--voice-source-hash", snapshot["source_hash"],
+        learn_ref = source.ref if source.kind == "sqlite" else str(source.json_path)
+        args = ["--learn-only", learn_ref, "--voice-source-hash", snapshot["source_hash"],
                 "--voice-profile-hash", snapshot["profile_hash"], "--voice-audio-hash", snapshot["audio_hash"],
                 "--voice-group", group, "--voice-vocab-path", snapshot.get("vocab_path") or "",
                 "--voice-vocab-hash", snapshot.get("vocab_hash") or "absent"]
@@ -513,21 +594,25 @@ def start_voice_update(snapshot):
 
 def revoke_voice_source(snapshot):
     """Отозвать вклад источника после подтверждения; другие записи не затрагиваются."""
-    group, jp = snapshot["group"], Path(snapshot["json"])
+    group = snapshot["group"]
     path = paths.voices_path(group)
     with settings.group_voice_lock(group):
-        if _voice_hash(jp) != snapshot["source_hash"] or _voice_hash(path) != snapshot["profile_hash"]:
+        source = _snapshot_source(snapshot)
+        if source.token != snapshot["source_hash"] or _voice_hash(path) != snapshot["profile_hash"]:
             raise core.CoreError("стенограмма или профиль изменились; повторите предварительный просмотр и подтверждение")
         if not path.exists():
             raise core.CoreError("профиль отсутствует")
-        data = json.loads(jp.read_text(encoding="utf-8"))
+        data = source.data
         key = str(Path(data["file"]).resolve())
         import voices
+        import voice_sources
         try:
             profile = voices.load_profile(path, convert=False)
         except voices.VoiceProfileError as ex:
             raise core.CoreError(f"голосовой профиль группы несовместим или повреждён: {ex}. "
                             "Отзыв не выполнен; перенесите профиль отдельно.") from ex
+        if source.kind == "sqlite":
+            key = voice_sources.existing_audio_key(profile, key)
         names = sorted(n for n, s in profile.get("speakers", {}).items() if key in s.get("parts", {}))
         if not names or names != snapshot["report"]["existing_contributions"]:
             raise core.CoreError("вклады изменились или отсутствуют; повторите просмотр")
@@ -535,16 +620,26 @@ def revoke_voice_source(snapshot):
         for name in names:
             profile["speakers"][name]["parts"].pop(key)
         profile.get("confusions", {}).pop(key, None)
-        profile.get("sources", {}).pop(str(jp.resolve()), None)
-        profile.get("source_selection_versions", {}).pop(str(jp.resolve()), None)
+        source_keys = [source.key] + [k for old in source.legacy_keys
+                                      for k in voice_sources.matching_keys(profile.get("sources"), old)]
+        for source_key in source_keys:
+            profile.get("sources", {}).pop(source_key, None)
+            profile.get("source_selection_versions", {}).pop(source_key, None)
         profile["revision"] = int(profile.get("revision", 0)) + 1
-        profile.setdefault("history", []).append({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                                   "from": jp.name, "kind": "source_revoked", "speakers": names})
+        entry = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "from": source.name, "kind": "source_revoked",
+                 "speakers": names}
+        if source.kind == "sqlite":
+            entry["source"] = source.key
+        profile.setdefault("history", []).append(entry)
         import tempfile
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
             json.dump(profile, f, ensure_ascii=False)
             tmp = f.name
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
         return {"group": group, "revoked": names, "revision": profile["revision"], "backup": backup}
 
 

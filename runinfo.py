@@ -109,6 +109,40 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+def audio_facts(audio_path, ffprobe=None):
+    """Сведения о самом файле аудио: наличие, SHA-256 байтов файла, контейнер и кодек (если есть ffprobe).
+
+    Хэш файла — то, по чему программа узнаёт запись (поле audio_sha256 стенограммы, ключ записи
+    лаборатории); хэш звука (audio_identity) — то, по чему узнаётся измеренный звук. Чего не удалось
+    узнать, того в ответе нет: ничего не подставляется."""
+    import shutil
+    p = Path(audio_path)
+    if not p.is_file():
+        return {"audio_available": False}
+    facts = {"audio_available": True}
+    digest = sha256_file(p)
+    if digest:
+        facts["audio_sha256"] = digest
+    ffprobe = ffprobe or shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            out = subprocess.run([ffprobe, "-v", "error", "-show_entries",
+                                  "format=format_name:stream=codec_name,codec_type", "-of", "json", str(p)],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 timeout=60, stdin=subprocess.DEVNULL)
+            info = json.loads(out.stdout or "{}")
+            fmt = (info.get("format") or {}).get("format_name")
+            codec = next((s.get("codec_name") for s in info.get("streams") or []
+                          if s.get("codec_type") == "audio"), None)
+            if fmt:
+                facts["container"] = fmt
+            if codec:
+                facts["codec"] = codec
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return facts
+
+
 def audio_identity(path, pcm_bytes, sample_rate, source_samples=None, offset_sec=0.0):
     """Что за звук измерялся — без имени и пути. pcm_bytes — отрывок: моно, s16le, sample_rate.
 

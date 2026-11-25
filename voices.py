@@ -179,7 +179,11 @@ def save_profile(path, prof):
                      for n, s in prof["speakers"].items()}
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
+    try:
+        tmp.replace(p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)    # прежний профиль остаётся байт в байт; недописанная копия не копится
+        raise
 
 
 def voice_vectors(prof, exclude_audio=None):
@@ -216,7 +220,12 @@ def source_fingerprint_status(stored, current, transcript_mtime):
     if stored is None:
         return "absent"
     if isinstance(stored, dict):
-        return "unchanged" if all(stored.get(k) == current.get(k) for k in FINGERPRINT_KEYS) else "changed"
+        if stored.get("kind") == "sqlite" or current.get("kind") == "sqlite":
+            import voice_sources
+            keys = ("kind",) + voice_sources.SQLITE_FINGERPRINT_KEYS
+        else:
+            keys = FINGERPRINT_KEYS
+        return "unchanged" if all(stored.get(k) == current.get(k) for k in keys) else "changed"
     if isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored):
         same = math.isclose(float(stored), float(transcript_mtime), rel_tol=0, abs_tol=1e-6)
         return "legacy_unchanged" if same else "legacy_changed"
@@ -724,7 +733,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     В профиль идут: отрезки, подписанные человеком (вес ×3), и — в подтверждённых расшифровках — слова
     без пометок сомнения. Поправки «A → B» человеком копятся как спутанные пары (confusions).
     Если профиль участника после пересчёта сильно отличается от прежнего (сходство < DRIFT_MIN),
-    это записывается в warnings. only — учесть только эти файлы .transcript.json.
+    это записывается в warnings. only — учесть только эти файлы .transcript.json или источники
+    voice_sources.Source; запись в базе (kind sqlite) учитывается только при allow_replace — в подтверждённом
+    обновлении, и тогда старый ключ файла, из которого она перенесена, снимается (source_rekeyed).
     Защита от тёзок: расшифровка другой группы (group) пропускается; вклад записи, непохожий на уже
     собранный голос этого имени (SAME_MIN, SAME_MARGIN), в профиль не идёт, а ждёт решения человека
     в prof["quarantine"] (resolve_voice: тот же человек или другой).
@@ -737,19 +748,28 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     def note(reason):
         if selection_report is not None:
             selection_report[reason] = selection_report.get(reason, 0) + 1
+    import voice_sources
     files = sorted(set(Path(folder).glob("*.transcript.json")) | set(Path(folder).glob("*.rus-transcriber/*.transcript.json")))
     if only:
-        files = [Path(p) for p in only]
+        files = [p if isinstance(p, voice_sources.Source) else Path(p) for p in only]
     best, conf_best = {}, {}
     for jp in files:
-        try:
-            data = json.loads(jp.read_text(encoding="utf-8"))
-        except Exception:
-            note("unreadable_transcript")
-            continue
-        if _is_sqlite_export(data):
-            note("sqlite_source_not_supported")
-            continue
+        record = isinstance(jp, voice_sources.Source) and jp.kind == "sqlite"
+        if record:                           # запись в базе: данные зафиксированной ревизии, не файл выгрузки
+            if not allow_replace:
+                note("sqlite_source_not_supported")
+                continue
+            data = jp.data
+        else:
+            jp = jp.json_path if isinstance(jp, voice_sources.Source) else jp
+            try:
+                data = json.loads(jp.read_text(encoding="utf-8"))
+            except Exception:
+                note("unreadable_transcript")
+                continue
+            if _is_sqlite_export(data):
+                note("sqlite_source_not_supported")
+                continue
         g = group_of(data)
         if group and g and g != group:       # расшифровка другой группы: её «Анна» — не наша
             note("other_group")
@@ -766,14 +786,18 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             note("missing_audio")
             continue
         akey = str(src.resolve())
-        mt = jp.stat().st_mtime
+        if record:
+            akey = voice_sources.existing_audio_key(prof, akey)
+        mt = 0.0 if record else jp.stat().st_mtime
         if akey not in best or mt > best[akey][1]:
             best[akey] = (jp, mt, data, src)
         if _confirmed(data) and (akey not in conf_best or mt > conf_best[akey][1]):
             conf_best[akey] = (jp, mt, data)
     if only and not allow_replace:  # при подтверждённом пересчёте используются только показанные данные
-        for jp in sorted(set(Path(files[0]).parent.glob("*.transcript.json")) |
-                         set(Path(files[0]).parent.parent.glob("*.transcript.json"))) if files else []:
+        first = files[0] if files else None
+        first = first.json_path if isinstance(first, voice_sources.Source) else first
+        for jp in sorted(set(Path(first).parent.glob("*.transcript.json")) |
+                         set(Path(first).parent.parent.glob("*.transcript.json"))) if first else []:
             try:
                 data = json.loads(jp.read_text(encoding="utf-8"))
                 if _is_sqlite_export(data):
@@ -791,8 +815,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     for akey, (jp, mt, data, src) in best.items():
         if len(learned) >= limit or (stop_when is not None and stop_when()):
             break
-        key = str(jp.resolve())
-        current_fp = source_fingerprint(jp, src)
+        record = isinstance(jp, voice_sources.Source)
+        key = jp.key if record else str(jp.resolve())
+        current_fp = jp.fingerprint(src) if record else source_fingerprint(jp, src)
         status = source_fingerprint_status(prof["sources"].get(key), current_fp, mt)
         if not only:
             if status in ("unchanged", "legacy_unchanged"):
@@ -861,7 +886,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             other_sec = {n: sum(pt["sec"] for source, pt in sp.get("parts", {}).items() if source.lower() != akey.lower())
                          for n, sp in prof["speakers"].items()}
             same_sims = {}
-            changed_names, quarantined_names = [], []
+            changed_names, quarantined_names, previous_confirmation = [], [], {}
             for name, items in per.items():
                 if ident.get(name) == "different":
                     note("identity_different")
@@ -891,7 +916,11 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                                      + (f" (ближе к «{near[1]}»)" if near[0] - sim >= SAME_MARGIN else "")
                                      + " — тёзка или ошибка подписи; в профиль не добавлено, решение — resolve_voice")})
                         continue
-                was_present = akey in prof["speakers"].get(name, {}).get("parts", {})
+                old_part = prof["speakers"].get(name, {}).get("parts", {}).get(akey)
+                was_present = old_part is not None
+                if was_present and old_part.get("confirmation") is not None:
+                    # пометка с переноса заменяется точным подсчётом; прежняя остаётся в истории
+                    previous_confirmation[name] = old_part["confirmation"]
                 prof["speakers"].setdefault(name, {"parts": {}})["parts"][akey] = {
                     "vec": c, "sec": round(sum(sec for _, _, h, sec in good if not h)
                                            + HUMAN_WEIGHT * sum(sec for _, _, h, sec in good if h), 1),
@@ -938,7 +967,10 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                                                  for n in changed_names},
                                     "drift": drift, "pairs": {f"{a}|{b}": n for (a, b), n in pairs.items()},
                                     "same_sim": same_sims,
-                                    **({"quarantine": sorted(quar[akey])} if quar.get(akey) else {})})
+                                    **({"quarantine": sorted(quar[akey])} if quar.get(akey) else {}),
+                                    **({"previous_confirmation": previous_confirmation}
+                                       if previous_confirmation else {}),
+                                    **({"source": key} if record else {})})
             prof["history"] = prof["history"][-200:]
             prof["warnings"] = prof["warnings"][-50:]
             prof["revision"] = int(prof.get("revision", 0)) + 1
@@ -946,6 +978,18 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             _log(f"профиль пополнен из {jp.name}: {sorted(per)} за {time.time() - t0:.1f} с")
             prof["sources"][key] = current_fp
             prof.setdefault("source_selection_versions", {})[key] = SELECTION_VERSION
+            if record:
+                # старый ключ файла, из которого запись перенесена, снимается: один источник — один ключ
+                rekeyed = [k for old in jp.legacy_keys for k in voice_sources.matching_keys(prof["sources"], old)
+                           if k != key]
+                for old in rekeyed:
+                    prof["sources"].pop(old, None)
+                    prof["source_selection_versions"].pop(old, None)
+                if rekeyed:                  # перед записью о пересчёте: последней остаётся она (её видит воркер)
+                    prof["history"].insert(len(prof["history"]) - 1, {
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": "source_rekeyed",
+                        "from": [Path(k).name for k in rekeyed], "to": key})
+                    prof["history"] = prof["history"][-200:]
         except Exception as ex:
             prof.clear()
             prof.update(before_update)
