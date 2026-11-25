@@ -506,6 +506,21 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
             for key in ("answer_ts", "at"):
                 if isinstance(row, dict) and key in row:
                     row[key] = _utc_text(row[key])
+        status = {item["id"]: item.get("status") or "open" for item in review.get("review") or []}
+        # Р-4 (решение владельца 26.11.2026, «пометить их ремонтом»): ждущий ответ, место которого уже закрыто, —
+        # событие «место уже решено» без попытки применить; ответы открытых мест ждут человека, как прежде
+        marked = 0
+        probe = {"answers": answers, "applied_answers": applied, "application_events": events, "undo_snapshots": {},
+                 "rejected": review["rejected"]}
+        now = time.strftime(ANSWER_TS_FORMAT, time.gmtime())
+        for aid, row in RP.answer_states_of(probe, manifest, outcome_details=False).items():
+            answer = answers[aid]
+            if (RP.rebuild_group(row["state"]) == "waiting" and status.get(aid) in CLOSED_STATUSES and
+                    answer.get("kind") not in ("skip", "repeat") and applied.get(aid) != RP._sig(answer)):
+                events.append({"id": aid, "version": answer.get("version"), "answer_ts": answer.get("ts"),
+                               "answer_source": answer.get("source"), "answer_sig_sha256": RP._sig_hash(answer),
+                               "action": RP.LEGACY_DECIDED_ACTION, "outcome": "already_decided", "at": now})
+                marked += 1
         pack = {"manifest": manifest, "applied_answers": applied, "applied_at": applied_at, "undo_snapshots": {},
                 "application_events": events,
                 "application_events_dropped": raw.get("application_events_dropped", 0)}
@@ -525,7 +540,7 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
                  "undo_snapshots": {}, "rejected": review["rejected"],
                  "outcome_details": pack.get("outcome_details")}
         waiting = RP.rebuild_check(state, manifest)["waiting"]
-        status = {item["id"]: item.get("status") or "open" for item in review.get("review") or []}
+        stats.update(already_decided_marked=marked)
         stats.update(state="full", version=version, answers_current=n, answers_skipped=skipped,
                      answers_other_version=len(other_version), ts_converted=converted,
                      manifest_items=len(manifest.get("items") or []), questions=len(questions),
@@ -1181,6 +1196,7 @@ def _repair_summary(report):
                      f"текущих {ps.get('answers_current', '-')}, в архиве {ps.get('answers_archived', '-')}, "
                      f"применённых {ps.get('applied', '-')}, ждущих {ps.get('waiting', '-')} "
                      f"(из них на закрытых местах {ps.get('waiting_closed_place', '-')}), "
+                     f"помечено «место уже решено» {ps.get('already_decided_marked', '-')}, "
                      f"снимков отмены не перенесено {ps.get('undo_snapshots_dropped', '-')}"
                      + (f"; {e['why']}" if e.get("why") else "") + (f"; ошибка: {e['error']}" if e.get("error") else ""))
     lines.append(f"итог: {report['summary']}" + (f"; резерв: {report['backup']}" if report.get("backup") else ""))

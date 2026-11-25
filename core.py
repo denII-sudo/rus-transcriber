@@ -1193,10 +1193,13 @@ def _apply_answers_files_once(jp, md):
     import review_pack
     state = review_pack.answers_state(jp, {"answers": {}})
     applied = review_pack._applied_map(state)
+    # Р-4: ответ с пометкой переноса «место уже решено» (только событие legacy_import/already_decided) не
+    # применяется (review_pack.decisions) и подтверждения не ждёт; любой другой ответ без автора — как прежде
     if any(answer.get("kind") not in ("skip", "repeat") and
            applied.get(aid) != review_pack._sig(answer) and
            answer.get("actor_kind") != "human" and
-           (answer.get("confirmation_context") or {}).get("actor_kind") != "human"
+           (answer.get("confirmation_context") or {}).get("actor_kind") != "human" and
+           not review_pack.legacy_decided(state, aid, answer)
            for aid, answer in state.get("answers", {}).items()):
         if store is not None:
             store.close()

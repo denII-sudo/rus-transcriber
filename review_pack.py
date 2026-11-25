@@ -1469,6 +1469,10 @@ def decisions(json_path):
         if not answer_is_current(a, it):       # ответ прежней редакции карточки к новому вопросу не применяется
             rep["unanswered"].append(aid)
             continue
+        if legacy_decided(store, aid, a):
+            # Р-4: место решено до переноса — ответ неизвестного автора не применяется от имени человека
+            rep.setdefault("legacy_decided", []).append(aid)
+            continue
         relation = over_applied(a, applied.get(aid))
         if relation == "applied" and confirms_check(a, events):
             # К-23: человек на ноутбуке подтвердил ответ, применённый с отметкой «проверьте» (тот же ответ или
@@ -1919,6 +1923,18 @@ def _answer_event(events, aid, answer):
                 ("answer_sig_sha256" not in row or row["answer_sig_sha256"] == _sig_hash(answer))):
             return row
     return None
+
+
+# Р-4 (решение владельца 26.11.2026): старый ответ, место которого уже закрыто, перенос помечает событием
+# применения с этим action и исходом already_decided — «место уже решено», ответ не применялся.
+LEGACY_DECIDED_ACTION = "legacy_import"
+
+
+def legacy_decided(store, aid, answer):
+    """Последнее событие применения этого ответа — пометка переноса «место уже решено» (Р-4). Такой ответ
+    «Применить» не применяет и не считает ждущим подтверждения: решения в нём больше нет."""
+    row = _answer_event(store.get("application_events"), aid, answer)
+    return bool(row) and row.get("action") == LEGACY_DECIDED_ACTION and row.get("outcome") == "already_decided"
 
 
 def _last_place_event(events, aid):

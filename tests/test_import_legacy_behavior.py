@@ -197,6 +197,20 @@ class RealCardsApplyTests(Built):
             store.close()
 
 
+class GuardOnOrdinaryRecordTests(Built):
+    def test_answer_without_author_on_closed_place_still_blocks_apply(self):
+        """Р-4: защита «Применить» пропускает только ответ с событием переноса legacy_import/already_decided.
+        На обычной записи (без переноса) ответ без автора на закрытом месте по-прежнему требует подтверждения."""
+        data = transcript.load(self.jp)
+        next(i for i in data["review"] if i["id"] == "r2")["status"] = "resolved"
+        transcript.save(data, self.jp, self.md)
+        self.answer("r2", 0, actor="unknown")
+        before = transcript.load(self.jp)["segments"]
+        with self.assertRaisesRegex(core.CoreError, "неизвестного происхождения"):
+            core.apply_answers_files(self.jp, self.md)
+        self.assertEqual(transcript.load(self.jp)["segments"], before)
+
+
 class SameActionsAfterImportTests(Built):
     """Б: после переноса работают те же действия над записью, что до него: состояния ответов, проверка
     пересборки, «Применить», дописывание порции (пункт 2а плана М-1)."""
