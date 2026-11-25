@@ -180,7 +180,9 @@ class WorkAnalysis(unittest.TestCase):
         self.assertEqual(cards["disagree_confirmed"], 1, work)       # «слово»: третья спорила, человек оставил
         self.assertEqual(work["m1"]["by_reason"]["conf"]["agree_corrected"], 1)
         self.assertEqual(work["m2"]["card"]["agree_corrected"], {"n": 1, "median": 0.9, "min": 0.9, "max": 0.9})
-        self.assertEqual(work["m1"]["shares"]["card"], {"not_measured": lab_work.FEW})
+        self.assertEqual(work["m1"]["shares"]["card"],
+                         {"corrected_when_agree": 1.0, "corrected_when_disagree": 0.0, "places": 2,
+                          "recordings": 1, "few_data": lab_work.FEW})
         self.assertEqual(work["recordings_with_agree_corrected"], 1)
         self.assertEqual(work["roles_matched_human"]["none"], 1)     # «другое» не дала ни одна модель
         self.assertEqual(work["roles_matched_human"]["primary"], 1)
@@ -214,6 +216,11 @@ class WorkAnalysis(unittest.TestCase):
         text = (s / "export" / "analysis.json").read_text(encoding="utf-8")
         for bad in (SECRET, "другое", "слива", rid, str(self.base), '"r1"', '"r2"', "w1"):
             self.assertNotIn(bad, text)
+        report = (s / "results" / "report.md").read_text(encoding="utf-8")
+        line = next(x for x in report.splitlines() if x.startswith("Доли (card):"))
+        self.assertIn("мест 2, записей 1", line)          # процент показан и при малых данных — с пометкой
+        self.assertIn(lab_work.FEW, line)
+        self.assertRegex(line, r"corrected_when_agree = \d+(\.\d)?%")
 
     def test_answers_not_of_human_and_unanswered_are_separate_rows(self):
         """Ответ неизвестного автора программа не применяет: он «сохранён, не применён». Применённый ответ
@@ -314,11 +321,15 @@ class Rules(unittest.TestCase):
         self.assertEqual(lab_work.place_window({"word_ids": ["a", "new"], "t1": 3, "t2": 4}, first), (3.0, 4.0, "time"))
         self.assertEqual(lab_work.place_window({"gap": [5, 6], "t1": 5, "t2": 6}, first), (5.0, 6.0, "pause"))
 
-    def test_shares_need_30_places_and_3_recordings(self):
+    def test_shares_always_shown_few_data_below_30_places_or_3_recordings(self):
         table = {c: 0 for c in lab_work.CELLS}
         table.update(agree_corrected=3, agree_confirmed=27)
-        self.assertIn("not_measured", lab_work._shares(table, 29, 3))
-        self.assertIn("not_measured", lab_work._shares(table, 30, 2))
+        for places, recs in ((29, 3), (30, 2)):
+            sh = lab_work._shares(table, places, recs)
+            self.assertEqual((sh["corrected_when_agree"], sh["places"], sh["recordings"], sh["few_data"]),
+                             (0.1, places, recs, lab_work.FEW))
+            self.assertIsNone(sh["corrected_when_disagree"])
+        self.assertNotIn("few_data", lab_work._shares(table, 30, 3))
         self.assertEqual(lab_work._shares(table, 30, 3)["corrected_when_agree"], 0.1)
 
     def test_models_agree_needs_all_three_roles(self):

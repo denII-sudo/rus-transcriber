@@ -16,8 +16,8 @@ from pathlib import Path
 import lab_sandbox
 
 GAP_TOL = 0.1                 # с: допуск начала слова гипотезы относительно окна места
-MIN_PLACES, MIN_RECORDINGS = 30, 3      # доли — только от 30 мест и 3 записей (ответ 3а-4)
-FEW = "мало данных: доли — от 30 мест и 3 записей"
+MIN_PLACES, MIN_RECORDINGS = 30, 3      # ниже — пометка «мало данных»; доли показываются всегда (DECISIONS 281547f)
+FEW = "мало данных: меньше 30 мест или 3 записей"
 
 # исход ответа (review_pack.OUTCOME_REASONS) -> строка учёта. Годится в основной счёт только «eligible»;
 # новый исход без строки роняет тест tests/test_lab_work.py, а не попадает в счёт молча
@@ -376,13 +376,15 @@ def _table(rows):
 
 
 def _shares(table, places, recordings):
-    if places < MIN_PLACES or recordings < MIN_RECORDINGS:
-        return {"not_measured": FEW}
-
+    """Доли всегда, рядом число мест и записей; ниже 30 мест / 3 записей — пометка FEW (процент не скрывается)."""
     def share(x, y):
         return round(x / (x + y), 3) if x + y else None
-    return {"corrected_when_agree": share(table["agree_corrected"], table["agree_confirmed"]),
-            "corrected_when_disagree": share(table["disagree_corrected"], table["disagree_confirmed"])}
+    out = {"corrected_when_agree": share(table["agree_corrected"], table["agree_confirmed"]),
+           "corrected_when_disagree": share(table["disagree_corrected"], table["disagree_confirmed"]),
+           "places": places, "recordings": recordings}
+    if places < MIN_PLACES or recordings < MIN_RECORDINGS:
+        out["few_data"] = FEW
+    return out
 
 
 def _spread(values):
@@ -510,8 +512,10 @@ def render_section(work):
         lines.append(f"| {src} | " + " | ".join(str(work["m1"][src][c]) for c in CELLS) + " |")
     lines += [""]
     for src, sh in work["m1"]["shares"].items():
-        lines.append(f"Доли ({src}): " + (sh["not_measured"] if "not_measured" in sh else
-                                          ", ".join(f"{k} = {v}" for k, v in sh.items())))
+        pct = ", ".join(f"{k} = {'—' if sh[k] is None else format(sh[k], '.1%')}"
+                        for k in ("corrected_when_agree", "corrected_when_disagree"))
+        lines.append(f"Доли ({src}): {pct}; мест {sh['places']}, записей {sh['recordings']}"
+                     + (f" — {sh['few_data']}" if sh.get("few_data") else ""))
     lines += ["", "М2 — наименьшая уверенность основной и второй моделей на месте (по клеткам М1):", ""]
     for src, cells in work["m2"].items():
         for c, v in cells.items():
