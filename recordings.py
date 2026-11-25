@@ -52,6 +52,8 @@ def merge_answer_draft(data, state):
     undo["review_pack"] = {field: copy.deepcopy(state.get(field)) for field in (
         "manifest", "applied_answers", "applied_at", "undo_snapshots",
         "application_events", "application_events_dropped")}
+    if state.get("outcome_details"):          # уточнения последнего «Применить» к ответам (К-22)
+        undo["review_pack"]["outcome_details"] = copy.deepcopy(state["outcome_details"])
     result["undo"] = undo
     result["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
     result["interaction_events_evicted"] = state.get("interaction_events_dropped", 0)
@@ -245,7 +247,10 @@ def read_review_pack_state(document_path):
         review = current["review"]["payload"]
         pack = (review.get("undo") or {}).get("review_pack") or {}
         applications = review.get("applications") or []
+        # уточнения последнего «Применить» к ответам (К-22) — только если есть: прежние записи без поля не меняются
+        details = {"outcome_details": copy.deepcopy(pack["outcome_details"])} if pack.get("outcome_details") else {}
         return {
+            **details,
             "_expected_versions": {"source_revision": current["transcript"]["revision"],
                                    "review_revision": current["review"]["revision"]},
             "version": review.get("question_version"),
@@ -299,6 +304,8 @@ def write_review_pack_state(document_path, state):
                 "review_pack", {}).get("application_events_dropped", 0),
             "interaction_events": copy.deepcopy(review.get("interaction_events") or []),
             "interaction_events_dropped": review.get("interaction_events_evicted", 0),
+            "outcome_details": copy.deepcopy((review.get("undo") or {}).get(
+                "review_pack", {}).get("outcome_details")) or None,
         }
         review["question_version"] = state.get("version")
         if "manifest" in state:
@@ -316,6 +323,10 @@ def write_review_pack_state(document_path, state):
         pack["undo_snapshots"] = copy.deepcopy(state.get("undo_snapshots") or {})
         pack["application_events"] = copy.deepcopy(state.get("application_events") or [])
         pack["application_events_dropped"] = state.get("application_events_dropped", 0)
+        if state.get("outcome_details"):
+            pack["outcome_details"] = copy.deepcopy(state["outcome_details"])
+        else:
+            pack.pop("outcome_details", None)
         undo["review_pack"] = pack
         review["undo"] = undo
         review["interaction_events"] = copy.deepcopy(state.get("interaction_events") or [])
@@ -326,8 +337,9 @@ def write_review_pack_state(document_path, state):
             raise ValueError("stored applications must be a list")
         if "application_events" in state:
             review["applications"] = copy.deepcopy(state["application_events"])
+        # уточнения к ответам (К-22) документ не меняют: как события, пишутся без пересборки документа
         event_fields = {"interaction_events", "interaction_events_dropped",
-                         "application_events", "application_events_dropped"}
+                         "application_events", "application_events_dropped", "outcome_details"}
         changed = {key for key in (set(previous_state) | set(state)) - {"_expected_versions"}
                    if previous_state.get(key) != state.get(key)}
         context = current_operation_context(store)
