@@ -126,6 +126,18 @@ def validate_profile(d, convert=True):
             raise VoiceProfileError("неподдерживаемая версия голосового профиля; сохранение запрещено")
         if not isinstance(d.get("speakers"), dict) or not isinstance(d.get("sources"), dict):
             raise ValueError("неверная структура")
+        confusions = d.get("confusions")
+        if confusions is not None:       # спутанные пары: {ключ аудио: {"а|б": целое ≥ 0}}; confusions() режет ключ по «|»
+            if not isinstance(confusions, dict):
+                raise ValueError("неверные спутанные пары")
+            for audio_key, pairs in confusions.items():
+                if not isinstance(audio_key, str) or not isinstance(pairs, dict):
+                    raise ValueError("неверные спутанные пары")
+                for pair, count in pairs.items():
+                    said, sep, confirmed = pair.partition("|") if isinstance(pair, str) else ("", "", "")
+                    if (not sep or not said or not confirmed or isinstance(count, bool)
+                            or not isinstance(count, int) or count < 0):
+                        raise ValueError("неверные спутанные пары")
         dimension = None
         for speaker in d["speakers"].values():
             if not isinstance(speaker, dict) or not isinstance(speaker.get("parts"), dict):

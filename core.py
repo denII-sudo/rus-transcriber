@@ -735,6 +735,8 @@ def _text_only(s, key):
                if quality.get(k)}
     if summary:
         data["asr_summary"] = summary
+    if quality.get("voices_error"):
+        data["voices_error"] = quality["voices_error"]
     for k in ("review", "edits", "quality", "timing"):
         data.pop(k, None)
     segs = []
