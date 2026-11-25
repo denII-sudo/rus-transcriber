@@ -935,8 +935,10 @@ class WorkerSnapshotTests(unittest.TestCase):
                 self.assertEqual(profile["speakers"], {})
                 with mock.patch.object(settings.paths, "STATE_DB", base / "state.sqlite3"), \
                         mock.patch.object(core, "job_json", return_value=(json_path, None)):
-                    with self.assertRaisesRegex(core.CoreError, "пока не поддерживается"):
-                        core.preview_voice_learning("synthetic-job")
+                    # файл выгрузки — не источник обучения (выше), а предпросмотр берёт ревизию записи из базы
+                    report = core.preview_voice_learning("synthetic-job")
+                    self.assertEqual((report["source"]["kind"], report["source"]["recording"]),
+                                     ("sqlite", "recording:" + draft_id))
                 item = {"id": "r1", "question": "Проверьте", "options": [
                     {"label": "Оставить", "decision": {}},
                     {"label": "Другое", "decision": {"text": "другое"}}]}

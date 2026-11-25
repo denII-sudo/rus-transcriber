@@ -3,8 +3,9 @@
 Только синтетические данные во временной папке; модели, настоящие профили и база не используются.
 Закрепляется: (1) запись, перенесённая в базу так же, как `tools/import_legacy.py`, даёт через
 `recordings.load_recording` тот же отбор отрезков, что и старый файл; (2) правка агента и отменённая
-отметка человека не считаются подтверждением человека ни в файле, ни в базе; (3) нынешний отказ
-обучаться по SQLite-записи во всех трёх местах; (4) прежнее поведение `voices.learn` на файлах.
+отметка человека не считаются подтверждением человека ни в файле, ни в базе; (3) ручной путь по записи в
+базе (Г2): предпросмотр без записи в базу, подтверждённое обновление и отзыв под резервом, перевязка старого
+ключа, отказ при изменении записи, повтор без изменений; (4) прежнее поведение `voices.learn` на файлах.
 """
 import copy
 import json
@@ -22,9 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import import_legacy as IL  # noqa: E402
 import core  # noqa: E402
 import documents  # noqa: E402
+import core_voices  # noqa: E402
 import paths  # noqa: E402
 import recordings  # noqa: E402
+import settings  # noqa: E402
 import storage  # noqa: E402
+import transcript  # noqa: E402
+import voice_sources  # noqa: E402
 import voices  # noqa: E402
 import worker  # noqa: E402
 
@@ -109,20 +114,20 @@ class SyntheticStore(unittest.TestCase):
         self.audio = self.root / "meeting.wav"
         self.audio.write_bytes(b"synthetic audio placeholder")
 
-    def migrate(self, legacy, legacy_path, tag=""):
+    def migrate(self, legacy, legacy_path, tag="", recording_id=None):
         """Записать старую стенограмму в базу как перенос П7; -> (recording_id, путь выгрузки, source)."""
         legacy_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
         source = {"path": str(legacy_path), "sha256": IL.sha256_file(legacy_path),
                   "size": legacy_path.stat().st_size}
-        rid, transcript, review, _ = IL.build_snapshots(
+        rid, snapshot, review, _ = IL.build_snapshots(
             json.loads(legacy_path.read_text(encoding="utf-8")),
-            recording_id=IL.recording_id_for(legacy_path, source["sha256"]), metadata={}, field_sources={},
-            variant={"tag": tag, "main": True}, source=source)
+            recording_id=recording_id or IL.recording_id_for(legacy_path, source["sha256"]), metadata={},
+            field_sources={}, variant={"tag": tag, "main": True}, source=source)
         layout = recordings.document_layout(self.audio, tag)
         layout["root"].mkdir(exist_ok=True)
         root_id = self.store.get_or_register_root(layout["root"])
         self.store.create_recording_with_document(
-            rid, recordings.normalize_location(self.audio), transcript, review, str(uuid.uuid4()),
+            rid, recordings.normalize_location(self.audio), snapshot, review, str(uuid.uuid4()),
             recordings.operation_context(self.store, "system"), root_id=root_id,
             generated_at="2026-11-25T00:00:00+00:00", document_paths=layout["paths"])
         documents.materialize_pending(self.store, root_id, layout["root"])
@@ -178,35 +183,288 @@ class AgentEditIsNotHuman(SyntheticStore):
                          ([], {"unconfirmed_source": 1}, {}, {}))
 
 
-class CurrentSqliteRefusal(SyntheticStore):
-    """Нынешний отказ: Г2 заменит его рабочим путём и поменяет эти проверки вместе с кодом."""
+CONFIRMATION = {"by": "human", "note": "синтетическая пометка с переноса", "decided": "2026-11-20"}
 
-    def test_learn_preview_and_worker_refuse_sqlite_record_without_touching_files(self):
-        legacy_path = self.root / "meeting.transcript.json"
-        rid, export, _ = self.migrate(legacy_data(self.audio), legacy_path)
-        legacy_path.unlink()                    # в папке аудио остаётся только выгрузка базы
-        export_before = export.read_bytes()
-        groups = self.root / "groups"
-        (groups / "demo-group").mkdir(parents=True)
-        profile, report = voices.empty_profile(), {}
-        self.assertEqual(voices.learn(profile, self.root, FakeEmbedder(), lambda _: self.fail("audio loaded"),
-                                      selection_report=report), [])
-        self.assertEqual(report, {"sqlite_source_not_supported": 1})
-        self.assertEqual((profile["speakers"], profile["sources"]), ({}, {}))
+
+class ManualSqlitePath(SyntheticStore):
+    """Ручной путь по записи в базе: предпросмотр, подтверждённое обновление воркером и отзыв."""
+
+    def setUp(self):
+        super().setUp()
+        self.groups = self.root / "groups"
+        self.group = self.groups / "demo-group"
+        self.group.mkdir(parents=True)
+        (self.group / "vocab.json").write_text(json.dumps(
+            {"group": "demo-group", "participants": [{"name": n} for n in ("Анна", "Борис", "Вера")]},
+            ensure_ascii=False), encoding="utf-8")
+        self.profile_path = self.group / "voices.json"
+        self.legacy_path = self.root / "meeting.transcript.json"
+        self.rid, self.export, _ = self.migrate(legacy_data(self.audio), self.legacy_path)
+        self.ref = voice_sources.RECORDING_PREFIX + self.rid
+        self.audio_key = str(self.audio.resolve())
+        self.legacy_key = str(self.legacy_path.resolve())
+        # профиль, обученный до переноса по старому файлу, с пометкой «кем подтверждены голоса»
+        profile = voices.empty_profile()
+        profile["speakers"]["Анна"] = {"parts": {self.audio_key: {
+            "vec": np.array([1.0, 0.0]), "sec": 9.0, "human_sec": 0.0, "auto_sec": 9.0,
+            "from": self.legacy_path.name, "confirmed": True, "selection_version": voices.SELECTION_VERSION,
+            "confirmation": CONFIRMATION}}}
+        profile["sources"][self.legacy_key] = voices.source_fingerprint(self.legacy_path, self.audio)
+        profile["source_selection_versions"] = {self.legacy_key: voices.SELECTION_VERSION}
+        voices.save_profile(self.profile_path, profile)
+        for item in (patch.object(paths, "STATE_DB", self.db), patch.object(paths, "GROUPS", self.groups),
+                     patch.object(paths, "JOBS", self.root / "jobs")):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def backups(self):
+        folder = self.group / "voice-backups"
+        return sorted(folder.iterdir()) if folder.is_dir() else []
+
+    def start(self, snapshot):
+        """start_voice_update без запуска процесса; -> аргументы воркера."""
+        launched = []
+        with patch.object(core, "launch", side_effect=lambda script, args, src, kind, **_: launched.append(args)
+                          or "job-learn"):
+            core.start_voice_update(snapshot)
+        self.assertEqual(len(launched), 1)
+        return launched[0]
+
+    def run_worker(self, args):
+        values = {key[2:].replace("-", "_"): value for key, value in zip(args[::2], args[1::2])}
+        namespace = types.SimpleNamespace(vocab="", group="", **values)
+        fake_audio = types.ModuleType("pyannote.audio")
+        fake_audio.Pipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
         status = Status()
-        with patch.object(paths, "STATE_DB", self.db), patch.object(paths, "GROUPS", groups), \
-                patch.object(core, "job_json", return_value=(str(export), None)):
-            for action in (core.preview_voice_learning, core.prepare_voice_action):
-                with self.subTest(action=action.__name__), \
-                        self.assertRaisesRegex(core.CoreError, "SQLite-записи пока не поддерживается"):
-                    action("synthetic-job")
-            args = types.SimpleNamespace(learn_only=str(export), voice_group_override="")
-            with self.assertRaisesRegex(RuntimeError, "SQLite-записи пока не поддерживается"):
-                worker.learn_only(args, status, {}, self.audio)
-        self.assertEqual(status.data["state"], "error")
-        self.assertEqual(export.read_bytes(), export_before)
-        self.assertEqual(list((groups / "demo-group").iterdir()), [])
-        self.assertEqual(recordings.load_recording(self.store, rid)["source_revision"], 1)
+        with patch.dict("sys.modules", {"pyannote.audio": fake_audio}), \
+                patch.object(worker, "load_audio", return_value=np.zeros(16000)), \
+                patch.object(voices, "Embedder", lambda _pipe: FakeEmbedder()):
+            worker.learn_only(namespace, status, {}, self.audio)
+        return status
+
+    def commit_new_revision(self):
+        data = recordings.load_recording(self.store, self.rid)
+        data["segments"][0]["text"] = "исправлено человеком после просмотра"
+        root_id = self.store.get_or_register_root(recordings.document_layout(self.audio)["root"])
+        recordings.commit_recording_data(
+            self.store, self.rid, data, {"source_revision": 1, "review_revision": 1}, str(uuid.uuid4()),
+            recordings.operation_context(self.store, "human"), root_id, "2026-11-25T01:00:00+00:00")
+        self.assertEqual(self.store.get_current(self.rid)["transcript"]["revision"], 2)
+
+    def store_state(self):
+        tables = [row[0] for row in self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        counts = {name: self.store.db.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0] for name in tables}
+        heads = [tuple(row) for row in self.store.db.execute(
+            "SELECT recording_id, source_revision, review_revision FROM recordings ORDER BY recording_id")]
+        return counts, heads
+
+    def test_preview_and_prepare_read_revision_without_writing_store_or_files(self):
+        before = (self.store_state(), self.export.read_bytes(), self.profile_path.read_bytes())
+        # черновик ответов и файл выгрузки в обучение не идут: transcript.load не вызывается
+        with patch.object(transcript, "load", side_effect=AssertionError("transcript.load в обучении")):
+            report = core.preview_voice_learning(self.ref)
+            snapshot = core.prepare_voice_action(self.ref)
+        self.assertEqual(before, (self.store_state(), self.export.read_bytes(), self.profile_path.read_bytes()))
+        self.assertEqual(report["source"], {"kind": "sqlite", "name": self.export.name, "recording": self.ref,
+                                            "revision": 1, "migrated_from": self.legacy_path.name})
+        self.assertEqual(report["existing_contributions"], ["Анна"])
+        self.assertEqual(report["confirmation_replaced"], ["Анна"])
+        self.assertEqual(report["other_variant_contributions"], [])
+        self.assertEqual(sorted(report["candidates"]), ["Анна", "Борис", "Вера"])
+        store_id = self.store.db.execute("SELECT store_id FROM store_meta").fetchone()[0]
+        payload_hash = self.store.get_current(self.rid)["transcript"]["payload_hash"]
+        self.assertEqual(snapshot["source_hash"], f"sqlite:{store_id}:{self.rid}:1:{payload_hash}")
+        self.assertEqual((snapshot["source_ref"], snapshot["source_kind"]), (self.ref, "sqlite"))
+        lines = core.voice_action_lines(snapshot)
+        self.assertIn(f"Источник: запись в базе, ревизия 1, перенесена из {self.legacy_path.name}; "
+                      "её старый ключ в профиле снимается.", lines)
+        self.assertIn("Пометка «кем подтверждены голоса» заменится подсчётом секунд (прежняя — в истории): Анна.",
+                      lines)
+        for revoke in (False, True):
+            lines = core.voice_action_lines(snapshot, revoke=revoke)
+            self.assertTrue(all(len(line) <= 200 for line in lines) and len("\n".join(lines)) <= 1100)
+        # длинный отчёт отбора сворачивается в одну строку, обязательные строки остаются
+        crowded = copy.deepcopy(snapshot)
+        crowded["report"]["selection_explanation"] = [
+            {"description": f"Синтетическая причина отбора номер {i} с длинным пояснением", "count": i}
+            for i in range(30)]
+        lines = core.voice_action_lines(crowded)
+        self.assertIn("Предварительный отбор: причин 30, подробно — в предпросмотре "
+                      "(результат модели может отличаться).", lines)
+        self.assertTrue(any(line.startswith("Пометка «кем подтверждены голоса»") for line in lines))
+        self.assertLessEqual(len("\n".join(lines)), 1100)
+
+    def test_confirmed_update_replaces_part_rekeys_old_source_and_replay_changes_nothing(self):
+        before = self.profile_path.read_bytes()
+        snapshot = core.prepare_voice_action(self.ref)
+        args = self.start(snapshot)
+        self.assertEqual(args[:2], ["--learn-only", self.ref])
+        status = self.run_worker(args)
+        self.assertEqual(status.data["state"], "done")
+        self.assertEqual(status.data["learned"], [self.export.name])
+        profile = voices.load_profile(self.profile_path)
+        self.assertEqual(sorted(profile["speakers"]), ["Анна", "Борис", "Вера"])
+        for speaker in profile["speakers"].values():          # один вклад на аудио, не второй рядом
+            self.assertEqual(list(speaker["parts"]), [self.audio_key])
+        anna = profile["speakers"]["Анна"]["parts"][self.audio_key]
+        self.assertNotIn("confirmation", anna)
+        self.assertEqual((anna["human_sec"], anna["auto_sec"], anna["from"]), (1.8, 2.4, self.export.name))
+        self.assertEqual(list(profile["sources"]), [self.ref])
+        fingerprint = profile["sources"][self.ref]
+        self.assertEqual((fingerprint["kind"], fingerprint["recording_id"], fingerprint["transcript_revision"]),
+                         ("sqlite", self.rid, 1))
+        self.assertEqual(profile["source_selection_versions"], {self.ref: voices.SELECTION_VERSION})
+        rekeyed, learned = profile["history"][-2:]
+        self.assertEqual((learned["source"], learned["previous_confirmation"]), (self.ref, {"Анна": CONFIRMATION}))
+        self.assertEqual((rekeyed["kind"], rekeyed["from"], rekeyed["to"]),
+                         ("source_rekeyed", [self.legacy_path.name], self.ref))
+        self.assertEqual([path.read_bytes() for path in self.backups()], [before])
+
+        after = self.profile_path.read_bytes()
+        with patch.object(core, "launch", side_effect=AssertionError("повтор запущен")), \
+                self.assertRaisesRegex(core.CoreError, "повторите"):
+            core.start_voice_update(snapshot)
+        with self.assertRaisesRegex(RuntimeError, "нужен новый просмотр"):
+            self.run_worker(args)
+        self.assertEqual(self.profile_path.read_bytes(), after)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_revoke_removes_part_and_linked_old_key_after_backup(self):
+        before = self.profile_path.read_bytes()
+        snapshot = core.prepare_voice_action(self.ref)
+        revoke_lines = core.voice_action_lines(snapshot, revoke=True)
+        self.assertTrue(any("её старый ключ в профиле снимается" in line for line in revoke_lines))
+        self.assertFalse(any("Пометка" in line for line in revoke_lines))
+        result = core.revoke_voice_source(snapshot)
+        self.assertEqual(result["revoked"], ["Анна"])
+        self.assertEqual(Path(result["backup"]).read_bytes(), before)
+        profile = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        self.assertEqual((profile["speakers"]["Анна"]["parts"], profile["sources"],
+                          profile["source_selection_versions"]), ({}, {}, {}))
+        self.assertEqual((profile["history"][-1]["kind"], profile["history"][-1]["source"]),
+                         ("source_revoked", self.ref))
+
+    def test_failure_between_backup_and_write_keeps_profile_bytes_and_backup(self):
+        before = self.profile_path.read_bytes()
+        args = self.start(core.prepare_voice_action(self.ref))
+        real_replace = Path.replace
+
+        def failing_replace(path, target):
+            if Path(path).suffix == ".tmp":
+                raise OSError("сбой записи профиля (проверка)")
+            return real_replace(path, target)
+
+        with patch.object(Path, "replace", failing_replace), self.assertRaisesRegex(OSError, "сбой записи"):
+            self.run_worker(args)
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual([path.read_bytes() for path in self.backups()], [before])
+        with patch.object(core_voices.os, "replace", side_effect=OSError("сбой замены (проверка)")), \
+                self.assertRaisesRegex(OSError, "сбой замены"):
+            core.revoke_voice_source(core.prepare_voice_action(self.ref))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual([path.read_bytes() for path in self.backups()], [before, before])
+        self.assertEqual(sorted(path.name for path in self.group.iterdir()),
+                         ["vocab.json", "voice-backups", "voices.json"])
+
+    def test_record_changed_after_preview_is_refused_without_writing(self):
+        before = self.profile_path.read_bytes()
+        snapshot = core.prepare_voice_action(self.ref)
+        args = self.start(snapshot)
+        self.commit_new_revision()
+        with patch.object(core, "launch", side_effect=AssertionError("запуск по старым данным")), \
+                self.assertRaisesRegex(core.CoreError, "повторите"):
+            core.start_voice_update(snapshot)
+        with self.assertRaisesRegex(RuntimeError, "нужен новый просмотр"):
+            self.run_worker(args)
+        with self.assertRaisesRegex(core.CoreError, "повторите"):
+            core.revoke_voice_source(snapshot)
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_other_store_identity_changes_token_and_fingerprint(self):
+        snapshot = core.prepare_voice_action(self.ref)
+        with patch.object(voice_sources, "_store_id", return_value="восстановленная-база"), \
+                patch.object(core, "launch", side_effect=AssertionError("запуск по чужой базе")), \
+                self.assertRaisesRegex(core.CoreError, "повторите"):
+            core.start_voice_update(snapshot)
+        source = voice_sources.open_ref(self.ref)
+        fingerprint = source.fingerprint(self.audio)
+        for field, value in (("store_id", "другая"), ("transcript_revision", 2), ("transcript_payload_hash", "x")):
+            self.assertEqual(voices.source_fingerprint_status(fingerprint, {**fingerprint, field: value}, 0.0),
+                             "changed")
+        self.assertEqual(voices.source_fingerprint_status(fingerprint, dict(fingerprint), 0.0), "unchanged")
+
+    def test_audio_key_in_other_letter_case_does_not_add_second_part(self):
+        profile = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        variant = self.audio_key.swapcase()
+        profile["speakers"]["Анна"]["parts"] = {variant: profile["speakers"]["Анна"]["parts"][self.audio_key]}
+        self.profile_path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+        snapshot = core.prepare_voice_action(self.ref)
+        self.assertEqual(snapshot["report"]["existing_contributions"], ["Анна"])
+        self.run_worker(self.start(snapshot))
+        profile = voices.load_profile(self.profile_path)
+        self.assertEqual({name: list(s["parts"]) for name, s in profile["speakers"].items()},
+                         {name: [variant] for name in ("Анна", "Борис", "Вера")})
+
+    def test_second_variant_of_same_audio_replaces_with_warning(self):
+        second = legacy_data(self.audio)
+        second["segments"][0]["text"] = "второй вариант"
+        rid, export, _ = self.migrate(second, self.root / "meeting.v2.transcript.json", tag="v2")
+        snapshot = core.prepare_voice_action(voice_sources.RECORDING_PREFIX + rid)
+        self.assertEqual(snapshot["report"]["other_variant_contributions"], [self.legacy_path.name])
+        lines = core.voice_action_lines(snapshot)
+        self.assertIn(f"Заменит вклад другого варианта стенограммы: {self.legacy_path.name}.", lines)
+        self.assertLessEqual(len("\n".join(lines)), core_voices.VOICE_ACTION_TEXT_LIMIT)
+        self.run_worker(self.start(snapshot))
+        profile = voices.load_profile(self.profile_path)
+        self.assertEqual(list(profile["speakers"]["Анна"]["parts"]), [self.audio_key])
+        self.assertEqual(profile["speakers"]["Анна"]["parts"][self.audio_key]["from"], export.name)
+        # ключ старого файла первого варианта не снимается: вторая копия перенесена из другого файла
+        self.assertEqual(sorted(profile["sources"]), sorted([self.legacy_key, "recording:" + rid]))
+
+    def test_old_job_id_redirects_only_to_single_unchanged_copy(self):
+        with patch.object(settings, "recording_backend", return_value="sqlite"), \
+                patch.object(core, "job_json", return_value=(str(self.legacy_path), None)):
+            snapshot = core.prepare_voice_action("old-job")
+            self.assertEqual(snapshot["report"]["source"]["redirected_from"], self.legacy_path.name)
+            self.assertEqual(snapshot["source_ref"], self.ref)
+            self.assertTrue(any("найдена по старому номеру задачи" in line
+                                for line in core.voice_action_lines(snapshot)))
+            self.assertEqual(self.start(snapshot)[:2], ["--learn-only", self.ref])
+            self.migrate(legacy_data(self.audio), self.legacy_path, tag="copy", recording_id=str(uuid.uuid4()))
+            with self.assertRaisesRegex(core.CoreError, r"нет единственной копии в базе \(найдено 2\)"):
+                core.preview_voice_learning("old-job")
+        lonely = self.root / "other.transcript.json"
+        lonely.write_text(json.dumps(legacy_data(self.audio)), encoding="utf-8")
+        with patch.object(settings, "recording_backend", return_value="sqlite"), \
+                patch.object(core, "job_json", return_value=(str(lonely), None)), \
+                self.assertRaisesRegex(core.CoreError, r"нет единственной копии в базе \(найдено 0\)"):
+            core.preview_voice_learning("old-job")
+
+    def test_worker_refuses_record_without_confirmed_snapshot(self):
+        before = self.profile_path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "только после просмотра и подтверждения"):
+            self.run_worker(["--learn-only", self.ref])
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        report = {}
+        self.assertEqual(voices.learn(voices.empty_profile(), self.root, FakeEmbedder(), lambda _: np.zeros(1),
+                                      only=[voice_sources.open_ref(self.ref)], selection_report=report), [])
+        self.assertEqual(report, {"sqlite_source_not_supported": 1})
+
+    def test_server_tools_change_nothing_without_human_confirmation(self):
+        import asyncio
+        import confirm
+        import migrate
+        with patch.object(migrate, "run"):
+            import server
+        before = self.profile_path.read_bytes()
+        with patch.object(confirm, "require", side_effect=confirm.NotConfirmed("отказ человека")), \
+                patch.object(core, "launch", side_effect=AssertionError("запуск без подтверждения")):
+            self.assertIn("отказ человека", asyncio.run(server.update_voice_profiles(self.ref)))
+            self.assertIn("отказ человека", asyncio.run(server.revoke_voice_profiles(self.ref)))
+        self.assertEqual(self.profile_path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
 
 
 class LegacyFilesBaseline(unittest.TestCase):

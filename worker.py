@@ -90,17 +90,20 @@ def wait_slot(st, cfg, status_path):
            queued_sec=round(time.time() - t, 1) if time.time() - t > 3 else None)
 
 
-def resolve_vocab_details(src, a, cfg, transcript_path=None, group_override=None):
-    """Разрешает словарь только по ограниченным путям и возвращает отчёт без содержимого словарей."""
+def resolve_vocab_details(src, a, cfg, transcript_path=None, group_override=None, transcript_data=None):
+    """Разрешает словарь только по ограниченным путям и возвращает отчёт без содержимого словарей.
+
+    transcript_data — уже прочитанные данные источника (у записи в базе файл transcript_path — выгрузка
+    другого вида, привязка группы и словаря берётся из ревизии)."""
     import vocab as vocab_mod
 
-    transcript_data = None
     binding = None
     if transcript_path:
-        try:
-            transcript_data = json.loads(Path(transcript_path).read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as ex:
-            raise RuntimeError("Не удалось прочитать исходную расшифровку для проверки группы") from ex
+        if transcript_data is None:
+            try:
+                transcript_data = json.loads(Path(transcript_path).read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as ex:
+                raise RuntimeError("Не удалось прочитать исходную расшифровку для проверки группы") from ex
         binding = vocab_mod.transcript_binding(transcript_data)
         if binding["conflict"]:
             raise vocab_mod.ResolutionError(
@@ -1307,6 +1310,22 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
     return ppath, prof, learned
 
 
+def _open_voice_source(ref):
+    import storage
+    import voice_sources
+    try:
+        return voice_sources.open_ref(ref)
+    except voice_sources.SourceError as ex:
+        raise RuntimeError(str(ex)) from ex
+    except (storage.StorageError, OSError, KeyError, ValueError) as ex:
+        raise RuntimeError(f"источник для голосового профиля недоступен: {type(ex).__name__}: {ex}") from ex
+
+
+def _voice_source_token(ref):
+    """Жетон источника: SHA-256 файла или ревизия записи в базе (sqlite:<база>:<запись>:<ревизия>:<хэш>)."""
+    return _open_voice_source(ref).token
+
+
 def _check_confirmed_voice_inputs(a, src, group, profile_path, resolution, core):
     source_hash = getattr(a, "voice_source_hash", "")
     profile_hash = getattr(a, "voice_profile_hash", "")
@@ -1315,7 +1334,7 @@ def _check_confirmed_voice_inputs(a, src, group, profile_path, resolution, core)
     authorized = bool(source_hash and profile_hash and audio_hash and expected_group)
     if not authorized:
         return False
-    if (group != expected_group or core._voice_hash(a.learn_only) != source_hash or
+    if (group != expected_group or _voice_source_token(a.learn_only) != source_hash or
             core._voice_hash(profile_path) != profile_hash or core._voice_hash(src) != audio_hash):
         raise RuntimeError("стенограмма, аудио или профиль изменились после подтверждения; нужен новый просмотр")
 
@@ -1336,15 +1355,14 @@ def _check_confirmed_voice_inputs(a, src, group, profile_path, resolution, core)
 def learn_only(a, st, cfg, src):
     """Подтверждаемое обновление только указанной расшифровки."""
     try:
-        transcript_path = Path(a.learn_only)
-        transcript_data = json.loads(transcript_path.read_text(encoding="utf-8-sig"))
-        if not isinstance(transcript_data, dict):
-            raise RuntimeError("исходная расшифровка должна быть JSON-объектом")
-        import recordings
-        store, binding = recordings.open_for_document(transcript_path)
-        if store is not None:
-            store.close()
-            raise RuntimeError("обновление голосового профиля по SQLite-записи пока не поддерживается")
+        source = _open_voice_source(a.learn_only)
+        transcript_path = source.json_path      # у записи в базе — её выгрузка (поиск словаря рядом)
+        transcript_data = source.data
+        if source.kind == "sqlite" and not (getattr(a, "voice_source_hash", "") and
+                                            getattr(a, "voice_profile_hash", "") and
+                                            getattr(a, "voice_audio_hash", "") and getattr(a, "voice_group", "")):
+            raise RuntimeError("обновление голосового профиля по записи в базе — только после просмотра и "
+                               "подтверждения человеком")
         override = getattr(a, "voice_group_override", "") or ""
         if transcript_data.get("no_profile"):
             if override:
@@ -1355,6 +1373,7 @@ def learn_only(a, st, cfg, src):
 
         import voices
         resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                           transcript_data=transcript_data,
                                            group_override=override or None)
         binding = voices.group_binding(transcript_data)
         group = override or binding["group"] or resolution["group"]
@@ -1377,6 +1396,7 @@ def learn_only(a, st, cfg, src):
         with settings.group_voice_lock(group):
             # Повторно обнаруживаем sidecar/reference уже под блокировкой до загрузки модели.
             resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                               transcript_data=transcript_data,
                                                group_override=override or None)
             binding = voices.group_binding(transcript_data)
             if (override or binding["group"] or resolution["group"]) != group:
@@ -1407,13 +1427,14 @@ def learn_only(a, st, cfg, src):
                 quality_policy = "warn"
             before_provenance = prof.get("provenance_revision", 0)
             learned = voices.learn(prof, transcript_path.parent, emb, load_audio, names=allowed or None,
-                                   only=[transcript_path], group=group, selection_report=selection_report,
+                                   only=[source], group=group, selection_report=selection_report,
                                    allow_replace=authorized, quality_policy=quality_policy,
                                    quality_report=quality_report)
             provenance_updated = prof.get("provenance_revision", 0) != before_provenance
 
             # Входы и разрешение словаря могут устареть даже во время вычисления.
             after_resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                                     transcript_data=transcript_data,
                                                      group_override=override or None)
             _check_confirmed_voice_inputs(a, src, group, profile_path, after_resolution, core)
             after_path = str(after_resolution["path"]) if after_resolution["path"] else None

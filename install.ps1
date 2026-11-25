@@ -761,6 +761,7 @@ if ($Source -ne $Target) {
         "diar_fast.py"
         "vocab.py"
         "voices.py"
+        "voice_sources.py"
         "gender.py"
         "words.py"
         "hypotheses.py"
