@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,52 @@ class ReviewHTTP(unittest.TestCase):
             self.assertEqual(conn.getresponse().status, 413)
         finally:
             conn.close()
+
+    def raw_post(self, path, length, parts, pause=0.3):
+        """Запрос на сыром сокете: заголовки с Content-Length=length и первая часть тела, после каждой паузы — следующая;
+        затем ответ читается до закрытия соединения. -> (статус, заголовки в нижнем регистре, тело, секунд до конца ответа)."""
+        port = self.url.port
+        head = (f"POST {self.url.path}{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").encode()
+        started = time.time()
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(head + parts[0])
+            for part in parts[1:]:
+                time.sleep(pause)
+                sock.sendall(part)
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        top, _, body = data.partition(b"\r\n\r\n")
+        lines = top.decode("iso-8859-1").split("\r\n")
+        headers = dict(line.lower().split(": ", 1) for line in lines[1:])
+        return int(lines[0].split()[1]), headers, body, time.time() - started
+
+    def test_413_for_a_body_that_arrives_after_the_refusal_still_reaches_the_client(self):
+        # Раньше сервер отвечал 413 по заголовку и закрывал соединение, пока тело ещё шло: в Windows клиент получал
+        # сброс (WinError 10053) вместо ответа. Теперь тело до MAX_DRAIN_BYTES дочитывается, потом идёт 413.
+        from review_page import MAX_ANSWER_BYTES
+        length = MAX_ANSWER_BYTES + 1
+        status, headers, body, _ = self.raw_post("api/answer", length, [b"x" * 100, b"x" * (length - 100)])
+        self.assertEqual(status, 413)
+        self.assertEqual(headers["connection"], "close")
+        self.assertIn("недопустимый размер", json.loads(body)["error"])
+
+    def test_body_over_the_drain_limit_is_refused_at_once_and_not_read(self):
+        from review_page import MAX_DRAIN_BYTES
+        status, headers, _, seconds = self.raw_post("api/answer", MAX_DRAIN_BYTES + 1, [b""])
+        self.assertEqual((status, headers["connection"]), (413, "close"))
+        self.assertLess(seconds, 1.5)                         # тело, которого никто не ждёт, сервер не дожидается
+
+    def test_declared_body_that_never_comes_gets_413_after_the_drain_timeout(self):
+        from review_page import DRAIN_TIMEOUT, MAX_ANSWER_BYTES
+        status, headers, _, seconds = self.raw_post("api/answer", MAX_ANSWER_BYTES + 1, [b""])
+        self.assertEqual((status, headers["connection"]), (413, "close"))
+        self.assertGreaterEqual(seconds, DRAIN_TIMEOUT - 0.5)
+        self.assertLess(seconds, DRAIN_TIMEOUT + 6)           # сервер не висит, пока клиент молчит
 
     def test_new_routes_enforce_origin_and_version(self):
         payload = json.dumps({"id": "r1", "version": "old", "text": "пример"}).encode()

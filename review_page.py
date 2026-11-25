@@ -33,6 +33,8 @@ SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
 mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_ANSWER_BYTES = 64 * 1024
 MAX_VOICE_BYTES = 16 * 1024 * 1024
+MAX_DRAIN_BYTES = 1024 * 1024   # слишком большое, но не больше этого тело дочитывается и отбрасывается перед ответом 413
+DRAIN_TIMEOUT = 2               # секунд на такое дочитывание: клиент, который тело не шлёт, не держит обработчик
 
 # Причины, которые страница может показать человеку дословно: в них нет путей, текста ответов и
 # чужих данных. Сообщение с таким началом и подробностями после «:» показывается без подробностей.
@@ -120,9 +122,12 @@ def main():
             # URL содержит секрет сессии: не записывать запрос целиком в журнал.
             pass
 
-        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        def _send(self, code, body, ctype="application/json; charset=utf-8", close=False):
             b = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b)))
             self.send_header("Cache-Control", "no-store")
@@ -191,7 +196,21 @@ def main():
                 return self._send(400, {"error": "неверная длина запроса"})
             n = int(length)
             if n <= 0 or n > (MAX_VOICE_BYTES if u == "api/voice" else MAX_ANSWER_BYTES):
-                return self._send(413, {"error": "недопустимый размер запроса"})
+                # Закрытие соединения с непрочитанным телом в Windows даёт клиенту сброс (WinError 10053) вместо
+                # ответа: браузер видит обрыв, а не 413. Тело до MAX_DRAIN_BYTES дочитываем и отбрасываем,
+                # потом отвечаем; больше — не читаем, отвечаем сразу и закрываем соединение.
+                if 0 < n <= MAX_DRAIN_BYTES:
+                    self.connection.settimeout(DRAIN_TIMEOUT)
+                    try:
+                        left = n
+                        while left > 0:
+                            chunk = self.rfile.read(min(65536, left))
+                            if not chunk:
+                                break
+                            left -= len(chunk)
+                    except OSError:
+                        pass                      # тело не пришло в срок: ответ тот же, соединение закрывается
+                return self._send(413, {"error": "недопустимый размер запроса"}, close=True)
             self.connection.settimeout(30)
             try:
                 body = self.rfile.read(n)
