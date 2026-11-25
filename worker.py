@@ -1794,6 +1794,10 @@ def main():
 
 
 def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
+    import runinfo
+    # сведения о самом файле — как у записей после переноса (tools/import_legacy.py): наличие, хэш файла,
+    # контейнер и кодек; по хэшу файла запись связывается с лабораторией и сохранёнными гипотезами
+    data.update(runinfo.audio_facts(src))
     if sqlite_target is None:
         transcript.save_new(data, json_path, md_path)
         return {}

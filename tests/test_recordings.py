@@ -1,6 +1,7 @@
 import copy
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import http.client
@@ -1248,6 +1249,9 @@ class BackendSelectionTests(unittest.TestCase):
             with mock.patch.object(settings.paths, "STATE_DB", db), \
                     mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
                 jp, md = result["json"], result["markdown"]
+                saved = transcript.load(jp)     # сведения о файле, как у записей после переноса
+                self.assertTrue(saved["audio_available"])
+                self.assertEqual(saved["audio_sha256"], hashlib.sha256(b"synthetic placeholder").hexdigest())
                 transcript.rename(jp, md, {"speaker-1": "Тестовый"})
                 transcript.apply_review(jp, md, [{"id": "r1", "status": "human"}])
                 checked = recordings.open_store(db)

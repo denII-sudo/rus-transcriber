@@ -362,6 +362,7 @@ class PipelineEngine:
         st.set(stage="конвертация звука")
         audio = worker.load_audio(src)
         duration = len(audio) / worker.SR
+        pcm_sha = pcm_sha256(audio)
         st.set(stage="разделение по спикерам")
         token = os.environ.get("HF_TOKEN", "").strip() or None
         max_spk = len(allowed) + 1 if allowed else 0
@@ -421,7 +422,8 @@ class PipelineEngine:
             label_of=label_of, voice_ctx=voice_ctx, allowed=allowed, genders_by_name=genders_by_name,
             vocab=vocab, quality=quality, no_profile=no_profile, group=None if no_profile else (vgroup or "default"),
             t_diar=t_diar, t_voice=t_voice, diar_info=diar_info, diarization_sha256=diar_sha,
-            shared_record={"duration_sec": round(duration, 2), "diarization_sha256": diar_sha,
+            shared_record={"duration_sec": round(duration, 2), "pcm_sha256": pcm_sha,
+                           "diarization_sha256": diar_sha,
                            "diarization_segments": segs, "diarization_info": diar_info,
                            "turns": len(turns), "label_name": label_name,
                            "voices": {k: quality.get(k) for k in ("voice_profile", "profile_names", "match",
@@ -704,6 +706,14 @@ def run(sandbox, experiment, experiment_sha, units_doc, engine, program_dir=None
         return {"computed": computed, "errors": errors, "run_id": run_id, "state": state}
     finally:
         db.close()
+
+
+def pcm_sha256(audio):
+    """Хэш звука (моно 16 кГц s16le) — тем же правилом, что у теста скорости и сохранённых гипотез
+    (runinfo.audio_identity, hypstore.pcm_bytes). Ключ записи лаборатории остаётся хэшем файла:
+    по нему запись связывается с базой записей; хэш звука — мостик к тесту скорости и гипотезам."""
+    import hypstore
+    return hashlib.sha256(hypstore.pcm_bytes(audio)).hexdigest()
 
 
 def engine_audio_sha(engine, path):
