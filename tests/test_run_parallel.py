@@ -485,6 +485,20 @@ class RunTests(Synthetic):
         self.assertEqual(code, 1, text)
         self.assertIn("НАРУШЕНИЕ:", text)
 
+    def test_tree_check_that_cannot_be_done_without_git_says_so_once_and_does_not_change_the_exit_code(self):
+        self.module("test_a")
+        self.module("test_b")
+        with mock.patch.object(rp, "tree_state", return_value=None):
+            code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(text.count("сверка «дерево репозитория не изменилось» не выполнена"), 1, text)
+        self.assertIn("\nOK\n", text)
+        self.assertNotIn("НАРУШЕНИЕ", text)
+        with mock.patch.object(rp, "tree_state", return_value=[]):
+            code, text = self.run_launcher("--jobs", "2")
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("не выполнена", text)                              # когда Git есть, строки нет
+
     def test_changed_repository_tree_is_caught(self):
         if shutil.which("git") is None:
             self.skipTest("нет git")

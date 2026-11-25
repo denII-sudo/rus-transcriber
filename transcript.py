@@ -288,6 +288,11 @@ def render_md(data, text_only=False):
         note = SKIPPED_RU.get((key, skipped.get("reason"))) if isinstance(skipped, dict) else None
         if note:
             lines.append("_" + note.format(model=model_label(skipped.get("model"))) + "._\n")
+    if q0.get("voices_error"):
+        lines.append("_Внимание: проверка голосов не выполнена или выполнена не полностью: голосовые профили "
+                     "к этой записи не применены, имена по голосам не подписаны, метки «Спикер N» — только "
+                     "деление pyannote. Причина — в статусе задачи и в JSON (quality.voices_error); имена "
+                     "подтверждает человек (rename_speakers)._\n")
     if q0.get("group_doubt"):
         lines.append(f"_Внимание: {q0['group_doubt']['note']}._\n")
     if q0.get("names_outside_vocab"):
