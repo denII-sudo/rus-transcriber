@@ -38,6 +38,9 @@ SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             '[hidden]{display:none!important}</style></head><body>{BODY}</body></html>')
 mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_BODY_BYTES = 64 * 1024
+MAX_DRAIN_BYTES = 1024 * 1024   # отказанное тело до этого размера дочитывается и отбрасывается перед ответом
+DRAIN_TIMEOUT = 2               # секунд на всё такое дочитывание вместе (общий срок, а не на одно чтение)
+# Тот же приём — в review_page.py (там свои копии констант и _refuse): правя один, смотри и другой.
 
 
 class ExclusiveHTTPServer(ThreadingHTTPServer):
@@ -124,9 +127,12 @@ def make_server(port):
             # URL содержит секрет сессии: не записывать запрос целиком в журнал.
             pass
 
-        def _send(self, code, body, ctype="application/json; charset=utf-8", headers=()):
+        def _send(self, code, body, ctype="application/json; charset=utf-8", headers=(), close=False):
             b = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b)))
             self.send_header("Cache-Control", "no-store")
@@ -137,17 +143,50 @@ def make_server(port):
             self.end_headers()
             self.wfile.write(b)
 
+        def _length(self):
+            """Объявленная длина тела POST или None, если заголовок неверен или тело идёт частями."""
+            length = self.headers.get("Content-Length", "")
+            if len(length) > 12 or not length.isascii() or not length.isdecimal() or self.headers.get("Transfer-Encoding"):
+                return None
+            return int(length)
+
+        def _refuse(self, code, body):
+            """Ранний отказ на POST, пока тело ещё не прочитано. Закрытие соединения с непрочитанным телом в Windows
+            даёт клиенту сброс (WinError 10053) вместо ответа: браузер видит обрыв, а не отказ. Поэтому объявленное
+            тело до MAX_DRAIN_BYTES дочитывается и отбрасывается, всё вместе не дольше DRAIN_TIMEOUT от начала (общий
+            срок: перед каждым куском сокету ставится остаток), потом идёт ответ; больше, без длины или не пришедшее
+            в срок — отвечаем сразу, соединение закрывается. Тот же приём — в review_page.py."""
+            n = self._length()
+            if n and n <= MAX_DRAIN_BYTES:
+                deadline = time.monotonic() + DRAIN_TIMEOUT
+                left = n
+                try:
+                    while left > 0:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self.connection.settimeout(remaining)
+                        chunk = self.rfile.read1(min(65536, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                except OSError:
+                    pass
+                self.connection.settimeout(DRAIN_TIMEOUT)     # запись ответа — со своим запасом, не с остатком срока
+            self._send(code, body, close=True)
+
         def _path(self, post=False):
+            refuse = self._refuse if post else self._send
             host = f"127.0.0.1:{self.server.server_port}"
             if self.headers.get("Host") != host:
-                self._send(403, {"error": "недопустимый адрес"})
+                refuse(403, {"error": "недопустимый адрес"})
                 return None
             if post and self.headers.get("Origin") != f"http://{host}":
-                self._send(403, {"error": "недопустимый источник"})
+                refuse(403, {"error": "недопустимый источник"})
                 return None
             u = urlparse(self.path)
             if not u.path.startswith(prefix):
-                self._send(403, {"error": "недействительная сессия"})
+                refuse(403, {"error": "недействительная сессия"})
                 return None
             return u.path[len(prefix):]
 
@@ -219,14 +258,12 @@ def make_server(port):
                 return
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype != "application/json":
-                return self._send(415, {"error": "недопустимый тип данных"})
-            length = self.headers.get("Content-Length", "")
-            if len(length) > 12 or not length.isascii() or not length.isdecimal() \
-                    or self.headers.get("Transfer-Encoding"):
-                return self._send(400, {"error": "неверная длина запроса"})
-            n = int(length)
+                return self._refuse(415, {"error": "недопустимый тип данных"})
+            n = self._length()
+            if n is None:
+                return self._refuse(400, {"error": "неверная длина запроса"})
             if n <= 0 or n > MAX_BODY_BYTES:
-                return self._send(413, {"error": "недопустимый размер запроса"})
+                return self._refuse(413, {"error": "недопустимый размер запроса"})
             self.connection.settimeout(30)
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")

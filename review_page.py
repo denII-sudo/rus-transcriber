@@ -34,7 +34,8 @@ mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_ANSWER_BYTES = 64 * 1024
 MAX_VOICE_BYTES = 16 * 1024 * 1024
 MAX_DRAIN_BYTES = 1024 * 1024   # слишком большое, но не больше этого тело дочитывается и отбрасывается перед ответом 413
-DRAIN_TIMEOUT = 2               # секунд на такое дочитывание: клиент, который тело не шлёт, не держит обработчик
+DRAIN_TIMEOUT = 2               # секунд на всё такое дочитывание вместе (общий срок, а не на одно чтение)
+# Тот же приём — в workflow_page.py (там свои копии констант и _refuse): правя один, смотри и другой.
 
 # Причины, которые страница может показать человеку дословно: в них нет путей, текста ответов и
 # чужих данных. Сообщение с таким началом и подробностями после «:» показывается без подробностей.
@@ -146,20 +147,26 @@ def main():
         def _refuse(self, code, body):
             """Ранний отказ на POST, пока тело ещё не прочитано. Закрытие соединения с непрочитанным телом в Windows
             даёт клиенту сброс (WinError 10053) вместо ответа: браузер видит обрыв, а не отказ. Поэтому объявленное
-            тело до MAX_DRAIN_BYTES дочитывается и отбрасывается (не дольше DRAIN_TIMEOUT), потом идёт ответ;
-            больше, без длины или не пришедшее в срок — отвечаем сразу, соединение закрывается."""
+            тело до MAX_DRAIN_BYTES дочитывается и отбрасывается, всё вместе не дольше DRAIN_TIMEOUT от начала (общий
+            срок: перед каждым куском сокету ставится остаток), потом идёт ответ; больше, без длины или не пришедшее
+            в срок — отвечаем сразу, соединение закрывается. Тот же приём — в workflow_page.py."""
             n = self._length()
             if n and n <= MAX_DRAIN_BYTES:
-                self.connection.settimeout(DRAIN_TIMEOUT)
+                deadline = time.monotonic() + DRAIN_TIMEOUT
+                left = n
                 try:
-                    left = n
                     while left > 0:
-                        chunk = self.rfile.read(min(65536, left))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self.connection.settimeout(remaining)
+                        chunk = self.rfile.read1(min(65536, left))
                         if not chunk:
                             break
                         left -= len(chunk)
                 except OSError:
                     pass
+                self.connection.settimeout(DRAIN_TIMEOUT)     # запись ответа — со своим запасом, не с остатком срока
             self._send(code, body, close=True)
 
         def _path(self, post=False):

@@ -3,9 +3,12 @@ import gc
 import http.client
 import json
 import os
+import select
 import shutil
+import socket
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -301,6 +304,67 @@ class P5ScreenHTTPTests(unittest.TestCase):
             return response.status, json.loads(response.read().decode("utf-8"))
         finally:
             conn.close()
+
+    def raw_head(self, path, length, headers=None, target=None):
+        # копия помощника tests/test_review_http.py (тот же приём в review_page.py): правя один, смотри и другой
+        fields = {"Host": self.host, "Origin": f"http://{self.host}", "Content-Type": "application/json",
+                  "Content-Length": str(length), "Connection": "close"}
+        fields.update(headers or {})
+        return (f"POST {target or self.prefix + path} HTTP/1.1\r\n"
+                + "".join(f"{k}: {v}\r\n" for k, v in fields.items()) + "\r\n").encode()
+
+    def raw_post(self, path, length, parts, pause=0.1, headers=None, target=None):
+        """Запрос на сыром сокете: после первой части тела — пауза перед каждой следующей (тело приходит уже после отказа)."""
+        with socket.create_connection(("127.0.0.1", self.srv.server_port), timeout=10) as sock:
+            sock.sendall(self.raw_head(path, length, headers, target) + parts[0])
+            for part in parts[1:]:
+                time.sleep(pause)
+                sock.sendall(part)
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        top, _, body = data.partition(b"\r\n\r\n")
+        lines = top.decode("iso-8859-1").split("\r\n")
+        return int(lines[0].split()[1]), dict(line.lower().split(": ", 1) for line in lines[1:]), body
+
+    def test_every_early_refusal_reads_the_body_first_so_the_client_gets_the_answer(self):
+        # Без дочитывания тела в Windows клиент получал сброс соединения (WinError 10053) вместо ответа
+        body = b'{"audio": "x"}'
+        limit = workflow_page.MAX_BODY_BYTES + 1
+        cases = (
+            ("403 адрес", 403, {"path": "api/start", "headers": {"Host": "evil.example"}}),
+            ("403 источник", 403, {"path": "api/start", "headers": {"Origin": "https://evil.example"}}),
+            ("403 сессия", 403, {"path": "", "target": self.prefix.rstrip("/") + "x/api/start"}),
+            ("415 тип", 415, {"path": "api/start", "headers": {"Content-Type": "text/plain"}}),
+            ("413 размер", 413, {"path": "api/start", "length": limit}),
+        )
+        for name, code, case in cases:
+            with self.subTest(name):
+                length = case.get("length", len(body))
+                parts = [body[:5], body[5:]] if length == len(body) else [b"x" * 100, b"x" * (length - 100)]
+                status, headers, answer = self.raw_post(case["path"], length, parts, headers=case.get("headers"),
+                                                        target=case.get("target"))
+                self.assertEqual(status, code)
+                self.assertEqual(headers["connection"], "close")
+                self.assertIn("error", json.loads(answer))
+
+    def test_a_body_that_trickles_in_does_not_hold_the_refusal_longer_than_the_drain_timeout(self):
+        started = time.time()
+        with socket.create_connection(("127.0.0.1", self.srv.server_port), timeout=10) as sock:
+            sock.sendall(self.raw_head("api/start", workflow_page.MAX_BODY_BYTES + 1))
+            while time.time() - started < workflow_page.DRAIN_TIMEOUT + 5:
+                if select.select([sock], [], [], 0.5)[0]:
+                    break
+                try:
+                    sock.sendall(b"x")
+                except OSError:
+                    break
+            seconds = time.time() - started
+        self.assertGreaterEqual(seconds, workflow_page.DRAIN_TIMEOUT - 0.5)
+        self.assertLess(seconds, workflow_page.DRAIN_TIMEOUT + 1.5)
 
     def test_page_and_api_flows(self):
         status, html = self.get("")

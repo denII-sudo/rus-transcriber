@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import select
 import socket
 import subprocess
 import sys
@@ -166,15 +167,19 @@ class ReviewHTTP(unittest.TestCase):
         finally:
             conn.close()
 
-    def raw_post(self, path, length, parts, pause=0.3, headers=None, target=None):
-        """Запрос на сыром сокете: заголовки с Content-Length=length и первая часть тела, после каждой паузы — следующая;
-        затем ответ читается до закрытия соединения. -> (статус, заголовки в нижнем регистре, тело, секунд до конца ответа)."""
+    def raw_head(self, path, length, headers=None, target=None):
         port = self.url.port
         fields = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}", "Content-Type": "application/json",
                   "Content-Length": str(length), "Connection": "close"}
         fields.update(headers or {})
-        head = (f"POST {target or self.url.path + path} HTTP/1.1\r\n"
+        return (f"POST {target or self.url.path + path} HTTP/1.1\r\n"
                 + "".join(f"{k}: {v}\r\n" for k, v in fields.items()) + "\r\n").encode()
+
+    def raw_post(self, path, length, parts, pause=0.1, headers=None, target=None):
+        """Запрос на сыром сокете: заголовки с Content-Length=length и первая часть тела, после каждой паузы — следующая;
+        затем ответ читается до закрытия соединения. -> (статус, заголовки в нижнем регистре, тело, секунд до конца ответа)."""
+        port = self.url.port
+        head = self.raw_head(path, length, headers, target)
         started = time.time()
         with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
             sock.sendall(head + parts[0])
@@ -225,6 +230,30 @@ class ReviewHTTP(unittest.TestCase):
                 self.assertEqual(status, code)
                 self.assertEqual(headers["connection"], "close")
                 self.assertIn("error", json.loads(answer))
+
+    def test_a_body_that_trickles_in_does_not_hold_the_refusal_longer_than_the_drain_timeout(self):
+        # DRAIN_TIMEOUT — общий срок на всё дочитывание, а не на каждое чтение: байт раз в полсекунды не продлевает его
+        from review_page import DRAIN_TIMEOUT, MAX_ANSWER_BYTES
+        started = time.time()
+        status = None
+        with socket.create_connection(("127.0.0.1", self.url.port), timeout=10) as sock:
+            sock.sendall(self.raw_head("api/answer", MAX_ANSWER_BYTES + 1))
+            while time.time() - started < DRAIN_TIMEOUT + 5:
+                if select.select([sock], [], [], 0.5)[0]:
+                    try:
+                        data = sock.recv(65536)
+                    except OSError:
+                        data = b""                       # соединение закрыто с непрочитанным: в Windows это сброс
+                    status = int(data.split()[1]) if data.startswith(b"HTTP/") else None
+                    break
+                try:
+                    sock.sendall(b"x")
+                except OSError:
+                    break
+            seconds = time.time() - started
+        self.assertGreaterEqual(seconds, DRAIN_TIMEOUT - 0.5)
+        self.assertLess(seconds, DRAIN_TIMEOUT + 1.5)             # а не DRAIN_TIMEOUT + 5: сервер перестал ждать
+        self.assertIn(status, (413, None))                        # ответ, если соединение его ещё принимает
 
     def test_body_over_the_drain_limit_is_refused_at_once_and_not_read(self):
         from review_page import MAX_DRAIN_BYTES
