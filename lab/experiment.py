@@ -8,6 +8,7 @@
     <python> lab\\experiment.py add-audio --sandbox D:\\lab-1 --audio "D:\\отрывок.m4a" [--group <группа>]
     <python> lab\\experiment.py analyze --sandbox D:\\lab-1
     <python> lab\\experiment.py export-bench --sandbox D:\\lab-1 [--to-data <папка данных> [--apply]]
+    <python> lab\\experiment.py prepare --sandbox D:\\lab-work-1 --voice-profiles skip --work
 
 <python> — интерпретатор установленной программы: %LOCALAPPDATA%\\rus-transcriber\\.venv\\Scripts\\python.exe.
 Код конвейера берётся из этого клона, модели — из кэша установленной программы, без сети.
@@ -93,7 +94,7 @@ def cmd_prepare(a):
                          + "; укажите --source-data")
     program = Path(a.program_dir) if a.program_dir else lab_sandbox.default_program_dir()
     lab_sandbox.prepare(a.sandbox, source, program, a.voice_profiles, audio=a.audio or (), group=a.group or None,
-                        only_audio=a.only_audio)
+                        only_audio=a.only_audio, work=a.work)
 
 
 def cmd_add_audio(a):
@@ -230,6 +231,9 @@ def main(argv=None):
                    "по умолчанию — как при обычной расшифровке нового файла")
     p.add_argument("--only-audio", action="store_true",
                    help="только файлы --audio: база записей не копируется (пробный запуск на отрывке)")
+    p.add_argument("--work", action="store_true",
+                   help="обычная работа: копия базы записей и сохранённых гипотез для анализа без прогона "
+                        "моделей; аудио, словари и профили не копируются (нужен --voice-profiles skip)")
     p.set_defaults(fn=cmd_prepare)
     d = sub.add_parser("add-audio", help="добавить в готовую песочницу единицу из аудиофайла вне базы записей")
     d.add_argument("--sandbox", required=True)

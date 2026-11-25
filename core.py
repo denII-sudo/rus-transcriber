@@ -845,7 +845,11 @@ def build_review_pack(job_id, items=None):
         items = [{"id": it["id"], "question": "Проверьте текст и говорящего. При необходимости введите свой ответ.",
                   "options": [{"label": "Оставить как есть", "decision": {}}]}
                  for it in data.get("review", []) if transcript.place_unresolved(it)]
-    return P.build(jp, items)
+    try:
+        P.check_rebuild(jp)             # быстрый отказ до резки клипов; build повторяет проверку под замком
+        return P.build(jp, items)
+    except P.RebuildRefused as ex:
+        raise CoreError(str(ex)) from ex
 
 
 def start_review_page(job_id, port=8765):
@@ -1145,15 +1149,19 @@ def _replace_open_cards(jp, report):
         places = {i.get("id"): i for i in transcript.load(jp).get("review") or []}
         stale = [aid for aid in stale if transcript.contradiction_pending(places.get(aid) or {})]
         try:
-            cards = review_pack.contradiction_cards(jp, stale)
+            cards = review_pack.contradiction_cards(jp, stale, why="слова изменились после показа")
             report["replaced_cards"] = [aid for aid, state in cards.items() if state == "updated"]
         except _card_errors() as ex:
             report["cards_not_replaced"] = [{"id": aid, "why": str(ex)} for aid in stale]
     ids = [row["id"] for row in outcomes if row.get("outcome") == "applied_open"]
+    # К-15: прежняя замена не состоялась, а человек уже ответил на старую редакцию — ответ ждёт поверх
+    # применённого. Отбор без замка — с запасом; под замком ответов upsert_cards перепроверяет условие.
+    due = [aid for aid in review_pack.open_after_answer_ids(review_pack.answers_state(jp)) if aid not in ids]
+    ids += due
     if not ids:
         return report
     try:
-        replaced = review_pack.open_after_answer_cards(jp, ids)
+        replaced = review_pack.open_after_answer_cards(jp, ids, due=due, report=report)
     except _card_errors() as ex:
         report["cards_not_replaced"] = (report.get("cards_not_replaced") or []) + \
             [{"id": aid, "why": str(ex)} for aid in ids]
@@ -1360,7 +1368,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         revision_conflicts = draft.get("revision_conflicts")
     revision_conflicts = dict(revision_conflicts or {})
     import freeform
-    applied_before = P._applied_map(P.answers_state(jp, {"answers": {}}))
+    state_before = P.answers_state(jp, {"answers": {}})
+    applied_before = P._applied_map(state_before)
+    # места, где ответы ноутбука и облака расходились (К-23): применённый более поздний ответ ждёт проверки
+    conflicted = {c.get("id") for c in state_before.get("conflicts") or []}
+    conflict_was = {c.get("id"): c.get("was") for c in state_before.get("conflicts") or []}
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
     if draft is not None:
@@ -1438,7 +1450,18 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                 else:
                     report[key] = value
             aid = decision.get("id")
-            if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
+            if aid in result.get("successful_ids", []) and decision.get("confirm_applied"):
+                # подтверждение человека (К-23): слова те же, снимок прежний — отмена вернёт место к состоянию
+                # до применённого ответа, а не к состоянию после него; отпечаток «после» — с подтверждением
+                kept = transcript.confirm_snapshot(
+                    (P.answers_state(jp, {"answers": {}}).get("undo_snapshots") or {}).get(aid), before, after)
+                if kept is not None:
+                    snapshots[aid] = kept
+                P.mark_applied(jp, {aid}, snapshots={aid: kept} if kept is not None else None,
+                               outcomes={aid: "applied"})
+            elif aid in result.get("successful_ids", []):
+                # Ответ, применённый с отметкой «проверить человеку» (human_after, К-23), тоже учитывается как
+                # применённый: подпись и снимок отмены ставятся, исход — applied_check.
                 remember_snapshot(aid, before, after)
                 # Без снимка ответ всё равно применён: отметка ставится, отмена сообщит, что снимка нет.
                 P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
@@ -1466,7 +1489,7 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
     successful.update(rep.get("free_text", {}).get("successful_ids", []))
-    successful.difference_update(rep.get("human", []))
+    successful.difference_update(blocked)          # заблокированные preflight не применялись
     rep["applied_from_answers"] = sum(1 for d in decisions if d.get("id") in successful)
     snapshots = {aid: snapshot for aid, snapshot in snapshots.items() if aid in successful}
     successful.update(undone)
@@ -1475,11 +1498,14 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     free_conflicts = {aid for row in free_report.get("conflicts") or [] for aid in row.get("cards") or []}
     free_not_found = set(free_report.get("not_found") or [])
     pause_refused = set(report.get("pause_refused") or [])      # пропуск без кнопки паузы (6б)
+    listen_mismatch = set(report.get("listen_mismatch") or [])  # кнопка прослушивания против слов (К-3/К-4)
     free_hints = set(free_report.get("hints") or [])             # короткий ответ — подсказка, место открыто
     outcomes = {}
+    human_after = set(rep.get("human_after") or [])
     for aid in requested_ids:
         if aid in successful:
-            outcomes[aid] = "reverted" if aid in undone else "applied"
+            checked = aid in human_after or (aid in free and aid in conflicted)
+            outcomes[aid] = "reverted" if aid in undone else "applied_check" if checked else "applied"
         elif aid in revision_conflicts:
             outcomes[aid] = "apply_conflict"
         elif aid in blocked:
@@ -1488,8 +1514,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = "undo_conflict"
         elif aid in (report.get("already_decided") or []):
             outcomes[aid] = "already_decided"
-        elif aid in rep.get("human", []):
+        elif aid in rep.get("human", []) or aid in human_after:
+            # human_after без успеха — например, кнопка прослушивания: при расхождении ответов её не применяют
             outcomes[aid] = "left_for_human"
+        elif aid in listen_mismatch:
+            outcomes[aid] = "listen_mismatch"
         elif aid in pause_refused:
             outcomes[aid] = "pause_refused"
         elif aid in free_hints:
@@ -1505,7 +1534,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             outcomes[aid] = ("kept_previous" if P.over_applied(free[aid], applied_before.get(aid)) == "kept_previous"
                              else "negative")
     # Исход есть у каждого сохранённого ответа пакета, а не только у тех, что применялись в этот раз.
-    stored = P.answers_state(jp, {"answers": {}}).get("answers") or {}
+    state_now = P.answers_state(jp, {"answers": {}})
+    stored = state_now.get("answers") or {}
+    events_now = state_now.get("application_events") or []
     # ответ прежней редакции карточки (остался после сбоя замены) не применялся и исхода не получает
     current_items = {item.get("id"): item for item in (P.manifest(jp) or {}).get("items") or []}
     stored = {aid: a for aid, a in stored.items() if P.answer_is_current(a, current_items.get(aid))}
@@ -1516,7 +1547,10 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         elif aid in outcomes:
             continue
         elif aid in rep.get("unchanged", []):
-            outcomes[aid] = "applied"
+            # неизменившийся ответ сохраняет отметку «проверьте» (К-23), пока человек её не снимет: иначе
+            # место human дало бы applied_open и замену карточки с потерей отмены
+            last = P._last_place_event(events_now, aid)
+            outcomes[aid] = "applied_check" if (last or {}).get("outcome") == "applied_check" else "applied"
         elif aid in rep.get("kept_previous", []):
             outcomes[aid] = "kept_previous"
         elif aid in rep.get("pending_new", []):
@@ -1535,16 +1569,19 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     if failed_outcomes:
         P.mark_applied(jp, set(), outcomes=failed_outcomes)
     # Оставшиеся (пропуск, отмена без применённого ответа, давняя отмена) — по сохранённому состоянию.
-    states = P.answer_states(jp)
+    states = P.answer_states(jp, outcome_details=False)
     for aid in stored:
         if aid not in outcomes:
             outcomes[aid] = states[aid]["state"]
     # Уточнения к исходу — то, что прежний отчёт показывал отдельными списками.
     details = {aid: [states[aid]["detail"]] if states[aid].get("detail") else [] for aid in stored}
+    fresh = {aid: [] for aid in stored}      # уточнения этого «Применить» — их же видит карточка (К-22)
 
     def add_detail(aid, text):
         if aid in details and text and text not in details[aid]:
             details[aid].append(text)
+            if text != P.UNDO_UNAVAILABLE:
+                fresh[aid].append(text)
 
     for row in rep.get("undo_conflicts") or []:
         add_detail(row.get("id"), row.get("why") or row.get("conflict"))
@@ -1554,6 +1591,13 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             add_detail(aid, "с карточкой " + ", ".join(str(x) for x in others) if others else conflict.get("why"))
     for aid, why in revision_conflicts.items():
         add_detail(aid, why)
+    items_now = {item.get("id"): item for item in (P.manifest(jp) or {}).get("items") or []}
+    for aid in stored:
+        if outcomes[aid] == "applied_check":
+            was = conflict_was.get(aid)
+            add_detail(aid, "раньше на это место был другой ответ" +
+                       (f" ({P._desc(was, items_now[aid])})" if was and aid in items_now else "") +
+                       "; ответы ноутбука и облака расходились")
     for aid in stored:
         if outcomes[aid] == "applied_open":
             note = (places_now.get(aid) or {}).get("note") or ""
@@ -1580,6 +1624,10 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         return out
 
     rep["outcomes"] = [row(aid) for aid in sorted(stored, key=lambda x: (states[x]["card"] or 0, x))]
+    # уточнения — под карточку (только при хранении в базе; в файловом режиме ничего не пишется)
+    P.remember_outcome_details(jp, {aid: (stored[aid].get("ts"), stored[aid].get("source"),
+                                          [text for text in fresh[aid] if text != P.OUTCOME_REASONS[outcomes[aid]]])
+                                    for aid in stored})
     if undone:
         rep["voice_profile_warning"] = {
             "answer_ids": undone,

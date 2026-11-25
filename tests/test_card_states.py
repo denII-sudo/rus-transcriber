@@ -83,7 +83,7 @@ class CardStates(unittest.TestCase):
           man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};
           if (cardStatus(one,changed) !== "применён прежний ответ" || !appliedCard(one,changed)) throw Error("kept");
           man.answer_states.r1 = {state:"applied",ts:"t1",source:"local"};
-          man.conflicts=[{id:"r1"}]; if (!cardStatus(one,a).startsWith("конфликт")) throw Error("conflict");
+          man.conflicts=[{id:"r1"}]; if (cardStatus(one,a) !== "применён ответ" || !hasConflict(one)) throw Error("conflict");  // К-23: конфликт — строкой под ответом
           if (!appliedCard(one,a)) throw Error("applied card");
           editing.add("r1"); if (appliedCard(one,a)) throw Error("editing card");
         })();

@@ -211,12 +211,14 @@ class BuildButtonsTests(Case):
         asr = {"id": "r5", "status": "open", "t": 3.0, "t1": 3.0, "t2": 3.2, "gap": [3.0, 3.2],
                "speaker": None, "text": "", "reasons": ["asr"],
                "asr_problem": {"model": "whisper", "state": "empty_unknown", "words_from": []}}
-        with files("legacy_files", result(extra_review=[asr]), questions() + [{"id": "r5", "options": [AS_IS]}]) \
+        # К-5 (К-а1): кнопки сбоя прохода сверяются по отпечатку слов своего интервала, как у паузы
+        with files("sqlite", result(extra_review=[asr]), questions() + [{"id": "r5", "options": [AS_IS]}]) \
                 as (jp, _md, _v):
             item = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r5")
             self.assertEqual([o["decision"] for o in item["options"]],
                              [{"listened": "words"}, {"listened": "silence"}])
-            self.assertNotIn("listen_fp", item)
+            self.assertEqual(item["listen_fp"], transcript._listening_fingerprint(
+                transcript._interval_words(transcript.load(jp), 3.0, 3.2)))
 
     def test_listen_fp_is_the_fingerprint_of_overlapping_words(self):
         """Тест 2: отпечаток — по словам, перекрывающим интервал (их пересверяет сохранение)."""
@@ -266,11 +268,12 @@ class PauseButtonsApplyTests(Case):
                 why = rep["conflicts"][0]["why"]
                 self.assertIn("в паузе есть слова («ага»)" if inside else "противоречит словам", why)
                 self.assertEqual(transcript.load(jp), before)
-        with files("legacy_files", result(inside=True)) as (jp, md, version):
+        # К-3 (К-а1): кнопка против слов паузы — свой исход listen_mismatch (новое — только в режиме базы)
+        with files("sqlite", result(inside=True)) as (jp, md, version):
             self.press(jp, version, SILENCE)
             rep = core.apply_answers_files(jp, md)
             row = self.outcomes(rep)["r1"]
-            self.assertEqual(row["outcome"], "pause_refused", rep.get("outcomes"))
+            self.assertEqual(row["outcome"], "listen_mismatch", rep.get("outcomes"))
             self.assertIn("в паузе есть слова", row.get("detail", ""))
 
     def test_words_button_on_pause_with_words_confirms_them(self):

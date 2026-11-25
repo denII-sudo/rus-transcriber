@@ -106,6 +106,8 @@ audio{width:100%;height:36px}
                    overlap: "говорят вместе", gender: "род глагола", missed: "пропущена речь",
                    contradiction: "противоречие"};
   const NUM = ["1", "2", "3", "4"];
+  // К-6: у места сбоя прохода (asr_state не disagreement) чип не говорит «модели расходятся»
+  const chipText = (it, r) => r === "asr" && it.asr_state && it.asr_state !== "disagreement" ? "сбой распознавания" : REASONS[r] || r;
   let man = null, answers = {}, live = {}, showAll = false, api = null;
   const pageSession = typeof window !== "undefined" && window.crypto && window.crypto.randomUUID ?
     window.crypto.randomUUID() :
@@ -155,8 +157,20 @@ audio{width:100%;height:36px}
   // revert_pending: отмена подготовлена, но не применена — правка тоже ещё на месте
   // cloud_keep: отмена снята в облаке — применённая правка на месте
   // applied_open: ответ применён, место осталось открытым (PR 7) — правка на месте, отмена доступна
-  const holdsApplied = (it, a) => ["applied", "applied_open", "pending_new", "kept_previous", "undo_conflict",
-                                   "revert_pending", "cloud_keep"].includes(stateOf(it, a));
+  // applied_check: применён более поздний из расходившихся ответов ноутбука и облака (К-23) — проверить
+  const holdsApplied = (it, a) => ["applied", "applied_open", "applied_check", "pending_new", "kept_previous",
+                                   "undo_conflict", "revert_pending", "cloud_keep"].includes(stateOf(it, a));
+  // «Ответ верен — оставить» (К-23): тот же применённый ответ ещё раз от человека на ноутбуке закрывает место
+  const confirmAnswer = (it) => {
+    const sig = (man.applied_answers || {})[it.id];
+    if (!Array.isArray(sig)) return null;
+    const [kind, option, text] = sig;
+    if (kind === "option" && option != null) return {option};
+    if (kind === "recommended") return {kind};
+    if (kind === "free" && text) return {kind, text};
+    return null;
+  };
+  const hasConflict = (it) => (man.conflicts || []).some(c => c.id === it.id);
   // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
   const revertButton = (it, a) => stateOf(it, a) === "revert_pending" ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
@@ -205,10 +219,14 @@ audio{width:100%;height:36px}
                   undo_conflict: "отмена не выполнена — прежний ответ на месте",
                   source_conflict: "не применён — стенограмма изменилась", not_found: "не применён — место не найдено",
                   not_applied: "не применён", pause_refused: "не применён — нужна кнопка паузы",
+                  applied_check: "применён — проверьте: ответы ноутбука и облака расходились",
+                  listen_mismatch: "не применён — ответ не совпадает со словами",
                   hint: "не применён — см. подсказку", cloud_saved: "сохранён в облаке — не применён",
                   cloud_keep: "отмена снята — перенесётся на ноутбук; применённый ответ на месте"};
-  const cardStatus = (it, a) => (man.conflicts || []).some(c => c.id === it.id) ? "конфликт — требуется проверка" :
+  // Заголовок — состояние ответа; расхождение ответов ноутбука и облака — отдельной строкой под ответом (К-23).
+  const cardStatus = (it, a) =>
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "требует проверки" : STATUS[stateOf(it, a)] || "не применён";
+  const CONFLICT_TEXT = "ответы ноутбука и облака расходились — проверьте";
   // Строки отчёта «Применить»: исход каждого ответа по номеру карточки, с уточнением программы.
   function reportLines(rep, items) {
     const lines = [];
@@ -216,6 +234,9 @@ audio{width:100%;height:36px}
       return `Карточка ${n || id}` + (it && it.t ? ` (${it.t})` : ""); };
     (rep.outcomes || []).forEach(o => lines.push(`${cardName(o.id, o.card)}: ${o.why}` + (o.detail ? ` — ${o.detail}` : "")));
     if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${cardName(c.id)}: ${c.was_now}`); });
+    (rep.cards_not_replaced || []).forEach(c => lines.push(`${cardName(c.id)}: новая редакция карточки не создана` +
+      (c.why ? ` (${c.why})` : "") + " — нажмите «Применить сохранённые ответы» ещё раз"));
+    (rep.answers_not_carried || []).forEach(c => lines.push(`${cardName(c.id)}: ваш ответ на прежнюю редакцию не применён — ответьте на карточке заново`));
     if (rep.source_conflict) lines.push("Конфликт источника: " + rep.source_conflict);
     if (rep.voice_profile_warning && rep.voice_profile_warning.message) lines.push(rep.voice_profile_warning.message);
     return lines;
@@ -356,6 +377,7 @@ audio{width:100%;height:36px}
     box.append(k, v, m);
     const note = programNote(it, a);
     if (note) { const w = document.createElement("span"); w.className = "m"; w.textContent = note; box.append(w); }
+    if (hasConflict(it)) { const w = document.createElement("span"); w.className = "m conflict"; w.textContent = CONFLICT_TEXT; box.append(w); }
     return box;
   }
   function speak(it) {
@@ -434,7 +456,7 @@ audio{width:100%;height:36px}
     head.innerHTML = `<span class="tc"></span><span class="who"></span><span class="reasons"></span>`;
     head.querySelector(".tc").textContent = it.t;
     head.querySelector(".who").textContent = it.speaker || "";
-    (it.reasons || []).forEach(r => { const s = document.createElement("span"); s.className = "chip"; s.textContent = REASONS[r] || r; head.querySelector(".reasons").append(s); });
+    (it.reasons || []).forEach(r => { const s = document.createElement("span"); s.className = "chip"; s.textContent = chipText(it, r); head.querySelector(".reasons").append(s); });
     if (revOf(it) > 1) { const s = document.createElement("span"); s.className = "chip"; s.textContent = "вопрос обновлён"; head.querySelector(".reasons").append(s); }
     c.append(head);
 
@@ -472,6 +494,13 @@ audio{width:100%;height:36px}
       const second = revertButton(it, a);
       rb.textContent = second.label; rb.title = second.title;
       rb.onclick = () => send(it, {kind: second.kind}, state);
+      const ok = LOCAL && stateOf(it, a) === "applied_check" ? confirmAnswer(it) : null;
+      if (ok) {
+        const cb = document.createElement("button"); cb.className = "btn"; cb.type = "button"; cb.textContent = "Ответ верен — оставить";
+        cb.title = "Применённый ответ верен: место закроется вашим подтверждением после «Применить сохранённые ответы».";
+        cb.onclick = () => send(it, ok, state);
+        er.append(cb);
+      }
       er.append(eb, rb); c.append(er);
     }
 

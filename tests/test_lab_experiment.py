@@ -1047,5 +1047,235 @@ class BenchExport(unittest.TestCase):
         self.assertEqual(experiment.main(base_args + ["--to-data", str(self.target / "нет"), "--apply"]), 2)
 
 
+UNIT_A, UNIT_B = "aaaaaaaaaaaa", "bbbbbbbbbbbb"
+RUN_1, RUN_2, RUN_3 = "20261125-100000-aaaaaa.json", "20261125-100001-bbbbbb.json", "20261125-100002-cccccc.json"
+
+
+def make_hypotheses(data):
+    """Синтетическая папка гипотез: три файла прогонов, кэши и посторонние имена (их копировать нельзя)."""
+    hyp = data / "hypotheses"
+    for unit, run in ((UNIT_A, RUN_1), (UNIT_A, RUN_2), (UNIT_B, RUN_3)):
+        (hyp / unit).mkdir(parents=True, exist_ok=True)
+        (hyp / unit / run).write_text(json.dumps({"schema": "hyp-2", "roles": [{"words": [{"w": SECRET}]}],
+                                                  "ids": {"run_id": run[:-5]}}, ensure_ascii=False),
+                                      encoding="utf-8")
+    (hyp / "_artifacts.json").write_text('{"x": 1}', encoding="utf-8")
+    (hyp / "_testbed.json").write_text('{"testbed_id": "0"}', encoding="utf-8")
+    (hyp / "notes.txt").write_text("посторонний файл", encoding="utf-8")
+    (hyp / "zz").mkdir()
+    (hyp / "zz" / RUN_1).write_text("{}", encoding="utf-8")                 # папка не по маске
+    (hyp / UNIT_B / "other.json").write_text("{}", encoding="utf-8")         # имя не по маске
+    return hyp
+
+
+def link_dir(link, target):
+    """Ссылка на папку: symlink, а в Windows без прав — junction. -> False, если не удалось."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError):
+        if os.name != "nt":
+            return False
+        import subprocess
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, check=False)
+        return link.exists()
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class WorkSandbox(unittest.TestCase):
+    """prepare --work (план лаборатории 3а, PR-А): только база записей и файлы гипотез, со сверкой SHA-256."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-work-")
+        self.base = Path(self.tmp.name)
+        self.data, self.audio = make_source(self.base)
+        self.hyp = make_hypotheses(self.data)
+        self.program = self.base / "program"
+        self.program.mkdir()
+        self.sandbox = self.base / "sandbox"
+        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.log = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def prepare(self, **kw):
+        kw.setdefault("voice_profiles", "skip")
+        return lab_sandbox.prepare(self.sandbox, self.data, self.program, env={}, log=self.log.append,
+                                   work=True, **kw)
+
+    def assert_source_unchanged(self):
+        self.assertEqual(snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
+        self.assertEqual(snapshot(self.audio), self.before[1], "папка с аудио изменилась")
+
+    def manifest(self):
+        s = lab_sandbox.real(self.sandbox)
+        return json.loads((s / "source" / lab_sandbox.HYP_MANIFEST).read_text(encoding="utf-8"))
+
+    def copies(self):
+        root = lab_sandbox.real(self.sandbox) / "source" / "hypotheses"
+        return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()) \
+            if root.exists() else []
+
+    def test_copies_database_and_run_files_only(self):
+        report = self.prepare()
+        self.assert_source_unchanged()
+        s = lab_sandbox.real(self.sandbox)
+        self.assertTrue((s / "source" / "state.sqlite3").is_file())
+        expected = [f"{UNIT_A}/{RUN_1}", f"{UNIT_A}/{RUN_2}", f"{UNIT_B}/{RUN_3}"]
+        self.assertEqual(self.copies(), expected)          # кэши, посторонние имена и папки не по маске — нет
+        for rel in expected:
+            self.assertEqual((s / "source" / "hypotheses" / rel).read_bytes(), (self.hyp / rel).read_bytes())
+        man = self.manifest()
+        self.assertEqual(man["schema"], lab_sandbox.HYP_MANIFEST_SCHEMA)
+        self.assertEqual([f["relative"] for f in man["files"]], expected)
+        for f in man["files"]:
+            self.assertEqual(f["result"], "copied")
+            self.assertEqual(f["sha256"], hashlib.sha256((self.hyp / f["relative"]).read_bytes()).hexdigest())
+            self.assertEqual(f["bytes"], (self.hyp / f["relative"]).stat().st_size)
+        self.assertEqual(man["counts"]["copied"], 3)
+        text = json.dumps(man, ensure_ascii=False)
+        self.assertNotIn(str(self.base), text)                # только относительные имена
+        self.assertNotIn(SECRET, text)
+        marker = json.loads((s / lab_sandbox.MARKER).read_text(encoding="utf-8"))
+        self.assertIs(marker["work"], True)
+        line = next(c for c in marker["copied"] if c["relative"] == "source/hypotheses")
+        self.assertEqual((line["files"], line["method"]), (3, "sha256"))
+        self.assertEqual(line["sha256"], hashlib.sha256((s / "source" / lab_sandbox.HYP_MANIFEST).read_bytes())
+                         .hexdigest())
+        self.assertEqual(sorted(c["relative"] for c in marker["copied"]), ["source/hypotheses", "source/state.sqlite3"])
+        # настройки, соль, словари и профили не копируются; единиц опыта нет
+        self.assertEqual([p.name for p in (s / "data").iterdir()], [])
+        units = json.loads((s / "units.json").read_text(encoding="utf-8"))
+        self.assertEqual((units["schema"], units["units"]), ("lab-units-1", []))
+        self.assertEqual(report["recordings"], 3)
+        self.assertEqual(report["hypotheses"]["copied"], 3)
+        lab_sandbox.load_sandbox(self.sandbox, env={})        # песочница читается штатно
+
+    def test_audio_is_not_opened_or_hashed(self):
+        import builtins
+        import runinfo
+        real_open, real_sha = builtins.open, runinfo.sha256_file
+        touched = []
+        audio_key = os.path.normcase(str(lab_sandbox.real(self.audio)))
+
+        def watch(path):
+            if os.path.normcase(str(lab_sandbox.real(path))).startswith(audio_key):
+                touched.append(Path(path).name)
+
+        def spy_open(file, *a, **kw):
+            if isinstance(file, (str, os.PathLike)):
+                watch(file)
+            return real_open(file, *a, **kw)
+
+        def spy_sha(path, *a, **kw):
+            watch(path)
+            return real_sha(path, *a, **kw)
+        with mock.patch("builtins.open", spy_open), mock.patch.object(runinfo, "sha256_file", spy_sha):
+            self.prepare()
+        self.assertEqual(touched, [])
+        self.assert_source_unchanged()
+
+    def test_links_are_not_followed(self):
+        outside = self.base / "outside"
+        (outside / "cccccccccccc").mkdir(parents=True)
+        (outside / "cccccccccccc" / RUN_1).write_text("{}", encoding="utf-8")
+        if not link_dir(self.hyp / "cccccccccccc", outside / "cccccccccccc"):
+            self.skipTest("не удалось создать ссылку на папку")
+        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.prepare()
+        self.assertNotIn(f"cccccccccccc/{RUN_1}", self.copies())
+        self.assertEqual(len(self.copies()), 3)
+
+    def test_changed_deleted_and_new_files_during_copy_are_not_taken(self):
+        real_copy = lab_sandbox._copy_file
+
+        def racing(src, dst):
+            real_copy(src, dst)
+            name = Path(src).name
+            if name == RUN_1:                              # файл изменился после копирования
+                with open(src, "ab") as f:
+                    f.write(b" ")
+            elif name == RUN_2:                            # файл удалили после копирования
+                os.unlink(src)
+                (self.hyp / UNIT_B / "20261125-100009-dddddd.json").write_text("{}", encoding="utf-8")
+        with mock.patch.object(lab_sandbox, "_copy_file", racing):
+            report = self.prepare()
+        results = {f["relative"]: f["result"] for f in self.manifest()["files"]}
+        self.assertEqual(results, {f"{UNIT_A}/{RUN_1}": "changed_during_copy",
+                                   f"{UNIT_A}/{RUN_2}": "deleted_during_copy",
+                                   f"{UNIT_B}/{RUN_3}": "copied"})
+        self.assertEqual(self.copies(), [f"{UNIT_B}/{RUN_3}"])
+        self.assertEqual(self.manifest()["appeared_during_copy"], 1)
+        self.assertEqual(report["hypotheses"]["changed_during_copy"], 1)
+        self.assertTrue(any("изменились при копировании: 1" in m for m in self.log))
+
+    def test_copy_that_does_not_match_is_dropped(self):
+        real_copy = lab_sandbox._copy_file
+
+        def corrupt(src, dst):
+            real_copy(src, dst)
+            if Path(src).name == RUN_3:
+                with open(dst, "ab") as f:
+                    f.write(b"x")
+        with mock.patch.object(lab_sandbox, "_copy_file", corrupt):
+            self.prepare()
+        results = {f["relative"]: f["result"] for f in self.manifest()["files"]}
+        self.assertEqual(results[f"{UNIT_B}/{RUN_3}"], "copy_mismatch")
+        self.assertNotIn(f"{UNIT_B}/{RUN_3}", self.copies())
+        self.assert_source_unchanged()
+
+    def test_missing_hypotheses_folder_is_not_created(self):
+        import shutil
+        shutil.rmtree(self.hyp)
+        self.before = (snapshot(self.data), snapshot(self.audio))
+        report = self.prepare()
+        self.assertFalse(self.hyp.exists())
+        self.assert_source_unchanged()
+        self.assertEqual(self.manifest()["files"], [])
+        self.assertEqual(report["hypotheses"]["copied"], 0)
+
+    def test_live_writer_with_wal_leaves_data_folder_untouched(self):
+        import storage
+        writer = storage.open_store(self.data / "state.sqlite3")
+        try:
+            writer.db.execute("UPDATE local_users SET display_name='ИЗ-ЖУРНАЛА'")
+            before = snapshot(self.data)
+            self.prepare()
+            self.assertEqual(snapshot(self.data), before, "при живом писателе папка данных не меняется")
+        finally:
+            writer.close()
+        marker = json.loads((lab_sandbox.real(self.sandbox) / lab_sandbox.MARKER).read_text(encoding="utf-8"))
+        self.assertEqual(next(c["method"] for c in marker["copied"] if c["relative"] == "source/state.sqlite3"),
+                         "bytes")
+        self.assertEqual(len(self.copies()), 3)
+
+    def test_refuses_wrong_options_and_dangerous_places(self):
+        for kw in ({"voice_profiles": "copy"}, {"audio": [self.audio / "one.wav"]},
+                   {"audio": [self.audio / "one.wav"], "only_audio": True}, {"group": "grp"}):
+            with self.subTest(kw=sorted(kw)), self.assertRaises(lab_sandbox.SandboxError):
+                self.prepare(**kw)
+        self.assertFalse(self.sandbox.exists())
+        for bad in (self.data / "lab", self.hyp / "lab", self.audio / "lab", self.program / "lab"):
+            with self.subTest(bad=bad), self.assertRaises(lab_sandbox.SandboxError):
+                lab_sandbox.prepare(bad, self.data, self.program, "skip", env={}, log=self.log.append, work=True)
+        self.assertFalse((self.data / "lab").exists())
+        self.assertFalse((self.hyp / "lab").exists())
+        self.assert_source_unchanged()
+
+    def test_command_line(self):
+        import experiment
+        experiment.main(["prepare", "--sandbox", str(self.sandbox), "--voice-profiles", "skip", "--work",
+                         "--source-data", str(self.data), "--program-dir", str(self.program)])
+        self.assertEqual(len(self.copies()), 3)
+        self.assert_source_unchanged()
+
+    def test_ordinary_prepare_does_not_copy_hypotheses(self):
+        lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append)
+        s = lab_sandbox.real(self.sandbox)
+        self.assertFalse((s / "source" / "hypotheses").exists())
+        self.assertNotIn("work", json.loads((s / lab_sandbox.MARKER).read_text(encoding="utf-8")))
+
+
 if __name__ == "__main__":
     unittest.main()

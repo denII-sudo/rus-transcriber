@@ -561,6 +561,26 @@ def answer_snapshot(before, after):
             "after": _undo_fingerprint(after)}
 
 
+def confirm_snapshot(snapshot, before, after):
+    """Снимок отмены ответа после подтверждения человека (К-23): слова и журнал правок те же, изменились только
+    строки мест, которые снимок и так восстанавливает. Тогда снимок прежний, с отпечатком состояния после
+    подтверждения: отмена вернёт место к состоянию до ответа. Иначе снимок не годится — None."""
+    if not snapshot or snapshot.get("format") != 2:
+        return None
+    if before.get("segments") != after.get("segments") or (before.get("edits") or []) != (after.get("edits") or []):
+        return None
+    old, new = before.get("review") or [], after.get("review") or []
+    if len(old) != len(new):
+        return None
+    try:
+        covered = {i for p in snapshot["review_patches"] for i in range(p["start"], p["start"] + p["remove"])}
+    except (KeyError, TypeError):
+        return None
+    if any(a != b and i not in covered for i, (a, b) in enumerate(zip(old, new))):
+        return None
+    return dict(snapshot, after=_undo_fingerprint(after))
+
+
 def _restore_patches(rows, patches):
     if not isinstance(patches, list):
         raise ValueError("неверный формат снимка")
@@ -1930,6 +1950,17 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         if not it:
             report["unknown"].append(d.get("id"))
             continue
+        if d.get("confirm_applied"):
+            # К-23: человек подтвердил применённый ответ, который ему отдали на проверку: слова не меняются,
+            # место закрывается его действием. Агент так не закрывает; решённое место не трогается.
+            if by != "human":
+                report.setdefault("conflicts", []).append({"id": it["id"], "why": "нет явного подтверждения человека"})
+                continue
+            if it.get("status") == "human":
+                it["status"] = "resolved"
+                it["note"] = d.get("note") or it.get("note")
+            report["successful_ids"].append(it["id"])
+            continue
         if d.get("status") == "human":
             # Слова не получают отметок человека. Место, уже оставленное человеку, не меняется.
             # if_open («Оставить человеку» на карточке): решённое место тоже не меняется — повтор после
@@ -1979,11 +2010,14 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             heard_words = _interval_words(data, start, end)
             # у пропуска проверка — по словам, начатым в паузе: хвост слова до паузы ей не принадлежит (6а)
             checked = [w for _, _, w in pause_words(data, start, end)] if gap_place else heard_words
+            # кнопка противоречит словам интервала — свой исход listen_mismatch (К-3/К-4), не «нужна кнопка паузы»
             if gap_place and d["listened"] in ("silence", "interjections") and checked:
                 refuse(PAUSE_HAS_WORDS.format(words=" ".join(str(w.get("w", "")) for w in checked)))
+                report.setdefault("listen_mismatch", []).append(it["id"])
                 continue
             if (d["listened"] == "silence" and checked) or (d["listened"] == "words" and not checked):
                 refuse("выбранный ответ противоречит словам стенограммы; сначала исправьте стенограмму")
+                report.setdefault("listen_mismatch", []).append(it["id"])
                 continue
             it["listening"] = {"by": "human", "result": d["listened"],
                                **({"via": "card"} if d.get("via") == "card" else {}),

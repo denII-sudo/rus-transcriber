@@ -81,7 +81,15 @@ class ListeningTests(unittest.TestCase):
                                 "local", trusted_actor="human")
         stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
         self.assertEqual(stored["answers"]["r1"]["diagnostic_id"], "missed-0001")
+        # К-5: сохранение без смены слов интервала кнопку не отклоняет, смена слов интервала — отклоняет
         transcript.save(transcript.load(self.jp), self.jp, self.md)
+        decisions, report = review_pack.decisions(self.jp)
+        self.assertEqual([d["id"] for d in decisions], ["r1"])
+        self.assertNotIn("source_conflict", report)
+        data = transcript.load(self.jp)
+        data["segments"] = [{"speaker": "S", "start": 0.1, "end": 0.2, "text": "да",
+                             "words": [{"w": "да", "s": 0.1, "e": 0.2}]}]
+        transcript.save(data, self.jp, self.md)
         decisions, report = review_pack.decisions(self.jp)
         self.assertEqual(decisions, [])
         self.assertIn("source_conflict", report)
