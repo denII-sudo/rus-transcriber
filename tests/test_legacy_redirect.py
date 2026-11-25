@@ -2,8 +2,9 @@
 
 Только синтетические данные во временной папке. Перенос — тем же путём, что `tools/import_legacy.py`
 (`build_snapshots`, `recording_id_for`, `sha256_file`), как в `tests/test_voice_sqlite.py`. Закрепляется:
-переадресация по единственной копии с тем же содержимым; отказы с подсказкой (не перенесена, изменена после
-переноса, файла нет, несколько копий); не основной вариант; прежнее поведение в режиме `legacy_files`, для
+переадресация по единственной копии с тем же содержимым и по тому же пути (в любом написании); отказы с
+подсказкой (не перенесена, изменена после переноса, файла нет, файла нет и по его пути ничего не переносили,
+несколько копий, копия файла по другому пути); не основной вариант; прежнее поведение в режиме `legacy_files`, для
 задач, сделанных уже в базе, и для неактивной базы; переадресация только читает.
 """
 import atexit
@@ -103,10 +104,11 @@ class Fixture(unittest.TestCase):
         return rid
 
     def job(self, path=None, job_id=JOB):
+        """Файл готовой задачи; path — Path или строка, записанная в задачу как есть."""
         path = path or self.legacy
         (self.jobs / f"{job_id}.json").write_text(json.dumps(
             {"state": "done", "kind": "transcribe", "file": str(self.audio), "json": str(path),
-             "markdown": str(path.with_suffix("").with_suffix(".md"))}, ensure_ascii=False), encoding="utf-8")
+             "markdown": str(Path(path).with_suffix("").with_suffix(".md"))}, ensure_ascii=False), encoding="utf-8")
         return job_id
 
     def operations(self):
@@ -188,6 +190,21 @@ class Redirect(Fixture):
         self.assertEqual(s["recording_id"], second)
         self.assertIn("recording:" + first, s["migration_hint"])
 
+    def test_path_spelling_variants(self):
+        """Путь в задаче записан иначе (косые черты, `..`, на Windows — регистр): та же запись."""
+        self.write_legacy(legacy_data(self.audio, recording_id=uuid.uuid4().hex))
+        rid = self.migrate()
+        (self.root / "sub").mkdir()
+        variants = [str(self.legacy).replace("\\", "/"), str(self.root / "sub" / ".." / self.legacy.name)]
+        if os.name == "nt":
+            variants.append(str(self.legacy).swapcase())
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.job(variant)
+                s = core.job_status(JOB)
+                self.assertEqual(s.get("recording_id"), rid)
+                self.assertEqual(s["legacy_json"], variant)
+
 
 class Refusals(Fixture):
     def refused(self, pattern):
@@ -219,6 +236,43 @@ class Refusals(Fixture):
         self.legacy.unlink()
         self.assertIn(f"старого файла нет на диске; записи в базе по этому пути — recording:{rid}",
                       core.job_status(JOB)["migration_hint"])
+
+    def test_file_missing_and_nothing_at_that_path(self):
+        """Ф209-1: старого файла нет, по его пути ничего не переносили (стенограмму перенесли из другой папки).
+
+        Записи не угадываются; отказ не советует переносить файл, которого нет, и не зовёт к legacy_files.
+        """
+        moved = self.root / "moved"
+        moved.mkdir()
+        other = self.write_legacy(legacy_data(self.audio, recording_id=uuid.uuid4().hex), moved / self.legacy.name)
+        self.migrate(other)
+        self.job()
+        self.assertFalse(self.legacy.exists())
+        ops = self.operations()
+        s = core.job_status(JOB)
+        self.assertEqual(s["json"], str(self.legacy))
+        self.assertNotIn("recording_id", s)
+        hint = s["migration_hint"]
+        self.assertIn("старого файла нет на диске и записей по этому пути в базе нет; если стенограмму перенесли "
+                      "из другой папки, найдите запись в списке записей и укажите recording:<id>", hint)
+        for advice in ("import_legacy", "legacy_files", "перенесите"):
+            self.assertNotIn(advice, hint)
+        self.assertEqual(recordings.find_migrated(self.store, self.legacy)["state"], "not_found")
+        self.refused("not registered in the active store; старого файла нет на диске и записей по этому пути")
+        self.assertEqual(self.operations(), ops)
+
+    def test_same_recording_id_other_path(self):
+        """Копия файла с тем же recording_id и тем же содержимым, но по другому пути: не та запись."""
+        self.write_legacy(legacy_data(self.audio, recording_id=uuid.uuid4().hex))
+        self.migrate()
+        copy = self.root / "copy.transcript.json"
+        copy.write_bytes(self.legacy.read_bytes())
+        self.assertEqual(IL.sha256_file(copy), IL.sha256_file(self.legacy))
+        self.job(copy)
+        s = core.job_status(JOB)
+        self.assertEqual(s["json"], str(copy))
+        self.assertNotIn("recording_id", s)
+        self.assertEqual(recordings.find_migrated(self.store, copy)["state"], "not_migrated")
 
     def test_two_copies_with_same_content(self):
         self.write_legacy(legacy_data(self.audio))

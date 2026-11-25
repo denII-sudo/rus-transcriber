@@ -217,6 +217,9 @@ _MIGRATION_HINTS = {
                     "docs/legacy-migration.md) или верните режим legacy_files",
     "changed": "старый файл изменился после переноса в базу; запись в базе — {refs}; выберите её явно",
     "file_missing": "старого файла нет на диске; записи в базе по этому пути — {refs}; выберите запись явно",
+    # файла нет и по его пути ничего не переносили: переносить нечего, но запись могли перенести из другой папки
+    "not_found": "старого файла нет на диске и записей по этому пути в базе нет; если стенограмму перенесли "
+                 "из другой папки, найдите запись в списке записей и укажите recording:<id>",
     "ambiguous": "по этому файлу в базе несколько записей — {refs}; выберите запись явно",
 }
 
@@ -226,7 +229,7 @@ def find_migrated(store, legacy_path):
 
     Сначала прежний `recording_id` из файла (перенос его сохраняет), иначе перебор записей по
     `quality.migration.source.path`. Подходит только запись с тем же SHA-256, что у файла сейчас.
-    -> {"state": found | not_migrated | changed | file_missing | ambiguous, "recording_id" (для found),
+    -> {"state": found | not_migrated | not_found | changed | file_missing | ambiguous, "recording_id" (для found),
         "candidates": [recording_id…] по пути, "hint": текст для человека}.
     """
     sha, old_id = _legacy_file_facts(legacy_path)
@@ -243,7 +246,7 @@ def find_migrated(store, legacy_path):
     if copies is None:
         copies = migrated_copies(store, legacy_path)
     if not copies:
-        state, matching = "not_migrated", []
+        state, matching = ("not_found" if sha is None else "not_migrated"), []
     elif sha is None:
         state, matching = "file_missing", copies
     else:

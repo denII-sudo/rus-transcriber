@@ -91,6 +91,17 @@ def _voice_job_source_ref(job_id):
     return jp
 
 
+def _legacy_job_json(job_id, ref):
+    """Старая стенограмма задачи, если номер переадресован к записи базы (core.job_status), иначе None.
+
+    Сверяется только сырой файл задачи: путь в нём отличается от выданного лишь при переадресации.
+    """
+    if not isinstance(job_id, str) or job_id.startswith("recording:"):
+        return None
+    old = (core._read_job_status(job_id) or {}).get("json")
+    return old if isinstance(old, str) and old and old != str(ref) else None
+
+
 def _source_contributions(profile, source, key):
     """Пометки с переноса, которые заменит обновление, и вклады из других вариантов стенограммы."""
     confirmation, other = [], set()
@@ -111,7 +122,11 @@ def preview_voice_learning(job_id, group_override=None):
     import voices
     import vocab
     import voice_sources
-    source = _open_voice_source(_voice_job_source_ref(job_id))
+    ref = _voice_job_source_ref(job_id)
+    source = _open_voice_source(ref)
+    legacy = _legacy_job_json(job_id, ref)
+    if legacy and source.kind == "sqlite" and not source.redirected_from:
+        source.redirected_from = Path(legacy).name   # окно подтверждения: «найдена по старому номеру задачи»
     try:
         data = source.data
         if data.get("no_profile"):
