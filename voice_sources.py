@@ -101,13 +101,8 @@ def _store_id(store):
 
 
 def _migration_link(store, recording_id):
-    import storage
-    try:
-        first = store.get_revision(recording_id, "transcript", 1)["payload"]
-    except (KeyError, storage.StorageError):
-        return {}
-    link = ((first.get("quality") or {}).get("migration") or {}).get("source") or {}
-    return link if isinstance(link.get("path"), str) and link["path"] else {}
+    import recordings
+    return recordings.migration_link(store, recording_id)
 
 
 def _revision_time(store, recording_id, revision):
@@ -209,13 +204,8 @@ def folder_sources(folder):
 
 def migrated_copies(store, legacy_path):
     """Записи базы, перенесённые из этого старого файла: [(recording_id, migration.source)]."""
-    target = Path(legacy_path).resolve()
-    out = []
-    for (recording_id,) in store.db.execute("SELECT recording_id FROM recordings ORDER BY recording_id").fetchall():
-        link = _migration_link(store, recording_id)
-        if link and same_path(Path(link["path"]).resolve(), target):
-            out.append((recording_id, link))
-    return out
+    import recordings
+    return recordings.migrated_copies(store, legacy_path)
 
 
 def _redirect(legacy_path):
@@ -224,15 +214,15 @@ def _redirect(legacy_path):
     store = recordings.open_store(readonly=True)
     try:
         store.current_identity()
-        copies = migrated_copies(store, legacy_path)
-        if len(copies) != 1:
-            raise SourceError("у этой старой записи нет единственной копии в базе "
-                              f"(найдено {len(copies)}); выберите запись в базе явно (recording:<id>)")
-        recording_id, link = copies[0]
-        if file_hash(legacy_path) != link.get("sha256"):
+        # тот же отбор, что у старых номеров задач (recordings.find_migrated): путь и SHA-256 файла сейчас
+        found = recordings.find_migrated(store, legacy_path)
+        if found["state"] == "changed":
             raise SourceError("старый файл изменился после переноса в базу; выберите запись в базе явно "
                               "(recording:<id>)")
-        return _sqlite_source(store, recording_id, redirected_from=Path(legacy_path).name)
+        if found["state"] != "found":
+            raise SourceError("у этой старой записи нет единственной копии в базе "
+                              f"(найдено {len(found['candidates'])}); выберите запись в базе явно (recording:<id>)")
+        return _sqlite_source(store, found["recording_id"], redirected_from=Path(legacy_path).name)
     finally:
         store.close()
 

@@ -88,6 +88,15 @@ def open_store(path=None, readonly=False):
     return storage.open_store_readonly(path) if readonly else storage.open_store(path)
 
 
+def document_backend_hint(document_path):
+    """`passport.storage_backend` файла стенограммы (`sqlite` — выгрузка записи базы) или None."""
+    try:
+        payload = json.loads(Path(document_path).read_text(encoding="utf-8"))
+        return (payload.get("passport") or {}).get("storage_backend")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return None
+
+
 def open_for_document(document_path, path=None, readonly=False):
     """Открыть Store только если путь зарегистрирован как текущая цель SQLite-записи."""
     import settings
@@ -95,13 +104,7 @@ def open_for_document(document_path, path=None, readonly=False):
     if path is None:
         import paths
         path = paths.STATE_DB
-    target = Path(document_path)
-    hint = None
-    try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
-        hint = (payload.get("passport") or {}).get("storage_backend")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-        pass
+    hint = document_backend_hint(document_path)
     if not Path(path).is_file():
         if hint == "sqlite" or sqlite_selected:
             raise storage.StorageError("SQLite database is missing for this recording")
@@ -115,9 +118,18 @@ def open_for_document(document_path, path=None, readonly=False):
     try:
         binding = resolve_document(store, document_path)
         if binding is None:
+            message = "SQLite document is not registered in the active store"
+            if sqlite_selected and hint != "sqlite":
+                # старая стенограмма после переключения на базу (М-2): подсказать перенесённую запись или
+                # причину, почему её нет; запись по старому пути не подменяется — от пути зависят папка
+                # разбора и файлы рядом с аудио
+                try:
+                    message += "; " + find_migrated(store, document_path)["hint"]
+                except (OSError, ValueError, KeyError, sqlite3.Error, storage.StorageError):
+                    pass
             store.close()
             if hint == "sqlite" or sqlite_selected:
-                raise storage.Conflict("SQLite document is not registered in the active store")
+                raise storage.Conflict(message)
             return None, None
         store.current_identity()  # fail closed for inactive/ambiguous restored stores
         return store, binding
@@ -138,6 +150,125 @@ def find_recordings(store, source_path):
     return [dict(row) for row in store.db.execute(
         "SELECT recording_id, location, source_revision, review_revision FROM recordings "
         "WHERE location=? ORDER BY recording_id", (location,))]
+
+
+# ---------- записи, перенесённые из старых файлов (П7, `tools/import_legacy.py`) ----------
+# Связь записи со старой стенограммой — только `quality.migration` первой ревизии стенограммы: путь и SHA-256
+# старого файла на момент переноса. Функции ниже только читают базу и старый файл.
+def migration_info(store, recording_id):
+    """`quality.migration` первой ревизии стенограммы записи или {} (запись не из переноса)."""
+    try:
+        first = store.get_revision(recording_id, "transcript", 1)["payload"]
+    except (KeyError, ValueError, storage.StorageError):
+        return {}
+    migration = (first.get("quality") or {}).get("migration")
+    return migration if isinstance(migration, dict) else {}
+
+
+def migration_link(store, recording_id):
+    """Сведения о старом файле записи (`path`, `sha256`, `size`) или {}."""
+    link = migration_info(store, recording_id).get("source") or {}
+    return link if isinstance(link, dict) and isinstance(link.get("path"), str) and link["path"] else {}
+
+
+def same_location(a, b):
+    """Пути равны без учёта регистра (в базе `location` хранится через normcase, в старых задачах — как есть)."""
+    return os.path.normcase(str(a)).lower() == os.path.normcase(str(b)).lower()
+
+
+def migrated_copies(store, legacy_path):
+    """Записи базы, перенесённые из этого старого файла: [(recording_id, migration.source)]."""
+    target = Path(legacy_path).resolve()
+    out = []
+    for (recording_id,) in store.db.execute("SELECT recording_id FROM recordings ORDER BY recording_id").fetchall():
+        link = migration_link(store, recording_id)
+        if link and same_location(Path(link["path"]).resolve(), target):
+            out.append((recording_id, link))
+    return out
+
+
+def _legacy_file_facts(legacy_path):
+    """(SHA-256 файла или None, если его нет; recording_id из файла или None)."""
+    import hashlib
+    p = Path(legacy_path)
+    if not p.is_file():
+        return None, None
+    digest = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    try:
+        old = json.loads(p.read_bytes().decode("utf-8-sig")).get("recording_id")
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError):
+        old = None
+    return digest.hexdigest(), old if isinstance(old, str) and old else None
+
+
+RECORDING_REF = "recording:"
+
+
+def _refs(copies):
+    return ", ".join(RECORDING_REF + rid for rid, _link in copies)
+
+
+_MIGRATION_HINTS = {
+    "found": "эта стенограмма перенесена в базу: {refs} — используйте его",
+    "not_migrated": "эта стенограмма не перенесена в базу; перенесите её (tools/import_legacy.py, "
+                    "docs/legacy-migration.md) или верните режим legacy_files",
+    "changed": "старый файл изменился после переноса в базу; запись в базе — {refs}; выберите её явно",
+    "file_missing": "старого файла нет на диске; записи в базе по этому пути — {refs}; выберите запись явно",
+    "ambiguous": "по этому файлу в базе несколько записей — {refs}; выберите запись явно",
+}
+
+
+def find_migrated(store, legacy_path):
+    """Единственная запись базы, перенесённая из этого старого файла, — только чтение.
+
+    Сначала прежний `recording_id` из файла (перенос его сохраняет), иначе перебор записей по
+    `quality.migration.source.path`. Подходит только запись с тем же SHA-256, что у файла сейчас.
+    -> {"state": found | not_migrated | changed | file_missing | ambiguous, "recording_id" (для found),
+        "candidates": [recording_id…] по пути, "hint": текст для человека}.
+    """
+    sha, old_id = _legacy_file_facts(legacy_path)
+    copies = None
+    if sha is not None and old_id:
+        try:
+            candidate = str(uuid.UUID(old_id))
+        except ValueError:
+            candidate = None
+        link = migration_link(store, candidate) if candidate else {}
+        if link and link.get("sha256") == sha and same_location(Path(link["path"]).resolve(),
+                                                                Path(legacy_path).resolve()):
+            copies = [(candidate, link)]
+    if copies is None:
+        copies = migrated_copies(store, legacy_path)
+    if not copies:
+        state, matching = "not_migrated", []
+    elif sha is None:
+        state, matching = "file_missing", copies
+    else:
+        matching = [c for c in copies if c[1].get("sha256") == sha]
+        state = {0: "changed", 1: "found"}.get(len(matching), "ambiguous")
+    shown = matching if state in ("found", "ambiguous") else copies
+    result = {"state": state, "candidates": [rid for rid, _link in copies],
+              "hint": _MIGRATION_HINTS[state].format(refs=_refs(shown))}
+    if state == "found":
+        result["recording_id"] = matching[0][0]
+        others = [c for c in copies if c[0] != result["recording_id"]]
+        if others:
+            result["hint"] += f"; другие перенесённые копии этого файла — {_refs(others)}"
+    return result
+
+
+def main_variant_of(store, recording_id):
+    """ID основного варианта той же записи (то же аудио, `migration.variant.main`) или None."""
+    row = store.db.execute("SELECT location FROM recordings WHERE recording_id=?", (recording_id,)).fetchone()
+    if row is None:
+        return None
+    mains = [rid for (rid,) in store.db.execute(
+        "SELECT recording_id FROM recordings WHERE location=? ORDER BY recording_id", (row[0],)).fetchall()
+        if (migration_info(store, rid).get("variant") or {}).get("main")]
+    return mains[0] if len(mains) == 1 else None
 
 
 def document_binding(store, recording_id):

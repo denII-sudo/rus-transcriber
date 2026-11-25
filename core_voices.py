@@ -513,9 +513,10 @@ def _refresh_recording_entry(store, key, stored, profile):
 
 def _refresh_migrated_copy(store, key, stored, profile, entry, audio_key):
     """Старый ключ при работе с базой: статус — по её единственной копии (связь — quality.migration.source)."""
+    import recordings
     import voice_sources
     try:
-        copies = voice_sources.migrated_copies(store, key)
+        copies = recordings.migrated_copies(store, key)
         if len(copies) != 1:
             return audio_key
         source = voice_sources.record_source(store, copies[0][0])
