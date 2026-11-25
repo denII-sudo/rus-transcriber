@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 PAD_BEFORE = 3.5     # клип начинается за 3,5 с до места (было 1,5)
@@ -71,6 +71,13 @@ OUTCOME_REASONS = {
     "pause_refused": ("не применён: паузу так не закрыть — нажмите кнопку прослушивания паузы "
                       "или впишите услышанное"),
     "hint": "не применён: короткий ответ не понят как слова, место осталось открытым — подсказка ниже",
+    # К-23: ответы ноутбука и облака на место расходились, применён более поздний — его проверяет человек
+    "applied_check": ("ответ применён к стенограмме, но раньше на это место был другой ответ — проверьте: "
+                      "если ответ верен, нажмите «Ответ верен — оставить», иначе измените ответ или "
+                      "подготовьте отмену"),
+    # К-3/К-4: кнопка прослушивания противоречит словам стенограммы в интервале
+    "listen_mismatch": ("не применён: выбранный ответ прослушивания не совпадает со словами стенограммы "
+                        "в интервале — исправьте слова или выберите другой ответ"),
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
 UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
@@ -82,6 +89,24 @@ PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом
 LISTEN_STALE = "слова в интервале паузы изменились после создания карточек; пересоберите пакет"
 CONTRADICTION_STALE = ("слова места изменились после показа карточки противоречия; ответ не применён, "
                        "карточка обновлена — выберите заново")
+# PR 17-Б: что пересборка пакета (build) делает с ответом в каждом состоянии. «Ждёт» — пересборка отказывает:
+# она потеряла бы ответ, ещё не применённый к стенограмме. «Применён» и «закончен» не блокируют (применённые
+# после пересборки не отменить со страницы — undo_lost в отчёте). «Неприменим» не блокирует и перечисляется в
+# отчёте. applied_check и listen_mismatch — исходы К-а1 («применён — проверить человеку», «прослушанное не
+# совпало со словами места»). Состояние вне таблицы считается ждущим.
+REBUILD_GROUPS = {
+    "waiting": frozenset({"saved", "revert_pending", "pending_new"}),
+    "applied": frozenset({"applied", "applied_open", "kept_previous", "applied_check"}),
+    "finished": frozenset({"reverted", "skipped", "already_decided", "left_for_human"}),
+    "unapplicable": frozenset({"negative", "hint", "pause_refused", "blocked_preflight", "apply_conflict",
+                               "source_conflict", "not_found", "not_applied", "undo_conflict", "listen_mismatch"}),
+}
+# что сделать человеку с ждущим ответом, чтобы пересборка стала возможной
+REBUILD_EXIT = {
+    "saved": "нажмите «Применить сохранённые ответы»",
+    "revert_pending": "нажмите «Применить сохранённые ответы» или «Не отменять»",
+    "pending_new": "«Подготовить отмену» → «Применить сохранённые ответы»",
+}
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -210,17 +235,46 @@ ASR_STATE_UNKNOWN_RU = "результат неполон или неизвес�
 OPEN_AFTER_ANSWER = "Ответ применён, место осталось открытым. "
 
 
-def open_after_answer_cards(json_path, ids):
+def open_after_answer_cards(json_path, ids, due=None, report=None):
     """Новая редакция карточек ids (механизм 13а, upsert_cards): вопрос прежний с OPEN_AFTER_ANSWER в начале.
-    Повтор ничего не пишет: вопрос с этим началом уже стоит. -> id заменённых карточек."""
+    Повтор ничего не пишет: вопрос с этим началом уже стоит. -> id заменённых карточек.
+    due — id, которые нужно перепроверить под замком ответов (К-15): кандидат отобран без замка, а страница
+    могла за это время изменить ответ; заменяется, только если open_after_answer_due ещё верно.
+    report (dict) получает answers_not_carried — ответы на прежнюю редакцию, которые не применены."""
     items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
     cards = [{**{k: items[aid].get(k) for k in ("question", "options", "recommended", "answer_mode", "note")
                  if items[aid].get(k) is not None}, "id": aid, "open_after_answer": True}
              for aid in ids if aid in items]
     if not cards:
         return []
-    rep = upsert_cards(json_path, cards, why="ответ применён, место осталось открытым")
+    recheck = set(due or ())
+    rep = upsert_cards(json_path, cards, why="ответ применён, место осталось открытым",
+                       only_if=(lambda store, aid: aid not in recheck or open_after_answer_due(store, aid))
+                       if recheck else None)
+    if report is not None and rep.get("answers_not_carried"):
+        report["answers_not_carried"] = (report.get("answers_not_carried") or []) + rep["answers_not_carried"]
     return [row["id"] for row in rep.get("replaced") or []]
+
+
+def open_after_answer_due(store, aid):
+    """К-15: на место с применённым ответом, после которого место осталось открытым (последнее событие этого
+    ответа — applied_open), сохранён другой ответ, ждущий отмены прежнего (pending_new, revert): замена карточки
+    не состоялась, и следующее «Применить» должно её сделать."""
+    applied_sig = _applied_map(store).get(aid)
+    answer = (store.get("answers") or {}).get(aid)
+    if not applied_sig or not answer or over_applied(answer, applied_sig) not in ("pending_new", "revert"):
+        return False
+    digest = hashlib.sha256(json.dumps(applied_sig, ensure_ascii=False, sort_keys=True,
+                                       separators=(",", ":")).encode("utf-8")).hexdigest()
+    for row in reversed(store.get("application_events") or []):
+        if row.get("id") == aid and row.get("answer_sig_sha256") == digest:
+            return row.get("outcome") == "applied_open"
+    return False
+
+
+def open_after_answer_ids(store):
+    """Места, где замена карточки после applied_open не состоялась и ждёт следующего «Применить» (К-15)."""
+    return sorted(aid for aid in (store.get("answers") or {}) if open_after_answer_due(store, aid))
 
 
 def _when(at):
@@ -280,14 +334,15 @@ def _contradiction_question(T, data, it):
             "Что верно?")
 
 
-def contradiction_cards(json_path, ids):
+def contradiction_cards(json_path, ids, why="противоречие"):
     """Карточки мест с противоречием в открытом пакете (механизм 13а, upsert_cards).
+    why — причина замены в истории карточки (К-20: «слова изменились после показа» при устаревшем выборе).
     -> {id: "added" | "updated" | "unchanged" | "pending"}; pending — пакета нет, карточка появится при сборке."""
     if not ids:
         return {}
     if not manifest(json_path):
         return {rid: "pending" for rid in ids}
-    rep = upsert_cards(json_path, [{"id": rid} for rid in ids], why="противоречие")
+    rep = upsert_cards(json_path, [{"id": rid} for rid in ids], why=why)
     out = {rid: "unchanged" for rid in rep.get("unchanged") or []}
     out.update({row["id"]: "added" for row in rep.get("added") or []})
     out.update({row["id"]: "updated" for row in rep.get("replaced") or []})
@@ -357,9 +412,14 @@ def _card(T, data, it, q):
     if contradiction:
         # варианты привязаны к словам, которые видел человек: ответ сверяется с ними при «Применить»
         manifest_item["seen_fp"] = _seen_fp(data, it)
-    if gap:
-        # отпечаток слов интервала на момент сборки: кнопка годна, пока они не изменились
-        manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *gap))
+    # отпечаток слов интервала на момент сборки: кнопка прослушивания годна, пока они не изменились. У пропуска
+    # и у «модели расходятся» / сбоя прохода (К-5) — по интервалу места: правка другого места кнопку не отклоняет
+    listen = gap or (T.gap_interval(it) if it.get("asr_problem") else None)
+    if listen:
+        manifest_item["listen_fp"] = T._listening_fingerprint(T._interval_words(data, *listen))
+    if it.get("asr_problem"):
+        # К-6: чип карточки различает расхождение моделей и сбой прохода; в отпечаток вопроса не входит
+        manifest_item["asr_state"] = it["asr_problem"].get("state")
     if q.get("answer_mode") == "speaker" and not it.get("asr_problem"):
         # подтверждение говорящего: свободный ответ не становится текстом реплики (freeform.card_edits)
         manifest_item["answer_mode"] = "speaker"
@@ -386,8 +446,63 @@ def _attach_clip(item, times, src, clip, pd, strict):
     return item
 
 
-def _card_fp(item):
-    return json.dumps({k: item.get(k) for k in _CARD_FP_FIELDS}, ensure_ascii=False, sort_keys=True)
+def rebuild_group(state):
+    """Группа состояния ответа для пересборки пакета (REBUILD_GROUPS); неизвестное — «ждёт»."""
+    return next((name for name, states in REBUILD_GROUPS.items() if state in states), "waiting")
+
+
+class RebuildRefused(RuntimeError):
+    """Пересборка пакета отказала: в нём есть ответы, ждущие «Применить». waiting — [{card, id, state}]."""
+
+    def __init__(self, waiting):
+        self.waiting = waiting
+        rows = "; ".join(f"карточка №{w['card']} ({w['id']}) — {REBUILD_EXIT.get(w['state'], 'примените ответ')}"
+                         for w in waiting)
+        super().__init__("Пакет карточек не пересобран: в нём есть ответы, ждущие «Применить», пересборка "
+                         f"потеряла бы их. {rows}. Потом соберите пакет снова.")
+
+
+def rebuild_check(store, man):
+    """Что пересборка сделает с ответами пакета по его состоянию store и manifest man (только ответы текущей
+    редакции карточек). -> {"waiting", "unapplicable": [{card, id, state}], "undo_lost": N} — N применённых
+    ответов со снимком отмены: после пересборки отменить их со страницы будет нельзя."""
+    snapshots = store.get("undo_snapshots") or {}
+    out = {"waiting": [], "unapplicable": [], "undo_lost": 0}
+    for aid, row in answer_states_of(store, man).items():
+        group = rebuild_group(row["state"])
+        if group == "applied":
+            out["undo_lost"] += aid in snapshots
+        elif group in ("waiting", "unapplicable"):
+            out[group].append({"card": row["card"], "id": aid, "state": row["state"]})
+    for rows in (out["waiting"], out["unapplicable"]):
+        rows.sort(key=lambda r: (r["card"] is None, r["card"] or 0, str(r["id"])))
+    return out
+
+
+def check_rebuild(json_path):
+    """Ранняя проверка перед пересборкой (до резки клипов): RebuildRefused, если есть ждущие ответы.
+    build повторяет её под замком ответов. В файловом режиме проверки нет (указание владельца: новое — только
+    при хранении записей в базе) -> None."""
+    import recordings
+    store = recordings.read_review_pack_state(json_path)
+    if store is None:
+        return None
+    rep = rebuild_check(store, store.get("manifest") or {})
+    if rep["waiting"]:
+        raise RebuildRefused(rep["waiting"])
+    return rep
+
+
+def _card_fp(item, skip=()):
+    return json.dumps({k: item.get(k) for k in _CARD_FP_FIELDS if k not in skip}, ensure_ascii=False, sort_keys=True)
+
+
+def _same_question(old, new):
+    """Тот же вопрос (поля _CARD_FP_FIELDS). Если у прежней карточки нет ключа listen_fp (пакеты до К-5: у
+    карточек «модели расходятся» его не было), а у новой есть, он не сравнивается. Только в эту сторону: смена
+    отпечатка у карточек с ключом и пропажа ключа — другой вопрос."""
+    skip = ("listen_fp",) if "listen_fp" in new and "listen_fp" not in old else ()
+    return _card_fp(old, skip) == _card_fp(new, skip)
 
 
 def build(json_path, items, base_url_note=None):
@@ -395,7 +510,10 @@ def build(json_path, items, base_url_note=None):
     по местам review. answer_mode="speaker" — карточка подтверждения говорящего: свой ответ на ней
     применяется только как решение о говорящем (имя или «Имя: точные слова»), иначе — человеку.
     -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся.
-    Заменить или дописать карточки, не меняя version и не теряя ответов, — upsert_cards."""
+    Заменить или дописать карточки, не меняя version и не теряя ответов, — upsert_cards.
+    При хранении в базе (PR 17-Б): есть ответы, ждущие «Применить», — RebuildRefused; проверка и запись идут под
+    замком ответов, клипы режутся до него в свою папку, при отказе или ошибке она удаляется. В отчёте —
+    unapplicable и undo_lost (rebuild_check). Файловый режим — прежний, без проверки."""
     import transcript as T
     data = T.load(json_path)
     import recordings
@@ -409,6 +527,15 @@ def build(json_path, items, base_url_note=None):
     if sqlite_mode:
         clips_dir = clips_dir / uuid.uuid4().hex
     clips_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _build_pack(json_path, items, T, data, sqlite_mode, src, review, pd, clips_dir)
+    except BaseException:
+        if sqlite_mode:                # папка только этой сборки: клипы открытого пакета лежат в своей
+            shutil.rmtree(clips_dir, ignore_errors=True)
+        raise
+
+
+def _build_pack(json_path, items, T, data, sqlite_mode, src, review, pd, clips_dir):
     out, skipped = [], []
     listed = {q.get("id") for q in items}
     items = list(items) + [{"id": i["id"]} for i in data.get("review") or []
@@ -449,7 +576,17 @@ def build(json_path, items, base_url_note=None):
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(),
            "clips_dir": clips_dir.relative_to(pd).as_posix(), "items": out}
+    # в базе состояние пакета читается, проверяется и пишется под замком ответов: ответ, сохранённый страницей
+    # после ранней проверки, виден здесь (PR 17-Б); порядок замков — ответы, затем запись, как у upsert_cards
+    with _answers_lock(json_path) if sqlite_mode else nullcontext():
+        return _build_write(json_path, data, sqlite_mode, pd, clips_dir, out, skipped, version, man)
+
+
+def _build_write(json_path, data, sqlite_mode, pd, clips_dir, out, skipped, version, man):
     ans = _read_answers(json_path, {})
+    guard = rebuild_check(ans, ans.get("manifest") or {}) if sqlite_mode else None
+    if guard and guard["waiting"]:
+        raise RebuildRefused(guard["waiting"])
     if sqlite_mode and ans.get("_expected_versions") != {
             "source_revision": data.get("source_revision"),
             "review_revision": data.get("review_revision")}:
@@ -469,22 +606,27 @@ def build(json_path, items, base_url_note=None):
     if not sqlite_mode:
         _write(pd / "manifest.json", man)
     shutil.copyfile(HERE / "cards.html", pd / "cards.html")
-    return {"pack": str(pd), "version": version, "items": len(out), "skipped": skipped,
-            "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
+    rep = {"pack": str(pd), "version": version, "items": len(out), "skipped": skipped,
+           "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
+    if guard is not None:
+        rep.update(unapplicable=guard["unapplicable"], undo_lost=guard["undo_lost"])
+    return rep
 
 
-def upsert_cards(json_path, cards, *, why, actor="system"):
+def upsert_cards(json_path, cards, *, why, actor="system", only_if=None):
     """Заменить или дописать карточки в собранном пакете, не меняя version и не трогая ответы других карточек.
     cards — вопросы в виде build. Новая карточка дописывается в конец (rev 1). Заменённая получает rev + 1;
     прежняя редакция с её ответом уходит в history карточки, снимок отмены и отметка применения прежнего
     ответа снимаются: новый вопрос отвечается заново. Тот же вопрос (те же поля _CARD_FP_FIELDS) ничего не
     пишет. Клип — <id>.r<rev>.mp3, прежние не затираются; нет аудио или клип не нарезался — карточка без звука.
     Одна запись состояния на вызов; pack_rev + 1, если что-то изменилось.
-    -> {"version", "pack_rev", "written", "added", "replaced", "unchanged", "skipped"}"""
+    only_if(store, id) — условие замены, проверяемое под замком ответов; не выполнено — id в not_due.
+    -> {"version", "pack_rev", "written", "added", "replaced", "unchanged", "skipped", "not_due"?,
+        "answers_not_carried"?}"""
     import recordings
     with recordings.operation_for_document(json_path, actor):
         with _answers_lock(json_path):
-            return _upsert_cards_locked(json_path, cards, why)
+            return _upsert_cards_locked(json_path, cards, why, only_if)
 
 
 def _pack_clips_dir(man, sqlite_mode):
@@ -514,7 +656,24 @@ def _history_row(old, answer, applied, conflicts, why):
     return row
 
 
-def _upsert_cards_locked(json_path, cards, why):
+def _history_rows(old, answer, applied_sig, conflicts, why):
+    """Строки истории заменяемой редакции. Если поверх применённого ответа ждёт другой (pending_new, отмена,
+    отрицание), применённый и ждущий — разные строки (К-15): ждущий не выдаётся за применённый, а применённый
+    не теряется. Применённый ответ берётся из копии applied_answer; без копии (пакеты до неё) — только ждущий,
+    с отметкой applied_sig_only: текст применённого ответа неизвестен. -> (строки, ждущий ответ не перенесён)"""
+    if not (applied_sig and answer and answer_is_current(answer, old) and _sig(answer) != applied_sig):
+        return [_history_row(old, answer, applied_sig is not None, conflicts, why)], False
+    kept = answer.get("applied_answer")
+    rows = []
+    if kept and _sig(kept) == applied_sig:
+        rows.append(_history_row(old, kept, True, [], why))
+    waiting = _history_row(old, answer, False, conflicts, why)
+    if not rows:
+        waiting["applied_sig_only"] = True
+    return rows + [waiting], True
+
+
+def _upsert_cards_locked(json_path, cards, why, only_if=None):
     import transcript as T
     man = manifest(json_path)
     if not man:
@@ -547,12 +706,15 @@ def _upsert_cards_locked(json_path, cards, why):
             rep["skipped"].append({"id": aid, "why": "карточка повторяется в вызове"})
             continue
         seen.add(aid)
+        if only_if is not None and not only_if(store, aid):
+            rep.setdefault("not_due", []).append(aid)
+            continue
         new, times = _card(T, data, it, q)
         if new is None:
             rep["skipped"].append({"id": aid, "why": times})
             continue
         old = items[index[aid]] if aid in index else None
-        if old is not None and _card_fp(old) == _card_fp(new):
+        if old is not None and _same_question(old, new):
             rep["unchanged"].append(aid)
             continue
         new["rev"] = card_rev(old) + 1 if old is not None else 1
@@ -569,8 +731,10 @@ def _upsert_cards_locked(json_path, cards, why):
             continue
         answers = store.setdefault("answers", {})
         conflicts = [c for c in store.get("conflicts") or [] if c.get("id") == aid]
-        new["history"] = list(old.get("history") or []) + [
-            _history_row(old, answers.get(aid), aid in applied, conflicts, why)]
+        rows, not_carried = _history_rows(old, answers.get(aid), applied.get(aid), conflicts, why)
+        new["history"] = list(old.get("history") or []) + rows
+        if not_carried:
+            rep.setdefault("answers_not_carried", []).append({"id": aid, "rev": card_rev(old)})
         answers.pop(aid, None)
         if conflicts:
             store["conflicts"] = [c for c in store["conflicts"] if c.get("id") != aid]
@@ -930,11 +1094,19 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
         old = store["answers"].get(aid)
         if old and not answer_is_current(old, it):
             old = None                     # ответ прежней редакции, оставшийся после сбоя замены, — не соперник
-        if old and old.get("source") != source and not _same(old, ans):
-            c = {"id": aid, "was": old, "now": ans}
-            store.setdefault("conflicts", []).append(c)
+        # Ответ человека на ноутбуке (страница, trusted_actor="human") — его действие над тем, что он видит.
+        # Он снимает расхождение места (К-11) там, где действительно записан, и не создаёт новое, если заменяет уже
+        # применённый ответ: применение страница показала (узкий вариант Ф-К-4). Ответ поверх неприменённого
+        # ответа облака расхождение записывает: страница могла не успеть его показать.
+        local_human = source == "local" and trusted_actor == "human"
+        conflict = None
+        replaces_applied = local_human and old is not None and _sig(old) == applied.get(aid)
+        if old and old.get("source") != source and not _same(old, ans) and not replaces_applied:
+            conflict = {"id": aid, "was": old, "now": ans}
             rep["conflicts"].append({"id": aid, "was": _desc(old, it), "now": _desc(ans, it)})
         if _newer(old, ans):
+            if conflict:
+                store.setdefault("conflicts", []).append(conflict)
             continue
         if old and over_applied(ans, applied.get(aid)) not in (None, "applied"):
             # Ответ поверх применённого хранит копию применённого ответа целиком: по «Не отменять» он
@@ -944,6 +1116,10 @@ def _add_answers(json_path, answers, source, trusted_actor="unknown"):
                 ans["applied_answer"] = {k: copy.deepcopy(v) for k, v in kept.items()
                                          if k not in ("applied_answer", "keep_request")}
         store["answers"][aid] = ans
+        if local_human and store.get("conflicts"):
+            store["conflicts"] = [c for c in store["conflicts"] if c.get("id") != aid]
+        if conflict:
+            store.setdefault("conflicts", []).append(conflict)
         rep["accepted"].append({"id": aid, "kind": ans["kind"], "answer": _desc(ans, it)})
         if ans["kind"] == "free":
             rep["free"].append({"id": aid, "text": ans.get("text")})
@@ -1012,7 +1188,8 @@ def decisions(json_path):
     conflicted = {c["id"] for c in store.get("conflicts") or []}
     out, rep = [], {"applied_from_answers": 0, "human": [], "free": [], "skipped": [], "unanswered": [],
                     "unchanged": [], "changed": [], "reverted": [], "kept_previous": [], "pending_new": [],
-                    "source_conflict_ids": []}
+                    "source_conflict_ids": [], "human_after": [], "confirmed": []}
+    events = store.get("application_events") or []
     if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
         rep["source_conflict"] = "пакет относится к другой стенограмме"
         rep["source_conflict_ids"] = [aid for aid in by_id if store["answers"].get(aid)]
@@ -1023,6 +1200,13 @@ def decisions(json_path):
             rep["unanswered"].append(aid)
             continue
         relation = over_applied(a, applied.get(aid))
+        if relation == "applied" and confirms_check(a, events):
+            # К-23: человек на ноутбуке подтвердил ответ, применённый с отметкой «проверьте» (тот же ответ или
+            # кнопка «Ответ верен — оставить»): место закрывается его действием, слова не меняются
+            out.append({"id": aid, "confirm_applied": True,
+                        "note": f"разбор ({a['source']}, {a['ts']}): человек проверил применённый ответ"})
+            rep["confirmed"].append(aid)
+            continue
         if relation == "applied":
             rep["unchanged"].append(aid)
             continue
@@ -1075,10 +1259,16 @@ def decisions(json_path):
                 note += (f" — ответы двух режимов расходились (раньше: {_desc(was, it)}), взят более поздний;"
                          " проверить человеку")
                 d["human_after"] = True
-                rep["human"].append(aid)
+                rep["human_after"].append(aid)     # применяется и учитывается как применённый (К-23)
             d["note"] = (d.get("note") + "; " if d.get("note") else "") + note
             if a.get("human_note"):
                 d["human_note"] = a["human_note"]
+            if d.get("status") == "human":
+                # К-10: вариант агента «оставить человеку» — как кнопка «Оставить человеку»: решённое место
+                # не возвращается человеку, кроме карточек подтверждения говорящего
+                if it.get("answer_mode") != "speaker":
+                    d["if_open"] = True
+                rep["human"].append(aid)
             rep["applied_from_answers"] += 1
         elif k == "human":
             # Только статус места: «Оставить человеку» ничего не подтверждает (слова без отметок человека).
@@ -1329,7 +1519,7 @@ def cloud_bundle(json_path, artifact_url=None):
                answers={k: _cloud_answer(v) for k, v in store.get("answers", {}).items()
                         if v.get("version") == man["version"] and answer_is_current(v, items.get(k))},
                applied_answers={k: _cloud_answer(v) for k, v in (store.get("applied_answers") or {}).items()},
-               answer_states=answer_states_of(store, man),
+               answer_states=answer_states_of(store, man, outcome_details=False),
                conflicts=[{"id": c["id"]} for c in store.get("conflicts") or []],
                applied=bool(store.get("applied_at")), applied_at=store.get("applied_at"),
                clips_removed=not have, artifact_url=meta.get("artifact_url"))
@@ -1450,14 +1640,35 @@ def _answer_event(events, aid, answer):
     return None
 
 
-def _answer_state(answer, applied_sig, event):
+def _last_place_event(events, aid):
+    """Последнее событие применения места — любого его ответа."""
+    return next((row for row in reversed(events or []) if row.get("id") == aid), None)
+
+
+def _local_human(answer):
+    return answer.get("source") == "local" and answer.get("actor_kind") == "human"
+
+
+def confirms_check(answer, events):
+    """К-23: ответ человека с ноутбука с той же подписью, что применённый с отметкой «проверьте» (applied_check):
+    своего события у него нет, а последнее событие места — applied_check. Это подтверждение человека."""
+    last = _last_place_event(events, answer.get("id"))
+    return (_local_human(answer) and _answer_event(events, answer.get("id"), answer) is None and
+            (last or {}).get("outcome") == "applied_check")
+
+
+def _answer_state(answer, applied_sig, event, place_event=None):
     kind = answer.get("kind")
     relation = over_applied(answer, applied_sig)
     if relation == "revert":
         # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
         return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
-    if relation == "applied" and (event or {}).get("outcome") == "applied_open":
-        return "applied_open"          # применён, место открыто (PR 7): подпись та же, исход последнего применения
+    if relation == "applied" and (event or {}).get("outcome") in ("applied_open", "applied_check"):
+        # применён, место открыто (PR 7) или ответ ждёт проверки (К-23): подпись та же, исход последнего применения
+        return event["outcome"]
+    if relation == "applied" and event is None and (place_event or {}).get("outcome") == "applied_check":
+        # тот же ответ ещё раз: от человека на ноутбуке — подтверждение, ждёт «Применить»; иначе проверка остаётся
+        return "saved" if _local_human(answer) else "applied_check"
     if relation is not None:
         return relation
     if event is not None and event.get("outcome") in OUTCOME_REASONS and event.get("outcome") != "applied":
@@ -1467,8 +1678,10 @@ def _answer_state(answer, applied_sig, event):
     return "saved"
 
 
-def answer_states_of(store, man):
-    """{id: {state, why, card, ts, source}} по сохранённому состоянию пакета — то, что показывает страница."""
+def answer_states_of(store, man, outcome_details=True):
+    """{id: {state, why, card, ts, source}} по сохранённому состоянию пакета — то, что показывает страница.
+    outcome_details — добавлять уточнения последнего «Применить» (К-22); облако их не получает: в них слова
+    стенограммы и текст ответа."""
     applied = _applied_map(store)
     events = store.get("application_events") or []
     snapshots = store.get("undo_snapshots") or {}
@@ -1479,11 +1692,16 @@ def answer_states_of(store, man):
     for aid, answer in (store.get("answers") or {}).items():
         if not answer_is_current(answer, items.get(aid)):
             continue                      # ответ прежней редакции: страница показывает его в истории карточки
-        state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer))
+        state = _answer_state(answer, applied.get(aid), _answer_event(events, aid, answer),
+                              _last_place_event(events, aid))
         out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
                     "ts": answer.get("ts"), "source": answer.get("source")}
         details = []
-        if aid in applied and aid not in snapshots and state in ("applied", "pending_new", "kept_previous"):
+        remembered = (store.get("outcome_details") or {}).get(aid) if outcome_details else None
+        if remembered and remembered.get("ts") == answer.get("ts") and remembered.get("source") == answer.get("source"):
+            details.extend(x for x in remembered.get("detail") or [] if x)
+        no_snapshot = aid in applied and aid not in snapshots
+        if no_snapshot and state in ("applied", "pending_new", "kept_previous") and UNDO_UNAVAILABLE not in details:
             details.append(UNDO_UNAVAILABLE)
         # Последний обработанный запрос «Не отменять»: по нему страница узнаёт, что её запрос принят или отклонён.
         accepted, rejected = answer.get("keep_request"), rejected_keeps.get(aid)
@@ -1498,8 +1716,36 @@ def answer_states_of(store, man):
     return out
 
 
-def answer_states(json_path):
-    return answer_states_of(_read_answers(json_path, {"answers": {}}), manifest(json_path) or {})
+def answer_states(json_path, outcome_details=True):
+    return answer_states_of(_read_answers(json_path, {"answers": {}}), manifest(json_path) or {}, outcome_details)
+
+
+def remember_outcome_details(json_path, details):
+    """К-22: уточнения последнего «Применить» к ответам — {id: (ts, source, [уточнения])} — в состоянии пакета,
+    чтобы страница показала их под карточкой и после перезагрузки. Одна запись на место, не журнал: в уточнении
+    бывает текст ответа, а журнал применения его не хранит. Только при хранении записей в базе (решение
+    владельца: новое не делается для файловой записи) — в файловом режиме ничего не пишется, карточка
+    показывает то же, что раньше. Вызывается внутри «Применить»: замок ответов уже взят. -> записано ли"""
+    import recordings
+    if recordings.answer_draft_for(json_path) is None:
+        return False
+    store = _read_answers(json_path, {"answers": {}})
+    before = store.get("outcome_details") or {}
+    kept = dict(before)
+    for aid, (ts, source, rows) in details.items():
+        rows = [x for x in rows or [] if x]
+        if rows:
+            kept[aid] = {"ts": ts, "source": source, "detail": rows}
+        else:
+            kept.pop(aid, None)
+    if kept == before:
+        return False
+    if kept:
+        store["outcome_details"] = kept
+    else:
+        store.pop("outcome_details", None)
+    _write_answers(json_path, store)
+    return True
 
 
 def drop_audio(json_path):

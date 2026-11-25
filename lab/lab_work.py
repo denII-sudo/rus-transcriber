@@ -29,10 +29,13 @@ OUTCOME_ROW = {
     "left_for_human": "left_for_human", "already_decided": "left_for_human",
     "apply_conflict": "not_applied", "blocked_preflight": "not_applied", "source_conflict": "not_applied",
     "not_found": "not_applied", "not_applied": "not_applied", "pause_refused": "not_applied", "hint": "not_applied",
+    "listen_mismatch": "not_applied",
+    # К-23: применён, но на место был другой ответ и человек его ещё не проверил — в основной счёт не идёт
+    "applied_check": "applied_unchecked",
 }
-ROWS = ("eligible", "unanswered", "previous_revision", "saved_not_applied", "reverted", "skipped",
-        "left_for_human", "not_applied", "speaker_only", "not_human", "no_decision_in_transcript", "overlapped",
-        "conflicting_between_variants", "recording_excluded")
+ROWS = ("eligible", "applied_unchecked", "unanswered", "previous_revision", "saved_not_applied", "reverted",
+        "skipped", "left_for_human", "not_applied", "speaker_only", "not_human", "no_decision_in_transcript",
+        "overlapped", "conflicting_between_variants", "recording_excluded")
 CELLS = ("agree_corrected", "agree_confirmed", "disagree_corrected", "disagree_confirmed", "agreement_unknown")
 REC_STATES = ("ok", "no_hypotheses", "several_files", "no_file_hash", "other_file", "mismatch")
 ROLES = ("primary", "second", "third")

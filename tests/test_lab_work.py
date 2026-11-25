@@ -294,6 +294,8 @@ class Rules(unittest.TestCase):
         self.assertEqual(self.classify({**human, "kind": "option", "option": 0}, "reverted"), "reverted")
         self.assertEqual(self.classify({**human, "kind": "revert"}, "skipped"), "reverted")
         self.assertEqual(self.classify({**human, "kind": "option", "option": 0}, "apply_conflict"), "not_applied")
+        self.assertEqual(self.classify({**human, "kind": "option", "option": 0}, "listen_mismatch"), "not_applied")
+        self.assertEqual(self.classify({**human, "kind": "option", "option": 0}, "applied_check"), "applied_unchecked")
         self.assertEqual(self.classify({"kind": "option", "option": 0}), "not_human")
         self.assertEqual(self.classify({"actor_kind": "model", "kind": "option", "option": 0}), "not_human")
         speaker = {"id": "r1", "options": [{"label": "Вера", "decision": {"speaker": "Вера"}}]}

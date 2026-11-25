@@ -6,7 +6,9 @@
 Формат — lab/README.md, раздел «Обезличенная сводка».
 """
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 SUMMARY_SCHEMA = "lab-summary-1"
@@ -156,3 +158,168 @@ def export_summary(db, units, experiment=None, out_path=None):
         tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
         tmp.replace(out_path)
     return summary
+
+
+# ── числа опытов для базы теста скорости (export-bench) ──────────────────────────────────────────
+
+BENCH_DATA_SUBDIR = ("bench", "lab")  # <папка данных>\bench\lab — отдельно от bench\runs замеров скорости
+
+
+def _repo_modules():
+    """benchdb и runinfo — из клона: benchdb же загружает эти файлы в базу теста скорости (только stdlib)."""
+    repo = str(Path(__file__).resolve().parent.parent)
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    import benchdb
+    import runinfo
+    return benchdb, runinfo
+
+
+def _loads(text):
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
+
+
+def bench_documents(db, units):
+    """Файлы опытов для базы теста скорости: только числа по списку разрешённых полей (benchdb.lab_clean).
+    -> (список (имя файла, документ, проблемы), число запусков в состоянии running).
+    Запуски в состоянии running не выгружаются; содержимое не зависит от времени выгрузки."""
+    benchdb, runinfo = _repo_modules()
+    audio_of = {u["unit_id"]: u.get("audio_sha256") for u in units}
+    docs, running = [], 0
+    runs = [dict(r) for r in db.execute(
+        "SELECT run_id, started_utc, finished_utc, state, experiment_name, experiment_sha256, passport_json "
+        "FROM runs ORDER BY started_utc, run_id")]
+    for run in runs:
+        if run["state"] == "running":
+            running += 1
+            continue
+        if run["state"] not in ("finished", "interrupted"):
+            continue
+        rid = run["run_id"]
+        passport = _loads(run["passport_json"]) or {}
+        shared = {r["unit_id"]: _loads(r["shared_json"]) or {} for r in db.execute(
+            "SELECT unit_id, shared_json FROM unit_runs WHERE run_id=?", (rid,))}
+        confs = []
+        for row in db.execute("SELECT DISTINCT p.config_id, p.config_sha256, c.roles_json, c.settings_json "
+                              "FROM pairs p LEFT JOIN configs c USING (config_id, config_sha256) "
+                              "WHERE p.run_id=? ORDER BY p.config_id, p.config_sha256", (rid,)):
+            confs.append({"config_id": row["config_id"], "config_sha256": row["config_sha256"],
+                          "roles": _loads(row["roles_json"]), "settings": _loads(row["settings_json"])})
+        pairs = []
+        for row in db.execute("SELECT unit_id, config_id, config_sha256, state, started_utc, finished_utc, "
+                              "error_kind, conditions_json, metrics_json FROM pairs WHERE run_id=? "
+                              "ORDER BY pair_id", (rid,)):
+            cond = _loads(row["conditions_json"]) or {}
+            sh = shared.get(row["unit_id"]) or {}
+            metrics = _loads(row["metrics_json"])
+            pairs.append({
+                "config_id": row["config_id"], "config_sha256": row["config_sha256"], "state": row["state"],
+                "audio_sha256": audio_of.get(row["unit_id"]), "pcm_sha256": sh.get("pcm_sha256"),
+                "duration_sec": sh.get("duration_sec") or (metrics or {}).get("duration_sec"),
+                "error_kind": error_kind(row["error_kind"]) if row["error_kind"] else None,
+                "started_utc": row["started_utc"], "finished_utc": row["finished_utc"],
+                "conditions": {"power_source": (cond.get("before") or {}).get("power_source"),
+                               "preflight": cond.get("preflight")},
+                "lab": benchdb.lab_numbers(metrics)})
+        doc = {"kind": benchdb.LAB_KIND, "lab_format": benchdb.LAB_FORMATS[-1],
+               "method_version": benchdb.LAB_METHOD, "run_id": benchdb.LAB_PREFIX + rid, "lab_run_id": rid,
+               "started_utc": run["started_utc"], "finished_utc": run["finished_utc"],
+               "status": "done" if run["state"] == "finished" else "interrupted",
+               "experiment": {"name": run["experiment_name"], "sha256": run["experiment_sha256"]},
+               "testbed": {"testbed_id": passport.get("testbed_id"), "hardware": passport.get("hardware")},
+               "environment": passport.get("environment"), "models": passport.get("models_cache"),
+               "configs": confs, "pairs": pairs}
+        clean = benchdb.lab_clean(runinfo.scrub(doc))
+        problems = benchdb.lab_check(clean)
+        if len(clean.get("pairs", [])) != len(pairs) or any(
+                not p.get("config_id") or p.get("state") not in ("done", "error") for p in clean.get("pairs", [])):
+            problems.append("pair_not_allowed")        # поле пары вне списка разрешённых (config_id, состояние)
+        docs.append((f"{doc['run_id']}.json", clean, problems))
+    return docs, running
+
+
+def bench_bytes(doc):
+    """Одни и те же байты для одного содержимого: порядок ключей, без времени выгрузки."""
+    return (json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=1) + "\n").encode("utf-8")
+
+
+def export_bench(db, units, out_dir):
+    """Записать файлы опытов в out_dir (песочница). -> {"written", "unchanged", "refused", "running"}.
+    Запись с проблемой (строка похожа на путь, поле вне списка) не пишется. Повторная выгрузка — те же байты."""
+    docs, running = bench_documents(db, units)
+    out_dir = Path(out_dir)
+    rep = {"written": [], "unchanged": [], "refused": [], "running": running}
+    for name, doc, problems in docs:
+        if problems:
+            rep["refused"].append({"file": name, "problems": sorted(set(problems))})
+            continue
+        data = bench_bytes(doc)
+        path = out_dir / name
+        if path.is_file() and path.read_bytes() == data:
+            rep["unchanged"].append(name)
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        rep["written"].append(name)
+    return rep
+
+
+def copy_bench_files(src_dir, data_dir, apply=False):
+    """Скопировать файлы опытов из песочницы в <папка данных>\\bench\\lab. Без apply — только показ.
+    Файл с тем же именем и той же суммой пропускается, с другой суммой — отказ (чужое не перезаписывается).
+    Перед копированием файл проверяется тем же разбором, что и при загрузке в базу (benchdb.parse_run).
+    -> {"new", "same", "conflict", "rejected": списки, "target": папка}."""
+    benchdb, _ = _repo_modules()
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        raise ValueError("папка данных не найдена")
+    target = data_dir.joinpath(*BENCH_DATA_SUBDIR)
+    rep = {"new": [], "same": [], "conflict": [], "rejected": [], "target": target}
+    src_dir = Path(src_dir)
+    files = sorted(src_dir.glob("lab-*.json")) if src_dir.is_dir() else []
+    for p in files:
+        data = p.read_bytes()
+        try:
+            benchdb.parse_run(data, p.name, benchdb.LAB_KIND)
+        except benchdb.RunRejected as ex:
+            rep["rejected"].append((p.name, str(ex)))
+            continue
+        dest = target / p.name
+        if dest.exists():
+            same = dest.is_file() and dest.read_bytes() == data
+            rep["same" if same else "conflict"].append(p.name)
+            continue
+        rep["new"].append(p.name)
+        if apply:
+            target.mkdir(parents=True, exist_ok=True)
+            if not _create_once(target, dest, data):
+                rep["new"].remove(p.name)
+                rep["conflict"].append(p.name)
+    return rep
+
+
+def _create_once(target, dest, data):
+    """Создать файл, только если его ещё нет (не перезаписывает). -> True, если создан."""
+    tmp = target / (dest.name + ".tmp")
+    tmp.write_bytes(data)
+    try:
+        try:
+            os.link(tmp, dest)                  # при существующем файле — FileExistsError, ничего не затирается
+            return True
+        except FileExistsError:
+            return False
+        except OSError:                         # файловая система без жёстких ссылок
+            if dest.exists():
+                return False
+            tmp.replace(dest)
+            return True
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass

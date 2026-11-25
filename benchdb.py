@@ -12,7 +12,9 @@
   * файлы прогонов не открываются на запись; units.json и testbed.json не читаются (в них пути и соль);
   * в базе нет путей, имён файлов записей и текстов: тексты вариантов остаются в <run_id>.texts.json,
     в базе о них только имя, контрольная сумма и размер (raw_output);
-  * числа разных методик (bench-1, bench-2, historical) не сравниваются.
+  * числа разных методик (bench-1, bench-2, lab-1, historical) не сравниваются;
+  * второй вид файла — опыт лаборатории (kind "lab", папка bench\\lab): только числа по списку разрешённых
+    полей, в столбцы скорости замера они не попадают (раздел «Опыты лаборатории» — lab/README.md).
 """
 import hashlib
 import json
@@ -25,11 +27,18 @@ import runinfo
 
 BENCH_DB_SCHEMA = 1                    # номер схемы базы; не то же, что runinfo.SCHEMA_VERSION (формат файла)
 KEY_VERSION = 1                        # версия правила ключа сопоставимости (раздел 7 задания)
-LOADER_VERSION = "benchdb-2"     # отклонённые прежним загрузчиком файлы проверяются заново
+LOADER_VERSION = "benchdb-3"     # отклонённые прежним загрузчиком файлы проверяются заново
 DB_NAME = "bench_runs.sqlite3"
 RUN_FORMATS = (1,)                     # какие значения schema_version файла прогона загрузчик понимает
 HISTORICAL_FORMAT = "bench-historical-1"
 HISTORICAL_METHOD = "historical"
+LAB_KIND = "lab"                       # вид файла опыта лаборатории и имя его папки bench\lab
+LAB_FORMATS = (1,)                     # какие значения lab_format загрузчик понимает
+LAB_METHOD = "lab-1"                   # методика опытов лаборатории: не bench-N, числа с замерами не сравниваются
+LAB_PREFIX = "lab-"                    # run_id опыта в базе: не сталкивается с run_id замера
+LAB_MODE = "pipeline"                  # measurement.mode опыта (у замеров скорости — steady)
+LAB_SPEED_COLUMNS = ("load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "total_10min")
+LAB_NOT_MEASURED = "другая методика: см. extra_json.lab"
 
 HELP_APPEND_ONLY = ("База только дописывается: лишний или ошибочный прогон убирается удалением файла базы "
                     "и повторной загрузкой из runs/*.json; код ничего не удаляет.")
@@ -47,7 +56,7 @@ NUM_FIELDS = ("load_sec", "first_chunk_sec", "asr_sec", "rtfx", "wall_sec", "tot
               "peak_memory_mb")
 INT_FIELDS = ("chunks", "empty_chunks", "compile_cache_new_files")
 BOOL_FIELDS = ("model_downloaded", "device_mismatch")
-_RUN_NAME = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")      # имя, которое даёт runinfo.new_run_id
+_RUN_NAME = re.compile(r"^(?:lab-)?\d{8}-\d{6}-[0-9a-f]{6}$")      # имя, которое даёт runinfo.new_run_id
 _ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.-]{0,79}$")
 
 SCHEMA = """
@@ -247,10 +256,25 @@ def _num(v, key, nm):
     return v
 
 
-def _axes(rec, variant, r, unit, tb_pk):
-    """Оси сравнимости измерения: {ось: {"value": ..., "known": bool}}. Неизвестное не равно известному."""
+def _shared_axes(rec, tb_pk, cond):
+    """Оси «стенд», «окружение», «питание»: одинаково у замера скорости и у опыта лаборатории."""
     hw = _get(rec, "testbed", "hardware") or {}
     pk = _get(rec, "environment", "packages", "key") or {}
+    drivers = sorted([str(d.get("name")), str(d.get("driver_version"))]
+                     for d in (hw.get("devices") or []) if isinstance(d, dict))
+    return {
+        "testbed": {"value": tb_pk, "known": bool(tb_pk) and hw.get("status") != "not_measured"},
+        "environment": {"value": {"packages": {k: pk[k] for k in COMPUTE_PACKAGES if k in pk},
+                                  "os": {"build": _get(rec, "environment", "os", "build"),
+                                         "ubr": _get(rec, "environment", "os", "ubr")},
+                                  "drivers": drivers}, "known": bool(pk)},
+        "power": {"value": {"source": cond.get("power_source"), "scheme": cond.get("power")},
+                  "known": bool(cond.get("power_source"))},
+    }
+
+
+def _axes(rec, variant, r, unit, tb_pk):
+    """Оси сравнимости измерения: {ось: {"value": ..., "known": bool}}. Неизвестное не равно известному."""
     cond = _get(rec, "conditions", "start") or {}
     name = variant.get("asr_model") or variant.get("asr_third_model") or f"default:{variant.get('family')}"
     revision = None
@@ -258,9 +282,8 @@ def _axes(rec, variant, r, unit, tb_pk):
         repo = str(m.get("repo") or "").lower()
         if repo and (repo == str(name).lower() or repo.endswith("/" + str(name).lower())):
             revision = m.get("ref_main")
-    drivers = sorted([str(d.get("name")), str(d.get("driver_version"))]
-                     for d in (hw.get("devices") or []) if isinstance(d, dict))
     backend, dev = r.get("backend_name"), r.get("device_actual")
+    shared = _shared_axes(rec, tb_pk, cond)
     return {
         "unit": {"value": {"pcm": _get(unit, "pcm"), "offset": _get(unit, "offset"),
                            "duration": _get(unit, "duration")}, "known": bool(_get(unit, "pcm"))},
@@ -272,13 +295,7 @@ def _axes(rec, variant, r, unit, tb_pk):
                              "requested": {k: variant.get(k) for k in REQUESTED_FIELDS if k in variant},
                              "chunk_max": _get(rec, "params", "chunk_max"),
                              "third_max_repeat": _get(rec, "params", "third_max_repeat")}, "known": True},
-        "testbed": {"value": tb_pk, "known": bool(tb_pk) and hw.get("status") != "not_measured"},
-        "environment": {"value": {"packages": {k: pk[k] for k in COMPUTE_PACKAGES if k in pk},
-                                  "os": {"build": _get(rec, "environment", "os", "build"),
-                                         "ubr": _get(rec, "environment", "os", "ubr")},
-                                  "drivers": drivers}, "known": bool(pk)},
-        "power": {"value": {"source": cond.get("power_source"), "scheme": cond.get("power")},
-                  "known": bool(cond.get("power_source"))},
+        "testbed": shared["testbed"], "environment": shared["environment"], "power": shared["power"],
     }
 
 
@@ -355,14 +372,20 @@ def _check_structure(rec):
         seen.add(rid)
 
 
-def parse_run(data, file_name=None):
-    """Раскладывает файл прогона по таблицам. Чистая функция: базу не открывает. Плохой файл — RunRejected."""
+def parse_run(data, file_name=None, source="runs"):
+    """Раскладывает файл прогона по таблицам. Чистая функция: базу не открывает. Плохой файл — RunRejected.
+    source — папка файла: runs (замер скорости, kind bench) или lab (опыт лаборатории, kind lab); вид файла
+    должен совпасть с папкой."""
     try:
         rec = json.loads(data.decode("utf-8-sig"), parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError, RecursionError) as ex:
         raise RunRejected("в файле NaN или Infinity" if "NaN" in str(ex) else "файл не JSON") from None
     if not isinstance(rec, dict):
         raise RunRejected("в файле не объект JSON")
+    if source == LAB_KIND:
+        if rec.get("kind") != LAB_KIND:
+            raise RunRejected("вид файла не lab")
+        return _parse_lab(rec, file_name)
     if rec.get("kind") != "bench":
         raise RunRejected("вид файла не bench")
     if rec.get("schema_version") not in RUN_FORMATS:
@@ -379,11 +402,8 @@ def parse_run(data, file_name=None):
         raise RunRejected(f"структура файла неверна ({type(ex).__name__})") from None
 
 
-def _build(rec, run_id):
-    """Раскладка проверенного файла по таблицам."""
-    method = str(rec.get("method_version") or "unknown")
-    out = {"run_id": run_id, "models": [], "configs": [], "measurements": [], "decisions": []}
-
+def _build_context(rec, out):
+    """Стенд, окружение и модели из паспорта — одинаково для замера и опыта лаборатории. -> (testbed_pk, env_pk)."""
     tb = rec.get("testbed") if isinstance(rec.get("testbed"), dict) else None
     tb_pk = ""
     if tb:
@@ -419,6 +439,14 @@ def _build(rec, run_id):
                                   "snapshots_json": None, "files": None, "size_mb": None,
                                   "size_bytes": m.get("size_bytes"),
                                   "extra_json": _js({"modified_utc": m.get("modified_utc")})})
+    return tb_pk, env_pk
+
+
+def _build(rec, run_id):
+    """Раскладка проверенного файла по таблицам."""
+    method = str(rec.get("method_version") or "unknown")
+    out = {"run_id": run_id, "models": [], "configs": [], "measurements": [], "decisions": []}
+    tb_pk, env_pk = _build_context(rec, out)
     audio = rec.get("audio") if isinstance(rec.get("audio"), dict) else None
     unit_pk, unit = "", {}
     if audio:
@@ -497,6 +525,264 @@ def _build(rec, run_id):
     return out
 
 
+# ── опыты лаборатории (kind "lab", папка bench\lab) ──────────────────────────────────────────────
+#
+# Файл — обезличенные числа одного запуска лаборатории (lab/experiment.py export-bench). В базу идёт только то,
+# что названо в списках ниже: «список разрешённых», а не «всё, кроме запрещённого», — новое поле лаборатории
+# само в базу не попадёт. Тексты, слова, места разбора, гипотезы, имена, пути и имена файлов в список не входят.
+# Те же функции чистят файл при выгрузке (лаборатория) и при загрузке (здесь): чистка идемпотентна.
+
+_LAB_CODE = re.compile(r"^[A-Za-z0-9_.:+/@-]{1,120}$")
+_LAB_ERR = re.compile(r"^(?:ошибка|[A-Za-z0-9_.:+@/-]{0,80}(?:: [A-Za-z_][A-Za-z0-9_.]*)?)$")
+_LAB_KEY = re.compile(r"^[A-Za-z0-9_]{1,40}$")
+_LAB_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_LAB_HEX = re.compile(r"^[0-9a-f]{64}$")
+_LAB_CID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+_LAB_NOT_NAME = re.compile(r"^[A-Za-z]:|^[/\\]")          # начало пути: диск или корень
+_ABS_PATH = re.compile(r"(?i)(?<![a-z0-9])[a-z]:[\\/]|\\\\[^\\\s]|/users/|/home/")
+_LAB_REASONS = ("asr", "conf", "voice", "missed", "overlap", "gender")
+LAB_TIMING_NUMBERS = ("total_sec", "pair_sec", "diarization_sec", "voices_sec", "embeddings_sec", "asr_sec",
+                      "asr_chunks", "asr2_sec", "asr3_sec", "asr3_load_sec", "asr3_compile_sec",
+                      "asr3_removed_words", "word_voice_sec", "word_windows", "interaction_sec",
+                      "realtime_factor")
+LAB_TIMING_NAMES = ("asr_backend", "asr_model", "asr2_model", "asr3_model", "asr3_device", "asr3_name",
+                    "asr3_mode", "asr3_pieces")
+_LAB_REQUESTED = ("asr_model", "asr_backend", "asr_device", "asr_batch", "asr_quant", "asr_quant_cpu",
+                  "asr_language")
+# Разрешённый лист: num — число, bool — да/нет, code — короткое название из кода (модель, среда, причина),
+# err — «движок:устройство: ТипОшибки» без сообщения, hex — контрольная сумма, utc — время, scalar — число,
+# да/нет или название. Словарь — фиксированные ключи; ("map", спецификация) — словарь с любыми допустимыми
+# ключами; список — список разрешённого.
+LAB_METRICS_SPEC = {
+    "schema": "code", "duration_sec": "num", "words": "num", "flagged_words": "num",
+    "review": {"total": "num", "by_reason": {r: "num" for r in _LAB_REASONS}, "other_reasons": "num",
+               "multi_reason_items": "num", "asr_problem_items": "num"},
+    "review_per_hour": "num",
+    "vote": {k: "num" for k in ("agree3", "agree2", "replaced", "inserted", "disputed")},
+    "vote3_skipped": "code",
+    "vote3_partial": {"reason": "code", "spans": "num", "seconds": "num"},
+    "asr_votes": "num", "asr_incomplete_chunks": "num",
+    "asr_diagnostics": ("map", {"backend": "code", "chunks": "num", "states": ("map", "num")}),
+    "asr2_error": "err", "asr3_errors": ["err"],
+    "missed_speech": "num", "voice_doubt_threshold": "num", "overlaps_sec": "num",
+    "timing": {**{k: "num" for k in LAB_TIMING_NUMBERS}, **{k: "code" for k in LAB_TIMING_NAMES}},
+    "fallbacks": {"asr3": ["err"]},
+    "make_asr": [{"requested": {k: "scalar" for k in _LAB_REQUESTED}, "actual": "code", "providers": ["code"],
+                  "fallbacks": ["err"], "error": "err"}],
+    "hypotheses": ("map", "num"),
+}
+LAB_PAIR_SPEC = {
+    "config_id": "cid", "config_sha256": "hex", "audio_sha256": "hex", "pcm_sha256": "hex",
+    "state": "state", "error_kind": "code", "started_utc": "utc", "finished_utc": "utc", "duration_sec": "num",
+    "conditions": {"power_source": "code", "preflight": {"ok": "bool", "reasons": ["code"]}},
+    "lab": LAB_METRICS_SPEC,
+}
+LAB_FILE_SPEC = {
+    "kind": "code", "lab_format": "num", "method_version": "code", "run_id": "code", "lab_run_id": "code",
+    "started_utc": "utc", "finished_utc": "utc", "status": "code",
+    "experiment": {"name": "code", "sha256": "hex"},
+    "configs": [{"config_id": "cid", "config_sha256": "hex", "roles": "plain", "settings": "plain"}],
+    "pairs": [LAB_PAIR_SPEC],
+}
+LAB_PASSPORT_KEYS = ("testbed", "environment", "models")      # паспорт теми же функциями, что у замера: как есть
+
+
+def _lab_leaf(kind, v):
+    if kind == "num":
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 2 ** 63 else None
+    if kind == "bool":
+        return v if isinstance(v, bool) else None
+    if kind == "scalar":
+        if isinstance(v, bool) or (isinstance(v, (int, float)) and abs(v) < 2 ** 63):
+            return v
+        return _lab_leaf("code", v)
+    if not isinstance(v, str):
+        return None
+    if kind == "code":
+        return v if _LAB_CODE.match(v) and not _LAB_NOT_NAME.match(v) else None
+    if kind == "err":
+        return v if len(v) <= 120 and _LAB_ERR.match(v) else None
+    if kind == "state":
+        return v if v in ("done", "error") else None
+    pattern = {"hex": _LAB_HEX, "utc": _LAB_UTC, "cid": _LAB_CID}[kind]
+    return v if pattern.match(v) else None
+
+
+def _lab_plain(v, depth=0):
+    """Роли и настройки конфигурации: словари с коротким латинским именем ключа, числа, да/нет, названия."""
+    if isinstance(v, dict) and depth < 4:
+        items = ((k, _lab_plain(x, depth + 1)) for k, x in v.items() if isinstance(k, str) and _LAB_KEY.match(k))
+        return {k: x for k, x in items if x is not None}
+    if isinstance(v, (int, float, bool, str)):
+        return _lab_leaf("scalar", v)
+    return None
+
+
+def _lab_apply(spec, v):
+    if isinstance(spec, str):
+        return _lab_plain(v) if spec == "plain" else _lab_leaf(spec, v)
+    if isinstance(spec, list):
+        if not isinstance(v, list):
+            return None
+        return [x for x in (_lab_apply(spec[0], i) for i in v[:200]) if x is not None]
+    if not isinstance(v, dict):
+        return None
+    if isinstance(spec, tuple):
+        items = ((k, _lab_apply(spec[1], x)) for k, x in v.items() if isinstance(k, str) and _LAB_KEY.match(k))
+    else:
+        items = ((k, _lab_apply(sub, v[k])) for k, sub in spec.items() if k in v)
+    return {k: x for k, x in items if x is not None}
+
+
+def lab_numbers(metrics):
+    """Числа пары по списку разрешённых полей (LAB_METRICS_SPEC): всё остальное отбрасывается."""
+    return _lab_apply(LAB_METRICS_SPEC, metrics) if isinstance(metrics, dict) else None
+
+
+def lab_clean(doc):
+    """Файл опыта лаборатории только из разрешённых полей; паспорт (стенд, окружение, модели) — как есть."""
+    out = _lab_apply(LAB_FILE_SPEC, doc) or {}
+    for key in LAB_PASSPORT_KEYS:
+        if isinstance(doc.get(key), dict):
+            out[key] = doc[key]
+    return out
+
+
+def lab_check(record):
+    """Строки и ключи без путей и домашней папки. -> список видов нарушений: absolute_path, home_dir."""
+    home = str(Path.home()).lower()
+    homes = {h for h in (home, home.replace("\\", "/")) if len(h) > 3}
+    found = []
+
+    def look(text):
+        low = text.lower()
+        if _ABS_PATH.search(low):
+            found.append("absolute_path")
+        if any(h in low for h in homes):
+            found.append("home_dir")
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, x in obj.items():
+                look(str(k))
+                walk(x)
+        elif isinstance(obj, (list, tuple)):
+            for x in obj:
+                walk(x)
+        elif isinstance(obj, str):
+            look(obj)
+    walk(record)
+    return sorted(set(found))
+
+
+def _parse_lab(rec, file_name):
+    """Файл опыта лаборатории -> раскладка по таблицам. Плохой файл — RunRejected."""
+    if rec.get("lab_format") not in LAB_FORMATS:
+        raise RunRejected(f"неизвестная версия формата файла опыта: {rec.get('lab_format')!r}")
+    if rec.get("method_version") != LAB_METHOD:
+        raise RunRejected(f"методика файла не {LAB_METHOD}")
+    run_id = rec.get("run_id")
+    if not isinstance(run_id, str) or not _ID.match(run_id) or not run_id.startswith(LAB_PREFIX):
+        raise RunRejected(f"нет допустимого run_id (с приставкой {LAB_PREFIX})")
+    if file_name is not None and file_name != f"{run_id}.json":
+        raise RunRejected("имя файла не совпадает с run_id")
+    problems = lab_check(rec)
+    if problems:
+        raise RunRejected("в файле строка похожа на путь или домашнюю папку: " + ", ".join(problems))
+    _check_structure(rec)
+    if rec.get("status") not in ("done", "interrupted"):
+        raise RunRejected("неверный статус запуска")
+    for key in ("pairs", "configs"):
+        if not isinstance(rec.get(key), list) or any(not isinstance(i, dict) for i in rec[key]):
+            raise RunRejected(f"неверный тип поля {key}")
+    clean = lab_clean(runinfo.scrub(rec))
+    if len(clean.get("pairs", [])) != len(rec["pairs"]) or any(
+            not p.get("config_id") or p.get("state") not in ("done", "error") for p in clean["pairs"]):
+        raise RunRejected("в pairs неверный config_id или состояние пары")
+    try:
+        return _build_lab(clean, run_id)
+    except (TypeError, ValueError, AttributeError, KeyError, OverflowError, RecursionError) as ex:
+        raise RunRejected(f"структура файла неверна ({type(ex).__name__})") from None
+
+
+def _lab_axes(clean, pair, roles, numbers, tb_pk):
+    primary = (roles or {}).get("primary") or {}
+    timing = (numbers or {}).get("timing") or {}
+    shared = _shared_axes(clean, tb_pk, pair.get("conditions") or {})
+    pcm = pair.get("pcm_sha256")
+    return {
+        "unit": {"value": {"pcm": pcm, "offset": 0.0, "duration": pair.get("duration_sec")}, "known": bool(pcm)},
+        "model": {"value": {"roles": {r: (v or {}).get("model") for r, v in (roles or {}).items()}},
+                  "known": bool(primary.get("model"))},
+        "device": {"value": {"backend": timing.get("asr_backend"), "third": timing.get("asr3_device")},
+                   "known": bool(timing.get("asr_backend"))},
+        "config": {"value": {"config_id": pair["config_id"], "config_sha256": pair.get("config_sha256")},
+                   "known": bool(pair.get("config_sha256"))},
+        "testbed": shared["testbed"], "environment": shared["environment"], "power": shared["power"],
+    }
+
+
+def _build_lab(clean, run_id):
+    """Раскладка проверенного и очищенного файла опыта по таблицам. Скорость замера у опыта пуста."""
+    out = {"run_id": run_id, "models": [], "configs": [], "measurements": [], "decisions": [], "units": []}
+    tb_pk, env_pk = _build_context(clean, out)
+    confs = {(c["config_id"], c.get("config_sha256")): c for c in clean.get("configs") or []}
+    seen_units, used = set(), {}
+    reasons = [] if clean["status"] == "done" else ["interrupted"]
+    for pair in clean["pairs"]:
+        cid, sha = pair["config_id"], pair.get("config_sha256")
+        conf = confs.get((cid, sha), {})
+        roles, settings = conf.get("roles") or {}, conf.get("settings") or {}
+        primary = roles.get("primary") or {}
+        cfg_pk = digest({"lab": cid, "config_sha256": sha})
+        out["configs"].append({"config_pk": cfg_pk, "variant_id": cid, "family": "lab",
+                               "asr_backend": primary.get("backend"), "asr_model": primary.get("model"),
+                               "device": primary.get("device"), "chunk_max": None,
+                               "third_max_repeat": (roles.get("third") or {}).get("max_repeat"),
+                               "config_json": _js({"config_sha256": sha, "roles": roles, "settings": settings})})
+        pcm = pair.get("pcm_sha256")
+        if pcm and pcm not in seen_units:
+            seen_units.add(pcm)
+            out["units"].append({"unit_pk": pcm, "unit_id": pcm[:12], "audio_sha256": pair.get("audio_sha256"),
+                                 "offset_sec": 0.0, "duration_sec": pair.get("duration_sec"),
+                                 "source_format": None, "source_duration_sec": None, "size_bytes": None,
+                                 "pcm_format": "mono 16000 Hz s16le"})
+        numbers = pair.get("lab")
+        axes = _lab_axes(clean, pair, roles, numbers, tb_pk)
+        key = (cid, pcm or "")
+        n = used[key] = used.get(key, -1) + 1        # звук неизвестен у нескольких пар: ключ строки не должен совпасть
+        done = pair["state"] == "done"
+        pre = (pair.get("conditions") or {}).get("preflight")
+        if not done:
+            pass                                    # у пары с ошибкой условий нет: оговорку прогона она не создаёт
+        elif not isinstance(pre, dict):
+            reasons.append("no_preflight")
+        elif not pre.get("ok"):
+            reasons.extend(pre.get("reasons") or ["preflight_not_ok"])
+        out["measurements"].append({
+            "run_id": run_id, "variant_id": cid, "unit_pk": pcm or "", "repeat_no": n, "mode": LAB_MODE,
+            "config_pk": cfg_pk, "family": "lab", "status": "done" if done else "error",
+            "status_reason": None if done else (pair.get("error_kind") or "error"),
+            "not_measured_json": _js({k: LAB_NOT_MEASURED for k in LAB_SPEED_COLUMNS}),
+            "axes_json": _js(axes), "speed_key": _speed_key(LAB_METHOD, axes),
+            "extra_json": _js({"lab": numbers, "pair": {"audio_sha256": pair.get("audio_sha256"),
+                                                         "config_sha256": sha,
+                                                         "started_utc": pair.get("started_utc"),
+                                                         "finished_utc": pair.get("finished_utc")}})})
+    exp = clean.get("experiment") or {}
+    out["run"] = {"run_id": run_id, "kind": LAB_KIND, "started_utc": clean.get("started_utc"),
+                  "finished_utc": clean.get("finished_utc"), "status": clean["status"],
+                  "method_version": LAB_METHOD, "run_schema_version": clean.get("lab_format"),
+                  "db_schema_version": BENCH_DB_SCHEMA, "loader_version": LOADER_VERSION,
+                  "testbed_pk": tb_pk, "env_pk": env_pk, "unit_pk": "",
+                  "params_json": _js({"experiment": exp, "lab_run_id": clean.get("lab_run_id"),
+                                      "pairs": len(clean["pairs"])}),
+                  "valid": "yes" if not reasons else "with_reservations",
+                  "valid_reason": ",".join(sorted(set(reasons))) or None, "is_historical": 0}
+    out["texts_file"] = None
+    return out
+
+
 # ── загрузка ─────────────────────────────────────────────────────────────────────────────────────
 
 def _insert(con, table, row, ignore=False):
@@ -530,14 +816,15 @@ def _classify(con, path):
     p = Path(path)
     data = p.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
-    item = {"file": p.name, "sha256": sha, "size_bytes": len(data), "run_id": None, "action": None, "reason": None}
+    item = {"file": p.name, "sha256": sha, "size_bytes": len(data), "run_id": None, "action": None, "reason": None,
+            "source": p.parent.name}
     earlier = _known(con, sha)
     if earlier:
         item.update(action="known", reason=f"уже учтён ({earlier['outcome']})", run_id=earlier["run_id"],
                     known_outcome=earlier["outcome"])
         return item, None
     try:
-        parsed = parse_run(data, p.name)
+        parsed = parse_run(data, p.name, p.parent.name)
     except RunRejected as ex:
         stem = p.name[:-len(".json")]
         item.update(action="rejected", reason=str(ex), run_id=stem if _RUN_NAME.match(stem) else None)
@@ -551,10 +838,13 @@ def _classify(con, path):
 
 
 def _run_files(bench_dir):
-    d = Path(bench_dir) / "runs"
-    if not d.is_dir():
-        return []
-    return sorted(p for p in d.glob("*.json") if p.is_file() and not p.name.endswith(".texts.json"))
+    """Файлы замеров (runs) и опытов лаборатории (lab): у каждого вида своя папка."""
+    out = []
+    for folder in ("runs", LAB_KIND):
+        d = Path(bench_dir) / folder
+        if d.is_dir():
+            out += sorted(p for p in d.glob("*.json") if p.is_file() and not p.name.endswith(".texts.json"))
+    return out
 
 
 def _counts(items):
@@ -610,6 +900,8 @@ def _store(con, bench_dir, parsed):
     for key, table in (("testbed", "testbed"), ("env", "env_snapshot"), ("unit", "test_unit")):
         if key in parsed:
             _insert(con, table, parsed[key], ignore=True)
+    for u in parsed.get("units", []):
+        _insert(con, "test_unit", u, ignore=True)
     for m in parsed["models"]:
         _insert(con, "model_artifact", m, ignore=True)
         _insert(con, "run_model", {"run_id": parsed["run_id"], "model_pk": m["model_pk"]}, ignore=True)
@@ -882,6 +1174,13 @@ def _print_report(rep, apply):
     label = {"new": "новых", "loaded": "загружено", "known": "уже учтено", "conflict": "конфликтов",
              "rejected": "отклонено"}
     print("Файлов: " + (", ".join(f"{label[k]} {c[k]}" for k in label if k in c) or "нет"))
+    n_lab = [it for it in rep["files"] if it.get("source") == LAB_KIND]
+    if n_lab:
+        by = {}
+        for it in n_lab:
+            by[it["action"]] = by.get(it["action"], 0) + 1
+        print("  из них опытов лаборатории (bench\\lab): "
+              + ", ".join(f"{label.get(k, k)} {v}" for k, v in sorted(by.items())))
     for it in rep["files"]:
         if it["action"] in ("new", "conflict", "rejected", "loaded") and it.get("reason"):
             print(f"  {it['file']}: {it['action']} — {it['reason']}")
