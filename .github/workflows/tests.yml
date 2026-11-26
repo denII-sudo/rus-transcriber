@@ -137,6 +137,11 @@ jobs:
       # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,
       # по одному в строке. Журнал публичный: --hide-words выводит только файл и строку, без слова.
       # PR из форков секрет не получают — там проверка пропускается с пометкой.
+      # В PR скрипт берётся из базового коммита (первый родитель merge-коммита, HEAD^1), а файлы проверяются
+      # из дерева PR (--root .): автор PR не может подменить сам tools/check_repo.py. Это частичная защита:
+      # для события pull_request GitHub берёт и сам tests.yml из PR, так что правкой этого файла секрет
+      # по-прежнему можно вывести; такие правки закрывает ревью код-владельца (.github/ в CODEOWNERS).
+      # На push, по расписанию и вручную (main) проверка идёт скриптом из дерева, как раньше.
       - name: Check tracked files for private words
         shell: pwsh
         env:
@@ -149,7 +154,19 @@ jobs:
           $list = Join-Path $env:RUNNER_TEMP "forbidden-words.txt"
           [IO.File]::WriteAllText($list, $env:FORBIDDEN_WORDS, (New-Object Text.UTF8Encoding $false))
           $env:RUS_FORBIDDEN_WORDS = $list
-          python -B tools/check_repo.py --hide-words
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $baseScript = Join-Path $env:RUNNER_TEMP "base-check-repo.py"
+            # python пишет байты как есть: без перекодировки, которая зависит от версии PowerShell
+            python -B -c "import subprocess, sys; open(sys.argv[2], 'wb').write(subprocess.run(['git', 'show', sys.argv[1]], check=True, capture_output=True).stdout)" "HEAD^1:tools/check_repo.py" $baseScript
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item $list -Force
+              Write-Output "::error::Could not read tools/check_repo.py from the base commit (HEAD^1): private-word check NOT done."
+              exit 1
+            }
+            python -B $baseScript --root . --hide-words
+          } else {
+            python -B tools/check_repo.py --hide-words
+          }
           $code = $LASTEXITCODE
           Remove-Item $list -Force
           exit $code
