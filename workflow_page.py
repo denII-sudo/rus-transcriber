@@ -105,9 +105,17 @@ def result_view(data):
             "source_revision": data.get("source_revision"),
             "review_revision": data.get("review_revision"),
             "document_sync": data.get("document_sync"),
-            "files": {"json": data.get("json"), "markdown": data.get("markdown"),
-                      "manifest": data.get("manifest")},
+            "files": _shown_files({"json": data.get("json"), "markdown": data.get("markdown"),
+                                   "manifest": data.get("manifest")}),
             "segments": segments, "doubts": doubts}
+
+
+def _shown_files(files):
+    """Пути файлов для показа в регистре с диска: база хранит корень в нижнем регистре."""
+    import core_conflicts
+    cache = {}
+    return {kind: (str(core_conflicts._real_case(path, cache)) if isinstance(path, str) and path else path)
+            for kind, path in files.items()}
 
 
 def state_ru(state):
