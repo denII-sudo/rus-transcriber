@@ -160,28 +160,75 @@ class SectionValidationTests(unittest.TestCase):
         self.assertIn("раздел 2", str(error.exception))
         self.assertIn("с пункта 3", str(error.exception))
 
-    def test_bad_also_references_are_rejected(self):
+    def test_bad_also_references_are_dropped_not_rejected(self):
+        # Ч-0а: отсылка — вспомогательное поле; ответ из-за неё не отвергается, что отброшено — в also_adjusted.
         cases = {
-            "больше трёх": [[3, 3], [4, 4], [5, 5], [3, 4]],
-            "внутри своего раздела": [[2, 2]],
-            "задевает свой раздел": [[2, 3]],
-            "не пара": [[3]],
-            "обратная": [[4, 3]],
-            "за концом": [[5, 6]],
-            "не список": "3-4",
+            "больше трёх": ([[3, 3], [4, 4], [5, 5], [3, 4]], 3, [("dropped", "too_many", [3, 4])]),
+            "повтор": ([[3, 3], [3, 3]], 1, [("dropped", "repeat", [3, 3])]),
+            "внутри своего раздела": ([[2, 2]], 0, [("dropped", "own_section", [2, 2])]),
+            "задевает свой раздел": ([[2, 3]], 0, [("dropped", "own_section", [2, 3])]),
+            "не пара": ([[3]], 0, [("dropped", "format", None)]),
+            "обратная": ([[4, 3]], 0, [("dropped", "outside", [4, 3])]),
+            "за концом": ([[5, 6]], 0, [("dropped", "outside", [5, 6])]),
+            "не список": ("3-4", 0, [("dropped", "format", None)]),
         }
-        for name, refs in cases.items():
-            with self.subTest(name), self.assertRaises(ValueError):
-                self.check(_sections((1, 2), (3, 5), also={0: refs}))
+        for name, (refs, kept, notes) in cases.items():
+            with self.subTest(name):
+                result = self.check(_sections((1, 2), (3, 5), also={0: refs}))
+                self.assertEqual(len(result["sections"][0]["also"]), kept)
+                self.assertEqual([(n["action"], n["reason"], n["ref"]) for n in result["also_adjusted"]], notes)
+                self.assertTrue(all(n["section"] == 1 for n in result["also_adjusted"]))
 
-    def test_long_reference_is_rejected(self):
+    def test_without_adjustments_the_result_has_no_also_adjusted(self):
+        self.assertNotIn("also_adjusted", self.check(_sections((1, 2), (3, 5), also={0: [[3, 4]]})))
+
+    def test_long_reference_is_truncated_to_its_first_20_points(self):
         turns = [{"turn": n, "speaker": "Участник 1"} for n in range(1, 31)]
         task = _task([word for n in range(30) for word in _words(1, n + 1, start=n)], turns)
         answer = {"source_revision": 3, "sections": _sections((1, 1), (2, 30), also={0: [[2, 22]]})}
-        with self.assertRaises(ValueError):
-            model_tasks.validate(task, answer, current_revision=3)
+        result = model_tasks.validate(task, answer, current_revision=3)
+        self.assertEqual(result["sections"][0]["also"], [[f"w{i}" for i in range(1, 21)]])
+        self.assertEqual(result["also_adjusted"], [{"section": 1, "action": "truncated", "reason": "long",
+                                                    "ref": [2, 22], "kept": [2, 21]}])
         answer["sections"][0]["also"] = [[2, 21]]
-        self.assertEqual(len(model_tasks.validate(task, answer, current_revision=3)["sections"][0]["also"][0]), 20)
+        result = model_tasks.validate(task, answer, current_revision=3)
+        self.assertEqual(len(result["sections"][0]["also"][0]), 20)
+        self.assertNotIn("also_adjusted", result)
+
+    def test_truncated_reference_that_reaches_its_own_section_is_dropped(self):
+        turns = [{"turn": n, "speaker": "Участник 1"} for n in range(1, 41)]
+        task = _task([word for n in range(40) for word in _words(1, n + 1, start=n)], turns)
+        answer = {"source_revision": 3, "sections": _sections((1, 10), (11, 40), also={1: [[1, 25]]})}
+        result = model_tasks.validate(task, answer, current_revision=3)
+        self.assertEqual(result["sections"][1]["also"], [])
+        self.assertEqual([(n["action"], n["reason"]) for n in result["also_adjusted"]], [("dropped", "own_section")])
+
+    def test_all_section_violations_are_named_in_one_error(self):
+        turns = [{"turn": n, "speaker": "Участник 1"} for n in range(1, 41)]
+        task = _task([word for n in range(40) for word in _words(100, n + 1, start=100 * n)], turns)
+        sections = _sections((1, 16), (17, 17), (19, 35), (36, 39))      # 1600 слов, пропуск, 1700 слов, не до конца
+        sections[1]["text"] = " "
+        with self.assertRaises(ValueError) as error:
+            model_tasks.validate(task, {"source_revision": 3, "sections": sections}, current_revision=3)
+        message = str(error.exception)
+        self.assertTrue(message.startswith("нарушений в ответе: 5, исправьте все — 1) "), message)
+        for part in ("раздел 1 (пункты 1–16) охватывает 1600 слов", "раздел 2: пустой текст",
+                     "раздел 3 начинается с пункта 19, а должен — с пункта 18",
+                     "раздел 3 (пункты 19–35) охватывает 1700 слов", "кончаются пунктом 39"):
+            self.assertIn(part, message)
+
+    def test_listed_errors_are_capped(self):
+        turns = [{"turn": n, "speaker": "Участник 1"} for n in range(1, 61)]
+        task = _task([word for n in range(60) for word in _words(1, n + 1, start=n)], turns)
+        sections = [{"from": n, "to": n, "text": ""} for n in range(1, 61)]
+        with self.assertRaises(ValueError) as error:
+            model_tasks.validate(task, {"source_revision": 3, "sections": sections}, current_revision=3)
+        message = str(error.exception)
+        self.assertIn(f"нарушений в ответе: 60", message)
+        self.assertIn(f"{model_tasks.MAX_LISTED_ERRORS}) раздел {model_tasks.MAX_LISTED_ERRORS}: пустой текст", message)
+        self.assertNotIn(f"{model_tasks.MAX_LISTED_ERRORS + 1}) ", message)
+        self.assertIn("и ещё 40", message)
+        self.assertLess(len(message), llm_provider.MAX_REPAIR_ERROR_CHARS)
 
     def test_section_of_several_points_is_limited_to_1500_words(self):
         turns = [{"turn": n, "speaker": "Участник 1"} for n in range(1, 18)]
