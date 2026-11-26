@@ -256,6 +256,9 @@ class NewInstallStoreEntryPointsTests(unittest.TestCase):
         # шаг внутри ветки «не режим приёмки»: там нет окружения программы
         acceptance = text.rindex("if ($AcceptanceCopyOnly) {", 0, step)
         self.assertIn("venv, зависимости и HF-проверки пропущены", text[acceptance:step])
+        devices = text[packages:step]                 # шаг 7 импортирует paths: папка данных та же, что у установки
+        self.assertLess(devices.index("$env:RUS_TRANSCRIBER_DATA = $DataDir"), devices.index("import paths, backends"))
+        self.assertIn("finally { $env:RUS_TRANSCRIBER_DATA = $prevData }", devices)
         ending = text[text.index('Step "11/11"'):]
         self.assertIn("if (($storeOk -eq $false) -or -not $selfCheckOk) { exit 2 }", ending)
 

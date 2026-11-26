@@ -901,7 +901,12 @@ if ($freezeBefore) {
         Write-Host "  откат к прежним версиям: & '$py' -m pip install -r '$freezeFile' (вместе с прежней версией программы, см. docs/development-and-installation.md)" -ForegroundColor DarkGray
     }
 }
-& $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
+# импорт paths создаёт каталоги в папке данных: она должна быть та же, что у установки (-DataDir)
+$prevData = $env:RUS_TRANSCRIBER_DATA
+try {
+    $env:RUS_TRANSCRIBER_DATA = $DataDir
+    & $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
+} finally { $env:RUS_TRANSCRIBER_DATA = $prevData }
 Write-Host "  нужны CPU и OpenVINOExecutionProvider; GPU желателен на Intel Arc; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
 # OpenVINO GPU/NPU — плагины Intel: на графике AMD/NVIDIA их не будет, и это не ошибка.
 $nonIntel = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
