@@ -5,9 +5,11 @@
 
 import copy
 import contextvars
+import errno
 import json
 import os
 import sqlite3
+import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -418,9 +420,42 @@ _EVENT_FIELDS = frozenset(("application_events", "application_events_dropped", "
 # События карточек пишет только append_review_event (таблица событий, Х1): запись состояния пакета их не трогает.
 _INTERACTION_FIELDS = frozenset(("interaction_events", "interaction_events_dropped"))
 REVIEW_EVENTS_NOT_UPGRADED = ("база не обновлена: показы карточек и проигрывания не записываются, отметки "
-                              "«прослушано» записываются — не удалось сделать резерв базы перед обновлением. "
-                              "Проверьте место на диске, закройте и снова откройте программу")
-_REVIEW_EVENTS_BACKUP_FAILED = set()
+                              "«прослушано» записываются — не удалось сделать резерв базы перед обновлением")
+# Ф204-4: причина отказа резерва — категория без путей и без текста исключения (в тексте OSError есть пути)
+BACKUP_NO_SPACE = "нет места на диске"
+BACKUP_LOCKED = "файл занят другой программой или нет доступа"
+BACKUP_NO_LINKS = "том не поддерживает жёсткие ссылки"
+BACKUP_INVALID_COPY = "копия базы не прошла проверку: в базе есть расхождение, резерв без его исправления невозможен"
+_BACKUP_ADVICE = {BACKUP_NO_SPACE: "Освободите место на диске, затем закройте и снова откройте страницу карточек"}
+_BACKUP_RETRY = "Закройте и снова откройте страницу карточек, чтобы попробовать снова"
+_REVIEW_EVENTS_BACKUP_FAILED = {}   # ключ базы -> причина отказа; до конца процесса страницы резерв не пробуется
+_REVIEW_EVENTS_BACKUP_DONE = {}     # ключ базы -> готовый резерв (Ф204-3): повтор только создаёт таблицу
+
+
+def backup_failure_reason(ex):
+    """Короткая причина отказа резерва для человека: нет места, файл занят, нет жёстких ссылок, проверка копии."""
+    if isinstance(ex, OSError):
+        code, win = ex.errno, getattr(ex, "winerror", None)
+        if code == errno.ENOSPC or win in (39, 112):
+            return BACKUP_NO_SPACE
+        if code in (errno.EXDEV, errno.EMLINK, getattr(errno, "ENOTSUP", None), getattr(errno, "EOPNOTSUPP", None)) \
+                or win in (1, 50, 1142):
+            return BACKUP_NO_LINKS
+        if code in (errno.EACCES, errno.EPERM) or win in (5, 32, 33):
+            return BACKUP_LOCKED
+        return f"ошибка файла ({type(ex).__name__})"
+    if isinstance(ex, sqlite3.Error):
+        if getattr(ex, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_FULL", 13):
+            return BACKUP_NO_SPACE
+        return f"ошибка SQLite ({type(ex).__name__})"
+    if isinstance(ex, storage.StorageError):
+        return BACKUP_INVALID_COPY
+    return type(ex).__name__
+
+
+def review_events_warning(reason):
+    """Предупреждение страницы, когда резерв перед созданием таблицы событий не удался."""
+    return f"{REVIEW_EVENTS_NOT_UPGRADED}. Причина: {reason}. {_BACKUP_ADVICE.get(reason, _BACKUP_RETRY)}"
 
 
 def _review_from_state(store, binding, state):
@@ -526,27 +561,42 @@ def ensure_review_events(store):
 
     Ничего не переносит, не переписывает и не удаляет: это делает только обновление базы (Х1у). True — таблица
     есть. False — резерв не удался: таблица не создана, и до перезапуска процесса резерв больше не пробуем
-    (иначе полная копия базы на каждое событие). Занятость базы (Busy) — не отказ: следующее событие попробует снова."""
+    (иначе полная копия базы на каждое событие); причина — в _REVIEW_EVENTS_BACKUP_FAILED и одной строкой в stderr
+    (журнал страницы). Занятость базы (Busy) — не отказ: следующее событие попробует снова. Резерв удался, а таблица
+    не создалась — следующее событие только создаёт таблицу, пока файл резерва на месте (Ф204-3)."""
     if store.has_review_events():
         return True
-    key = os.path.normcase(str(store.path))
+    key = _review_events_key(store)
     if key in _REVIEW_EVENTS_BACKUP_FAILED:
         return False
-    try:
-        folder = review_events_backup_dir(store)
-        folder.mkdir(exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = folder / f"state-before-review-events-{stamp}.sqlite3"
-        if target.exists():
-            target = folder / f"state-before-review-events-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
-        store.backup(target, allow_damaged_copies=True)
-    except storage.Busy:
-        raise
-    except (OSError, storage.StorageError, sqlite3.Error):
-        _REVIEW_EVENTS_BACKUP_FAILED.add(key)
-        return False
+    done = _REVIEW_EVENTS_BACKUP_DONE.get(key)
+    if done is None or not done.is_file():
+        try:
+            folder = review_events_backup_dir(store)
+            folder.mkdir(exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target = folder / f"state-before-review-events-{stamp}.sqlite3"
+            if target.exists():
+                target = folder / f"state-before-review-events-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
+            store.backup(target, allow_damaged_copies=True)
+        except storage.Busy:
+            raise
+        except (OSError, storage.StorageError, sqlite3.Error) as ex:
+            reason = backup_failure_reason(ex)
+            _REVIEW_EVENTS_BACKUP_FAILED[key] = reason
+            # без путей и текста исключения: только категория и тип
+            print(f"[review-events] резерв базы перед обновлением не удался: {reason} ({type(ex).__name__})",
+                  file=sys.stderr, flush=True)
+            return False
+        _REVIEW_EVENTS_BACKUP_DONE[key] = target
     store.create_review_events_table()
     return True
+
+
+def _review_events_key(store):
+    """Путь базы и её store_id: восстановленная на том же месте другая база не берёт чужой резерв."""
+    row = store.db.execute("SELECT store_id FROM store_meta").fetchone()
+    return os.path.normcase(str(store.path)), row[0] if row else None
 
 
 def append_review_event(document_path, event, state=None):
@@ -573,7 +623,8 @@ def append_review_event(document_path, event, state=None):
         if not ensure_review_events(store):
             if review is not None:
                 store.commit_change(recording_id, expected, str(uuid.uuid4()), context, review=review)
-            return {"stored": False, "warning": REVIEW_EVENTS_NOT_UPGRADED, "heard_saved": review is not None}
+            reason = _REVIEW_EVENTS_BACKUP_FAILED.get(_review_events_key(store), "")
+            return {"stored": False, "warning": review_events_warning(reason), "heard_saved": review is not None}
         result = store.append_review_event(recording_id, event, str(uuid.uuid4()), context,
                                            expected_versions=expected, review=review)
         return {"stored": True, **result}
