@@ -5,7 +5,11 @@
     .venv\\Scripts\\python.exe worker.py запись.m4a --speakers 3 --no-emotions
 
 Устройство и модель берутся из config.json (его заполняет bench.py).
-Результат кладётся рядом с аудио: <имя>.transcript.md и <имя>.transcript.json
+Новая запись сохраняется только в базу записей (state.sqlite3 папки данных; создаёт её установщик
+или `rt.py db-init`), её документы — рядом с аудио в папке <имя>.rus-transcriber: <имя>.transcript.md
+и <имя>.transcript.json. Без базы worker отказывает до тяжёлой работы.
+Автор записи: программа передаёт его в файле статуса (--status); при ручном запуске без --status
+worker берёт его из базы сам, как программа в момент запуска.
 Нужна переменная окружения HF_TOKEN и ffmpeg в PATH.
 """
 import argparse
@@ -1572,8 +1576,6 @@ def main():
     ap.add_argument("--vocab", default="", help="путь к словарю группы (rus-transcriber.vocab.json)")
     ap.add_argument("--group", default="", help="группа (папка DATA_DIR\\groups\\<группа>): её словарь и голосовой профиль")
     ap.add_argument("--tag", default="", help="метка в имени результата: <имя>.<метка>.transcript.md")
-    ap.add_argument("--storage-backend", choices=("legacy_files", "sqlite"), default="legacy_files",
-                    help=argparse.SUPPRESS)
     ap.add_argument("--no-voices", action="store_true", help="без голосовых профилей и проверки голосов")
     ap.add_argument("--names", default="", help="имена участников записи через запятую: голоса только среди них")
     ap.add_argument("--learn-only", default="", help="только пересчитать профили голосов по этой расшифровке")
@@ -1590,10 +1592,9 @@ def main():
                     help="только для третьей модели Whisper: сколько раз подряд она может повторить одну фразу "
                          "(зацикливание); 0 — без ограничения")
     a = ap.parse_args()
-    if a.storage_backend == "sqlite":
-        import recordings
-        if not recordings.SQLITE_RUNTIME_READY:
-            raise RuntimeError("SQLite backend unavailable until all recording writers are routed")
+    import recordings
+    if not recordings.SQLITE_RUNTIME_READY:
+        raise RuntimeError("SQLite backend unavailable until all recording writers are routed")
 
     st = Status(a.status)
     src = Path(a.audio).expanduser().resolve()
@@ -1616,29 +1617,24 @@ def main():
 
         tag = "".join(ch for ch in a.tag if ch.isalnum() or ch in "-_")
         stem = src.stem + (f".{tag}" if tag else "")
-        out_dir = src.parent / f"{src.stem}.rus-transcriber"   # все файлы результата — в подпапке рядом с аудио
+        # новая запись — только в базу; документы — в подпапке рядом с аудио
+        layout = recordings.document_layout(src, tag)
+        out_dir = layout["root"]
         out_dir.mkdir(exist_ok=True)
-        md_path = out_dir / (stem + ".transcript.md")
-        json_path = out_dir / (stem + ".transcript.json")
-        sqlite_target = None
-        if a.storage_backend == "sqlite":
-            import recordings
-            out_dir = recordings.document_layout(src, tag)["root"]
-            out_dir.mkdir(exist_ok=True)
-            layout = recordings.document_layout(src, tag)
-            store = recordings.open_store()
-            try:
-                root_id, document_paths = recordings.prepare_new_layout(store, out_dir, layout["paths"])
-            finally:
-                store.close()
-            json_path = out_dir / document_paths["json"]
-            md_path = out_dir / document_paths["md"]
+        store = recordings.open_store()
+        try:
+            root_id, document_paths = recordings.prepare_new_layout(store, out_dir, layout["paths"])
             context = st.data.get("recording_context")
-            if not isinstance(context, dict) or context.get("actor_kind") != "model":
-                raise RuntimeError("SQLite job is missing its captured initiator context")
-            sqlite_target = {"root_id": root_id, "paths": document_paths, "context": context}
-        else:
-            transcript.ensure_new_result(json_path, md_path)
+            if context is None and not a.status:
+                # ручной запуск: автора берём из базы, как core.start_transcription в момент запуска
+                context = recordings.operation_context(store, "model")
+        finally:
+            store.close()
+        json_path = out_dir / document_paths["json"]
+        md_path = out_dir / document_paths["md"]
+        if not isinstance(context, dict) or context.get("actor_kind") != "model":
+            raise RuntimeError("SQLite job is missing its captured initiator context")
+        sqlite_target = {"root_id": root_id, "paths": document_paths, "context": context}
 
         resolution = resolve_vocab_details(src, a, cfg)
         vocab_path, vocab, vgroup = resolution["path"], resolution["vocab"], resolution["group"]
@@ -1934,9 +1930,8 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
     # сведения о самом файле — как у записей после переноса (tools/import_legacy.py): наличие, хэш файла,
     # контейнер и кодек; по хэшу файла запись связывается с лабораторией и сохранёнными гипотезами
     data.update(runinfo.audio_facts(src))
-    if sqlite_target is None:
-        transcript.save_new(data, json_path, md_path)
-        return {}
+    if not sqlite_target:
+        raise RuntimeError("Новая запись сохраняется только в базу: нет раскладки записи базы")
     import recordings
     store = recordings.open_store()
     try:
