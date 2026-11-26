@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -38,6 +39,24 @@ REVIEW_EVENTS_DDL = """CREATE TABLE review_events (
 REVIEW_EVENTS_COLUMNS = frozenset(("recording_id", "seq", "event_json", "review_revision", "origin",
                                    "operation_id", "created_at"))
 MAX_REVIEW_EVENT_BYTES = 16384
+# Гипотезы моделей (Г-1, РАР-4.2): запись hyp-2 одного прогона расшифровки — часть записи. Удалить запись, не
+# удалив её гипотезы, нельзя: внешний ключ (сторож будущего удаления записи, tests/test_hypotheses_db.py).
+# Таблицы нет в базе, созданной до Г-1, — её создаёт recordings.ensure_hypotheses (резерв, потом пустая таблица).
+# Машинные данные: операций и ревизий не создают; удаляются только очисткой гипотез после подтверждения человеком.
+HYPOTHESES_DDL = """CREATE TABLE hypotheses (
+            run_id TEXT PRIMARY KEY,
+            recording_id TEXT NOT NULL REFERENCES recordings(recording_id),
+            sound_id TEXT NOT NULL CHECK(length(sound_id) = 12),
+            job_id TEXT,
+            format TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+            created_at TEXT NOT NULL)"""
+HYPOTHESES_INDEX_DDL = "CREATE INDEX hypotheses_by_recording ON hypotheses(recording_id)"
+HYPOTHESES_COLUMNS = frozenset(("run_id", "recording_id", "sound_id", "job_id", "format", "record_json",
+                                "size_bytes", "created_at"))
+HYPOTHESIS_RUN_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+HYPOTHESIS_SOUND_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 class StorageError(Exception):
@@ -493,7 +512,7 @@ def _initialize_at(path, initial_display_name=None):
             kind TEXT NOT NULL, state TEXT NOT NULL, result_json TEXT,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(run_id, kind));
-        """ + REVIEW_EVENTS_DDL + ";")
+        """ + REVIEW_EVENTS_DDL + ";\n" + HYPOTHESES_DDL + ";\n" + HYPOTHESES_INDEX_DDL + ";")
         db.execute("INSERT INTO store_meta VALUES (?, ?)", (str(uuid.uuid4()), SCHEMA_VERSION))
         if initial_display_name is not None:
             user_id, installation_id = str(uuid.uuid4()), str(uuid.uuid4())
@@ -618,6 +637,9 @@ def _check_schema(db):
         # таблица событий карточек необязательна: базы до Х1 её не имеют (номер схемы тот же, 4)
         if "review_events" in names:
             columns["review_events"] = REVIEW_EVENTS_COLUMNS
+        # таблица гипотез необязательна: базы до Г-1 её не имеют (номер схемы тот же, 4)
+        if "hypotheses" in names:
+            columns["hypotheses"] = HYPOTHESES_COLUMNS
         for table, expected in columns.items():
             if not expected <= {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
                 raise UnsupportedSchema("required columns missing")
@@ -708,6 +730,12 @@ def validate_copy(path, *, allow_damaged_copies=False):
                     raise StorageError("review event operation mismatch")
             if joined != db.execute("SELECT count(*) FROM review_events").fetchone()[0]:
                 raise StorageError("review event without operation")
+        if _has_table(db, "hypotheses"):
+            for row in db.execute("SELECT record_json, size_bytes FROM hypotheses"):
+                if not isinstance(_loads(row["record_json"]), dict):
+                    raise StorageError("hypothesis record must be an object")
+                if len(row["record_json"].encode("utf-8")) != row["size_bytes"]:
+                    raise StorageError("hypothesis record size mismatch")
         for row in db.execute("SELECT r.payload AS review, t.payload AS transcript FROM review_revisions r "
                               "JOIN transcript_revisions t ON t.recording_id=r.recording_id "
                               "AND t.revision=r.source_revision"):
@@ -1556,6 +1584,88 @@ class Store:
             return []
         return [_loads(row["event_json"]) for row in self.db.execute(
             "SELECT event_json FROM review_events WHERE recording_id=? ORDER BY seq", (recording_id,))]
+
+    def has_hypotheses(self):
+        """Есть ли в базе таблица гипотез моделей (Г-1)."""
+        return _has_table(self.db, "hypotheses")
+
+    def create_hypotheses_table(self):
+        """Создать пустую таблицу гипотез в базе до Г-1. Ничего не переносит и не переписывает; резерв перед этим
+        делает вызывающий (recordings.ensure_hypotheses). Повторный вызов ничего не меняет."""
+        with self._transaction():
+            if not self.has_hypotheses():
+                self.db.execute(HYPOTHESES_DDL)
+                self.db.execute(HYPOTHESES_INDEX_DDL)
+
+    def add_hypotheses(self, run_id, recording_id, sound_id, record, *, job_id=None, fmt="hyp-2"):
+        """Записать гипотезы одного прогона расшифровки записи. Один раз: повтор run_id — Conflict.
+        -> {"run_id", "recording_id", "size_bytes"}."""
+        if not isinstance(run_id, str) or not HYPOTHESIS_RUN_RE.match(run_id):
+            raise ValueError("invalid hypotheses run_id")
+        _uuid(recording_id)
+        if not isinstance(sound_id, str) or not HYPOTHESIS_SOUND_RE.match(sound_id):
+            raise ValueError("invalid hypotheses sound_id")
+        if not isinstance(record, dict):
+            raise ValueError("hypotheses record must be an object")
+        if job_id is not None and not isinstance(job_id, str):
+            raise ValueError("job_id must be a string")
+        # как прежний файл hyp-2: без сортировки ключей; NaN и бесконечность не запрещены
+        encoded = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        size = len(encoded.encode("utf-8"))
+        with self._transaction():
+            if not self.has_hypotheses():
+                raise StorageError("hypotheses table missing")
+            if self.db.execute("SELECT 1 FROM recordings WHERE recording_id=?", (recording_id,)).fetchone() is None:
+                raise KeyError(recording_id)
+            if self.db.execute("SELECT 1 FROM hypotheses WHERE run_id=?", (run_id,)).fetchone():
+                raise Conflict("hypotheses run already stored")
+            self.db.execute("INSERT INTO hypotheses VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (run_id, recording_id, sound_id, job_id, str(fmt), encoded, size, _now()))
+        return {"run_id": run_id, "recording_id": recording_id, "size_bytes": size}
+
+    @staticmethod
+    def _hypotheses_where(recording_id=None, sound_id=None, created_before=None):
+        clauses, params = [], []
+        if recording_id is not None:
+            _uuid(recording_id)
+            clauses.append("recording_id=?")
+            params.append(recording_id)
+        if sound_id is not None:
+            if not isinstance(sound_id, str) or not HYPOTHESIS_SOUND_RE.match(sound_id):
+                raise ValueError("invalid hypotheses sound_id")
+            clauses.append("sound_id=?")
+            params.append(sound_id)
+        if created_before is not None:
+            clauses.append("created_at<?")
+            params.append(created_before.astimezone(timezone.utc).isoformat())
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def hypotheses_summary(self, recording_id=None, sound_id=None, created_before=None):
+        """Сколько гипотез подходит под отбор: {"runs", "recordings", "bytes"}. Та же выборка, что удаляет
+        delete_hypotheses: человек видит ровно то, что удалится. Без таблицы — нули."""
+        where, params = self._hypotheses_where(recording_id, sound_id, created_before)
+        if not self.has_hypotheses():
+            return {"runs": 0, "recordings": 0, "bytes": 0}
+        row = self.db.execute("SELECT count(*), count(DISTINCT recording_id), COALESCE(sum(size_bytes), 0) "
+                              "FROM hypotheses" + where, params).fetchone()
+        return {"runs": row[0], "recordings": row[1], "bytes": row[2]}
+
+    def delete_hypotheses(self, recording_id=None, sound_id=None, created_before=None):
+        """Удалить гипотезы по отбору (все, записи, звука, созданные раньше created_before) сразу и навсегда.
+        -> сводка удалённого, как hypotheses_summary до удаления."""
+        where, params = self._hypotheses_where(recording_id, sound_id, created_before)
+        with self._transaction():
+            summary = self.hypotheses_summary(recording_id, sound_id, created_before)
+            if summary["runs"]:
+                self.db.execute("DELETE FROM hypotheses" + where, params)
+        return summary
+
+    def hypotheses_rows(self):
+        """Все прогоны гипотез: [{"run_id", "recording_id", "sound_id", "record_json"}] по run_id (лаборатория)."""
+        if not self.has_hypotheses():
+            return []
+        return [dict(row) for row in self.db.execute(
+            "SELECT run_id, recording_id, sound_id, record_json FROM hypotheses ORDER BY run_id")]
 
     def save_conspect(self, recording_id, conspect_id, name, source_revision, expected_revision,
                       payload, json_bytes, md_bytes, json_relative, md_relative, root_id,

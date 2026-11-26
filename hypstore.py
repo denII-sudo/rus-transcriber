@@ -1,20 +1,26 @@
-"""Сохранение гипотез моделей на диск (РАР-4, этап 4.2, шаг 3): файл hyp-2 в папке данных и его удаление.
+"""Гипотезы моделей (РАР-4, этап 4.2): запись hyp-2 прогона расшифровки — в базе записей, частью записи (Г-1).
 
-Включается настройкой save_hypotheses (по умолчанию выключена). Гипотезы содержат полный текст записи,
-поэтому лежат только в папке данных: <папка данных>\\hypotheses\\<unit_id>\\<run_id>.json, где unit_id —
-первые 12 знаков SHA-256 звука (моно 16 кГц s16le, как в паспорте теста скорости runinfo.audio_identity),
-run_id — как runinfo.new_run_id. Связь с задачей и записью (ids.job_id, ids.recording_id) — внутри
-файла; source_revision в файле нет: запись расшифровки новая, её ревизия 1 и есть итог этого прогона.
-Путей к аудио и имён файлов нет.
+Включается настройкой save_hypotheses (по умолчанию выключена). Гипотезы содержат полный текст записи и
+хранятся только в базе записей (state.sqlite3 папки данных), в таблице hypotheses: строка на прогон, с номером
+записи (recording_id), звука (sound_id — первые 12 знаков SHA-256 звука, моно 16 кГц s16le, как в паспорте теста
+скорости runinfo.audio_identity), задачи и прогона (run_id — как runinfo.new_run_id). Внутри записи те же
+ids.job_id и ids.recording_id; source_revision нет: запись расшифровки новая, её ревизия 1 и есть итог прогона.
+Путей к аудио и имён файлов нет. Удаление записи (когда оно появится) обязано удалить её гипотезы: внешний ключ
+таблицы не даёт удалить запись с гипотезами.
 
-Что пишет модуль: файлы прогонов и два кэша в той же папке — _artifacts.json (хэши файлов моделей,
-пересчёт только при смене размера или времени изменения) и _testbed.json (конфигурация компьютера,
-опрос через PowerShell долгий; пересчёт раз в сутки). Обезличенный testbed_id берётся тем же способом,
-что в тесте скорости (соль в <папка данных>\\bench\\testbed.json — создаётся, если её ещё нет).
-Что удаляет: только файлы прогонов внутри hypotheses\\ и только через cleanup (отчёт без применения,
-затем apply=True после подтверждения человека в MCP и rt.py). Ссылкам (junction/symlink) не следует.
+Что пишет модуль: строку гипотез в базу (в базе до Г-1 — сначала резерв базы и пустая таблица,
+recordings.ensure_hypotheses) и два кэша в папке <папка данных>\\hypotheses — _artifacts.json (хэши файлов
+моделей, пересчёт только при смене размера или времени изменения) и _testbed.json (конфигурация компьютера,
+опрос через PowerShell долгий; пересчёт раз в сутки). Обезличенный testbed_id берётся тем же способом, что в
+тесте скорости (соль в <папка данных>\\bench\\testbed.json — создаётся, если её ещё нет).
 
-Выгрузки (data_io.export_data), резервные копии, облако и модельные задания этот каталог не читают.
+Прежние файлы прогонов (<папка данных>\\hypotheses\\<unit_id>\\<run_id>.json, до Г-1) читаются и удаляются
+очисткой, новые не пишутся; их перенос в базу — Г-2. Удаляет модуль только через cleanup (отчёт без применения,
+затем apply=True после подтверждения человека в MCP и rt.py) — строки базы и прежние файлы прогонов, сразу
+и навсегда. Ссылкам (junction/symlink) не следует.
+
+Выгрузки (data_io.export_data), облако и модельные задания гипотезы не читают. Резерв базы (свой, для
+восстановления) содержит их вместе с записью.
 """
 import json
 import os
@@ -279,6 +285,35 @@ def write(record, unit_id, run_id, data_dir=None, forbid=()):
     return path
 
 
+def _store_path(store_path=None):
+    if store_path is not None:
+        return Path(store_path)
+    import paths
+    return paths.STATE_DB
+
+
+def write_db(record, unit_id, run_id, recording_id, forbid=(), job_id=None, store_path=None):
+    """Записать гипотезы прогона в базу записей, частью записи recording_id. Один раз на run_id.
+    Перед записью — check_record: при строке, похожей на путь, или имени исходного аудио (forbid) записи нет.
+    В базе до Г-1 сначала резерв базы и пустая таблица (recordings.ensure_hypotheses).
+    -> {"run_id", "recording_id", "size_bytes"}."""
+    import recordings
+    if not UNIT_RE.match(str(unit_id)) or not RUN_RE.match(f"{run_id}.json"):
+        raise ValueError("неверный unit_id или run_id")
+    if not isinstance(recording_id, str) or not recording_id:
+        raise ValueError("гипотезы сохраняются только для записи в базе: нет номера записи")
+    problems = check_record(record, forbid)
+    if problems:
+        raise UnsafeRecord(f"запись гипотез не сохранена: {', '.join(sorted(set(problems)))}")
+    store = recordings.open_store(_store_path(store_path))
+    try:
+        recordings.ensure_hypotheses(store)
+        return store.add_hypotheses(run_id, recording_id, unit_id, record, job_id=job_id,
+                                    fmt=str(record.get("schema") or "hyp-2"))
+    finally:
+        store.close()
+
+
 # ── удаление ─────────────────────────────────────────────────────────────────────────────────────
 
 def _run_files(base, unit_id=None):
@@ -299,18 +334,64 @@ def _run_files(base, unit_id=None):
     return out
 
 
-def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=None):
-    """Удаление файлов гипотез: всех, одной записи (unit_id) или старше older_than_days дней по времени
-    изменения файла. apply=False — только отчёт. Кэши _artifacts.json и _testbed.json не трогаются.
-    -> {"files", "bytes", "units", "applied"}."""
+def _file_recording_id(p):
+    """ids.recording_id прежнего файла прогона или None (файл не читается, номера нет)."""
+    data = _read_json(p, {})
+    ids = data.get("ids")
+    rid = ids.get("recording_id") if isinstance(ids, dict) else None
+    return rid if isinstance(rid, str) and rid else None
+
+
+def _cutoff(older_than_days, now):
+    # 0 дней — всё сразу, без сравнения времени: иначе только что записанное может оказаться «новее»
+    # текущего времени из-за разной точности часов файловой системы и time.time()
+    if older_than_days is not None and float(older_than_days) > 0:
+        return (time.time() if now is None else now) - max(0.0, float(older_than_days)) * 86400
+    return None
+
+
+def _database_part(recording_id, unit_id, cutoff, apply, store_path):
+    """Строки гипотез базы под отбор: сводка, при apply — удаление. Базы нет — нули."""
+    import datetime as dt
+    import storage
+    path = _store_path(store_path)
+    if not path.is_file():
+        return {"runs": 0, "recordings": 0, "bytes": 0}
+    before = dt.datetime.fromtimestamp(cutoff, dt.timezone.utc) if cutoff is not None else None
+    store = storage.open_store(path) if apply else storage.open_store_readonly(path)
+    try:
+        if apply:
+            return store.delete_hypotheses(recording_id, unit_id, before)
+        return store.hypotheses_summary(recording_id, unit_id, before)
+    finally:
+        store.close()
+
+
+def _check_recording_id(recording_id):
+    import uuid
+    try:
+        ok = str(uuid.UUID(str(recording_id))) == recording_id
+    except ValueError:
+        ok = False
+    if not ok:
+        raise ValueError("recording_id — номер записи базы (UUID)")
+
+
+def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=None, recording_id=None,
+            store_path=None):
+    """Удаление гипотез моделей: всех, одной записи (recording_id — номер записи базы), одного звука (unit_id —
+    12 знаков) или старше older_than_days дней. Строки базы и прежние файлы прогонов (у файла — по ids.recording_id
+    внутри и времени изменения); кэши _artifacts.json и _testbed.json не трогаются. apply=False — только отчёт:
+    те же числа, что удалит apply=True. data_dir — папка гипотез (по умолчанию <папка данных>\\hypotheses),
+    store_path — база записей (по умолчанию paths.STATE_DB). -> {"database": {"runs", "recordings", "bytes"},
+    "files", "bytes", "units", "applied", ...}: files/bytes/units — прежние файлы."""
     if unit_id is not None and not UNIT_RE.match(str(unit_id)):
         raise ValueError("unit_id — 12 знаков 0-9a-f")
+    if recording_id is not None:
+        _check_recording_id(recording_id)
     base = Path(data_dir) if data_dir is not None else root()
-    cutoff = None
-    # 0 дней — все файлы сразу, без сравнения времени: иначе только что записанный файл может оказаться
-    # «новее» текущего времени из-за разной точности часов файловой системы и time.time()
-    if older_than_days is not None and float(older_than_days) > 0:
-        cutoff = (time.time() if now is None else now) - max(0.0, float(older_than_days)) * 86400
+    cutoff = _cutoff(older_than_days, now)
+    database = _database_part(recording_id, unit_id, cutoff, apply, store_path)
     n = size = 0
     units = set()
     for p in _run_files(base, unit_id):
@@ -320,14 +401,35 @@ def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=
             continue
         if cutoff is not None and st.st_mtime > cutoff:
             continue
+        if recording_id is not None and _file_recording_id(p) != recording_id:
+            continue
         n += 1
         size += st.st_size
         units.add(p.parent.name)
         if apply:
             p.unlink()
             try:
-                p.parent.rmdir()          # пустая папка записи убирается; непустая остаётся
+                p.parent.rmdir()          # пустая папка звука убирается; непустая остаётся
             except OSError:
                 pass
-    return {"unit_id": unit_id, "older_than_days": older_than_days, "files": n, "bytes": size,
-            "units": len(units), "applied": bool(apply)}
+    return {"unit_id": unit_id, "recording_id": recording_id, "older_than_days": older_than_days,
+            "database": database, "files": n, "bytes": size, "units": len(units), "applied": bool(apply)}
+
+
+def summary(cfg=None, data_dir=None, store_path=None):
+    """Объём гипотез для показа (get_settings, self_check): числа те же, что у cleanup() без отбора.
+    -> {"enabled", "database": {"runs", "recordings", "bytes", "share_of_database"}, "old_files": {...}}.
+    Ничего не меняет; база недоступна — "database": {"error": вид ошибки}."""
+    out = {"enabled": enabled(cfg)}
+    try:
+        report = cleanup(data_dir=data_dir, store_path=store_path)
+    except Exception as ex:          # показ объёма не должен ронять настройки и самопроверку
+        return {**out, "database": {"error": type(ex).__name__}}
+    database = dict(report["database"])
+    try:
+        total = _store_path(store_path).stat().st_size
+    except OSError:
+        total = 0
+    database["share_of_database"] = round(database["bytes"] / total, 4) if total else None
+    return {**out, "database": database,
+            "old_files": {"files": report["files"], "bytes": report["bytes"], "units": report["units"]}}

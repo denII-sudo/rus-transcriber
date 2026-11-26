@@ -1,8 +1,10 @@
-"""Сохранение гипотез моделей (РАР-4.2, шаг 3, PR Б2): настройка save_hypotheses, файл hyp-2, удаление.
+"""Сохранение гипотез моделей (РАР-4.2, шаг 3, PR Б2; с Г-1 — в базе записей): настройка save_hypotheses,
+запись hyp-2, удаление.
 
-Только синтетика: модели подменены (как в tests/test_run_words_golden.py), папка гипотез и соль стенда —
-во временной папке, опрос компьютера и условий подменён. Главное условие: включённая настройка результат
-расшифровки не меняет (отметка о записи — в статусе задачи), файл пишется только после сохранения результата.
+Только синтетика: модели подменены (как в tests/test_run_words_golden.py), база записей, папка гипотез (кэши
+и прежние файлы) и соль стенда — во временной папке, опрос компьютера и условий подменён. Главное условие:
+включённая настройка результат расшифровки не меняет (отметка о записи — в статусе задачи), гипотезы пишутся
+только после сохранения результата в базу и только с номером записи.
 """
 import copy
 import json
@@ -11,6 +13,7 @@ import shutil
 import tempfile
 import time
 import unittest
+import uuid
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +27,7 @@ import hypstore
 import paths
 import runinfo
 import settings
+import storage
 import worker
 from tests import test_run_words_golden as G
 
@@ -51,11 +55,41 @@ _CODE_REVISION_ONCE = _computed_once(runinfo.code_revision)
 _PACKAGES_ONCE = _computed_once(runinfo.packages)
 
 
+def make_store(path, recordings=2):
+    """Синтетическая база записей (как tests/test_storage_revisions.py) с recordings записями. -> их номера."""
+    store = storage.initialize(path)
+    try:
+        user = store.create_user("")
+        installation = str(uuid.uuid4())
+        store.bind_installation(installation, user)
+        ctx = store.capture_context(installation, "human")
+        ids = [str(uuid.uuid4()) for _ in range(recordings)]
+        for rid in ids:
+            store.create_recording(rid, "synthetic/hyp", {"segments": [{"segment_id": "s1", "speaker": None,
+                                                                       "words": [{"word_id": "w1", "w": "пример"}]}]},
+                                   {"review": [], "answers": {}}, str(uuid.uuid4()), ctx)
+    finally:
+        store.close()
+    return ids
+
+
+def stored(db):
+    """Строки гипотез базы: [(строка без record_json, запись)] по run_id."""
+    store = storage.open_store_readonly(db)
+    try:
+        rows = store.hypotheses_rows()
+    finally:
+        store.close()
+    return [({k: v for k, v in r.items() if k != "record_json"}, json.loads(r["record_json"])) for r in rows]
+
+
 class Sandbox(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rt-hyp-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.hyp = self.root / "hypotheses"
+        self.db = self.root / "state.sqlite3"
+        self.rec_a, self.rec_b = make_store(self.db)
         # paths.py при импорте ставит HF_HOME и TORCH_HOME на кэш установленной программы; hypstore ищет веса в
         # HF_HOME раньше своего каталога кэша. Без подмены в установленной копии тест хэшировал бы настоящие веса.
         env = mock.patch.dict(os.environ, {"HF_HOME": str(self.root / "cache" / "huggingface"),
@@ -64,6 +98,7 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop("HF_HUB_CACHE", None)                       # восстановит env.stop
         for patch in (mock.patch.object(paths, "HYPOTHESES", self.hyp),
+                      mock.patch.object(paths, "STATE_DB", self.db),
                       mock.patch.object(paths, "BENCH", self.root / "bench"),
                       mock.patch.object(paths, "CACHE", self.root / "cache"),
                       mock.patch.object(runinfo, "hardware", return_value=HW),
@@ -74,7 +109,12 @@ class Sandbox(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def files(self):
+        """Прежние файлы прогонов (до Г-1) в папке гипотез."""
         return sorted(p for p in self.hyp.rglob("*.json") if not p.name.startswith("_")) if self.hyp.exists() else []
+
+    def records(self):
+        """Гипотезы в базе: [(строка, запись)]."""
+        return stored(self.db)
 
 
 class SettingTests(unittest.TestCase):
@@ -102,18 +142,21 @@ def no_seconds(obj):
 
 
 def finish(data, saved=None):
-    """Как worker.main: служебное _hyp забирается до сохранения результата, файл пишется после.
-    -> поля для статуса задачи."""
+    """Как worker.main: служебное _hyp забирается до сохранения результата, гипотезы пишутся после, с номером
+    записи из сохранённого результата (saved). -> поля для статуса задачи."""
     return worker._finish_hypotheses(data.pop("_hyp", None), data["quality"], data["_timing"], VOCAB, saved)
 
 
+SAVED_A = object()          # по умолчанию результат сохранён в первую запись базы песочницы
+
+
 class RunWordsWithSavingTests(Sandbox):
-    def scenario(self, name, save=True, saved=None):
+    def scenario(self, name, save=True, saved=SAVED_A):
         """-> (данные расшифровки, журнал вызовов, поля статуса задачи)."""
         params = dict(G.SCENARIOS[name])
         params["cfg_extra"] = {**params.get("cfg_extra", {}), **({"save_hypotheses": True} if save else {})}
         data, calls = G.run_scenario(**params)
-        return data, calls, finish(data, saved)
+        return data, calls, finish(data, {"recording_id": self.rec_a} if saved is SAVED_A else saved)
 
     def test_result_is_the_same_with_setting_on(self):
         for name in ("three_models", "whisper_doubt", "whisper_fails", "second_fails", "whisper_off",
@@ -128,16 +171,18 @@ class RunWordsWithSavingTests(Sandbox):
         params = dict(G.SCENARIOS["three_models"])
         data, calls = G.run_scenario(**params)
         self.assertNotIn("_hyp", data)
-        self.assertEqual(finish(data), {})
+        self.assertEqual(finish(data, {"recording_id": self.rec_a}), {})
         self.assertFalse(self.hyp.exists())
+        self.assertEqual(self.records(), [])
 
     def test_no_file_until_result_is_saved(self):
-        """Файл пишет main после _save_worker_result: run_words сам ничего не пишет."""
+        """Гипотезы пишет main после _save_worker_result: run_words сам ничего не пишет."""
         params = dict(G.SCENARIOS["three_models"])
         params["cfg_extra"] = {**params.get("cfg_extra", {}), "save_hypotheses": True}
         data, calls = G.run_scenario(**params)
         self.assertIn("_hyp", data)
         self.assertEqual(self.files(), [])
+        self.assertEqual(self.records(), [])
 
     def test_failed_task_after_combine_leaves_no_file(self):
         params = dict(G.SCENARIOS["three_models"])
@@ -145,7 +190,7 @@ class RunWordsWithSavingTests(Sandbox):
         with mock.patch.object(worker, "_emotions", side_effect=RuntimeError("сбой после сведения")):
             with self.assertRaises(RuntimeError):
                 G.run_scenario(**params)
-        self.assertEqual(self.files(), [])
+        self.assertEqual(self.records(), [])
         self.assertFalse(self.hyp.exists())
 
     def test_main_writes_file_after_result_and_reports_in_status(self):
@@ -157,23 +202,33 @@ class RunWordsWithSavingTests(Sandbox):
         self.assertLess(save, finish_at)
         self.assertIn("**hyp_state", main[finish_at:])
 
-    def test_recording_id_from_saved_result(self):
-        self.scenario("three_models", saved={"recording_id": "rec-synthetic-1"})
-        self.scenario("whisper_off")
-        recs = [json.loads(p.read_text(encoding="utf-8")) for p in self.files()]
-        ids = sorted(json.dumps(r["ids"]["recording_id"], ensure_ascii=False) for r in recs)
-        self.assertIn('"rec-synthetic-1"', ids)
-        other = next(r["ids"]["recording_id"] for r in recs if r["ids"]["recording_id"] != "rec-synthetic-1")
-        self.assertEqual(other["status"], "not_available")
+    def test_recording_id_from_saved_result_and_nothing_without_it(self):
+        """Номер записи — из сохранённого результата: строка базы и ids.recording_id внутри. Без номера
+        (результат не в базе) гипотезы не пишутся, задача не падает, в статусе — вид ошибки."""
+        _, _, state = self.scenario("three_models", saved={"recording_id": self.rec_b})
+        self.assertEqual(state, {"hypotheses_saved": True})
+        for saved in (None, {}, {"recording_id": None}):
+            with self.subTest(saved=saved):
+                _, _, state = self.scenario("whisper_off", saved=saved)
+                self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "ValueError"})
+        (row, rec), = self.records()
+        self.assertEqual(row["recording_id"], self.rec_b)
+        self.assertEqual(rec["ids"]["recording_id"], self.rec_b)
+        self.assertEqual(self.files(), [])                       # прежних файлов не пишется
+
+    def test_unknown_recording_saves_nothing(self):
+        _, _, state = self.scenario("three_models", saved={"recording_id": str(uuid.uuid4())})
+        self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "KeyError"})
+        self.assertEqual(self.records(), [])
 
     def test_file_has_votes_of_every_model_before_vote_and_trace(self):
         self.scenario("three_models")
-        (path,) = self.files()
-        rec = json.loads(path.read_text(encoding="utf-8"))
+        (row, rec), = self.records()
         self.assertEqual(rec["schema"], "hyp-2")
         self.assertEqual(hypotheses.check(rec), [])
-        self.assertEqual(path.parent.name, rec["ids"]["unit_id"])
-        self.assertEqual(path.stem, rec["ids"]["run_id"])
+        self.assertEqual(row["sound_id"], rec["ids"]["unit_id"])
+        self.assertEqual(row["run_id"], rec["ids"]["run_id"])
+        self.assertEqual(row["recording_id"], self.rec_a)
         roles = {b["role"]: b for b in rec["roles"]}
         self.assertEqual(list(roles), ["primary", "second", "third"])
         primary = [w["w"] for w in roles["primary"]["words"]]
@@ -191,14 +246,14 @@ class RunWordsWithSavingTests(Sandbox):
         self.assertEqual(rec["conditions"]["start"], COND)
         self.assertEqual(rec["config"]["vocab"]["entries"], 1)                # словарь — только сумма и число
         self.assertNotIn("борька", json.dumps(rec["config"], ensure_ascii=False))
-        self.assertNotIn("synthetic.wav", path.read_text(encoding="utf-8"))   # имён файлов и путей нет
+        self.assertNotIn("synthetic.wav", json.dumps(rec, ensure_ascii=False))   # имён файлов и путей нет
         self.assertTrue(runinfo.scrub(rec) == rec)
 
     def test_file_names_the_program_version_and_the_code(self):
         """Блок program не подменяется пометкой «не передано/не измерено»: версия и сумма файлов кода есть."""
         self.scenario("three_models")
-        (path,) = self.files()
-        program = json.loads(path.read_text(encoding="utf-8"))["program"]
+        (_, rec), = self.records()
+        program = rec["program"]
         version = program.get("version")
         self.assertTrue(isinstance(version, str) and version.strip(), program)
         self.assertEqual(version, runinfo.program_version(worker.HERE))
@@ -209,8 +264,8 @@ class RunWordsWithSavingTests(Sandbox):
 
     def test_doubt_mode_marks_chunks_the_third_model_did_not_hear(self):
         self.scenario("whisper_doubt")
-        (path,) = self.files()
-        third = next(b for b in json.loads(path.read_text(encoding="utf-8"))["roles"] if b["role"] == "third")
+        (_, rec), = self.records()
+        third = next(b for b in rec["roles"] if b["role"] == "third")
         heard = [c["heard"] for c in third["chunks"]]
         self.assertIn(False, heard)
         self.assertIn(True, heard)
@@ -218,18 +273,22 @@ class RunWordsWithSavingTests(Sandbox):
 
     def test_missing_models_are_written_explicitly(self):
         self.scenario("second_fails")
-        (path,) = self.files()
-        rec = json.loads(path.read_text(encoding="utf-8"))
+        (_, rec), = self.records()
         second = next(b for b in rec["roles"] if b["role"] == "second")
         self.assertTrue(hypotheses.is_missing(second["words"]))
         self.assertEqual(hypotheses.check(rec), [])
 
     def test_failure_to_save_does_not_break_transcription(self):
-        with mock.patch.object(hypstore, "write", side_effect=OSError("диск <путь> полон")):
+        with mock.patch.object(hypstore, "write_db", side_effect=OSError("диск <путь> полон")):
             data, calls, state = self.scenario("three_models")
         self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "OSError"})   # без текста и пути
         self.assertEqual(G.digest(data, calls), G.EXPECTED["three_models"])
-        self.assertEqual(self.files(), [])
+        self.assertEqual(self.records(), [])
+        with mock.patch.object(storage.Store, "add_hypotheses", side_effect=storage.StorageError("заперта")):
+            data, calls, state = self.scenario("three_models")
+        self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "StorageError"})
+        self.assertEqual(G.digest(data, calls), G.EXPECTED["three_models"])
+        self.assertEqual(self.records(), [])
 
     def test_no_none_inside_model_engine_timing(self):
         """Неизвестное внутри блоков model, engine, timing — not_measured, а не None (в words и chunks None —
@@ -245,10 +304,9 @@ class RunWordsWithSavingTests(Sandbox):
         for name in ("three_models", "whisper_doubt", "whisper_fails", "second_fails", "whisper_off",
                      "primary_chunk_error", "gpu_then_cpu"):
             self.scenario(name)
-        files = self.files()
-        self.assertEqual(len(files), 7)
-        for path in files:
-            rec = json.loads(path.read_text(encoding="utf-8"))
+        records = self.records()
+        self.assertEqual(len(records), 7)
+        for _, rec in records:
             for block in rec["roles"]:
                 for key in ("model", "engine", "timing"):
                     with self.subTest(role=block["role"], key=key):
@@ -258,12 +316,14 @@ class RunWordsWithSavingTests(Sandbox):
         self.scenario("three_models")
         time.sleep(0.01)
         self.scenario("three_models")
-        files = self.files()
-        self.assertEqual(len(files), 2)
-        self.assertEqual(files[0].parent, files[1].parent)
+        (first, _), (second, _) = self.records()
+        self.assertEqual(first["sound_id"], second["sound_id"])
+        self.assertNotEqual(first["run_id"], second["run_id"])
 
 
 class StoreTests(Sandbox):
+    """Прежние файлы прогонов (до Г-1): hypstore.write остаётся для них и для проверки очистки."""
+
     def put(self, unit="abcdef012345", run="20261124-100000-aaaaaa", age_days=0):
         p = hypstore.write({"schema": "hyp-2"}, unit, run, self.hyp)
         if age_days:
@@ -422,7 +482,11 @@ class UnsafeRecordTests(Sandbox):
                                    forbid=("встреча.wav",))
                 self.assertNotIn("встреча", str(cm.exception).lower())
                 self.assertNotIn(home.lower(), str(cm.exception).lower())
+                with self.assertRaises(hypstore.UnsafeRecord):
+                    hypstore.write_db(self.record(**meta), "abcdef012345", "20261124-100000-aaaaaa", self.rec_a,
+                                      forbid=("встреча.wav",))
                 self.assertEqual(self.files(), [])
+                self.assertEqual(self.records(), [])
 
     def test_model_name_and_legacy_paths_are_refused(self):
         rec = self.record()
@@ -446,11 +510,11 @@ class UnsafeRecordTests(Sandbox):
         with mock.patch.object(runinfo, "os_info", return_value={"name": str(Path.home() / "x")}):
             data, calls, state = RunWordsWithSavingTests.scenario(self, "three_models")
         self.assertEqual(state, {"hypotheses_saved": False, "hypotheses_error": "UnsafeRecord"})
-        self.assertEqual(self.files(), [])
+        self.assertEqual(self.records(), [])
         with mock.patch.object(runinfo, "os_info", return_value={"name": "копия synthetic.WAV"}):
             data, calls, state = RunWordsWithSavingTests.scenario(self, "three_models")
         self.assertEqual(state["hypotheses_error"], "UnsafeRecord")
-        self.assertEqual(self.files(), [])
+        self.assertEqual(self.records(), [])
 
 
 class NotExportedTests(Sandbox):
@@ -473,10 +537,11 @@ class NotExportedTests(Sandbox):
         self.assertNotIn("текст записи".encode("utf-8"), blob)
 
     def test_only_storage_modules_mention_the_folder(self):
-        """Выгрузки, резервные копии, облако и модельные задания папку гипотез не читают."""
+        """Выгрузки, облако и модельные задания папку гипотез не читают. storage.py и recordings.py — таблица
+        гипотез базы (Г-1) и её создание; резерв базы (свой, для восстановления) содержит гипотезы вместе с записью."""
         root = Path(__file__).resolve().parent.parent
         allowed = {"hypotheses.py", "hypstore.py", "worker.py", "paths.py", "data_io.py", "core.py", "server.py",
-                   "rt.py", "settings.py", "buildinfo.py", "backends.py", "words.py"}
+                   "rt.py", "settings.py", "buildinfo.py", "backends.py", "words.py", "storage.py", "recordings.py"}
         for p in sorted(root.glob("*.py")):
             if p.name in allowed:
                 continue
@@ -497,14 +562,21 @@ class NotExportedTests(Sandbox):
 class CleanupToolTests(Sandbox):
     def test_core_report_and_apply(self):
         import core
-        hypstore.write({}, "eeeeeeeeeeee", "20261124-100000-eeeeee", self.hyp)
-        self.assertEqual(core.do_cleanup_hypotheses("", None, False)["files"], 1)
+        hypstore.write({}, "eeeeeeeeeeee", "20261124-100000-eeeeee", self.hyp)          # прежний файл
+        hypstore.write_db({}, "eeeeeeeeeeee", "20261124-100000-e0e0e0", self.rec_a)     # строка базы
+        rep = core.do_cleanup_hypotheses("", None, False)
+        self.assertEqual((rep["files"], rep["database"]), (1, {"runs": 1, "recordings": 1, "bytes": 2}))
+        self.assertEqual(core.do_cleanup_hypotheses("", None, False, self.rec_b)["database"]["runs"], 0)
         lines = core.describe_cleanup_hypotheses("eeeeeeeeeeee")
-        self.assertIn("файлов 1", lines[0])
+        self.assertIn("в базе — прогонов 1, записей 1", lines[0])
+        self.assertIn("Прежние файлы гипотез: 1", lines[1])
+        self.assertIn(f"записи {self.rec_a}", core.describe_cleanup_hypotheses("", None, self.rec_a)[0])
         self.assertEqual(core.do_cleanup_hypotheses("", 0, True)["files"], 1)     # days=0 — всё сразу
         self.assertEqual(self.files(), [])
-        with self.assertRaises(core.CoreError):
-            core.do_cleanup_hypotheses("../..", None, False)
+        self.assertEqual(self.records(), [])
+        for bad in (("../..", None, False), ("", None, False, "не-номер")):
+            with self.subTest(bad=bad), self.assertRaises(core.CoreError):
+                core.do_cleanup_hypotheses(*bad)
 
     def test_mcp_apply_needs_human_and_report_does_not(self):
         import asyncio
@@ -514,16 +586,21 @@ class CleanupToolTests(Sandbox):
         except ImportError:
             self.skipTest("нет пакета mcp")
         hypstore.write({}, "ffffffffffff", "20261124-100000-ffffff", self.hyp)
+        hypstore.write_db({}, "ffffffffffff", "20261124-100000-f0f0f0", self.rec_a)
+        hypstore.write_db({}, "ffffffffffff", "20261124-100000-f1f1f1", self.rec_b)
         with mock.patch.object(confirm, "require", side_effect=AssertionError("отчёт без подтверждения")):
             rep = json.loads(asyncio.run(server.cleanup_hypotheses()))
-        self.assertEqual((rep["files"], rep["applied"]), (1, False))
+        self.assertEqual((rep["files"], rep["database"]["runs"], rep["applied"]), (1, 2, False))
         with mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as req:
             self.assertEqual(asyncio.run(server.cleanup_hypotheses(apply=True)), "нет")
         req.assert_called_once()
-        self.assertEqual(len(self.files()), 1)                     # без «да» ничего не удалено
+        self.assertEqual((len(self.files()), len(self.records())), (1, 2))     # без «да» ничего не удалено
+        with mock.patch.object(confirm, "require", return_value="dialog"):
+            asyncio.run(server.cleanup_hypotheses(recording_id=self.rec_b, apply=True))
+        self.assertEqual([row["recording_id"] for row, _ in self.records()], [self.rec_a])
         with mock.patch.object(confirm, "require", return_value="dialog"):
             asyncio.run(server.cleanup_hypotheses(apply=True))
-        self.assertEqual(self.files(), [])
+        self.assertEqual((self.files(), self.records()), ([], []))
 
 
 class TimedThirdTests(unittest.TestCase):
@@ -580,7 +657,7 @@ class TimedThirdTests(unittest.TestCase):
 
 
 class TimedThirdInRunWordsTests(Sandbox):
-    """Проверенная третья модель: слова со временами в файле, результат расшифровки тот же."""
+    """Проверенная третья модель: слова со временами в записи гипотез, результат расшифровки тот же."""
 
     def run_case(self, verified):
         fake = TimedThirdTests().fake_asr()
@@ -592,7 +669,7 @@ class TimedThirdInRunWordsTests(Sandbox):
         with mock.patch.object(G, "FakeTexts", factory), \
                 mock.patch.object(worker, "TIMED_THIRD_VERIFIED", frozenset(verified)):
             data, calls = G.run_scenario(cfg_extra=cfg)
-            self.assertEqual(finish(data), {"hypotheses_saved": True})
+            self.assertEqual(finish(data, {"recording_id": self.rec_a}), {"hypotheses_saved": True})
         return no_seconds(data)
 
     def test_same_result_with_and_without_timed_path(self):
@@ -600,10 +677,9 @@ class TimedThirdInRunWordsTests(Sandbox):
         timed = self.run_case({"multilingual_large_ctc"})
         self.assertEqual(json.dumps(plain, ensure_ascii=False, default=str),
                          json.dumps(timed, ensure_ascii=False, default=str))
-        files = self.files()
-        self.assertEqual(len(files), 2)
-        thirds = [next(b for b in json.loads(f.read_text(encoding="utf-8"))["roles"] if b["role"] == "third")
-                  for f in files]
+        records = self.records()
+        self.assertEqual(len(records), 2)
+        thirds = [next(b for b in rec["roles"] if b["role"] == "third") for _, rec in records]
         self.assertEqual(sorted(t["word_times"]["status"] for t in thirds), ["available", "not_measured"])
         timed_block = next(t for t in thirds if t["word_times"]["status"] == "available")
         self.assertTrue(timed_block["words"])

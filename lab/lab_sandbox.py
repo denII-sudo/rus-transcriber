@@ -500,6 +500,46 @@ def copy_hypotheses(src_dir, dest_dir, manifest_path):
     return manifest
 
 
+def add_database_hypotheses(db_copy, dest_dir, manifest_path, manifest):
+    """Гипотезы из копии базы песочницы (таблица hypotheses, Г-1) — файлами в dest_dir, как прежние файлы:
+    <sound_id>/<run_id>.json, тот же текст записи hyp-2; в опись — с origin=database и суммой SHA-256 файла.
+
+    Источник — только копия базы в песочнице (настоящая база здесь не читается). Прогон, который уже взят
+    прежним файлом (тот же относительный путь), не повторяется: в описи один раз. Базы до Г-1 (без таблицы)
+    ничего не добавляют. -> обновлённая опись (она же переписывается в manifest_path)."""
+    runinfo = _import_repo_module("runinfo")
+    storage = _import_repo_module("storage")
+    dest_dir = Path(dest_dir)
+    for f in manifest["files"]:
+        f.setdefault("origin", "files")
+    taken = {f["relative"] for f in manifest["files"] if f["result"] == HYP_COPIED}
+    store = storage.open_store_readonly(db_copy)
+    try:
+        rows = store.hypotheses_rows()
+    finally:
+        store.close()
+    duplicates = 0
+    for row in rows:
+        rel = f"{row['sound_id']}/{row['run_id']}.json"
+        if rel in taken:
+            duplicates += 1
+            continue
+        target = dest_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = row["record_json"].encode("utf-8")
+        with open(target, "xb") as out:
+            out.write(data)
+        manifest["files"].append({"relative": rel, "bytes": len(data), "sha256": runinfo.sha256_file(target),
+                                  "result": HYP_COPIED, "origin": "database"})
+        taken.add(rel)
+    manifest["files"].sort(key=lambda f: f["relative"])
+    manifest["from_database"] = len(rows) - duplicates
+    manifest["database_duplicates_of_files"] = duplicates
+    manifest["counts"] = {k: sum(1 for f in manifest["files"] if f["result"] == k) for k in HYP_RESULTS}
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return manifest
+
+
 def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=print, audio=(), group=None,
             only_audio=False, work=False):
     """Создать песочницу. -> отчёт (что скопировано, сколько единиц, каких записей нет).
@@ -554,9 +594,12 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
                        "bytes": (s / "source" / "state.sqlite3").stat().st_size, "method": copy_method})
     hyp = None
     if work:
-        # после базы: файл гипотез пишется после записи, поэтому гипотеза без записи в копии базы возможна —
-        # это отметка анализа «записи нет в копии», а не ошибка
+        # после базы: прежний файл гипотез (до Г-1) писался после записи, поэтому гипотеза без записи в копии
+        # базы возможна — это отметка анализа «записи нет в копии», а не ошибка
         hyp = copy_hypotheses(source_data / HYP_DIR, s / "source" / HYP_DIR, s / "source" / HYP_MANIFEST)
+        # с Г-1 гипотезы — в базе: выкладка из копии базы песочницы в те же файлы и ту же опись
+        hyp = add_database_hypotheses(s / "source" / "state.sqlite3", s / "source" / HYP_DIR,
+                                      s / "source" / HYP_MANIFEST, hyp)
         kept = [f for f in hyp["files"] if f["result"] == HYP_COPIED]
         copied.append({"what": "гипотезы моделей (полный текст записей; только на этом компьютере)",
                        "relative": f"source/{HYP_DIR}", "bytes": sum(f["bytes"] for f in kept), "files": len(kept),
@@ -605,7 +648,8 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
            "audio_hours": round(sum(u["duration_sec"] or 0 for u in units) / 3600, 2),
            "missing_audio_recordings": len(missing), "voice_profiles": voice_profiles}
     if work:
-        out["hypotheses"] = dict(hyp["counts"], appeared_during_copy=hyp["appeared_during_copy"])
+        out["hypotheses"] = dict(hyp["counts"], appeared_during_copy=hyp["appeared_during_copy"],
+                                 from_database=hyp["from_database"])
         out["recordings"] = len(recordings)          # записей в копии базы; единиц опыта в этом режиме нет
     log("Песочница подготовлена: " + str(s))
     log("Скопировано (только на этом компьютере, наружу ничего не передаётся):")
