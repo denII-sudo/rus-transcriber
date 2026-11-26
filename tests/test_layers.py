@@ -257,6 +257,8 @@ class ServerGateTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(paths.group_dir("lay-gate"), ignore_errors=True)
+        # группа теста А6а: имя группы — «запрещённое слово» для tests/test_repo_clean.py, если тот идёт в том же процессе
+        shutil.rmtree(paths.group_dir("lay-tmp"), ignore_errors=True)
         shutil.rmtree(paths.DATA_DIR / "_deleted", ignore_errors=True)
 
     def call(self, fn, *a, **kw):
