@@ -428,8 +428,9 @@ class PageParts(unittest.TestCase):
         self.run_page(r'''
           const lines = reportLines({cards_not_replaced:[{id:"r1",why:"диск занят"}], answers_not_carried:[{id:"r1"}]},
                                     [{id:"r1", t:"00:01"}]);
-          if (!lines[0].includes("новая редакция карточки не создана (диск занят)")) throw Error(lines[0]);
-          if (!lines[1].includes("ответьте на карточке заново")) throw Error(lines[1]);
+          if (lines[0] !== "Нужно ваше действие:") throw Error(lines[0]);       // КН-15: группа действий (4.4)
+          if (!lines[1].includes("новая редакция карточки не создана (диск занят)")) throw Error(lines[1]);
+          if (!lines[2].includes("ответьте на карточке заново")) throw Error(lines[2]);
         ''')
 
     def test_failed_pass_chip(self):

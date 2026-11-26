@@ -104,6 +104,8 @@ def answers_payload(json_path):
     store["answer_states"] = P.answer_states_of(store, man)
     # места, уже прослушанные целиком (раздел 10): их кнопки прослушивания доступны сразу
     store["heard_ids"] = P.heard_ids(store, man)
+    # 9.3: место открыто; ответ на карточке не внесётся (версии стенограммы карточки нет в базе) — только чтение
+    store["card_conditions"] = P.card_conditions(json_path, man)
     # По ним страница узнаёт, что карточки заменены или дописаны, и перечитывает manifest.json.
     store["pack_version"], store["pack_rev"] = man.get("version"), man.get("pack_rev", 0)
     if "_expected_versions" in store:
@@ -322,6 +324,10 @@ def main():
                         return self._send(400, {"error": stale})
                     with lock:
                         aid = obj["id"]
+                        # КН-14: сначала те же проверки, что у «Применить» (версия стенограммы, слова вне карточки)
+                        guard = P.answer_guard(a.json_path, a.markdown, aid, {"kind": "free", "text": obj["text"]})
+                        if guard:
+                            return self._send(200, {"cards": [], "guard": guard})
                         free = P.free_answers(a.json_path)
                         free[aid] = {"text": obj["text"]}
                         decisions, _ = P.decisions(a.json_path)

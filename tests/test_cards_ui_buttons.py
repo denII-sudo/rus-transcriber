@@ -9,6 +9,7 @@
 import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -204,6 +205,96 @@ class Texts(unittest.TestCase):
         for text in texts:
             for word in ("ревизи", "снимк", "интервал", "пакет", "редакци"):
                 self.assertNotIn(word, text.lower(), text)
+
+
+def page(body):
+    """Начало сценария cards.html и функции до card() — в Node. Документ — заглушка, элементы — простые объекты."""
+    html = (six.PROJECT / "cards.html").read_text(encoding="utf-8")
+    script = html.split("<script>", 1)[1]
+    head, rest = script.split("  // ответы этой версии вопросов", 1)
+    middle = "  // ответы этой версии вопросов" + rest.split("  function card(it)", 1)[0]
+    stubs = ('global.location={hostname:"127.0.0.1"};\n'
+             'const el = (tag) => ({tag, children:[], dataset:{}, style:{}, textContent:"", attrs:{},\n'
+             '  append(...xs){ this.children.push(...xs); }, setAttribute(k, v){ this.attrs[k] = v; }});\n'
+             'global.document={getElementById:() => null, querySelector:() => null, createElement:el};\n'
+             'const textOf = (n) => typeof n === "string" ? n : [n.textContent, ...(n.children || []).map(textOf)].join(" ");\n'
+             'const find = (n, f) => f(n) ? n : (n.children || []).map(x => find(x, f)).find(Boolean);\n')
+    wrapped = "(async () => {\n" + body + "\n})().catch(e => { console.error(e && e.message || e); process.exit(1); });\n"
+    return subprocess.run([shutil.which("node")], input=stubs + head + middle + wrapped + "})();\n",
+                          capture_output=True, text=True, encoding="utf-8")
+
+
+@unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+class Page(unittest.TestCase):
+    """Страница (раздел 3.3 плана): перечни состояний, вид 9.3, предпросмотр, число на «Применить»."""
+
+    def run_page(self, body):
+        result = page(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_needs_answer_and_status(self):
+        """В-4: «оставлено вам» — без ответа; карточка 9.3 — без ответа, пока её не оставили как есть."""
+        self.run_page(r'''
+          const st = (s) => ({state: s, ts: "t", source: "local"});
+          man = {items: ["r1", "r2", "r3", "r4"].map(id => ({id, options: []})),
+                 answer_states: {r1: st("left_for_human"), r2: st("saved"), r3: st("skipped"), r4: st("applied")},
+                 card_conditions: {r2: {cannot_apply: true}, r3: {cannot_apply: true}, r4: {cannot_apply: true}}};
+          answers = {r1: {id: "r1", ts: "t", source: "local", kind: "human"},
+                     r2: {id: "r2", ts: "t", source: "local", option: 0},
+                     r3: {id: "r3", ts: "t", source: "local", kind: "skip", text: "пропущено"},
+                     r4: {id: "r4", ts: "t", source: "local", option: 0}};
+          const open = man.items.filter(needsAnswer).map(it => it.id).join();
+          if (open !== "r1,r2") throw Error(open);
+          if (cardStatus(man.items[0], answers.r1) !== "оставлено вам — выберите ответ") throw Error(cardStatus(man.items[0], answers.r1));
+          if (cardStatus(man.items[1], answers.r2) !== STALE_SAVED) throw Error(cardStatus(man.items[1], answers.r2));
+          if (cannotApply(man.items[3], answers.r4)) throw Error("у внесённого ответа — обычный вид");
+          if (STATUS.already_decided !== "место решено раньше — этот ответ не вносился") throw Error(STATUS.already_decided);
+          if (waitingCount() !== 1) throw Error("ждут «Применить»: " + waitingCount());
+        ''')
+
+    def test_stale_view(self):
+        """9.3: главная кнопка «Оставить как есть» = «Пропустить»; шаг для Claude — по состоянию места, с номером."""
+        self.run_page(r'''
+          const it = {id: "r2", question: "Что сказано?", options: [{label: "тот"}, {label: "этот"}]};
+          man = {items: [{id: "r1"}, it], answer_states: {}, card_conditions: {r2: {cannot_apply: true, place_open: false}}};
+          const sent = []; send = (card, a) => sent.push(a);
+          let box = staleView(it, null, {});
+          const text = textOf(box);
+          if (!text.includes(STALE_TITLE) || !text.includes(STALE_PLACE.closed)) throw Error(text);
+          if (!text.includes("«переоткрой место карточки 2 и дособери карточки»")) throw Error(text);
+          if (!text.includes("Что сказано?") || !text.includes("этот")) throw Error("прежний вопрос не свёрнут в текст");
+          const keep = find(box, n => n.tag === "button");
+          if (keep.textContent !== "Оставить как есть" || keep.className !== "btn primary") throw Error(keep.textContent);
+          keep.onclick();
+          if (JSON.stringify(sent) !== '[{"kind":"skip","text":"пропущено"}]') throw Error(JSON.stringify(sent));
+          man.card_conditions.r2.place_open = true;
+          box = staleView(it, {kind: "skip", ts: "t", source: "local"}, {});
+          if (!textOf(box).includes(STALE_STEP.open)) throw Error(textOf(box));
+          if (find(box, n => n.tag === "button").attrs["aria-pressed"] !== "true") throw Error("пропуск не отмечен");
+        ''')
+
+    def test_preview_text(self):
+        """КН-14: сначала проверка программы; хвост «может измениться» — только при других сохранённых ответах."""
+        self.run_page(r'''
+          man = {items: [{id: "r1"}, {id: "r2"}], answer_states: {}};
+          answers = {};
+          const it = man.items[0];
+          if (previewText(it, {guard: "причина"}) !== "Этот ответ не внесётся: причина") throw Error("guard");
+          if (!previewText(it, {preflight_conflicts: [{}]}).startsWith("Этот ответ не внесётся: он затрагивает")) throw Error("preflight");
+          let t = previewText(it, {cards: [{was_now: "было → стало"}], not_found: ["r1"]});
+          if (t !== "Предпросмотр (без записи): было → стало; программа не нашла в нынешнем тексте слова этой карточки.") throw Error(t);
+          answers.r2 = {id: "r2", ts: "t", source: "local", option: 0};
+          t = previewText(it, {cards: [], left_to_human: ["r1"]});
+          if (!t.includes("программа не внесёт это сама: место останется вам") || !t.endsWith("другие сохранённые ответы.")) throw Error(t);
+        ''')
+
+    def test_disabled_button_style(self):
+        """КН-12: неактивная кнопка бледнее и без подсветки при наведении."""
+        html = (six.PROJECT / "cards.html").read_text(encoding="utf-8")
+        self.assertIn(".btn:disabled{opacity:.5;cursor:not-allowed}", html)
+        self.assertIn(".btn:hover:not(:disabled){", html)
+        self.assertNotIn(".btn:hover{", html)
+        self.assertNotIn("Отменить нельзя", html)
 
 
 if __name__ == "__main__":

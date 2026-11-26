@@ -48,7 +48,7 @@ audio{width:100%;height:36px}
 .opts{display:grid;gap:6px}
 .opt:disabled{opacity:.55;cursor:not-allowed}
 .opt{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:flex-start;text-align:left;width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);font:inherit;cursor:pointer}
-.opt:hover{border-color:var(--accent)}
+.opt:hover:not(:disabled){border-color:var(--accent)}
 .opt .n{font:500 .85rem var(--f-mono);color:var(--muted);min-width:1.2em}
 .opt .lbl{flex:1 1 0;min-width:8em;overflow-wrap:anywhere}
 .opt small{flex:1 1 100%;min-width:0;padding-left:calc(1.2em + 10px);color:var(--muted);overflow-wrap:anywhere}
@@ -58,7 +58,11 @@ audio{width:100%;height:36px}
 .opt[aria-pressed="true"] .n,.opt[aria-pressed="true"] .rec{color:var(--accent-ink)}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .btn{font:500 .88rem var(--f-body);padding:6px 12px;border-radius:7px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer}
-.btn:hover{border-color:var(--fg)}
+.btn:hover:not(:disabled){border-color:var(--fg)}
+/* КН-12: неактивная кнопка видно неактивна и не подсвечивается при наведении */
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.btn.primary:hover:not(:disabled){border-color:var(--fg)}
 .btn[aria-pressed="true"]{background:var(--fg);color:var(--bg)}
 .btn.rec-on{background:#c0392b;color:#fff;border-color:#c0392b}
 .free{display:flex;gap:8px;flex-wrap:wrap}
@@ -70,6 +74,11 @@ audio{width:100%;height:36px}
 .last .v{font-weight:600;min-width:0;overflow-wrap:anywhere;white-space:pre-wrap;flex:1 1 100%}
 .last .m{font:400 .8rem var(--f-mono);color:var(--muted)}
 .card[data-applied="1"] .opts,.card[data-applied="1"] .row,.card[data-applied="1"] .free{display:none}
+/* 9.3: ответ на этой карточке не внесётся — прежний вопрос свёрнут, вариантов и своего поля нет */
+.stale{display:grid;gap:6px}
+.stale b{color:var(--warn)}
+.stale details{color:var(--muted)}
+.stale details ol{margin:4px 0 0;padding-left:1.4em}
 .edit-row{display:none;flex-wrap:wrap;gap:8px}
 .card[data-applied="1"] .edit-row{display:flex}
 .last[data-pending="1"]{background:color-mix(in srgb,var(--warn) 12%,var(--surface));border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
@@ -149,6 +158,9 @@ audio{width:100%;height:36px}
   const LISTEN_FIRST = "Сначала прослушайте место целиком — кнопки прослушивания станут доступны (можно частями, перемотка не в счёт)";
   const NO_CLIP_LISTEN = "Звук места недоступен — ответьте своим текстом";
   const CLIP_FAILED = "Звук места не загрузился: файла клипа нет или он не открывается.";
+  // шаг А: звук места не загрузился в этой сессии страницы («id#редакция») — кнопок прослушивания нет, как без клипа
+  const clipFailed = new Set();
+  const clipFailedNote = () => Object.assign(document.createElement("p"), {className: "side clip-failed", textContent: CLIP_FAILED});
   const playedSpans = {};          // «id#редакция» → слитые проигранные куски клипа в этой сессии страницы
   const heardHere = new Set();     // «id#редакция»: отрезок места проигран целиком в этой сессии
   const isListen = (o) => !!(o && o.decision && o.decision.listened);
@@ -192,6 +204,12 @@ audio{width:100%;height:36px}
   };
   const whyOf = (it) => ((man.answer_states || {})[it.id] || {}).why || "";
   const detailOf = (it) => ((man.answer_states || {})[it.id] || {}).detail || "";
+  // В-1: у внесённого ответа нет снимка — со страницы его не отменить и не заменить
+  const undoOf = (it) => ((man.answer_states || {})[it.id] || {}).undo;
+  // 9.3: признаки карточки от программы (card_conditions, только на ноутбуке): место сейчас открыто; ответ на этой
+  // карточке не внесётся (её собрали по версии стенограммы, которой нет в базе). У внесённого ответа — обычный вид.
+  const conditionOf = (it) => ((man && man.card_conditions) || {})[it.id] || {};
+  const cannotApply = (it, a) => LOCAL && !!conditionOf(it).cannot_apply && !holdsApplied(it, a);
   // применённая правка на месте: прежний ответ (новый ждёт отмены или не меняет его)
   // undo_conflict: отмена не выполнилась — прежняя правка на месте, кнопки «Изменить» и «Отмена» нужны
   // revert_pending: отмена подготовлена, но не применена — правка тоже ещё на месте
@@ -205,16 +223,19 @@ audio{width:100%;height:36px}
   // В облаке состояния до переноса на ноутбук неизвестны: там отвечено всё, на что есть ответ.
   const NEEDS_ANSWER = ["negative", "hint", "pause_refused", "listen_mismatch", "apply_conflict", "blocked_preflight",
                         "source_conflict", "not_found", "not_applied", "reverted", "applied_open", "applied_check",
-                        "not_heard"];
+                        "not_heard", "left_for_human"];
+  // карточка, где ответ не внесётся (9.3), — «без ответа», пока её не оставили как есть («Пропустить»)
   const needsAnswer = (it) => {
     const a = answers[it.id];
-    return !a || (LOCAL && NEEDS_ANSWER.includes(stateOf(it, a)));
+    return !a || (LOCAL && (NEEDS_ANSWER.includes(stateOf(it, a)) || (cannotApply(it, a) && kindOf(a) !== "skip")));
   };
+  // ответы, которые ждут «Применить»: их число — на кнопке (КН-10)
+  const WAITING = ["saved", "pending_new", "revert_pending"];
+  const waitingCount = () => man.items.filter(it => answers[it.id] && WAITING.includes(stateOf(it, answers[it.id]))).length;
   // Пустой список «без ответа»: есть ли что применять
   const emptyText = () => {
     if (!LOCAL) return "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами.";
-    const waiting = man.items.some(it => answers[it.id] && ["saved", "pending_new", "revert_pending"].includes(stateOf(it, answers[it.id])));
-    return waiting ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки."
+    return waitingCount() ? "Ответы сохранены. Для изменения стенограммы нажмите «Применить сохранённые ответы». Нажмите «все», чтобы увидеть карточки."
       : "Все места разобраны, применять нечего. Нажмите «все», чтобы увидеть карточки.";
   };
   // «Ответ верен — оставить» (К-23): тот же применённый ответ ещё раз от человека на ноутбуке закрывает место
@@ -229,13 +250,9 @@ audio{width:100%;height:36px}
   };
   const hasConflict = (it) => (man.conflicts || []).some(c => c.id === it.id);
   // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
-  // К-18: без снимка (answer_states.undo === false) — неактивная «Отменить нельзя». К-16: отмена из облака —
-  // «Не отменять».
+  // В-1: без снимка (undo === false) кнопок нет — только строка с шагом (card). К-16: отмена из облака — «Не отменять».
   const revertButton = (it, a) => ["revert_pending", "cloud_revert"].includes(stateOf(it, a)) ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
-    ((man.answer_states || {})[it.id] || {}).undo === false ?
-    {label: "Отменить нельзя", kind: "revert", disabled: true,
-     title: "нет снимка для отмены: исправьте ответом на эту карточку или правкой отрезка"} :
     {label: "Подготовить отмену", kind: "revert",
      title: "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось."};
   const pending = (it, a) => stateOf(it, a) === "pending_new";
@@ -289,6 +306,12 @@ audio{width:100%;height:36px}
   // то, что знает программа, относится к прежнему ответу.
   function programNote(it, a) {
     const state = stateOf(it, a), cloud = ["cloud_saved", "cloud_keep", "cloud_revert"].includes(state);
+    if (cannotApply(it, a)) return "";      // 9.3: причину и шаг говорит плашка карточки
+    // В-1: рецепт замены через отмену у ответа без снимка не годится — вместо него «Вернуть как было»
+    if (!cloud && state === "pending_new" && undoOf(it) === false) {
+      const n = ((man.answer_states || {})[it.id] || {}).card || ((man.items || []).indexOf(it) + 1) || "";
+      return `${PENDING_NO_UNDO}. Если внесённый ответ неверен — скажите Claude: «исправь место карточки ${n}»`;
+    }
     const reason = cloud || ["applied", "saved"].includes(state) ? "" : whyOf(it);
     return [reason, cloud ? "" : detailOf(it)].filter(Boolean).join(" — ");
   }
@@ -298,8 +321,8 @@ audio{width:100%;height:36px}
                   applied_open: "применён ответ, место открыто — нужно прослушивание",
                   revert_pending: "отмена подготовлена — нажмите «Применить»; прежний ответ на месте",
                   kept_previous: "применён прежний ответ", reverted: "ответ отменён", skipped: "пропущено",
-                  negative: "не применён — место открыто", left_for_human: "требует проверки",
-                  already_decided: "место уже решено — ничего не изменилось",
+                  negative: "не применён — место открыто", left_for_human: "оставлено вам — выберите ответ",
+                  already_decided: "место решено раньше — этот ответ не вносился",
                   apply_conflict: "не применён — слова изменились", blocked_preflight: "не применён — пересекается с другой карточкой",
                   undo_conflict: "отмена не выполнена — прежний ответ на месте",
                   source_conflict: "не применён — стенограмма изменилась", not_found: "не применён — место не найдено",
@@ -312,26 +335,60 @@ audio{width:100%;height:36px}
                   cloud_revert: "отмена сохранена в облаке — применённый ответ пока на месте"};
   // Заголовок — состояние ответа; расхождение ответов ноутбука и облака — отдельной строкой под ответом (К-23).
   const cardStatus = (it, a) =>
+    staleSaved(it, a) ? STALE_SAVED :
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "оставлено человеку — ещё не применено" :   // К-9
     STATUS[stateOf(it, a)] || "не применён";
   const CONFLICT_TEXT = "ответы ноутбука и облака расходились — проверьте";
-  // Строки отчёта «Применить»: исход каждого ответа по номеру карточки, с уточнением программы.
+  const PENDING_NO_UNDO = "Новый ответ не внесётся: внесённый ответ со страницы не заменить. «Вернуть как было» снимет новый ответ";
+  // 9.3: карточка, где ответ не внесётся
+  const STALE_TITLE = "Ответ здесь уже не внести";
+  const STALE_WHY = "Карточку собрала прежняя версия программы, а слова места с тех пор изменились.";
+  const STALE_PLACE = {open: "Место в стенограмме ещё не решено.", closed: "Место в стенограмме уже решено."};
+  const STALE_KEEP = "Стенограмма не изменится, карточка уйдёт из списка «без ответа».";
+  const STALE_STEP = {open: "Ответить на это место — скажите Claude: «дособери карточки»: вопрос обновится.",
+                      closed: "Если текст верен — «Оставить как есть». Решить место заново — скажите Claude: «переоткрой место карточки {n} и дособери карточки»."};
+  const STALE_SAVED = "ответ сохранён, но на этой карточке не внесётся";
+  const staleSaved = (it, a) => cannotApply(it, a) && stateOf(it, a) === "saved" && kindOf(a) !== "skip";
+  // КН-8: у ответа «место осталось открытым» на карточке нет кнопок прослушивания — путь «вписать»
+  const OPEN_TYPE_IT = "Кнопок прослушивания здесь нет: нажмите «Изменить ответ» и впишите, что услышали.";
+  // КН-14: предпросмотр говорит то же, что «Применить»: сначала проверка программы (guard), затем изменение без записи.
+  // Хвост «может измениться» — только если есть другие сохранённые ответы: они применятся вместе с этим.
+  function previewText(it, r) {
+    if (r.guard) return "Этот ответ не внесётся: " + r.guard;
+    if ((r.preflight_conflicts || []).length) return "Этот ответ не внесётся: он затрагивает те же слова, что и сохранённый ответ другой карточки.";
+    const one = (r.cards || [])[0];
+    const others = man.items.some(x => x.id !== it.id && answers[x.id] && WAITING.includes(stateOf(x, answers[x.id])));
+    return "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
+      ((r.left_to_human || []).length ? "; программа не внесёт это сама: место останется вам" : "") +
+      ((r.not_found || []).length ? "; программа не нашла в нынешнем тексте слова этой карточки" : "") + "." +
+      (others ? " Результат может измениться: вместе с ним применятся другие сохранённые ответы." : "");
+  }
+  // Строки отчёта «Применить» (4.4): что внесено сейчас, что без изменений, где нужно действие человека — по номеру
+  // карточки, с причиной и шагом программы. Пустой список — применять было нечего.
   function reportLines(rep, items) {
-    const lines = [];
+    const lines = [], action = [];
     const cardName = (id, n) => { const it = items.find(x => x.id === id); n = n || (items.indexOf(it) + 1);
       return `Карточка ${n || id}` + (it && it.t ? ` (${it.t})` : ""); };
-    // К-14: ответ, применённый раньше и не изменившийся, — «без изменений» (или «ждёт вашей проверки»)
+    const num = (o) => o.card || (items.findIndex(x => x.id === o.id) + 1) || o.id;
+    // К-14: ответ, внесённый раньше и не изменившийся, — «без изменений»; исходы, где решать человеку, — всегда в действиях
     const same = new Set(rep.unchanged || []), rows = rep.outcomes || [];
-    const before = (o) => same.has(o.id) && ["applied", "applied_check"].includes(o.outcome);
-    if (rows.length && rows.every(before)) lines.push("Новых изменений нет");
-    rows.forEach(o => lines.push(before(o) ?
-      `${cardName(o.id, o.card)}: ответ применён раньше — ` + (o.outcome === "applied_check" ? "ждёт вашей проверки" : "без изменений") :
-      `${cardName(o.id, o.card)}: ${o.why}` + (o.detail ? ` — ${o.detail}` : "")));
+    const DONE = ["applied", "reverted", "kept_previous"], QUIET = ["skipped", "already_decided"];
+    const now = rows.filter(o => DONE.includes(o.outcome) && !same.has(o.id));
+    const quiet = rows.filter(o => QUIET.includes(o.outcome) || (DONE.includes(o.outcome) && same.has(o.id)));
+    if (now.length) lines.push(`Применено сейчас: ${now.length} (карточки ${now.map(num).join(", ")})`);
+    // уточнение к внесённому (например, В-1: со страницы его не отменить) — строкой под группой
+    now.filter(o => o.detail).forEach(o => lines.push(`${cardName(o.id, o.card)}: ${o.detail}`));
     if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${cardName(c.id)}: ${c.was_now}`); });
-    (rep.cards_not_replaced || []).forEach(c => lines.push(`${cardName(c.id)}: новая редакция карточки не создана` +
+    if (quiet.length) lines.push(`Без изменений: ${quiet.length} — применены раньше или пропущены (карточки ${quiet.map(num).join(", ")})`);
+    // apply_conflict: уточнение программы (версия стенограммы, слова вне места) полнее общей причины — без повтора
+    rows.filter(o => !DONE.includes(o.outcome) && !QUIET.includes(o.outcome)).forEach(o =>
+      action.push(`${cardName(o.id, o.card)}: ` + (o.outcome === "apply_conflict" && o.detail ? `не применён: ${o.detail}` :
+        o.why + (o.detail ? ` — ${o.detail}` : ""))));
+    (rep.cards_not_replaced || []).forEach(c => action.push(`${cardName(c.id)}: новая редакция карточки не создана` +
       (c.why ? ` (${c.why})` : "") + " — нажмите «Применить сохранённые ответы» ещё раз"));
-    (rep.answers_not_carried || []).forEach(c => lines.push(`${cardName(c.id)}: ваш ответ на прежнюю редакцию не применён — ответьте на карточке заново`));
-    if (rep.source_conflict) lines.push("Конфликт источника: " + rep.source_conflict);
+    (rep.answers_not_carried || []).forEach(c => action.push(`${cardName(c.id)}: ваш ответ на прежнюю редакцию не применён — ответьте на карточке заново`));
+    if (rep.source_conflict) action.push("Конфликт источника: " + rep.source_conflict);
+    if (action.length) lines.push("Нужно ваше действие:", ...action);
     if (rep.voice_profile_warning && rep.voice_profile_warning.message) lines.push(rep.voice_profile_warning.message);
     return lines;
   }
@@ -358,7 +415,7 @@ audio{width:100%;height:36px}
       async load() { const r = await fetch("api/answers"); if (!r.ok) throw new Error(r.status); const s = await r.json();
         // карточки заменены или дописаны (pack_rev) или пакет пересобран (version): перечитать manifest.json
         if (s.pack_version !== undefined && (s.pack_version !== man.version || (s.pack_rev || 0) !== (man.pack_rev || 0))) await reloadManifest();
-        man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; man.heard_ids = s.heard_ids || []; live = pick(Object.values(s.answers || {})); return merge(); },
+        man.applied_answers = s.applied_answers || {}; man.answer_states = s.answer_states || {}; man.conflicts = s.conflicts || []; man.applied_at = s.applied_at; man.heard_ids = s.heard_ids || []; man.card_conditions = s.card_conditions || {}; live = pick(Object.values(s.answers || {})); return merge(); },
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
@@ -468,7 +525,7 @@ audio{width:100%;height:36px}
     const what = answerText(a, it);
     const k = document.createElement("span"); k.className = "k";
     k.textContent = cardStatus(it, a);
-    if (pending(it, a)) box.dataset.pending = "1";
+    if (pending(it, a) || cannotApply(it, a)) box.dataset.pending = "1";      // 9.3: ответ не внесётся — жёлтым
     const v = document.createElement("span"); v.className = "v"; v.textContent = what;
     const m = document.createElement("span"); m.className = "m";
     m.textContent = answerMeta(a);
@@ -521,7 +578,7 @@ audio{width:100%;height:36px}
       else if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
       else if (skip && typed) flash(it.id, SKIP_NOTE_TEXT);
       else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
-      else if (a.kind === "keep") flash(it.id, "Отмена снята: применённый ответ остаётся");
+      else if (a.kind === "keep") flash(it.id, "Применённый ответ остаётся: подготовленная отмена или новый ответ сняты");
       else if (a.kind === "revert") flash(it.id, "Отмена подготовлена: нажмите «Применить сохранённые ответы»");
       else flash(it.id, acc && acc.answer ? "Сохранено (ещё не применено): " + acc.answer : "Ответ записан");
     } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
@@ -576,7 +633,8 @@ audio{width:100%;height:36px}
   const showsAskedText = (it, a) => !!a && (holdsApplied(it, a) || stateOf(it, a) === "reverted");
   const cardCache = new Map();
   const cardSig = (it) => JSON.stringify([man.version, revOf(it), answers[it.id] || null, (man.answer_states || {})[it.id] || null,
-    editing.has(it.id), (man.conflicts || []).some(c => c.id === it.id), !!man.clips_removed, api && api.voiceMode, heardOf(it)]);
+    editing.has(it.id), (man.conflicts || []).some(c => c.id === it.id), !!man.clips_removed, api && api.voiceMode, heardOf(it),
+    conditionOf(it), clipFailed.has(`${it.id}#${revOf(it)}`)]);
   function cardFor(it) {
     const sig = cardSig(it), hit = cardCache.get(it.id);
     if (hit && hit.sig === sig) return hit.el;
@@ -588,6 +646,28 @@ audio{width:100%;height:36px}
     }
     cardCache.set(it.id, {sig, el});
     return el;
+  }
+  // 9.3: карточка, где ответ не внесётся. Варианты, голос и своё поле не показываются: ответ всё равно не внесётся.
+  // Главное действие — «Оставить как есть» (= «Пропустить»); следующий шаг — словами для Claude, по состоянию места.
+  function staleView(it, a, state) {
+    const box = document.createElement("div"); box.className = "note stale"; box.dataset.kind = "warn";
+    const add = (tag, text, cls) => { const el = document.createElement(tag); el.textContent = text; if (cls) el.className = cls; box.append(el); return el; };
+    const open = conditionOf(it).place_open ? "open" : "closed";
+    add("b", STALE_TITLE);
+    add("span", `${STALE_WHY} ${STALE_PLACE[open]}`);
+    const d = document.createElement("details"), sum = document.createElement("summary"), list = document.createElement("ol");
+    sum.textContent = "Прежний вопрос карточки";
+    (it.options || []).forEach(o => { const li = document.createElement("li"); li.textContent = o.label; list.append(li); });
+    const q = document.createElement("p"); q.textContent = it.question || "";
+    d.append(sum, q, list); box.append(d);
+    const row = document.createElement("div"); row.className = "row";
+    const keep = document.createElement("button"); keep.className = "btn primary"; keep.type = "button"; keep.textContent = "Оставить как есть";
+    if (a && kindOf(a) === "skip") keep.setAttribute("aria-pressed", "true");
+    keep.onclick = () => send(it, {kind: "skip", text: "пропущено"}, state);
+    row.append(keep); box.append(row);
+    add("span", STALE_KEEP, "side");
+    add("span", STALE_STEP[open].replace("{n}", String(man.items.indexOf(it) + 1)));
+    return box;
   }
   function card(it) {
     const a = answers[it.id];
@@ -601,14 +681,18 @@ audio{width:100%;height:36px}
     if (revOf(it) > 1) { const s = document.createElement("span"); s.className = "chip"; s.textContent = "вопрос обновлён"; head.querySelector(".reasons").append(s); }
     c.append(head);
 
-    if (!man.clips_removed && it.clip) {         // карточка без звука: нет исходной записи или клип не нарезался
+    const listenKey = `${it.id}#${revOf(it)}`;
+    if (!man.clips_removed && it.clip && clipFailed.has(listenKey)) c.append(clipFailedNote());
+    else if (!man.clips_removed && it.clip) {    // карточка без звука: нет исходной записи или клип не нарезался
       const au = document.createElement("audio"); au.controls = true; au.preload = "none"; au.src = it.clip;
       au.addEventListener("play", () => sendInteraction(it, "audio_play"));
       au.addEventListener("ended", () => sendInteraction(it, "audio_ended"));
       ["timeupdate", "pause", "ended"].forEach(t => au.addEventListener(t, () => trackPlayed(it, au, c)));
       // звук не загрузился (файла клипа нет или он не открывается): вместо молча посеревшего плеера — надпись
+      // шаг А: кнопки прослушивания скрываются, как у карточки без клипа, — карточка рисуется заново
       au.addEventListener("error", () => {
-        const s = document.createElement("p"); s.className = "side clip-failed"; s.textContent = CLIP_FAILED; au.replaceWith(s);
+        au.replaceWith(clipFailedNote());
+        if (!clipFailed.has(listenKey)) { clipFailed.add(listenKey); render(); }
       });
       c.append(au);
     }
@@ -622,7 +706,8 @@ audio{width:100%;height:36px}
     if (it.after) { const q = document.createElement("p"); q.className = "side"; q.textContent = it.after; ctx.append(q); }
     c.append(ctx);
 
-    const q = document.createElement("p"); q.className = "q"; q.textContent = it.question; c.append(q);
+    const stale = cannotApply(it, a);
+    const q = document.createElement("p"); q.className = "q"; q.textContent = it.question; if (!stale) c.append(q);
     if ((it.history || []).length) c.append(historyNote(it));
     if (it.automation_diagnostic) {
       const d = it.automation_diagnostic, candidate = d.candidate || {}, interval = d.speech_interval || {};
@@ -635,29 +720,41 @@ audio{width:100%;height:36px}
     }
     if (a) c.append(lastAnswer(a, it));
     const state = document.createElement("div"); state.className = "state";
+    if (stale) { c.append(staleView(it, a, state), state); return c; }
+    // нет звука места (или он не загрузился) и место не прослушано раньше — кнопок прослушивания нет (раздел 10)
+    const canHear = !man.clips_removed && !!it.clip && !clipFailed.has(listenKey), heardNow = heardOf(it);
     if (holdsApplied(it, a)) {
       const er = document.createElement("div"); er.className = "edit-row";
-      const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
-      eb.onclick = () => { editing.add(it.id); render(); };
-      const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
-      const second = revertButton(it, a);
-      rb.textContent = second.label; rb.title = second.title;
-      if (second.disabled) rb.disabled = true;
-      else rb.onclick = () => send(it, {kind: second.kind}, state);
-      const ok = LOCAL && stateOf(it, a) === "applied_check" ? confirmAnswer(it) : null;
-      if (ok) {
-        const cb = document.createElement("button"); cb.className = "btn"; cb.type = "button"; cb.textContent = "Ответ верен — оставить";
+      const st = stateOf(it, a), noUndo = undoOf(it) === false;
+      const ok = LOCAL && st === "applied_check" ? confirmAnswer(it) : null;
+      if (ok) {         // КН-11: подтверждение — главная кнопка
+        const cb = document.createElement("button"); cb.className = "btn primary"; cb.type = "button"; cb.textContent = "Ответ верен — оставить";
         cb.title = "Применённый ответ верен: место закроется вашим подтверждением после «Применить сохранённые ответы».";
         cb.onclick = () => send(it, ok, state);
         er.append(cb);
       }
-      er.append(eb, rb); c.append(er);
+      if (noUndo && st === "pending_new") {   // В-1: новый ответ поверх внесённого без снимка — выход: вернуть внесённый
+        const bb = document.createElement("button"); bb.className = "btn primary"; bb.type = "button"; bb.textContent = "Вернуть как было";
+        bb.title = "Снять новый ответ: на карточке снова будет внесённый ответ, стенограмма не изменится.";
+        bb.onclick = () => send(it, {kind: "keep"}, state);     // тот же путь, что «Не отменять»: внесённый ответ из копии
+        er.append(bb);
+      }
+      if (!noUndo) {    // В-1: без снимка «Изменить ответ» и отмены нет — строка с шагом уже под ответом
+        const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
+        eb.onclick = () => { editing.add(it.id); render(); };
+        const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
+        const second = revertButton(it, a);
+        rb.textContent = second.label; rb.title = second.title;
+        rb.onclick = () => send(it, {kind: second.kind}, state);
+        er.append(eb, rb);
+      }
+      if (er.children.length) c.append(er);
+      if (st === "applied_open" && !noUndo && !(it.options.some(isListen) && (canHear || heardNow))) {
+        const h = document.createElement("p"); h.className = "note"; h.textContent = OPEN_TYPE_IT; c.append(h);
+      }
     }
 
     const opts = document.createElement("div"); opts.className = "opts";
-    // нет звука места и оно не прослушано раньше — кнопок прослушивания нет (раздел 10)
-    const canHear = !man.clips_removed && !!it.clip, heardNow = heardOf(it);
-    const listenKey = `${it.id}#${revOf(it)}`;
     it.options.forEach((o, k) => {
       if (isListen(o) && !canHear && !heardNow) return;
       const b = document.createElement("button"); b.className = "opt"; b.type = "button";
@@ -725,10 +822,8 @@ audio{width:100%;height:36px}
     if (LOCAL && api.preview) {
       const preview = document.createElement("button"); preview.type = "button"; preview.className = "btn"; preview.textContent = "Предпросмотр";
       preview.onclick = async () => { if (!inp.value.trim()) return; state.textContent = "Проверяю без записи…";
-        try { const r = await api.preview(it, inp.value.trim()); const one = (r.cards || [])[0];
-          if ((r.preflight_conflicts || []).length) { state.textContent = "Предпросмотр не применим: конфликт с другой сохранённой карточкой. Требуется проверка человеком."; return; }
-          state.textContent = "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
-            ((r.left_to_human || []).length ? "; требуется проверка человеком" : "") + ((r.not_found || []).length ? "; место не найдено" : "") + ". Результат может измениться при последующих правках.";
+        try { const r = await api.preview(it, inp.value.trim());
+          state.textContent = previewText(it, r);
         } catch (e) { if (!(await staleShown(e, it))) state.textContent = "Предпросмотр недоступен: " + e.message; } };
       free.append(preview);
     }
@@ -749,6 +844,8 @@ audio{width:100%;height:36px}
     const list = $("list");
     const done = man.items.filter(it => !needsAnswer(it)).length;
     $("count").textContent = `${done} / ${man.items.length}`;
+    const waiting = LOCAL ? waitingCount() : 0;
+    $("apply").textContent = "Применить сохранённые ответы" + (waiting ? ` (${waiting})` : "");
     $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
     const show = man.items.filter(it => showAll || needsAnswer(it));
     const active = document.activeElement && document.activeElement.id;
@@ -782,11 +879,11 @@ audio{width:100%;height:36px}
   $("f-open").onclick = () => { showAll = false; $("f-open").setAttribute("aria-pressed", "true"); $("f-all").setAttribute("aria-pressed", "false"); render(); };
   $("f-all").onclick = () => { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false"); render(); };
   $("apply").onclick = async () => {
-    if (!confirm("Применить сохранённые ответы к стенограмме? Отмена возможна только при наличии снимка и отсутствии более поздних конфликтующих правок.")) return;
+    if (!confirm("Применить сохранённые ответы к стенограмме? Ответ, который внести не получится, останется на карточке с причиной и следующим шагом.")) return;
     const box = $("apply-report"); box.hidden = false; box.textContent = "Применяю…"; $("apply").disabled = true;
     try { const rep = await api.apply(); const lines = reportLines(rep, man.items);
       box.style.whiteSpace = "pre-line";
-      box.textContent = lines.length ? lines.join("\n") : "Новых изменений нет. Проверьте сохранённые ответы."; showAll = true; render(); }
+      box.textContent = lines.length ? lines.join("\n") : "Применять нечего: новых ответов нет. Карточки, где нужно ваше действие, — в списке «без ответа»."; showAll = true; render(); }
     catch (e) { box.textContent = "Не удалось применить: " + e.message; }
     finally { $("apply").disabled = false; }
   };

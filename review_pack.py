@@ -138,7 +138,7 @@ SOURCE_UNAVAILABLE = ("карточку собрала прежняя верси
 WORDS_CHANGED = "слова этого места изменились после того, как собрали карточку"
 FREE_OUTSIDE = "ваш ответ меняет слова за пределами места карточки — впишите только слова этого места"
 NEXT_STEP_OPEN = "Скажите Claude: «дособери карточки» — вопрос обновится"
-NEXT_STEP_CLOSED = ("Если текст верен — «Пропустить». Решить заново — скажите Claude: "
+NEXT_STEP_CLOSED = ("Если текст верен — «Оставить как есть». Решить заново — скажите Claude: "
                     "«переоткрой место карточки {n} и дособери карточки»")
 # прежние тексты тех же уточнений: они остаются в уточнениях, записанных до этой версии (К-22)
 OLD_SOURCE_TEXTS = ("недоступна исходная ревизия карточки", "слова карточки изменились или недоступна исходная ревизия")
@@ -953,7 +953,10 @@ def card_conditions(json_path, man=None):
     man = manifest(json_path) if man is None else man
     if not man:
         return {}
-    places = {r.get("id"): r for r in T.load(json_path).get("review") or []}
+    try:
+        places = {r.get("id"): r for r in T.load(json_path).get("review") or []}
+    except (OSError, ValueError):
+        return {}           # стенограмма не читается: признаков нет, «Применить» само назовёт причину
     stale = source_unavailable_ids(man, transcript_revisions(json_path))
     return {it["id"]: {"place_open": it["id"] in places and T.place_unresolved(places[it["id"]]),
                        "cannot_apply": it["id"] in stale}
