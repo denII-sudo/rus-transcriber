@@ -104,6 +104,21 @@ class InstallationStoreTests(unittest.TestCase):
                 self.assertIn("не открывается", report["message"])
                 self.assert_untouched(before, report)
 
+    def test_restored_inactive_copy_is_reported_not_selected(self):
+        self.make_store()
+        import sqlite3
+        db = sqlite3.connect(self.db)
+        try:
+            db.execute("UPDATE restore_guard SET locked=1 WHERE id=1")       # как у восстановленной копии
+            db.commit()
+        finally:
+            db.close()
+        self.write_config({"recording_backend": "sqlite"})     # уже выбрана: ловит только проверка чтением
+        before = (_digest(self.db), _digest(self.config))
+        report = recordings.prepare_installation_store()
+        self.assertEqual((report["case"], report["ok"]), ("error", False))
+        self.assert_untouched(before, report)
+
     def test_unreadable_config_is_not_rewritten(self):
         for raw in (b"{ broken", b"[1, 2]"):
             with self.subTest(raw=raw):
