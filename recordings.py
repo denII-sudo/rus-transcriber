@@ -1066,7 +1066,7 @@ def prepare_installation_store(check_only=False):
     не открывается — `ok=False`, ничего не чинится и не создаётся. Ключ `case`: `created` — база создана и
     выбрана; `selected` — база была, выбрано хранение в ней; `ready` — база была и уже выбрана; `error` —
     база записей не готова (установщик: код 2), причина в `message`. check_only=True — только сказать,
-    что было бы сделано.
+    что было бы сделано; базу и настройки не меняет.
     """
     import paths
     import settings
@@ -1085,8 +1085,8 @@ def prepare_installation_store(check_only=False):
         return done("error", False, f"База записей не готова: {what} ({type(ex).__name__}: {ex}).")
 
     if not _config_readable():
-        return done("error", False, f"База записей не готова: {paths.CONFIG_FILE} не читается; исправьте или "
-                    "удалите файл и запустите `rt.py db-init` снова. Ничего не изменено.")
+        return done("error", False, f"База записей не готова: {paths.CONFIG_FILE} не читается. Исправьте файл (в нём и "
+                    "выбор теста скорости) и запустите `rt.py db-init` снова. Ничего не изменено.")
     try:
         selected = settings.recording_backend() == "sqlite"
     except ValueError:
@@ -1118,8 +1118,12 @@ def prepare_installation_store(check_only=False):
             return failed(f"не удалось создать {db}", ex)
         result["changed"].append("state.sqlite3")
         created = True
+    # Выбор пишется только в config.json: база уже проверена чтением (или только что создана), а
+    # set_recording_backend открыл бы её на запись и при остаточном -wal слил бы журнал в основной файл.
     try:
-        settings.set_recording_backend("sqlite")
+        if not SQLITE_RUNTIME_READY:
+            raise RuntimeError("SQLite backend is unavailable until all recording writers are routed")
+        settings.update(recording_backend="sqlite")
     except (OSError, ValueError, RuntimeError, sqlite3.Error, storage.StorageError) as ex:
         return failed(f"база {db} есть, но выбрать её не удалось; запустите `rt.py db-init` снова", ex)
     result["changed"].append("config.json")

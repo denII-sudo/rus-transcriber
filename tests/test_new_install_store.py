@@ -92,6 +92,42 @@ class InstallationStoreTests(unittest.TestCase):
                 self.assertEqual(_digest(self.db), before_db)
                 self.assertEqual(settings.recording_backend(), "sqlite")
 
+    def test_existing_store_with_leftover_wal_is_selected_without_checkpoint(self):
+        import shutil
+        import sqlite3
+        source = self.data.parent / "source"
+        source.mkdir()
+        src_db = source / "state.sqlite3"
+        recordings.initialize_store(src_db, display_name="Синтетический").close()
+        db = sqlite3.connect(src_db, isolation_level=None)
+        try:
+            db.execute("PRAGMA wal_autocheckpoint=0")
+            db.execute("CREATE TABLE synthetic_note(x)")       # запись, оставшаяся только в -wal
+            db.execute("INSERT INTO synthetic_note VALUES (1)")
+            shutil.copyfile(src_db, self.db)                 # копия «после сбоя»: журнал не слит в файл
+            shutil.copyfile(source / "state.sqlite3-wal", self.data / "state.sqlite3-wal")
+        finally:
+            db.close()
+        wal = self.data / "state.sqlite3-wal"
+        self.assertGreater(wal.stat().st_size, 0)
+        self.write_config({"recording_backend": "legacy_files", "asr_device": "GPU"})
+        before = (_digest(self.db), _digest(wal))
+        report = recordings.prepare_installation_store()
+        self.assertEqual((report["case"], report["ok"], report["changed"]), ("selected", True, ["config.json"]))
+        self.assertEqual((_digest(self.db), _digest(wal)), before)      # основной файл и -wal побайтно прежние
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual((saved["recording_backend"], saved["asr_device"]), ("sqlite", "GPU"))
+
+    def test_creation_failure_inside_initialize_leaves_no_files(self):
+        self.write_config({"asr_device": "GPU"})
+        before = sorted(p.name for p in self.data.iterdir())
+        for target in ("os.link", "validate_copy"):
+            with self.subTest(target=target),                     mock.patch(f"storage.{target}", side_effect=OSError("сбой публикации")):
+                for _ in range(2):                            # повтор не копит незаконченные файлы
+                    report = recordings.prepare_installation_store()
+                    self.assertEqual((report["case"], report["ok"]), ("error", False))
+                self.assertEqual(sorted(p.name for p in self.data.iterdir()), before)
+
     def test_broken_store_is_reported_and_not_repaired(self):
         for content in (b"", b"not a database" * 100):
             with self.subTest(size=len(content)):
@@ -138,6 +174,7 @@ class InstallationStoreTests(unittest.TestCase):
                 report = recordings.prepare_installation_store()
                 self.assertEqual((report["case"], report["ok"]), ("error", False))
                 self.assertEqual(self.config.read_bytes(), raw)
+                self.assertNotIn("удалите", report["message"])   # в config.json и выбор теста скорости
                 self.assertFalse(self.db.exists())
 
     def test_creation_failure_reports_reason_and_keeps_config(self):
@@ -152,7 +189,7 @@ class InstallationStoreTests(unittest.TestCase):
                 self.assertEqual(_digest(self.config), before)
 
     def test_failed_selection_is_finished_by_next_run(self):
-        with mock.patch.object(settings, "set_recording_backend", side_effect=OSError("занят")):
+        with mock.patch.object(settings, "update", side_effect=OSError("занят")):
             report = recordings.prepare_installation_store()
         self.assertEqual((report["ok"], report["changed"]), (False, ["state.sqlite3"]))
         before_db = _digest(self.db)
