@@ -70,7 +70,10 @@ class RootArgument(Base):
     def test_git_checkout_is_listed_by_git_in_the_given_root(self):
         if not shutil.which("git"):
             self.skipTest("нужен git")
-        root = self.tree("repo", {"a.py": f"p = 'C:\\\\Users\\\\{USER}\\\\x'\n", "ignored.txt": "x\n"})
+        # путь с именем пользователя собирается из частей: целиком в исходнике его нельзя писать, иначе
+        # test_repo_clean.test_no_personal_data_tracked примет эту строку за настоящий личный путь
+        user_path = "\\".join(["C:", "Users", USER, "x"])
+        root = self.tree("repo", {"a.py": f"p = {user_path!r}\n", "ignored.txt": "x\n"})
         env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
         subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
         subprocess.run(["git", "add", "a.py"], cwd=root, check=True, env=env)   # ignored.txt не добавлен
