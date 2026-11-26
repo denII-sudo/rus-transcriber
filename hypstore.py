@@ -350,19 +350,57 @@ def _cutoff(older_than_days, now):
     return None
 
 
-def _database_part(recording_id, unit_id, cutoff, apply, store_path):
-    """Строки гипотез базы под отбор: сводка, при apply — удаление. Базы нет — нули."""
+def recording_entry(recording_id, label, runs=0, size=0):
+    """Строка перечня записей для человека: название (title, иначе имя файла аудио без папки), дата записи
+    (recorded_at), иначе дата обработки (первая ревизия текста), номер записи. Ни путей, ни текста стенограммы."""
+    label = label or {}
+    name = label.get("title") or label.get("file_name") or "без названия"
+    if label.get("recorded_at"):
+        date, kind = label["recorded_at"][:10], "recorded"
+    elif label.get("processed_at"):
+        date, kind = label["processed_at"][:10], "processed"
+    else:
+        date, kind = None, None
+    return {"recording_id": recording_id, "name": name, "date": date, "date_kind": kind, "runs": runs,
+            "bytes": size}
+
+
+def entry_text(entry):
+    """«Название — записано ГГГГ-ММ-ДД (номер …)»: подпись записи в окне подтверждения и отчёте."""
+    date = {"recorded": "записано ", "processed": "обработано "}.get(entry.get("date_kind"), "") + (
+        entry.get("date") or "дата неизвестна")
+    return f"«{entry['name']}» — {date} (номер {entry['recording_id']})"
+
+
+def _database_part(recording_id, unit_id, cutoff, apply, store_path, with_recordings=False):
+    """Строки гипотез базы под отбор: сводка, при apply — удаление. Базы нет — нули. with_recordings=True —
+    (сводка, перечень записей recording_entry той же выборки по дате, названию и номеру; при apply — снятый до
+    удаления в той же транзакции; при отборе по записи без строк базы — подпись этой записи с нулями)."""
     import datetime as dt
     import storage
     path = _store_path(store_path)
     if not path.is_file():
-        return {"runs": 0, "recordings": 0, "bytes": 0}
+        empty = {"runs": 0, "recordings": 0, "bytes": 0}
+        return (empty, []) if with_recordings else empty
     before = dt.datetime.fromtimestamp(cutoff, dt.timezone.utc) if cutoff is not None else None
     store = storage.open_store(path) if apply else storage.open_store_readonly(path)
     try:
+        if not with_recordings:
+            if apply:
+                return store.delete_hypotheses(recording_id, unit_id, before)
+            return store.hypotheses_summary(recording_id, unit_id, before)
         if apply:
-            return store.delete_hypotheses(recording_id, unit_id, before)
-        return store.hypotheses_summary(recording_id, unit_id, before)
+            database, rows = store.delete_hypotheses(recording_id, unit_id, before, with_recordings=True)
+        else:
+            database = store.hypotheses_summary(recording_id, unit_id, before)
+            rows = store.hypotheses_recordings(recording_id, unit_id, before)
+        listed = sorted((recording_entry(row["recording_id"], row, row["runs"], row["bytes"]) for row in rows),
+                        key=lambda e: (e["date"] or "", e["name"], e["recording_id"]))     # как читает человек
+        if recording_id is not None and not listed:
+            label = store.recording_label(recording_id)
+            if label is not None:
+                listed = [recording_entry(recording_id, label)]
+        return database, listed
     finally:
         store.close()
 
@@ -384,14 +422,15 @@ def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=
     внутри и времени изменения); кэши _artifacts.json и _testbed.json не трогаются. apply=False — только отчёт:
     те же числа, что удалит apply=True. data_dir — папка гипотез (по умолчанию <папка данных>\\hypotheses),
     store_path — база записей (по умолчанию paths.STATE_DB). -> {"database": {"runs", "recordings", "bytes"},
-    "files", "bytes", "units", "applied", ...}: files/bytes/units — прежние файлы."""
+    "recordings": [recording_entry…], "files", "bytes", "units", "applied", ...}: files/bytes/units — прежние
+    файлы; "recordings" — записи, чьи строки базы попали в отбор (при отборе по записи — она сама)."""
     if unit_id is not None and not UNIT_RE.match(str(unit_id)):
         raise ValueError("unit_id — 12 знаков 0-9a-f")
     if recording_id is not None:
         _check_recording_id(recording_id)
     base = Path(data_dir) if data_dir is not None else root()
     cutoff = _cutoff(older_than_days, now)
-    database = _database_part(recording_id, unit_id, cutoff, apply, store_path)
+    database, listed = _database_part(recording_id, unit_id, cutoff, apply, store_path, with_recordings=True)
     n = size = 0
     units = set()
     for p in _run_files(base, unit_id):
@@ -413,7 +452,8 @@ def cleanup(unit_id=None, older_than_days=None, apply=False, data_dir=None, now=
             except OSError:
                 pass
     return {"unit_id": unit_id, "recording_id": recording_id, "older_than_days": older_than_days,
-            "database": database, "files": n, "bytes": size, "units": len(units), "applied": bool(apply)}
+            "database": database, "recordings": listed, "files": n, "bytes": size, "units": len(units),
+            "applied": bool(apply)}
 
 
 def summary(cfg=None, data_dir=None, store_path=None):

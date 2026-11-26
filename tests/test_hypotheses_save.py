@@ -55,8 +55,9 @@ _CODE_REVISION_ONCE = _computed_once(runinfo.code_revision)
 _PACKAGES_ONCE = _computed_once(runinfo.packages)
 
 
-def make_store(path, recordings=2):
-    """Синтетическая база записей (как tests/test_storage_revisions.py) с recordings записями. -> их номера."""
+def make_store(path, recordings=2, extra=None):
+    """Синтетическая база записей (как tests/test_storage_revisions.py) с recordings записями. extra — список
+    словарей с полями стенограммы (title, file, recorded_at) по записям. -> их номера."""
     store = storage.initialize(path)
     try:
         user = store.create_user("")
@@ -64,9 +65,11 @@ def make_store(path, recordings=2):
         store.bind_installation(installation, user)
         ctx = store.capture_context(installation, "human")
         ids = [str(uuid.uuid4()) for _ in range(recordings)]
-        for rid in ids:
+        for n, rid in enumerate(ids):
+            fields = (extra or [])[n] if n < len(extra or []) else {}
             store.create_recording(rid, "synthetic/hyp", {"segments": [{"segment_id": "s1", "speaker": None,
-                                                                       "words": [{"word_id": "w1", "w": "пример"}]}]},
+                                                                       "words": [{"word_id": "w1", "w": "пример"}]}],
+                                                          **fields},
                                    {"review": [], "answers": {}}, str(uuid.uuid4()), ctx)
     finally:
         store.close()
@@ -569,14 +572,69 @@ class CleanupToolTests(Sandbox):
         self.assertEqual(core.do_cleanup_hypotheses("", None, False, self.rec_b)["database"]["runs"], 0)
         lines = core.describe_cleanup_hypotheses("eeeeeeeeeeee")
         self.assertIn("в базе — прогонов 1, записей 1", lines[0])
-        self.assertIn("Прежние файлы гипотез: 1", lines[1])
-        self.assertIn(f"записи {self.rec_a}", core.describe_cleanup_hypotheses("", None, self.rec_a)[0])
+        self.assertIn("Прежние файлы гипотез: 1", lines[-2])           # перед ней — перечень записей (Ф225-1)
+        self.assertIn(f"записи «hyp» — обработано ", core.describe_cleanup_hypotheses("", None, self.rec_a)[0])
+        self.assertIn(f"(номер {self.rec_a}):", core.describe_cleanup_hypotheses("", None, self.rec_a)[0])
         self.assertEqual(core.do_cleanup_hypotheses("", 0, True)["files"], 1)     # days=0 — всё сразу
         self.assertEqual(self.files(), [])
         self.assertEqual(self.records(), [])
         for bad in (("../..", None, False), ("", None, False, "не-номер")):
             with self.subTest(bad=bad), self.assertRaises(core.CoreError):
                 core.do_cleanup_hypotheses(*bad)
+
+    def test_window_and_report_name_recordings_by_title_and_date(self):
+        """Ф225-1: окно подтверждения и отчёт удаления называют запись названием (title, иначе имя файла аудио без
+        папки) и датой записи (иначе обработки); номер — в конце. Ни путей, ни текста стенограммы."""
+        import re
+        import core
+        self.db.unlink()
+        a, b, c, d = make_store(self.db, 4, extra=[
+            {"title": "Встреча по бюджету", "file": "C:\\Скрытая папка\\вложенная\\a.wav",
+             "recorded_at": "2026-11-20T10:00:00+03:00"},
+            {"file": "D:/архив/личное/запись-б.m4a"},
+            {"title": "   "},                                    # пустое название — имя из места записи
+            {"title": "Без гипотез"}])
+        for n, rid in enumerate((a, b, c)):
+            hypstore.write_db({"schema": "hyp-2", "text": "секретная фраза"}, "aaaaaaaaaaaa",
+                              f"20261124-1000{n:02d}-a0a0a{n}", rid)
+        line_a = f"«Встреча по бюджету» — записано 2026-11-20 (номер {a})"
+        processed = r"обработано \d{4}-\d{2}-\d{2} \(номер "
+        lines = core.describe_cleanup_hypotheses()
+        text = "\n".join(lines)
+        self.assertEqual(lines[1], "Записи:")
+        self.assertEqual(lines[2], f"— {line_a}")
+        rest = lines[3:5]                                    # по дате, затем по названию
+        self.assertRegex(rest[0], f"^— «hyp» — {processed}{c}\\)$")
+        self.assertRegex(rest[1], f"^— «запись-б.m4a» — {processed}{b}\\)$")
+        self.assertEqual(len(lines), 6)                      # заголовок, «Записи:», три записи, предупреждение
+        self.assertNotIn("Без гипотез", text)                # у записи нет гипотез — в перечень не входит
+        for secret in ("Скрытая", "вложенная", "архив", "личное", "секретная", "пример", ":\\", "D:/"):
+            self.assertNotIn(secret, text)
+        one = core.describe_cleanup_hypotheses("", None, a)
+        self.assertIn(f"гипотез моделей (полный текст записей) записи {line_a}: в базе — прогонов 1", one[0])
+        self.assertNotIn("Записи:", one)
+        none = core.describe_cleanup_hypotheses("", None, d)  # запись без строк базы — всё равно по названию
+        self.assertIn(f"записи «Без гипотез» — обработано ", none[0])
+        with mock.patch.object(core, "HYPOTHESES_CLEANUP_LIST_LIMIT", 2):
+            capped = core.describe_cleanup_hypotheses()
+        self.assertEqual(capped[1:4], ["Записи:", f"— {line_a}", "— и ещё записей: 2 (полный перечень — в отчёте "
+                                       "без apply)"])
+        report = core.do_cleanup_hypotheses("", None, True, a)
+        self.assertEqual(report["recordings_text"], [line_a])
+        self.assertEqual({k: report["recordings"][0][k] for k in ("recording_id", "name", "date", "date_kind",
+                                                                   "runs")},
+                         {"recording_id": a, "name": "Встреча по бюджету", "date": "2026-11-20",
+                          "date_kind": "recorded", "runs": 1})
+        report = core.do_cleanup_hypotheses("", None, True)
+        by_id = {e["recording_id"]: e["name"] for e in report["recordings"]}
+        self.assertEqual(by_id, {b: "запись-б.m4a", c: "hyp"})
+        self.assertEqual(len(report["recordings_text"]), 2)
+        for entry, line in zip(report["recordings"], report["recordings_text"]):
+            self.assertRegex(line, f"^«{re.escape(entry['name'])}» — {processed}{entry['recording_id']}\\)$")
+        dumped = json.dumps(report, ensure_ascii=False)
+        for secret in ("Скрытая", "архив", "секретная", "пример", "synthetic"):
+            self.assertNotIn(secret, dumped)
+        self.assertEqual(self.records(), [])
 
     def test_mcp_apply_needs_human_and_report_does_not(self):
         import asyncio

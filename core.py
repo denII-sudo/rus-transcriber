@@ -1855,10 +1855,18 @@ def do_cleanup(days=30, apply=False):
     return data_io.cleanup_jobs(days, apply)
 
 
+HYPOTHESES_CLEANUP_LIST_LIMIT = 25     # строк перечня записей в окне подтверждения; в отчёте — все
+
+
 def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False, recording_id=""):
+    """Очистка гипотез (data_io.cleanup_hypotheses). В отчёте "recordings" — записи с названием и датой,
+    "recordings_text" — те же записи строками «название — дата (номер)» для человека."""
+    import hypstore
     import storage
     try:
-        return data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply, recording_id or None)
+        report = data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply, recording_id or None)
+        report["recordings_text"] = [hypstore.entry_text(entry) for entry in report.get("recordings") or []]
+        return report
     except ValueError as ex:
         raise CoreError(str(ex)) from ex
     except storage.StorageError as ex:
@@ -1902,10 +1910,21 @@ def describe_cleanup(days=30):
 def describe_cleanup_hypotheses(unit_id="", older_than_days=None, recording_id=""):
     r = do_cleanup_hypotheses(unit_id, older_than_days, False, recording_id)
     db = r["database"]
-    scope = (f"записи {recording_id}" if recording_id else f"звука {unit_id}" if unit_id else "всех записей")
+    named = r["recordings_text"]
+    if recording_id:
+        scope = f"записи {named[0]}" if named else f"записи (номер {recording_id})"
+    else:
+        scope = f"звука {unit_id}" if unit_id else "всех записей"
     age = f", старше {older_than_days} дн." if older_than_days is not None else ""
     lines = [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
              f"в базе — прогонов {db['runs']}, записей {db['recordings']}, {db['bytes'] // 1024} КБ."]
+    if not recording_id and named:
+        limit = HYPOTHESES_CLEANUP_LIST_LIMIT
+        shown = named if len(named) <= limit else named[:limit - 1]
+        lines.append("Записи:")
+        lines.extend(f"— {line}" for line in shown)
+        if len(shown) < len(named):
+            lines.append(f"— и ещё записей: {len(named) - len(shown)} (полный перечень — в отчёте без apply)")
     if r["files"]:
         lines.append(f"Прежние файлы гипотез: {r['files']}, звуков {r['units']}, {r['bytes'] // 1024} КБ.")
     lines.append("Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить.")

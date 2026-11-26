@@ -1650,15 +1650,58 @@ class Store:
                               "FROM hypotheses" + where, params).fetchone()
         return {"runs": row[0], "recordings": row[1], "bytes": row[2]}
 
-    def delete_hypotheses(self, recording_id=None, sound_id=None, created_before=None):
+    def delete_hypotheses(self, recording_id=None, sound_id=None, created_before=None, with_recordings=False):
         """Удалить гипотезы по отбору (все, записи, звука, созданные раньше created_before) сразу и навсегда.
-        -> сводка удалённого, как hypotheses_summary до удаления."""
+        -> сводка удалённого, как hypotheses_summary до удаления; with_recordings=True — (сводка, перечень записей
+        как hypotheses_recordings до удаления, в той же транзакции)."""
         where, params = self._hypotheses_where(recording_id, sound_id, created_before)
         with self._transaction():
             summary = self.hypotheses_summary(recording_id, sound_id, created_before)
+            listed = self.hypotheses_recordings(recording_id, sound_id, created_before) if with_recordings else None
             if summary["runs"]:
                 self.db.execute("DELETE FROM hypotheses" + where, params)
-        return summary
+        return (summary, listed) if with_recordings else summary
+
+    _RECORDING_LABEL_SQL = (
+        "r.location, json_extract(t.payload, '$.title') AS title, json_extract(t.payload, '$.file') AS file, "
+        "json_extract(t.payload, '$.recorded_at') AS recorded_at, "
+        "(SELECT o.created_at FROM transcript_revisions f JOIN operations o USING(operation_id) "
+        " WHERE f.recording_id=r.recording_id ORDER BY f.revision LIMIT 1) AS processed_at ")
+    _RECORDING_LABEL_JOIN = (
+        "LEFT JOIN transcript_revisions t ON t.recording_id=r.recording_id AND t.revision=r.source_revision ")
+
+    @staticmethod
+    def _recording_label(row):
+        source = row["file"] if isinstance(row["file"], str) and row["file"] else row["location"]
+        title = row["title"] if isinstance(row["title"], str) and row["title"].strip() else None
+        return {"title": title,
+                "file_name": re.split(r"[\\/]", source)[-1] if isinstance(source, str) else None,
+                "recorded_at": row["recorded_at"] if isinstance(row["recorded_at"], str) else None,
+                "processed_at": row["processed_at"]}
+
+    def recording_label(self, recording_id):
+        """Подпись записи для человека: {"title", "file_name", "recorded_at", "processed_at"} или None, если записи
+        нет. file_name — только имя файла аудио, без папки; processed_at — время первой ревизии текста. Текст
+        стенограммы и пути не отдаются."""
+        _uuid(recording_id)
+        row = self.db.execute("SELECT " + self._RECORDING_LABEL_SQL + "FROM recordings r " + self._RECORDING_LABEL_JOIN
+                              + "WHERE r.recording_id=?", (recording_id,)).fetchone()
+        return self._recording_label(row) if row is not None else None
+
+    def hypotheses_recordings(self, recording_id=None, sound_id=None, created_before=None):
+        """Записи, у которых есть гипотезы под отбор (та же выборка, что hypotheses_summary), с подписью
+        recording_label: [{"recording_id", "runs", "bytes", "title", "file_name", "recorded_at", "processed_at"}]
+        по времени обработки. Без таблицы — []."""
+        where, params = self._hypotheses_where(recording_id, sound_id, created_before)
+        if not self.has_hypotheses():
+            return []
+        rows = self.db.execute(
+            "SELECT h.recording_id, count(*) AS runs, COALESCE(sum(h.size_bytes), 0) AS bytes, "
+            + self._RECORDING_LABEL_SQL + "FROM (SELECT * FROM hypotheses" + where + ") h "
+            "JOIN recordings r ON r.recording_id=h.recording_id " + self._RECORDING_LABEL_JOIN
+            + "GROUP BY h.recording_id ORDER BY processed_at, h.recording_id", params).fetchall()
+        return [{"recording_id": row["recording_id"], "runs": row["runs"], "bytes": row["bytes"],
+                 **self._recording_label(row)} for row in rows]
 
     def hypotheses_rows(self):
         """Все прогоны гипотез: [{"run_id", "recording_id", "sound_id", "record_json"}] по run_id (лаборатория)."""
