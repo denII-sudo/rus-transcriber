@@ -1786,6 +1786,11 @@ def legacy_speaker_review(job_id, build_pack=False):
 
 
 # ---------- настройки, группы, профили ----------
+def _hypotheses_summary():
+    import hypstore
+    return hypstore.summary(settings.load_config())
+
+
 def settings_info():
     import recordings
     import storage
@@ -1793,7 +1798,9 @@ def settings_info():
               "overrides": settings.load_overrides(), "effective": settings.load_config(),
               "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
               # старая раскладка данных переносится только явной командой migrate_data
-              "legacy_migration_pending": bool(migrate.pending())}
+              "legacy_migration_pending": bool(migrate.pending()),
+              # объём гипотез моделей (те же числа, что у очистки без отбора): записи с гипотезами, прогоны, байты
+              "hypotheses": _hypotheses_summary()}
     if paths.STATE_DB.is_file():
         try:
             store = recordings.open_store()
@@ -1848,11 +1855,22 @@ def do_cleanup(days=30, apply=False):
     return data_io.cleanup_jobs(days, apply)
 
 
-def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False):
+HYPOTHESES_CLEANUP_LIST_LIMIT = 25     # строк перечня записей в окне подтверждения; в отчёте — все
+
+
+def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False, recording_id=""):
+    """Очистка гипотез (data_io.cleanup_hypotheses). В отчёте "recordings" — записи с названием и датой,
+    "recordings_text" — те же записи строками «название — дата (номер)» для человека."""
+    import hypstore
+    import storage
     try:
-        return data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply)
+        report = data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply, recording_id or None)
+        report["recordings_text"] = [hypstore.entry_text(entry) for entry in report.get("recordings") or []]
+        return report
     except ValueError as ex:
         raise CoreError(str(ex)) from ex
+    except storage.StorageError as ex:
+        raise CoreError(f"База записей недоступна: {say_error(ex)}") from ex
 
 
 # ---------- описание действия для человека (без выполнения) ----------
@@ -1889,13 +1907,28 @@ def describe_cleanup(days=30):
     return [f"Удаление статусов и логов задач старше {days} дн.: файлов {r['files']}, {r['bytes'] // 1024} КБ."]
 
 
-def describe_cleanup_hypotheses(unit_id="", older_than_days=None):
-    r = do_cleanup_hypotheses(unit_id, older_than_days, False)
-    scope = f"записи {unit_id}" if unit_id else "всех записей"
+def describe_cleanup_hypotheses(unit_id="", older_than_days=None, recording_id=""):
+    r = do_cleanup_hypotheses(unit_id, older_than_days, False, recording_id)
+    db = r["database"]
+    named = r["recordings_text"]
+    if recording_id:
+        scope = f"записи {named[0]}" if named else f"записи (номер {recording_id})"
+    else:
+        scope = f"звука {unit_id}" if unit_id else "всех записей"
     age = f", старше {older_than_days} дн." if older_than_days is not None else ""
-    return [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
-            f"файлов {r['files']}, записей {r['units']}, {r['bytes'] // 1024} КБ.",
-            "Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить."]
+    lines = [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
+             f"в базе — прогонов {db['runs']}, записей {db['recordings']}, {db['bytes'] // 1024} КБ."]
+    if not recording_id and named:
+        limit = HYPOTHESES_CLEANUP_LIST_LIMIT
+        shown = named if len(named) <= limit else named[:limit - 1]
+        lines.append("Записи:")
+        lines.extend(f"— {line}" for line in shown)
+        if len(shown) < len(named):
+            lines.append(f"— и ещё записей: {len(named) - len(shown)} (полный перечень — в отчёте без apply)")
+    if r["files"]:
+        lines.append(f"Прежние файлы гипотез: {r['files']}, звуков {r['units']}, {r['bytes'] // 1024} КБ.")
+    lines.append("Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить.")
+    return lines
 
 
 def describe_migrate():

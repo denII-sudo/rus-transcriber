@@ -1049,7 +1049,7 @@ def _emotions(audio, segments, cfg, a, quality, timing):
 
 class _HypCapture:
     """Сбор гипотез для сохранения (hypstore, настройка save_hypotheses). Результат расшифровки не меняет:
-    добавляется только файл в папке данных и поля hypotheses_saved/hypotheses_error в статусе задачи."""
+    добавляется только строка гипотез записи в базе и поля hypotheses_saved/hypotheses_error в статусе задачи."""
 
     def __init__(self, audio, cfg, a, src=None):
         import runinfo
@@ -1075,11 +1075,12 @@ class _HypCapture:
                                                                load_interval=0))
 
     def save(self, quality, timing, vocab, recording_id=None):
-        """Запись файла после сохранения результата задачи. Сбой записи задачу не роняет.
+        """Запись гипотез в базу после сохранения результата задачи. Сбой записи задачу не роняет.
         -> поля для статуса задачи: hypotheses_saved и при сбое hypotheses_error (вид ошибки без текста и пути)."""
         try:
-            path = _save_hypotheses(self, quality, timing, vocab, recording_id)
-            print(f"[words] гипотезы моделей сохранены ({path.parent.name}/{path.name})", file=sys.stderr, flush=True)
+            saved = _save_hypotheses(self, quality, timing, vocab, recording_id)
+            print(f"[words] гипотезы моделей сохранены в базу (прогон {saved['run_id']}, "
+                  f"{saved['size_bytes'] // 1024} КБ)", file=sys.stderr, flush=True)
             return {"hypotheses_saved": True}
         except Exception as ex:
             print(f"[words] гипотезы моделей не сохранены: {type(ex).__name__}", file=sys.stderr, flush=True)
@@ -1087,8 +1088,9 @@ class _HypCapture:
 
 
 def _finish_hypotheses(hyp, quality, timing, vocab, saved):
-    """Файл гипотез — только у задачи, результат которой уже сохранён (main, после _save_worker_result).
-    Отменённая или упавшая задача файла не оставляет. -> поля для статуса задачи ({} — настройка выключена)."""
+    """Гипотезы — только у задачи, результат которой уже сохранён в базу (main, после _save_worker_result):
+    им нужен номер записи. Отменённая или упавшая задача гипотез не оставляет.
+    -> поля для статуса задачи ({} — настройка выключена)."""
     if hyp is None:
         return {}
     return hyp.save(quality, timing, vocab, (saved or {}).get("recording_id"))
@@ -1112,7 +1114,7 @@ def pcm_sha256(audio, block=1 << 20):
 
 def _always_layer(audio, cfg, vocab, quality, hyp):
     """Слой «всегда» (план лаборатории, раздел 0.1): в quality.asr_run каждой новой записи, у всех, без
-    настройки — хэш звука, ссылка на файл гипотез, обезличенный стенд, снимок настроек распознавания,
+    настройки — хэш звука, ссылка на гипотезы прогона, обезличенный стенд, снимок настроек распознавания,
     хэши файлов весов и ключевые пакеты. Только числа, хэши и имена моделей, без текстов и путей.
     Сбой любого поля пишется как not_measured и расшифровку не роняет."""
     import hypotheses as H
@@ -1130,8 +1132,9 @@ def _always_layer(audio, cfg, vocab, quality, hyp):
     if hyp is None:
         run["hypotheses"] = {"state": "off", "reason": "save_hypotheses выключена"}
     else:
-        # имя файла, который будет записан после сохранения результата; запись могла не удаться — файл ищут
-        # по этим полям и проверяют его наличие (сбой виден в статусе задачи, hypotheses_error)
+        # прогон, гипотезы которого будут записаны в базу после сохранения результата (строка таблицы hypotheses
+        # с этим run_id, Г-1); запись могла не удаться — строку ищут по run_id и проверяют её наличие (сбой виден
+        # в статусе задачи, hypotheses_error)
         hyp.run_id = runinfo.new_run_id()
         run["hypotheses"] = {"state": "expected",
                              "sound_id": sound[0][:12] if isinstance(sound, tuple)
@@ -1190,7 +1193,8 @@ def _no_none(obj):
 
 
 def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
-    """Запись файла гипотез hyp-2 (hypstore) после сохранения результата задачи. -> путь файла."""
+    """Запись гипотез hyp-2 в базу (hypstore.write_db) после сохранения результата задачи, частью записи
+    recording_id. -> {"run_id", "recording_id", "size_bytes"}."""
     import platform
     import hypotheses as H
     import hypstore
@@ -1198,7 +1202,9 @@ def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
     b = cap.before
     if b is None:
         raise RuntimeError("гипотезы до голосования не собраны")
-    base = hypstore.root()
+    if not recording_id:
+        raise ValueError("гипотезы сохраняются только для записи в базе: нет номера записи")
+    base = hypstore.root()           # папка кэшей _artifacts.json и _testbed.json
     base.mkdir(parents=True, exist_ok=True)
     pcm = hypstore.pcm_bytes(cap.audio)
     src = Path(cap.a.audio).expanduser() if getattr(cap.a, "audio", "") else None
@@ -1266,19 +1272,19 @@ def _save_hypotheses(cap, quality, timing, vocab, recording_id=None):
             "config": hypstore.config_snapshot(cap.cfg, vocab),
             "ids": {"run_id": run_id, "unit_id": unit_id,
                     "job_id": Path(cap.a.status).stem if getattr(cap.a, "status", "") else None,
-                    "recording_id": recording_id or H.not_available("хранение json: записи в базе нет"),
+                    "recording_id": recording_id,
                     "written_utc": runinfo.utc_now()}}
     combine = {"function": "vote_n", "rule": cap.trace.get("rule") or dict(W.TWO_OF_THREE),
                "partial": quality.get("vote3_partial"), "skipped": quality.get("vote3_skipped"),
                "third_words": b["whisper"], "third_plan": b["plan"]}
     rec = H.build_record(roles, legacy={"combine_rule": "vote3_partial"}, combine=combine,
                          trace=cap.trace or None, meta=meta)
-    path = hypstore.write(rec, unit_id, run_id, base, forbid=cap.forbid)
+    saved = hypstore.write_db(rec, unit_id, run_id, recording_id, forbid=cap.forbid, job_id=meta["ids"]["job_id"])
     try:
         hypstore._write_json_atomic(base / hypstore.ARTIFACTS_FILE, arts)
     except OSError:
         pass
-    return path
+    return saved
 
 
 def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of, voice_ctx,

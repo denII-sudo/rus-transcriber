@@ -370,11 +370,13 @@ def delete_group(group, confirm="", permanent=False):
     return {"group": g, "deleted": "перенесена (можно вернуть)", "folder": str(dst)}
 
 
-def cleanup_hypotheses(unit_id=None, older_than_days=None, apply=False):
-    """Удаление сохранённых гипотез моделей (hypstore): всех, одной записи (unit_id — 12 знаков) или
-    старше older_than_days дней. apply=False — только подсчёт. Только файлы прогонов в папке hypotheses."""
+def cleanup_hypotheses(unit_id=None, older_than_days=None, apply=False, recording_id=None):
+    """Удаление сохранённых гипотез моделей (hypstore): всех, одной записи (recording_id — номер записи базы),
+    одного звука (unit_id — 12 знаков) или старше older_than_days дней. apply=False — только подсчёт.
+    Строки гипотез в базе записей и прежние файлы прогонов в папке hypotheses."""
     import hypstore
-    return hypstore.cleanup(unit_id=unit_id or None, older_than_days=older_than_days, apply=apply)
+    return hypstore.cleanup(unit_id=unit_id or None, older_than_days=older_than_days, apply=apply,
+                            recording_id=recording_id or None)
 
 
 def cleanup_jobs(days=30, apply=False):

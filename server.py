@@ -89,7 +89,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.25.13"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.25.14"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -387,6 +387,8 @@ async def backup_state(destination: str) -> str:
         "Создание резерва состояния БД", {"destination": destination},
         lambda: [f"Новый файл: {destination}",
                  "Копия неактивна: установки отключены, незавершённые запуски прерываются.",
+                 "В копии вся база, в том числе сохранённые гипотезы моделей (полный текст записей), "
+                 "если включалась настройка save_hypotheses.",
                  "Существующие файлы не изменяются и не удаляются.",
                  "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением."],
         lambda: _backup_for_agent(destination), require_human=True)
@@ -1036,6 +1038,8 @@ async def self_check(tests: bool = True) -> str:
     Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части."""
     import selfcheck
     r = await asyncio.to_thread(selfcheck.run, VERSION, bool(tests), True, True)
+    # объём гипотез моделей в базе этой установки — только числа, ничего не меняется
+    r["hypotheses"] = await asyncio.to_thread(core._hypotheses_summary)
     return json.dumps(r, ensure_ascii=False, indent=1)
 
 
@@ -1104,17 +1108,22 @@ async def cleanup_jobs(days: int = 30, apply: bool = False) -> str:
 
 
 @mcp.tool()
-async def cleanup_hypotheses(unit_id: str = "", older_than_days: float = -1, apply: bool = False) -> str:
-    """Удаляет сохранённые гипотезы моделей (настройка save_hypotheses; в них полный текст записей):
-    всех, одной записи (unit_id) или старше older_than_days дней (-1 — без ограничения по возрасту).
-    apply=false — только подсчёт; apply=true — после подтверждения человеком в окне на экране.
-    Выключение save_hypotheses уже сохранённые файлы не удаляет."""
+async def cleanup_hypotheses(recording_id: str = "", unit_id: str = "", older_than_days: float = -1,
+                             apply: bool = False) -> str:
+    """Удаляет сохранённые гипотезы моделей (настройка save_hypotheses; в них полный текст записей; хранятся
+    в базе записей вместе с записью): всех, одной записи (recording_id — номер записи базы), одного звука
+    (unit_id — 12 знаков) или старше older_than_days дней (-1 — без ограничения по возрасту). Прежние файлы
+    гипотез папки данных — тем же отбором. apply=false — только подсчёт (те же числа, что удалятся);
+    apply=true — после подтверждения человеком в окне на экране, сразу и навсегда. Выключение save_hypotheses
+    уже сохранённые гипотезы не удаляет; объём виден в get_settings (hypotheses)."""
     days = None if older_than_days < 0 else older_than_days
     if not apply:
-        return await _gated(None, None, None, lambda: core.do_cleanup_hypotheses(unit_id, days, False))
-    return await _gated("Удаление гипотез моделей", {"unit_id": unit_id, "older_than_days": days},
-                        lambda: core.describe_cleanup_hypotheses(unit_id, days),
-                        lambda: core.do_cleanup_hypotheses(unit_id, days, True))
+        return await _gated(None, None, None,
+                            lambda: core.do_cleanup_hypotheses(unit_id, days, False, recording_id))
+    return await _gated("Удаление гипотез моделей",
+                        {"recording_id": recording_id, "unit_id": unit_id, "older_than_days": days},
+                        lambda: core.describe_cleanup_hypotheses(unit_id, days, recording_id),
+                        lambda: core.do_cleanup_hypotheses(unit_id, days, True, recording_id))
 
 
 def _local_voice_tool():
