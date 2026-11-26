@@ -4,6 +4,8 @@ r"""Проверка перед коммитом: в отслеживаемых 
     python tools/check_repo.py --staged     # только то, что собираетесь закоммитить (для pre-commit)
     python tools/check_repo.py --list-words # показать, какие слова считаются запрещёнными (без привязки к файлам)
     python tools/check_repo.py --hide-words # не показывать найденные слова и имена в путях (для публичного журнала CI)
+    python tools/check_repo.py --root ПУТЬ  # проверить папку ПУТЬ, а не ту, где лежит скрипт (CI: скрипт из main,
+                                            # файлы из PR; сам скрипт из проверяемой папки не запускается)
 
 Что проверяется:
   1. файлы, которых в репозитории быть не должно: *.voices.json, groups/, jobs/, hypotheses/, config.json, bench*, аудио,
@@ -16,7 +18,8 @@ r"""Проверка перед коммитом: в отслеживаемых 
      RUS_FORBIDDEN_WORDS или forbidden_words.txt в папке данных. Слова короче 3 букв пропускаются; общеупотребительные
      слова, попавшие в список по ошибке, внесите в allow_words.txt рядом со списком. Имя общей группы «default»
      личными данными не считается и в список не попадает.
-Код возврата: 0 — чисто, 1 — найдены нарушения, 2 — не удалось получить список слов (проверьте на компьютере с данными).
+Код возврата: 0 — чисто, 1 — найдены нарушения, 2 — проверка выполнена не полностью: не удалось получить список слов
+(проверьте на компьютере с данными) или в --root указана не папка.
 """
 import fnmatch
 import json
@@ -97,26 +100,28 @@ def forbidden_words():
     return sorted(out, key=str.lower)
 
 
-def tracked(staged):
+def tracked(staged, root=None):
+    # root=None — корень берётся из ROOT в момент вызова (тесты подменяют его)
+    root = ROOT if root is None else Path(root)
     try:
         if staged:
-            r = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=ROOT,
+            r = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=root,
                                capture_output=True, text=True, encoding="utf-8", check=True)
         else:
-            r = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=True)
+            r = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, encoding="utf-8", check=True)
         return [l for l in r.stdout.splitlines() if l.strip()], True
     except (OSError, subprocess.CalledProcessError):
         files = []
-        gi = [l.strip() for l in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-              if l.strip() and not l.startswith("#")] if (ROOT / ".gitignore").exists() else []
+        gi = [l.strip() for l in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+              if l.strip() and not l.startswith("#")] if (root / ".gitignore").exists() else []
         # папка без git (например, установленная копия программы): окружение, кэши и личные данные
         # не являются файлами исходников, а .gitignore там может отсутствовать — не заходим в них вовсе
         skip_dirs = BAD_DIRS | {".git", "__pycache__"}
-        for dirpath, dirnames, filenames in os.walk(ROOT):
+        for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip_dirs]
             for name in filenames:
                 p = Path(dirpath) / name
-                rel = p.relative_to(ROOT).as_posix()
+                rel = p.relative_to(root).as_posix()
                 if any(fnmatch.fnmatch(rel, g.rstrip("/") + ("/*" if g.endswith("/") else "")) or
                        fnmatch.fnmatch(p.name, g.rstrip("/")) or
                        (g.endswith("/") and (rel.startswith(g) or f"/{g}" in f"/{rel}")) for g in gi):
@@ -125,8 +130,9 @@ def tracked(staged):
         return files, False
 
 
-def check(staged=False, require_words=True, hide_words=False):
-    files, is_git = tracked(staged)
+def check(staged=False, require_words=True, hide_words=False, root=None):
+    root = ROOT if root is None else Path(root)
+    files, is_git = tracked(staged, root)
     problems = []
     for rel in files:
         parts = rel.split("/")
@@ -139,7 +145,7 @@ def check(staged=False, require_words=True, hide_words=False):
     words = forbidden_words()
     wrx = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(" + "|".join(re.escape(w) for w in words) + r")(?![А-Яа-яЁёA-Za-z])", re.I) if words else None
     for rel in files:
-        p = ROOT / rel
+        p = root / rel
         if not p.is_file() or p.stat().st_size > TEXT_MAX:
             continue
         try:
@@ -159,12 +165,34 @@ def check(staged=False, require_words=True, hide_words=False):
     return problems, words, is_git
 
 
+def _root_arg(argv):
+    """Значение --root ПУТЬ или --root=ПУТЬ; None, если ключа нет. Без значения — ValueError."""
+    for i, a in enumerate(argv):
+        if a == "--root":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise ValueError("после --root нужен путь к папке")
+            return argv[i + 1]
+        if a.startswith("--root="):
+            if not a[len("--root="):]:
+                raise ValueError("после --root нужен путь к папке")
+            return a[len("--root="):]
+    return None
+
+
 def main():
     if "--list-words" in sys.argv:
         for w in forbidden_words():
             print(w)
         return 0
-    problems, words, is_git = check("--staged" in sys.argv, hide_words="--hide-words" in sys.argv)
+    try:
+        root = _root_arg(sys.argv[1:])
+    except ValueError as e:
+        print(f"ОШИБКА: {e}. Проверка не выполнена.", file=sys.stderr)
+        return 2
+    if root is not None and not Path(root).is_dir():
+        print("ОШИБКА: путь в --root не является папкой. Проверка не выполнена.", file=sys.stderr)
+        return 2
+    problems, words, is_git = check("--staged" in sys.argv, hide_words="--hide-words" in sys.argv, root=root)
     if not words:
         print("ВНИМАНИЕ: список запрещённых слов пуст (нет данных в папке данных и forbidden_words.txt). "
               "Проверка слов не выполнена — запустите на компьютере с данными.", file=sys.stderr)

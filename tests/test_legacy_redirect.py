@@ -4,8 +4,8 @@
 (`build_snapshots`, `recording_id_for`, `sha256_file`), как в `tests/test_voice_sqlite.py`. Закрепляется:
 переадресация по единственной копии с тем же содержимым и по тому же пути (в любом написании); отказы с
 подсказкой (не перенесена, изменена после переноса, файла нет, файла нет и по его пути ничего не переносили,
-несколько копий, копия файла по другому пути); не основной вариант; прежнее поведение в режиме `legacy_files`, для
-задач, сделанных уже в базе, и для неактивной базы; переадресация только читает.
+несколько копий, копия файла по другому пути); не основной вариант; без изменений — задачи, сделанные уже в
+базе, и неактивная база; переадресация только читает.
 """
 import atexit
 import json
@@ -293,15 +293,6 @@ class Refusals(Fixture):
 
 
 class Unchanged(Fixture):
-    def test_legacy_files_mode_reads_old_file(self):
-        self.write_legacy(legacy_data(self.audio))
-        self.migrate()
-        self.job()
-        self.backend = "legacy_files"
-        self.assertEqual(core.job_json(JOB)[0], str(self.legacy))
-        self.assertNotIn("migration_hint", core.job_status(JOB))
-        self.assertIn("старый текст", core.read_transcript(JOB))
-
     def test_job_made_in_store_is_not_searched(self):
         self.write_legacy(legacy_data(self.audio))
         rid = self.migrate()

@@ -2,7 +2,9 @@
 
 Механизмы А и Б разбора причин М-1 (ops research/2026-11-26-migration-root-cause, раздел 4) и находка Ф207-5:
 - фикстура — запись в файловом режиме, пакет которой собран штатными вызовами (review_pack.build, add_answers,
-  core.apply_answers_files, add_interaction_event), а не написан руками;
+  core.apply_answers_files, add_interaction_event), а не написан руками: программа собрала её один раз, и она
+  заморожена в образцах tests/legacy_samples/ (Л-3.1; загрузчик — tests/legacy_sample_loader.py), чтобы тесты
+  не зависели от файловых веток, которые уйдут в Л-5;
 - опись ключей пакета (import_legacy.LEGACY_PACK_INVENTORY): ключ без назначения роняет тест;
 - после переноса (и после ремонта записи, перенесённой прежней версией) работают те же действия, что до него:
   проверка пересборки, «Применить», дописывание порции карточек.
@@ -29,6 +31,7 @@ sys.path.insert(0, str(PROJECT))
 
 import core  # noqa: E402
 import import_legacy as IL  # noqa: E402
+import legacy_sample_loader as samples  # noqa: E402
 import paths  # noqa: E402
 import recordings  # noqa: E402
 import review_pack  # noqa: E402
@@ -36,28 +39,6 @@ import settings  # noqa: E402
 import transcript  # noqa: E402
 
 AS_IS = {"label": "Оставить как есть", "decision": {}}
-
-
-def word(wid, text, s):
-    return {"word_id": wid, "w": text, "s": s, "e": s + 0.3}
-
-
-def legacy_result(audio):
-    """Стенограмма файлового режима нынешнего вида: ID слов, сомнения со ссылками на слова. r5 — открытое место
-    без карточки (для следующей порции)."""
-    words = [word("w1", "начало", 0.5), word("w2", "вот", 2.0), word("w3", "дальше", 2.5), word("w4", "та", 3.0),
-             word("w5", "конец", 3.5)]
-
-    def place(rid, w, t):
-        return {"id": rid, "status": "open", "t": t, "t1": t, "t2": t + 0.3, "speaker": "Анна", "reasons": ["conf"],
-                "text": w["w"], "word_ids": [w["word_id"]]}
-    return {"file": str(audio), "duration": "00:00:04", "speakers": ["Анна"], "speaker_labels": ["speaker-1"],
-            "timing": {"total_sec": 4}, "group": "demo", "quality": {"asr_incomplete_chunks": 0},
-            "vocab_suggestions": [], "review_done": False, "edits": [],
-            "segments": [{"start": 0.5, "end": 3.8, "label": "speaker-1", "speaker": "Анна",
-                          "text": " ".join(w["w"] for w in words), "words": words}],
-            "review": [place("r2", words[1], 2.0), place("r3", words[2], 2.5), place("r4", words[3], 3.0),
-                       place("r5", words[4], 3.5)]}
 
 
 def questions(ids=("r2", "r3", "r4")):
@@ -68,8 +49,9 @@ def questions(ids=("r2", "r3", "r4")):
 
 
 class Built(unittest.TestCase):
-    """Запись файлового режима рядом с аудио и её пакет, собранный программой: r3 — ответ человека применён
-    («Применить» файлового режима), r4 — ответ человека ждёт «Применить», r2 — без ответа, r5 — без карточки."""
+    """Запись файлового режима рядом с аудио и её пакет, собранный программой (образец «built»): r3 — ответ
+    человека применён («Применить» файлового режима), r4 — ответ человека ждёт «Применить», r2 — без ответа,
+    r5 — без карточки."""
     _ts = 0
 
     def setUp(self):
@@ -90,12 +72,8 @@ class Built(unittest.TestCase):
         stack.enter_context(mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _o: t1))
         self.backend = "legacy_files"
         stack.enter_context(mock.patch.object(settings, "recording_backend", side_effect=lambda: self.backend))
-        transcript.save(legacy_result(self.audio), self.jp, self.md)
-        self.version = review_pack.build(self.jp, questions())["version"]
-        self.answer("r3", 1)
-        core.apply_answers_files(self.jp, self.md)
-        self.answer("r4", 1)
-        review_pack.add_interaction_event(self.jp, "r4", self.version, "audio_ended", "s" * 10)
+        samples.load("built", side, self.audio)
+        self.version = review_pack.manifest(self.jp)["version"]
         self.pack = review_pack.pack_dir(self.jp)
 
     def answer(self, aid, option, actor="human", jp=None):
@@ -146,9 +124,11 @@ def states(jp):
 class InventoryTests(Built):
     def test_every_key_and_file_of_a_built_pack_has_a_destination(self):
         """А: пакет, собранный программой (с архивом прежней редакции), — каждый ключ answers*.json и
-        manifest*.json и каждый файл папки разбора названы в описи; новый ключ формата роняет этот тест."""
-        core.apply_answers_files(self.jp, self.md)
-        review_pack.build(self.jp, questions(("r2", "r3", "r4", "r5")))     # прежняя редакция уходит в архив
+        manifest*.json и каждый файл папки разбора названы в описи; ключ, которого нет в описи, роняет этот тест.
+        Пакет — образец «built_archive» (Л-3.1): программа применила r4 и пересобрала пакет с карточками r2…r5,
+        прежняя редакция ушла в архив; ключи, которые она запишет в будущем, образец уже не покажет — файловый
+        режим новых пакетов не создаёт (Л-4а)."""
+        samples.load("built_archive", self.jp.parent, self.audio)
         packs, manifests = IL._read_pack_files([self.pack])
         self.assertGreater(len(packs), 1, "нет архива прежней редакции — фикстура не покрывает архивы")
         self.assertEqual(IL.unknown_pack_keys(packs, manifests), [])
@@ -175,12 +155,10 @@ class RealCardsApplyTests(Built):
         self.assertEqual(transcript.load(dj)["segments"], before)
 
     def test_waiting_answer_on_imported_revision_is_applied(self):
-        tj = self.jp.with_name("вторая.transcript.json")
+        tj = samples.load("waiting", self.jp.parent, self.audio)      # r3 ждёт «Применить», ревизия та же, что у пакета
         md = tj.with_suffix(".md")
         self.backend = "legacy_files"
-        transcript.save(legacy_result(self.audio), tj, md)
-        self.version = review_pack.build(tj, questions())["version"]
-        self.answer("r3", 1, jp=tj)                       # ждёт «Применить», ревизия та же, что у пакета
+        self.version = review_pack.manifest(tj)["version"]
         self.jp, self.md, self.pack = tj, md, review_pack.pack_dir(tj)
         entry = self.migrate()
         dj = entry["documents"]["json"]

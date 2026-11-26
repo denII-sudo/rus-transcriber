@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import import_legacy as IL  # noqa: E402
+import legacy_sample_loader as samples  # noqa: E402
 import paths  # noqa: E402
 import recordings  # noqa: E402
 import storage  # noqa: E402
@@ -189,11 +190,9 @@ class ConversionTests(Fixture):
             IL.legacy_conspect_markdown(broken)
 
     def test_file_saved_by_current_program_keeps_ids_and_runtime_fields(self):
-        """После переноса подтверждений голосов старый файл сохранён штатно: есть recording_id и ID слов."""
-        import transcript
-        md = self.side / "встреча.v2.transcript.md"
-        with mock.patch.object(transcript, "_refresh_conspects", return_value=None):
-            transcript.save(json.loads(self.tj.read_text(encoding="utf-8")), self.tj, md)
+        """После переноса подтверждений голосов старый файл сохранён штатно: есть recording_id и ID слов.
+        Файл — образец (Л-3.1): его один раз сохранила программа поверх `legacy_transcript`, образец заморожен."""
+        samples.load("saved", self.side, self.audio)
         saved = json.loads(self.tj.read_text(encoding="utf-8"))
         self.assertIn("recording_id", saved)
         ids = [w["word_id"] for s in saved["segments"] for w in s.get("words", [])]
