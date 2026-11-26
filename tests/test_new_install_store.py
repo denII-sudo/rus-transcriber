@@ -119,6 +119,17 @@ class InstallationStoreTests(unittest.TestCase):
         self.assertEqual((report["case"], report["ok"]), ("error", False))
         self.assert_untouched(before, report)
 
+    def test_selected_but_missing_store_is_refused_not_recreated(self):
+        self.write_config({"recording_backend": "sqlite", "asr_device": "GPU"})
+        before = (_digest(self.db), _digest(self.config))
+        for check_only in (False, True):
+            with self.subTest(check_only=check_only):
+                report = recordings.prepare_installation_store(check_only=check_only)
+                self.assertEqual((report["case"], report["ok"]), ("error", False))
+                self.assertIn("не найдена", report["message"])
+                self.assert_untouched(before, report)
+                self.assertFalse(self.db.exists())
+
     def test_unreadable_config_is_not_rewritten(self):
         for raw in (b"{ broken", b"[1, 2]"):
             with self.subTest(raw=raw):
