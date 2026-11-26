@@ -63,6 +63,17 @@ class ScreenSmallFixes(unittest.TestCase):
                 result = core_screen.recording_conspects("rec")
             self.assertEqual(result[0]["files"]["md"], str(real / "Заметка.md"))
 
+    def test_transcript_file_paths_keep_case_from_disk(self):
+        import workflow_page
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "МоиЗаписи"
+            real.mkdir()
+            (real / "Встреча.transcript.md").write_text("x", encoding="utf-8")
+            lowered = os.path.normcase(str(real / "Встреча.transcript.md"))
+            shown = workflow_page._shown_files({"markdown": lowered, "json": None})
+            self.assertEqual(shown["markdown"], str(real / "Встреча.transcript.md"))
+            self.assertIsNone(shown["json"])
+
     def test_page_has_local_time_helper_and_dark_theme(self):
         html = (ROOT / "workflow.html").read_text(encoding="utf-8")
         self.assertIn("getTimezoneOffset", html)
