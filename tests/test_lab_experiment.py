@@ -18,6 +18,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 LAB = ROOT / "lab"
 HAVE_LAB = (LAB / "lab_run.py").is_file()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_snapshot import folder_snapshot  # noqa: E402
 if HAVE_LAB:
     sys.path.insert(0, str(LAB))
     import lab_run  # noqa: E402
@@ -28,17 +30,6 @@ if HAVE_LAB:
 SECRET = "Тайнословие"           # «текст записи»: не должен попасть в сводку
 NAME = "Неизвестнов"            # «имя участника»
 EXPERIMENT = LAB / "experiments" / "models-arbitration.json"
-
-
-def snapshot(root):
-    """Состояние папки: путь -> (размер, сумма, время изменения)."""
-    out = {}
-    for p in sorted(Path(root).rglob("*")):
-        if p.is_file():
-            st = p.stat()
-            out[p.relative_to(root).as_posix()] = (st.st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
-                                                   st.st_mtime_ns)
-    return out
 
 
 def make_source(base):
@@ -237,7 +228,7 @@ class PrepareAndRun(unittest.TestCase):
         self.program = self.base / "program"
         self.program.mkdir()
         self.sandbox = self.base / "sandbox"
-        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.before = (folder_snapshot(self.data), folder_snapshot(self.audio))
         self.log = []
 
     def tearDown(self):
@@ -248,8 +239,8 @@ class PrepareAndRun(unittest.TestCase):
                                    log=self.log.append)
 
     def assert_source_unchanged(self):
-        self.assertEqual(snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
-        self.assertEqual(snapshot(self.audio), self.before[1], "папка с аудио изменилась")
+        self.assertEqual(folder_snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
+        self.assertEqual(folder_snapshot(self.audio), self.before[1], "папка с аудио изменилась")
 
     def test_prepare_copies_and_leaves_source_untouched(self):
         report = self.prepare("skip")
@@ -301,9 +292,9 @@ class PrepareAndRun(unittest.TestCase):
         try:
             writer.db.execute("UPDATE local_users SET display_name='ИЗ-ЖУРНАЛА'")
             self.assertGreater((self.data / "state.sqlite3-wal").stat().st_size, 0)
-            before = snapshot(self.data)
+            before = folder_snapshot(self.data)
             self.prepare()
-            self.assertEqual(snapshot(self.data), before,
+            self.assertEqual(folder_snapshot(self.data), before,
                              "при живом писателе папка данных не меняется (и -shm тоже)")
         finally:
             writer.close()
@@ -326,10 +317,10 @@ class PrepareAndRun(unittest.TestCase):
             writer.close()
         shutil.copyfile(keep / db.name, db)                      # состояние «после сбоя»: база + -wal, без -shm
         shutil.copyfile(keep / "state.sqlite3-wal", self.data / "state.sqlite3-wal")
-        before = snapshot(self.data)
+        before = folder_snapshot(self.data)
         self.assertNotIn("state.sqlite3-shm", before)
         self.prepare()
-        self.assertEqual(snapshot(self.data), before, "новый -shm не появился, ничего не изменилось")
+        self.assertEqual(folder_snapshot(self.data), before, "новый -shm не появился, ничего не изменилось")
         self.assertEqual(self.copied_method(), "bytes")
         self.assertEqual(self.copied_user_name(), "ПОСЛЕ-СБОЯ")
 
@@ -469,7 +460,7 @@ class TrialOnAudioFile(unittest.TestCase):
         self.program.mkdir()
         self.sandbox = self.base / "sandbox"
         self.log = []
-        self.before = (snapshot(self.data), snapshot(self.audio), snapshot(self.trial.parent))
+        self.before = (folder_snapshot(self.data), folder_snapshot(self.audio), folder_snapshot(self.trial.parent))
         self.experiment = self.base / "trial-experiment.json"
         self.experiment.write_text(json.dumps({
             "schema": lab_spec.SCHEMA, "name": "trial",
@@ -527,9 +518,9 @@ class TrialOnAudioFile(unittest.TestCase):
             for forbidden in (TRIAL_NAME, f"{TRIAL_NAME}.wav", TRIAL_DIR, str(self.base),
                               json.dumps(str(self.base))[1:-1], "четыре", "шесть", "Неизвестнов"):
                 self.assertNotIn(forbidden, text, f"{path.name}: {forbidden}")
-        self.assertEqual(snapshot(self.data), self.before[0])
-        self.assertEqual(snapshot(self.audio), self.before[1])
-        self.assertEqual(snapshot(self.trial.parent), self.before[2], "пробный файл только читается")
+        self.assertEqual(folder_snapshot(self.data), self.before[0])
+        self.assertEqual(folder_snapshot(self.audio), self.before[1])
+        self.assertEqual(folder_snapshot(self.trial.parent), self.before[2], "пробный файл только читается")
 
     def test_add_audio_to_existing_sandbox_and_run_only_it(self):
         lab_sandbox.prepare(self.sandbox, self.data, self.program, "skip", env={}, log=self.log.append)
@@ -553,7 +544,7 @@ class TrialOnAudioFile(unittest.TestCase):
         self.assertEqual(analysis["human"]["not_measured"], lab_analyze.NO_HUMAN)
 
         # копия изменилась после добавления — контрольная сумма перед прогоном не сходится, пара не считается
-        self.assertEqual(snapshot(self.trial.parent), self.before[2], "исходный файл только читается")
+        self.assertEqual(folder_snapshot(self.trial.parent), self.before[2], "исходный файл только читается")
         write_wav(copy_path, seconds=2.0)
         sandbox, marker, units_doc = lab_sandbox.load_sandbox(self.sandbox, env={})
         spec, sha = lab_spec.load(self.experiment)
@@ -601,7 +592,7 @@ class TrialOnAudioFile(unittest.TestCase):
         upath.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         with self.assertRaises(lab_sandbox.SandboxError):
             lab_sandbox.load_sandbox(self.sandbox, env={})
-        self.assertEqual(snapshot(self.trial.parent)[self.trial.name], self.before[2][self.trial.name],
+        self.assertEqual(folder_snapshot(self.trial.parent)[self.trial.name], self.before[2][self.trial.name],
                          "исходный файл только читается")
 
 
@@ -1093,7 +1084,7 @@ class WorkSandbox(unittest.TestCase):
         self.program = self.base / "program"
         self.program.mkdir()
         self.sandbox = self.base / "sandbox"
-        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.before = (folder_snapshot(self.data), folder_snapshot(self.audio))
         self.log = []
 
     def tearDown(self):
@@ -1105,8 +1096,8 @@ class WorkSandbox(unittest.TestCase):
                                    work=True, **kw)
 
     def assert_source_unchanged(self):
-        self.assertEqual(snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
-        self.assertEqual(snapshot(self.audio), self.before[1], "папка с аудио изменилась")
+        self.assertEqual(folder_snapshot(self.data), self.before[0], "настоящая папка данных изменилась")
+        self.assertEqual(folder_snapshot(self.audio), self.before[1], "папка с аудио изменилась")
 
     def manifest(self):
         s = lab_sandbox.real(self.sandbox)
@@ -1182,7 +1173,7 @@ class WorkSandbox(unittest.TestCase):
         (outside / "cccccccccccc" / RUN_1).write_text("{}", encoding="utf-8")
         if not link_dir(self.hyp / "cccccccccccc", outside / "cccccccccccc"):
             self.skipTest("не удалось создать ссылку на папку")
-        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.before = (folder_snapshot(self.data), folder_snapshot(self.audio))
         self.prepare()
         self.assertNotIn(f"cccccccccccc/{RUN_1}", self.copies())
         self.assertEqual(len(self.copies()), 3)
@@ -1228,7 +1219,7 @@ class WorkSandbox(unittest.TestCase):
     def test_missing_hypotheses_folder_is_not_created(self):
         import shutil
         shutil.rmtree(self.hyp)
-        self.before = (snapshot(self.data), snapshot(self.audio))
+        self.before = (folder_snapshot(self.data), folder_snapshot(self.audio))
         report = self.prepare()
         self.assertFalse(self.hyp.exists())
         self.assert_source_unchanged()
@@ -1240,9 +1231,9 @@ class WorkSandbox(unittest.TestCase):
         writer = storage.open_store(self.data / "state.sqlite3")
         try:
             writer.db.execute("UPDATE local_users SET display_name='ИЗ-ЖУРНАЛА'")
-            before = snapshot(self.data)
+            before = folder_snapshot(self.data)
             self.prepare()
-            self.assertEqual(snapshot(self.data), before, "при живом писателе папка данных не меняется")
+            self.assertEqual(folder_snapshot(self.data), before, "при живом писателе папка данных не меняется")
         finally:
             writer.close()
         marker = json.loads((lab_sandbox.real(self.sandbox) / lab_sandbox.MARKER).read_text(encoding="utf-8"))
