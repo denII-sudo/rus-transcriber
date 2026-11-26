@@ -1,7 +1,7 @@
 """Длинная запись частями по паузе с изложением предыдущих частей (РАР-7, этап 7.4в).
 
-Запись до 10 000 слов — как раньше: одно задание версии 4 без поля `parts`, запрос и хэш
-побайтно прежние. Длиннее — N = ceil(слов / 10 000) частей (не больше 6), граница каждой —
+Запись до 10 000 слов — как раньше: одно задание версии 4 без поля `parts`, задание и хэш
+побайтно прежние (текст запроса намеренно изменён в Ч-0а — см. GOLDEN_PROMPT_SHA). Длиннее — N = ceil(слов / 10 000) частей (не больше 6), граница каждой —
 самая длинная пауза между пунктами в окне ±10 % размера части у цели k·W/N, без превышения
 10 000 слов в части; без пауз — граница пункта, ближайшая к цели. Части уходят по очереди,
 к части k прилагается изложение частей 1…k−1 (тексты принятых разделов), сокращённое
@@ -41,9 +41,12 @@ GOLDEN_TASK = json.loads(
     '"uncertain": false, "word_id": "w4"}]}')
 GOLDEN_HASH = "270df125fb3e297ad6083a3e5b7226740c64266df31e4abaa065455fdc9f71fd"
 GOLDEN_FINGERPRINT = "55fc2935bff7d2aec338d0f32036216afa2f8652fcbc295cfa7f17c8eeeb3409"
-GOLDEN_PROMPT_SHA = "80b741b7583f41fca1383dcf0253d089af6db54fa0f7a5bb10487b24bdad3219"
+# Текст запроса намеренно изменён в Ч-0а (однозначные правила раздела и also, число слов к концу пунктов);
+# задание и его хэш — прежние. Хэш запроса до Ч-0а: 80b741b7583f41fca1383dcf0253d089af6db54fa0f7a5bb10487b24bdad3219.
+GOLDEN_PROMPT_SHA = "a89d0a7dbbd5b799dda3a7756b1b07c6f6874dc186623d6d95963adb062f02ba"
 # Запись 5 000 + 4 990 слов через базу (prepare_request ниже без пауз): текст запроса на main 55248e9.
-GOLDEN_9990_PROMPT_SHA = "f705968eccf495882db6798333c664c748d1281fbf01aba9ecf7d56a94f2227c"
+# До Ч-0а: f705968eccf495882db6798333c664c748d1281fbf01aba9ecf7d56a94f2227c.
+GOLDEN_9990_PROMPT_SHA = "a64ab2b42696f23890fd3cf61d97f7184d6bb52e4f289e879f0351091b87d362"
 
 
 def prompt_of(task, **kwargs):
@@ -169,9 +172,11 @@ class PartTaskTests(unittest.TestCase):
         crossing = {"source_revision": 3, "sections": [{"from": 1, "to": 3, "text": "x"}]}
         with self.assertRaises(ValueError):
             model_tasks.validate(first, crossing, current_revision=3)
+        # Отсылка за пределы части ответ не отвергает (Ч-0а): она отбрасывается с отметкой.
         outside = {"source_revision": 3, "sections": [{"from": 1, "to": 2, "text": "x", "also": [[5, 5]]}]}
-        with self.assertRaises(ValueError):
-            model_tasks.validate(first, outside, current_revision=3)
+        dropped = model_tasks.validate(first, outside, current_revision=3)
+        self.assertEqual(dropped["sections"][0]["also"], [])
+        self.assertEqual([(n["action"], n["reason"]) for n in dropped["also_adjusted"]], [("dropped", "outside")])
         second = model_tasks.part_task(self.task, 2)
         early = {"source_revision": 3, "sections": [{"from": 1, "to": 6, "text": "x"}]}
         with self.assertRaises(ValueError):

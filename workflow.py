@@ -1207,9 +1207,14 @@ def _completed_result(store, request):
             "недоступен. Решите конфликт на экране программы (rt.py screen) или освободите файл и повторите "
             "workflow_execute_model — в облако повторно ничего не уйдёт.") from ex
     total = len(_part_bounds(request["model_task"]))
-    return {"request_id": request["request_id"], "state": "completed",
-            "model": f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}",
-            "part_count": total, "completed_parts": total}
+    result = {"request_id": request["request_id"], "state": "completed",
+              "model": f"{llm_provider.PROVIDER_ID}/{llm_provider.MODEL_ID}",
+              "part_count": total, "completed_parts": total}
+    adjusted = (request.get("model_result") or {}).get("also_adjusted")
+    if adjusted:
+        # Отсылки «См. также», урезанные или отброшенные при приёме ответа (Ч-0а): ответ из-за них не отвергнут.
+        result["also_adjusted"] = adjusted
+    return result
 
 
 def _limit_problem(request, words, *, limit=None, unsplit=False):
