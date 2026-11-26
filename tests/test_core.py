@@ -572,6 +572,33 @@ class Settings(unittest.TestCase):
         saved = settings.load_overrides()
         self.assertEqual({k: saved.get(k) for k in chosen}, chosen)
         self.assertEqual(saved["default_group"], "example")
+
+    def _write_raw(self, data):
+        paths.CONFIG_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_wrong_type_value_survives_other_writes(self):
+        self._write_raw({"schema_version": paths.DATA_SCHEMA, "asr_batch": "4"})
+        self.assertEqual(settings.load_config()["asr_batch"], settings.DEFAULTS["asr_batch"])
+        settings.update(default_group="example")
+        saved = json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved["asr_batch"], "4")
+        self.assertEqual(saved["default_group"], "example")
+        self.assertEqual(settings.load_config()["asr_batch"], settings.DEFAULTS["asr_batch"])
+        settings.save_overrides({"default_group": "other"})
+        self.assertEqual(json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8"))["asr_batch"], "4")
+
+    def test_valid_write_replaces_wrong_type_value(self):
+        self._write_raw({"schema_version": paths.DATA_SCHEMA, "asr_batch": "4"})
+        settings.update(asr_batch=8)
+        self.assertEqual(json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8"))["asr_batch"], 8)
+
+    def test_wrong_type_new_value_not_written(self):
+        settings.save_overrides({"default_group": "example"})
+        settings.save_overrides({"asr_batch": "4"})
+        self.assertNotIn("asr_batch", json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8")))
+        with self.assertRaises(ValueError):
+            settings.update(asr_batch="4")
+        self.assertNotIn("asr_batch", json.loads(paths.CONFIG_FILE.read_text(encoding="utf-8")))
         settings.update(asr_batch=16)
         settings.update(asr_batch=settings.DEFAULTS["asr_batch"])
         self.assertEqual(settings.load_overrides()["asr_batch"], settings.DEFAULTS["asr_batch"])

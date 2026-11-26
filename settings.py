@@ -120,7 +120,14 @@ def _save_overrides_locked(overrides, explicit=()):
     keep = set(explicit)
     diff = {k: v for k, v in usable.items()
             if k != "schema_version" and (k in keep or DEFAULTS.get(k, object()) != v)}
-    out = {"schema_version": paths.DATA_SCHEMA, **diff}
+    # Неверное значение, уже лежащее в файле, при чужой записи не теряем: чтение берёт умолчание,
+    # человек сам увидит и исправит. Новое верное значение того же ключа заменяет его (diff ниже).
+    preserved = {k: v for k, v in load_overrides().items()
+                 if k in CONFIG_TYPES and k not in usable and not _valid_config_value(k, v)}
+    for key in preserved:
+        print(f"config.json: значение {key} с неверным типом оставлено в файле как есть",
+              file=sys.stderr)
+    out = {"schema_version": paths.DATA_SCHEMA, **diff, **preserved}
     paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=paths.DATA_DIR,
                                      prefix="config.", suffix=".tmp", delete=False) as f:
