@@ -507,15 +507,17 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
                 if isinstance(row, dict) and key in row:
                     row[key] = _utc_text(row[key])
         status = {item["id"]: item.get("status") or "open" for item in review.get("review") or []}
-        # Р-4 (решение владельца 26.11.2026, «пометить их ремонтом»): ждущий ответ, место которого уже закрыто, —
-        # событие «место уже решено» без попытки применить; ответы открытых мест ждут человека, как прежде
+        # Р-4 (решение владельца 26.11.2026, «пометить их ремонтом»): сохранённый и не применённый ответ (saved),
+        # место которого уже закрыто, — событие «место уже решено» без попытки применить; ответы открытых мест
+        # ждут человека, как прежде. Отмену (revert_pending) и новый ответ поверх применённого (pending_new)
+        # не помечать (Ф212-2): их состояние от события не зависит, они остались бы ждущими
         marked = 0
         probe = {"answers": answers, "applied_answers": applied, "application_events": events, "undo_snapshots": {},
                  "rejected": review["rejected"]}
         now = time.strftime(ANSWER_TS_FORMAT, time.gmtime())
         for aid, row in RP.answer_states_of(probe, manifest, outcome_details=False).items():
             answer = answers[aid]
-            if (RP.rebuild_group(row["state"]) == "waiting" and status.get(aid) in CLOSED_STATUSES and
+            if (row["state"] == "saved" and status.get(aid) in CLOSED_STATUSES and
                     answer.get("kind") not in ("skip", "repeat") and applied.get(aid) != RP._sig(answer)):
                 events.append({"id": aid, "version": answer.get("version"), "answer_ts": answer.get("ts"),
                                "answer_source": answer.get("source"), "answer_sig_sha256": RP._sig_hash(answer),
@@ -1329,7 +1331,8 @@ def main(argv=None):
     status = write_artifacts(a.out, plan, report, a.command, verification) if a.out else _status(a.command, report, None)
     print(_summary(report))
     print(f"статус: {status}")
-    return 0 if status in ("checked", "verified_copy") and         not any(e["status"] in ("error", "unknown_pack_keys") for e in report) else 1
+    failed = any(e["status"] in ("error", "unknown_pack_keys") for e in report)
+    return 0 if status in ("checked", "verified_copy") and not failed else 1
 
 
 if __name__ == "__main__":

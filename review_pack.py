@@ -1470,8 +1470,8 @@ def decisions(json_path):
             rep["unanswered"].append(aid)
             continue
         if legacy_decided(store, aid, a):
-            # Р-4: место решено до переноса — ответ неизвестного автора не применяется от имени человека
-            rep.setdefault("legacy_decided", []).append(aid)
+            # Р-4: место решено до переноса — ответ неизвестного автора не применяется от имени человека;
+            # исход already_decided в отчёте «Применить» берётся из сохранённого состояния ответа
             continue
         relation = over_applied(a, applied.get(aid))
         if relation == "applied" and confirms_check(a, events):
@@ -1579,13 +1579,14 @@ def decisions(json_path):
 
 def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}. Отрицание — и после применения (место
-    остаётся с подсказкой, применённая правка не трогается)."""
+    остаётся с подсказкой, применённая правка не трогается). Ответ с пометкой переноса «место уже решено»
+    (Р-4, legacy_decided) не применяется, как и в decisions."""
     import freeform
     store = _read_answers(json_path, {"answers": {}})
     items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
     applied = _applied_map(store)
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and
-            answer_is_current(a, items.get(aid)) and
+            answer_is_current(a, items.get(aid)) and not legacy_decided(store, aid, a) and
             (aid not in applied or freeform.negative_answer(a.get("text")))}
 
 

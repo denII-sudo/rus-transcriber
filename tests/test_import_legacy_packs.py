@@ -234,6 +234,55 @@ class TransferTests(PackFixture):
         self.assertEqual(states["r-edited"]["state"], "already_decided")
         self.assertEqual(review_pack.check_rebuild(entry["documents"]["json"])["waiting"], [])
 
+    def test_marked_free_answer_is_not_applied_and_apply_repeats(self):
+        """Ф212-1: старый свободный ответ («свой текст») без автора на закрытом месте помечен «место уже решено».
+        «Применить» его не трогает: пометка остаётся последним событием, слова не меняются, повторное «Применить»
+        не отказывает «неизвестного происхождения» (было: попытка применения поверх пометки и возврат Ф207-1)."""
+        answers = self.answers()
+        answers.pop("r-time")
+        answers["r-edited"] = {"id": "r-edited", "version": VERSION, "source": "local", "ts": AFTER,
+                               "kind": "free", "text": "месяцы"}
+        self.write_pack(answers=answers)
+        self.init_db()
+        entry = self.apply()
+        rid, jp = entry["recording_id"], entry["documents"]["json"]
+        self.assertNotIn("r-edited", review_pack.free_answers(jp))
+        import core
+        before = self.current(rid)["transcript"]
+        for _ in range(2):
+            report = core.apply_answers("recording:" + rid)
+            self.assertEqual({o["id"]: o["outcome"] for o in report["outcomes"]}["r-edited"], "already_decided")
+        after = self.current(rid)["transcript"]
+        self.assertEqual((after["revision"], after["payload"]), (before["revision"], before["payload"]))
+        state = recordings.read_review_pack_state(jp)
+        self.assertEqual([(e["action"], e["outcome"]) for e in state["application_events"] if e["id"] == "r-edited"],
+                         [(review_pack.LEGACY_DECIDED_ACTION, "already_decided")])
+        self.assertNotIn("r-edited", state["applied_answers"])
+
+    def _not_marked_over_applied(self, answer, expected_state):
+        """Ф212-2: пометку получает только сохранённый ответ (saved). Ответ поверх применённого на закрытом месте
+        (неприменённая отмена — revert_pending, новый ответ — pending_new) не помечается: его состояние от события
+        не зависит, с пометкой он остался бы ждущим, а «Применить» его пропускал бы."""
+        answers = self.answers()
+        for aid in ("r-time", "r-edited"):
+            answers.pop(aid)
+        answers["r-ok"] = {"id": "r-ok", "version": VERSION, "source": "local", "ts": AFTER, **answer}
+        self.write_pack(answers=answers, applied_answers={"r-ok": ["option", 0, None], "r-ambig": ["free", None, "да"]})
+        self.init_db()
+        entry = self.apply()
+        rid, jp = entry["recording_id"], entry["documents"]["json"]
+        stats = self.current(rid)["transcript"]["payload"]["quality"]["migration"]["pack_state"]
+        self.assertEqual(stats["already_decided_marked"], 0)
+        state = recordings.read_review_pack_state(jp)
+        self.assertFalse([e for e in state["application_events"] if e.get("action") == review_pack.LEGACY_DECIDED_ACTION])
+        self.assertEqual(review_pack.answer_states(jp)["r-ok"]["state"], expected_state)
+
+    def test_unapplied_revert_on_closed_place_is_not_marked(self):
+        self._not_marked_over_applied({"kind": "revert"}, "revert_pending")
+
+    def test_new_answer_over_applied_on_closed_place_is_not_marked(self):
+        self._not_marked_over_applied({"kind": "option", "option": 1}, "pending_new")
+
     def test_waiting_answer_without_author_is_refused(self):
         """Ждущий старый ответ без автора не применяется вслепую: штатная защита «Применить» требует
         подтверждения (Ф207-1). Сверку ревизий проверяют тесты карточек настоящего вида (Ф207-5,
