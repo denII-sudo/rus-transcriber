@@ -19,6 +19,8 @@
     python rt.py screen [--port 8766]          # локальный экран в браузере (запуск, состояние, резерв)
     python rt.py workflow-list [--limit 20]    # последние запросы workflow
     python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
+    python rt.py db-init [--check]           # базы нет — создать и выбрать; есть — проверить чтением и выбрать;
+        # --check — только сказать, что будет; базу и настройки не меняет
     python rt.py db-restore РЕЗЕРВ.sqlite3 [--dest ПУТЬ] [--root ID=ПУТЬ]
         # мастер восстановления: новые корни и установка, документы формируются заново,
         # прежняя база сохраняется рядом; спрашивает подтверждение на клавиатуре
@@ -244,6 +246,7 @@ def build():
     vrp = sub.add_parser("voice-refresh-plan"); vrp.add_argument("--group", default="")
     vbk = sub.add_parser("voice-backup"); vbk.add_argument("--group", default="")
     dbk = sub.add_parser("db-backup"); dbk.add_argument("dest")
+    dbi = sub.add_parser("db-init"); dbi.add_argument("--check", action="store_true")
     dbr = sub.add_parser("db-restore"); dbr.add_argument("backup")
     dbr.add_argument("--dest", default="", help="куда восстановить; по умолчанию текущая база состояния")
     dbr.add_argument("--root", action="append", default=[], metavar="ID=ПУТЬ",
@@ -307,6 +310,17 @@ def run(a):
               "Копия неактивна; для использования нужен rebind_restored_copy.")
         if warning:
             say("\n".join(warning))
+    elif c == "db-init":
+        import recordings
+        import sqlite3
+        import storage
+        try:
+            report = recordings.prepare_installation_store(check_only=a.check)
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:      # причина, не трассировка
+            report = {"ok": False, "case": "error", "changed": [],
+                      "message": f"База записей не готова: {type(ex).__name__}: {ex}."}
+        out(report)
+        return 0 if report["ok"] else 1
     elif c == "db-restore":
         return cmd_db_restore(a)
     elif c == "bench-db":

@@ -110,6 +110,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 - проверит, что в пути нет кириллицы, папка не лежит в OneDrive и на диске хватает места (около 8 ГБ);
 - поставит окружение Python и библиотеки; все кэши (pip, модели, компиляция под видеокарту) окажутся внутри папки программы;
 - покажет, какие устройства видит OpenVINO. Нужен хотя бы `CPU`; `GPU` (Arc) желателен для ускорения, `NPU` не обязателен — на Meteor Lake он для GigaAM не используется;
+- подготовит базу записей `<папка данных>\state.sqlite3` (`rt.py db-init`): если её нет — создаст пустую, если есть — только проверит, что она открывается, и не изменит; в обоих случаях выберет хранение записей в базе. Если программа уже была переключена на базу, а базы нет, пустую не создаст: попросит восстановить базу из резерва (`rt.py db-restore`). Если база не открывается, её не удалось создать или `config.json` не читается, ничего не чинит и завершается с кодом 2; посмотреть, что сделал бы шаг, не меняя базу и настройки, — `rt.py db-init --check`;
 - спросит токен Hugging Face (ввод скрыт) и проверит, что он рабочий и что условия pyannote приняты;
 - пропишет сервер в настройки приложения ИИ-агента (например, Claude Desktop), предварительно сделав резервную копию файла настроек. Claude Desktop из Microsoft Store хранит их в `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`, обычная установка — в `%APPDATA%\Claude\claude_desktop_config.json`; установщик пишет во все найденные места.
 
@@ -209,9 +210,9 @@ $env:HF_TOKEN = "hf_ваш_токен"
 `<папка>` — это `%LOCALAPPDATA%\rus-transcriber` или путь из `-Target`. Если переменная `HF_HOME` уже задана в системе, модели Hugging Face будут храниться там.
 
 ## Как пользоваться
-**Сохранённый процесс (режим SQLite):** нужна явно созданная база
-(`initialize_recording_store`) и выбранный режим `recording_backend = "sqlite"`
-(`set_recording_backend`). Тогда `start_workflow` (или `rt.py workflow-start`)
+**Сохранённый процесс (режим SQLite):** нужна созданная база и выбранный режим
+`recording_backend = "sqlite"`. Их готовит установщик (шаг «База записей»: базы нет — создаёт, есть — проверяет и
+выбирает) или команда `rt.py db-init`. Тогда `start_workflow` (или `rt.py workflow-start`)
 сохраняет процесс и запускает обработку без голосовых профилей; при `require_conspect=true` OpenCode автоматически вызывает
 OpenAI `gpt-6-luna` без открытого чата, **только при явном согласии**: по умолчанию
 `allow_cloud_model=false`, текст никуда не уходит. Согласие — `allow_cloud_model=true` в MCP,
@@ -722,7 +723,7 @@ gigaam 0.2.0 requires onnxruntime, which is not installed
     `voice-quality-policy`, `voice-auto-learn`, `voice-backup` (изменяющие команды спрашивают согласие в терминале);
   - сохранённый процесс и локальный экран: `workflow-start`, `workflow-status`, `workflow-list`, `workflow-questions`,
     `workflow-policy`, `workflow-confirm`, `workflow-abandon`, `workflow-task`, `workflow-part`, `workflow-part-result`,
-    `workflow-result`, `workflow-execute`, `screen [--port 8766] [--hours 6]`, `db-backup`, `db-restore`;
+    `workflow-result`, `workflow-execute`, `screen [--port 8766] [--hours 6]`, `db-init [--check]`, `db-backup`, `db-restore`;
   - данные: `export`, `import`, `delete-group`, `cleanup`, `migrate`, `audit`, `approve`.
 - Разбор сомнительных мест и конспект: логика — в `core.py`; формулировку вопросов, выбор между вариантами и
   текст конспекта делает клиент с моделью, а из командной строки доступны сборка и страница карточек, применение
@@ -862,7 +863,7 @@ Microsoft Store) подменяются скрытой папкой внутри
 - То же из командной строки: `python rt.py export|import|delete-group|cleanup|audit` (`audit` ищет абсолютные пути);
   опасные действия спрашивают согласие в терминале (см. «Подтверждение опасных действий человеком»).
 - Установщик: `-DataDir <путь>` задаёт папку данных (записывается в настройки сервера как `RUS_TRANSCRIBER_DATA`,
-  если запись настроек не отключена `-SkipClaudeConfig`), повторная установка данные не трогает; `-Uninstall` отдельно спрашивает про программу (по умолчанию да) и про
+  если запись настроек не отключена `-SkipClaudeConfig`), повторная установка данные не трогает (только создаёт базу записей, если её нет, и выбирает её); `-Uninstall` отдельно спрашивает про программу (по умолчанию да) и про
   данные (по умолчанию нет). Пример словаря — `examples\group.example\`.
 - Проверки: `python -B -m unittest discover -s tests` в изолированной папке (см. «Проверка качества и тесты»).
   Тесты работают только во временной папке данных (каждый модуль задаёт её до первого импорта; `test_data_safety.py`
@@ -905,7 +906,7 @@ Microsoft Store) подменяются скрытой папкой внутри
 | `voice_quality_policy_default` | `warn` (по умолчанию) — только предупреждать; `reject_clipping` — не учитывать источник с клиппингом |
 | `confirm_mode` | `auto` (окно, иначе терминал), `dialog`, `terminal`, `off` — подтверждение опасных действий человеком |
 | `confirm_timeout_sec` | сколько секунд ждать ответа в окне подтверждения (по умолчанию 180); нет ответа — отказ |
-| `recording_backend` | где хранить результаты: `legacy_files` (по умолчанию, файлы рядом с аудио) или `sqlite` (база `state.sqlite3`, нужна созданная база; переключение — `set_recording_backend`, старые записи не переносятся) |
+| `recording_backend` | где хранить результаты: `legacy_files` (умолчание в коде, файлы рядом с аудио) или `sqlite` (база `state.sqlite3`, нужна созданная база; переключение — `set_recording_backend`, старые записи не переносятся). Установщик выбирает `sqlite` сам (шаг «База записей») |
 | `voices` | `false` — не проверять голоса (то же, что `voices=false` в `start_transcription`) |
 | `review_local` | `true` — включить голосовой разбор (`start_voice_review`, `speak`, `play_clip`, `listen_reply`) |
 | `review_missed` | `false` — не предупреждать о возможно пропущенной речи (по умолчанию предупреждения включены) |

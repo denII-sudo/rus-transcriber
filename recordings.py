@@ -1038,3 +1038,95 @@ def _ensure_ids(transcript, recording_id):
                 ident = str(uuid.uuid5(namespace, f"word:{segment_index}:{word_index}"))
                 word["word_id"] = ident
             seen_words.add(ident)
+
+
+# --- База записей установки (шаг «База записей» install.ps1, `rt.py db-init`) ---
+# Явная операция, которую запускает человек (установщиком или командой); сервер и обычные инструменты базу
+# по-прежнему не создают. Это не перенос: создаётся пустая база, файлы записей не читаются и не меняются.
+
+
+def _config_readable():
+    """config.json нет или он читается как словарь; иначе дописывание выбора стёрло бы остальные настройки."""
+    import paths
+    p = Path(paths.CONFIG_FILE)
+    if not p.exists():
+        return True
+    try:
+        return isinstance(json.loads(p.read_text(encoding="utf-8-sig")), dict)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def prepare_installation_store(check_only=False):
+    """Базы нет — создать её штатно и выбрать `sqlite`; база есть — не трогать, только выбрать `sqlite`.
+
+    Выбран `sqlite`, а базы нет — отказ (`ok=False`): это потеря базы, пустая скрыла бы её.
+
+    Существующая база открывается только чтением и проверяется (схема, единственная активная установка);
+    не открывается — `ok=False`, ничего не чинится и не создаётся. Ключ `case`: `created` — база создана и
+    выбрана; `selected` — база была, выбрано хранение в ней; `ready` — база была и уже выбрана; `error` —
+    база записей не готова (установщик: код 2), причина в `message`. check_only=True — только сказать,
+    что было бы сделано; базу и настройки не меняет.
+    """
+    import paths
+    import settings
+    db = Path(paths.STATE_DB)
+    result = {"database": str(db), "check_only": bool(check_only), "changed": []}
+
+    def done(case, ok, message):
+        result.update(case=case, ok=ok, message=message)
+        try:
+            result["recording_backend"] = settings.recording_backend()
+        except ValueError:
+            result["recording_backend"] = None
+        return result
+
+    def failed(what, ex):
+        return done("error", False, f"База записей не готова: {what} ({type(ex).__name__}: {ex}).")
+
+    if not _config_readable():
+        return done("error", False, f"База записей не готова: {paths.CONFIG_FILE} не читается. Исправьте файл (в нём и "
+                    "выбор теста скорости) и запустите `rt.py db-init` снова. Ничего не изменено.")
+    try:
+        selected = settings.recording_backend() == "sqlite"
+    except ValueError:
+        selected = False                  # неверное значение — будет заменено выбором базы
+    created = False
+    if db.exists():
+        try:
+            store = open_store(db, readonly=True)
+            try:
+                store.current_identity()
+            finally:
+                store.close()
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:
+            return failed(f"{db} не открывается; база не изменена, новая не создана", ex)
+        if selected:
+            return done("ready", True, f"База записей есть: {db}. Записи хранятся в базе.")
+        if check_only:
+            return done("selected", True, f"База записей есть: {db}; будет выбрано хранение в ней.")
+    else:
+        if selected:                      # программа уже на базе, а файла нет — признак потери, не новая установка
+            return done("error", False, f"База записей не найдена ({db}), хотя программа переключена на неё. "
+                        "Восстановите базу из резерва (`rt.py db-restore`). Новая пустая база не создаётся, "
+                        "чтобы не скрыть потерю; настройки не изменены.")
+        if check_only:
+            return done("created", True, f"Будет создана база записей: {db}.")
+        try:
+            initialize_store(db, display_name="").close()
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:
+            return failed(f"не удалось создать {db}", ex)
+        result["changed"].append("state.sqlite3")
+        created = True
+    # Выбор пишется только в config.json: база уже проверена чтением (или только что создана), а
+    # set_recording_backend открыл бы её на запись и при остаточном -wal слил бы журнал в основной файл.
+    try:
+        if not SQLITE_RUNTIME_READY:
+            raise RuntimeError("SQLite backend is unavailable until all recording writers are routed")
+        settings.update(recording_backend="sqlite")
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, storage.StorageError) as ex:
+        return failed(f"база {db} есть, но выбрать её не удалось; запустите `rt.py db-init` снова", ex)
+    result["changed"].append("config.json")
+    if created:
+        return done("created", True, f"База записей создана: {db}. Записи будут храниться в базе.")
+    return done("selected", True, f"База записей есть: {db}. Выбрано хранение записей в ней; база не изменена.")
