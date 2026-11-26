@@ -1,9 +1,9 @@
 """Замена ответа, «Пропустить» и исход каждого ответа карточек — в обоих режимах хранения.
 
 Синтетическая стенограмма из двух слов («тест», «слово») у выдуманного Глеба, две карточки.
-Правило до появления полной замены: применённый ответ другим ответом не заменяется —
-новый ответ сохраняется и ждёт, пока прежний не отменят. Пропуск и отрицание оставляют
-применённый ответ. У каждого сохранённого ответа ровно один исход, и состояние, которое
+Правило замены (К-В3): новый ответ поверх применённого со снимком отмены заменяет его одним
+«Применить» — прежний снимается по снимку, новый вносится; без снимка новый ждёт (В-1).
+Пропуск и отрицание оставляют применённый ответ. У каждого сохранённого ответа ровно один исход, и состояние, которое
 показывает страница, совпадает с отчётом применения.
 """
 import atexit
@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -161,36 +162,52 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
         self.assertEqual(self.outcomes(rep)["r1"], "applied")
         return self.words(jp)
 
-    def test_new_answer_over_applied_waits_and_keeps_previous(self):
+    def test_new_answer_over_applied_replaces_it(self):
+        """К-В3, было — новый ответ ждал (pending_new) и рецепт из четырёх шагов; стало — одно «Применить»
+        снимает прежний по снимку и вносит новый; у нового свой снимок — его можно отменить."""
         cases = {
-            "кнопка → кнопка": ({"option": 0}, {"option": 1}),
-            "кнопка → текст": ({"option": 0}, {"text": "пятое"}),
-            "текст → кнопка": ({"text": "пятое"}, {"option": 1}),
-            "текст → текст": ({"text": "пятое"}, {"text": "шестое"}),
-            "кнопка → рекомендация": ({"option": 1}, {"kind": "recommended"}),
-            "кнопка → оставить человеку": ({"option": 0}, {"kind": "human"}),
+            "кнопка → кнопка": ({"option": 0}, {"option": 1}, "applied", "третье"),
+            "кнопка → текст": ({"option": 0}, {"text": "пятое"}, "applied", "пятое"),
+            "текст → кнопка": ({"text": "пятое"}, {"option": 1}, "applied", "третье"),
+            "текст → текст": ({"text": "пятое"}, {"text": "шестое"}, "applied", "шестое"),
+            "кнопка → рекомендация": ({"option": 1}, {"kind": "recommended"}, "applied", "другое"),
+            "кнопка → оставить человеку": ({"option": 0}, {"kind": "human"}, "left_for_human", "тест"),
         }
         # Файловый режим (legacy_files) уходит: в нём остаются два случая (кнопка и текст поверх применённого); sqlite — все шесть.
         files_cases = ("кнопка → кнопка", "текст → текст")
         for backend in BACKENDS:
-            for name, (first, second) in cases.items():
+            for name, (first, second, outcome, word) in cases.items():
                 if backend == "legacy_files" and name not in files_cases:
                     continue
                 with self.subTest(backend=backend, case=name), answer_files(backend) as (jp, md, version):
                     applied_words = self.first(jp, md, version, first)
                     self.assertNotEqual(applied_words[0], "тест")
-                    before = transcript.load(jp)
                     self.save(jp, version, **second)
+                    self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "pending_new")
+                    self.assertNotIn("Подготовить отмену", review_pack.answer_states(jp)["r1"]["why"])
                     rep = self.apply(jp, md)
-                    self.assertEqual(self.outcomes(rep)["r1"], "pending_new")
-                    after = transcript.load(jp)
-                    self.assertEqual(after["segments"], before["segments"], "прежняя правка снята")
-                    self.assertEqual(after["review"], before["review"])
+                    self.assertEqual(self.outcomes(rep)["r1"], outcome)
+                    self.assertEqual(self.words(jp), [word, "слово"])
+                    self.assertEqual(rep["replaced"], ["r1"])
                     self.assertFalse(rep["reverted"])
-                    self.assertFalse(rep.get("changed"))
+                    self.assertIn(review_pack.REPLACED, rep["outcomes"][0]["detail"])
+                    edits = transcript.load(jp)["edits"]
+                    self.assertTrue(edits and all(e.get("reverted") for e in edits[:1]), "прежняя правка не снята")
+                    # журнал: прежний применён один раз, новый — «заменил» и (кроме «оставить человеку») «применён»
                     events = [e for e in self.pack_state(jp).get("application_events") or [] if e["id"] == "r1"]
-                    self.assertEqual([e["outcome"] for e in events].count("applied"), 1, "ложное «применён»")
-                    self.assertIn("Подготовить отмену", rep["outcomes"][0]["why"])
+                    self.assertEqual([e["outcome"] for e in events].count("replaced"), 1)
+                    self.assertEqual([e["outcome"] for e in events].count("applied"),
+                                     2 if outcome == "applied" else 1, "ложное «применён»")
+                    state = self.pack_state(jp)
+                    self.assertNotIn("applied_answer", state["answers"]["r1"])
+                    if outcome != "applied":
+                        self.assertNotIn("r1", state.get("applied_answers") or {})
+                        continue
+                    # у нового ответа свой снимок: «Отменить ответ» возвращает слова до обоих ответов
+                    self.assertIn("r1", state.get("undo_snapshots") or {})
+                    self.save(jp, version, kind="revert")
+                    self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "reverted")
+                    self.assertEqual(self.words(jp), ["тест", "слово"])
 
     def test_without_snapshot_new_answer_also_waits(self):
         for backend in BACKENDS:
@@ -205,12 +222,14 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
                 self.assertEqual(self.words(jp), ["другое", "слово"])
                 self.assertFalse(rep.get("undo_conflicts"))
 
-    def test_revert_then_choose_again(self):
+    def test_replace_then_revert_then_choose_again(self):
+        """Было: второй ответ ждал отмены прежнего. Стало: он заменяет прежний, отмена снимает уже его."""
         for backend in BACKENDS:
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
                 self.first(jp, md, version, {"option": 0})
                 self.save(jp, version, option=1)
-                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "pending_new")
+                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "applied")
+                self.assertEqual(self.words(jp), ["третье", "слово"])
                 self.save(jp, version, kind="revert")
                 self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "revert_pending")
                 rep = self.apply(jp, md)
@@ -232,13 +251,113 @@ class ReplaceAppliedAnswer(AnswerOutcomeCase):
                 self.assertEqual(transcript.load(jp)["segments"], before["segments"])
                 self.save(jp, version, text="пятое")
                 rep = self.apply(jp, md)
-                self.assertEqual(self.outcomes(rep)["r1"], "pending_new")
-                self.assertEqual(self.words(jp), ["другое", "слово"])
+                self.assertEqual(self.outcomes(rep)["r1"], "applied")      # было: pending_new (К-В3)
+                self.assertEqual(self.words(jp), ["пятое", "слово"])
                 self.save(jp, version, kind="revert")
                 self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "reverted")
                 self.save(jp, version, text="пятое")
                 self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "applied")
                 self.assertEqual(self.words(jp), ["пятое", "слово"])
+
+
+class ReplaceInOneApply(AnswerOutcomeCase):
+    """К-В3: замена внесённого ответа одним «Применить» — отказ, провал нового ответа, гонка с сохранением."""
+
+    def apply_once(self, jp, md):
+        rep = core.apply_answers_files(jp, md)
+        self.check_outcomes(jp, rep)
+        return rep
+
+    def test_refused_when_transcript_changed_after_previous(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                core.edit_span_files(jp, md, 0.7, 1.0, "слово два", by="human")   # поздняя правка рядом
+                later = transcript.load(jp)
+                self.save(jp, version, option=1)
+                rep = self.apply_once(jp, md)
+                row = next(r for r in rep["outcomes"] if r["id"] == "r1")
+                self.assertEqual(row["outcome"], "undo_conflict")
+                self.assertIn("прежний ответ не заменён", row["detail"])
+                self.assertEqual(rep["replaced"], [])
+                self.assertEqual(transcript.load(jp)["segments"], later["segments"], "прежний ответ снят")
+                self.assertEqual(self.pack_state(jp)["answers"]["r1"]["option"], 1, "новый ответ потерян")
+                # «Вернуть как было» снимает новый ответ: снова внесённый, стенограмма та же
+                rep = self.save(jp, version, kind="keep")
+                self.assertTrue(rep["accepted"][0].get("restored"), rep)
+                self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
+                self.assertEqual(transcript.load(jp)["segments"], later["segments"])
+
+    def test_new_answer_not_applied_after_previous_removed(self):
+        """Прежний снят, новый не внёсся — место открыто, строка словами; страница видит тот же исход."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
+                self.save(jp, version, option=0)
+                self.apply(jp, md)
+                self.save(jp, version, option=1)
+                original = transcript.apply_review
+
+                def fails(json_path, md_path, decisions, **kw):
+                    return transcript.load(json_path), {"successful_ids": [], "not_found": [d["id"] for d in decisions]}
+
+                with mock.patch.object(transcript, "apply_review", side_effect=fails):
+                    rep = self.apply_once(jp, md)
+                self.assertIs(transcript.apply_review, original)
+                row = next(r for r in rep["outcomes"] if r["id"] == "r1")
+                self.assertEqual(row["outcome"], "not_found")
+                self.assertIn(review_pack.REPLACED_NOT_APPLIED, row["detail"])
+                self.assertEqual(self.words(jp), ["тест", "слово"])
+                self.assertNotIn("r1", self.pack_state(jp).get("applied_answers") or {})
+                self.assertEqual(transcript.load(jp)["review"][0]["status"], "open")
+                # следующее «Применить» — обычный ответ на открытое место
+                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "applied")
+                self.assertEqual(self.words(jp), ["третье", "слово"])
+
+    def test_answer_saved_during_apply_is_not_lost_or_applied_twice(self):
+        """Гонка: пока «Применить» заменяет ответ, страница сохраняет на ту же карточку ещё один (sqlite: другой
+        поток, без черновика). Итог: последний ответ сохранён и внесён один раз, прежние сняты по одному разу."""
+        with answer_files("sqlite") as (jp, md, version):
+            self.save(jp, version, option=0)
+            self.apply(jp, md)
+            self.save(jp, version, option=1)
+            original, threads, errors = transcript.undo_answer, [], []
+
+            def concurrent_save():
+                try:
+                    review_pack.add_answers(jp, [{"id": "r1", "version": version, "text": "шестое",
+                                                  "ts": "2026-11-23T23:30:00"}], "local", trusted_actor="human")
+                except Exception as ex:          # noqa: BLE001 — итог потока проверяется ниже
+                    errors.append(ex)
+
+            def undo_with_save(*args, **kw):
+                result = original(*args, **kw)
+                if not threads:
+                    t = threading.Thread(target=concurrent_save)
+                    threads.append(t)
+                    t.start()
+                    t.join(5)
+                return result
+
+            import storage
+            with mock.patch.object(transcript, "undo_answer", side_effect=undo_with_save):
+                try:
+                    core.apply_answers_files(jp, md)
+                except storage.Conflict:
+                    pass                          # запись сменилась во время «Применить» — ничего не записано
+            threads[0].join(10)
+            self.assertFalse(threads[0].is_alive())
+            self.assertFalse(errors, errors)
+            for _ in range(2):                    # человек нажимает «Применить» ещё раз
+                rep = self.apply_once(jp, md)
+            self.assertEqual(self.outcomes(rep)["r1"], "applied")
+            self.assertEqual(self.pack_state(jp)["answers"]["r1"].get("text"), "шестое")
+            self.assertEqual(self.words(jp), ["шестое", "слово"])
+            live = [e for e in transcript.load(jp)["edits"] if not e.get("reverted")]
+            self.assertEqual(len(live), 1, live)
+            events = [e for e in self.pack_state(jp).get("application_events") or [] if e["id"] == "r1"]
+            applied = [e["answer_sig_sha256"] for e in events if e["outcome"] == "applied"]
+            self.assertEqual(len(applied), len(set(applied)), "один ответ применён дважды")
 
 
 class SkipAnswer(AnswerOutcomeCase):
@@ -295,8 +414,8 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                 self.save(jp, version, option=1)
                 self.save(jp, version, aid="r2", option=1)
                 rep = self.apply(jp, md)
-                self.assertEqual(self.outcomes(rep), {"r1": "pending_new", "r2": "applied"})
-                self.assertEqual(self.words(jp), ["другое", "иное"])
+                self.assertEqual(self.outcomes(rep), {"r1": "applied", "r2": "applied"})   # было: r1 pending_new
+                self.assertEqual(self.words(jp), ["третье", "иное"])
 
     def test_each_kind_of_answer(self):
         kinds = {"кнопка": ({"option": 0}, "applied"), "рекомендация": ({"kind": "recommended"}, "applied"),
@@ -470,7 +589,7 @@ def page_with_answers(host="127.0.0.1"):
 
 def run_page(test, body, host="127.0.0.1"):
     script = page_script(host) + body + "\n})();\n"
-    result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
     test.assertEqual(result.returncode, 0, result.stderr)
     return result.stdout
 
@@ -774,9 +893,10 @@ class EventsWithoutAnswerText(AnswerOutcomeCase):
                 ts = "2026-11-23T21:00:00"
                 review_pack.add_answers(jp, [{"id": "r1", "version": version, "text": self.SECRET, "ts": ts}],
                                         "local", trusted_actor="human")
-                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "pending_new")   # повтор — без новых событий
+                # К-В3: свой текст заменяет применённый — события «заменил» и «применён»; повтор — без новых
+                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "applied")
                 rows = [r for r in self.events(jp) if r.get("id") == "r1" and r.get("answer_ts") == ts]
-                self.assertEqual(len(rows), 1, rows)
+                self.assertEqual([r["outcome"] for r in rows], ["replaced", "applied"], rows)
                 self.assertNotIn(self.SECRET, json.dumps(self.events(jp), ensure_ascii=False))
                 self.assertNotIn("answer_sig", rows[0])
                 self.assertRegex(rows[0]["answer_sig_sha256"], r"^[0-9a-f]{64}$")
@@ -785,8 +905,9 @@ class EventsWithoutAnswerText(AnswerOutcomeCase):
                                               "ts": ts}], "local", trusted_actor="human")
                 core.apply_answers_files(jp, md)
                 rows = [r for r in self.events(jp) if r.get("id") == "r1" and r.get("answer_ts") == ts]
-                self.assertEqual(len(rows), 2, rows)
-                self.assertNotEqual(rows[0]["answer_sig_sha256"], rows[1]["answer_sig_sha256"])
+                self.assertEqual(len(rows), 4, rows)
+                self.assertNotEqual(rows[1]["answer_sig_sha256"], rows[3]["answer_sig_sha256"])
+                self.assertNotIn(self.SECRET, json.dumps(self.events(jp), ensure_ascii=False))
 
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -803,7 +924,7 @@ class CloudKeepPath(AnswerOutcomeCase):
         script = page_with_answers("cards.example") + "\n  man = " + text + ";\n  live = {r1: " + \
             json.dumps(keep) + "};\n  const it = man.items.find(x => x.id === \"r1\"), a = merge().r1;\n" + \
             body + "\n})();\n"
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True,
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True,
                                 encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         return text
@@ -884,7 +1005,7 @@ class CloudKeep(unittest.TestCase):
           man.answer_states.r1.why = "отмена подготовлена"; man.answer_states.r1.detail = "уточнение";
           if (programNote(one, keep) !== "") throw Error("причина прежнего ответа: " + programNote(one, keep));
           const b = revertButton(one, keep);
-          if (b.kind !== "revert" || b.label !== "Подготовить отмену") throw Error("«Не отменять» повторно: " + JSON.stringify(b));
+          if (b.kind !== "revert" || b.label !== "Отменить ответ") throw Error("«Не отменять» повторно: " + JSON.stringify(b));
           const p = revertButton(one, revert);
           if (p.kind !== "keep" || p.label !== "Не отменять") throw Error("подготовленная отмена: " + JSON.stringify(p));
         ''', host="cards.example")

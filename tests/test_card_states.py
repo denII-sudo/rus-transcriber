@@ -27,7 +27,7 @@ class CardStates(unittest.TestCase):
             if (button.disabled || box.hidden) throw Error("report state");
           }).catch(e => { console.error(e); process.exitCode = 1; });
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -63,7 +63,7 @@ class CardStates(unittest.TestCase):
         })();
         '''
         source = stubs + prefix + lines + layer + "  let render;\n" + body
-        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=source, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -103,7 +103,7 @@ class CardStates(unittest.TestCase):
         })();
         """
         source = stubs + prefix + reload + layer + "  let render;\n" + body
-        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=source, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -119,7 +119,7 @@ class CardStates(unittest.TestCase):
           if (cardStatus(one,a) !== "применён ответ" || cardStatus(two,a) !== "ответ сохранён") throw Error("status");
           if (cardStatus(two,{kind:"human"}) !== "оставлено человеку — ещё не применено") throw Error("human");   // К-9
           man.answer_states.r1 = {state:"pending_new",ts:"t2",source:"local",why:"ждёт"};
-          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — не применён" || !appliedCard(one,changed)) throw Error("pending");
+          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — заменит прежний после «Применить»" || !appliedCard(one,changed)) throw Error("pending");
           man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};
           if (cardStatus(one,changed) !== "применён прежний ответ" || !appliedCard(one,changed)) throw Error("kept");
           man.answer_states.r1 = {state:"applied",ts:"t1",source:"local"};
@@ -128,7 +128,7 @@ class CardStates(unittest.TestCase):
           editing.add("r1"); if (appliedCard(one,a)) throw Error("editing card");
         })();
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -143,7 +143,7 @@ class CardStates(unittest.TestCase):
           if (no !== "говорящий → Б; подтвердить говорящего у слов места (2)") throw Error(no);
           if (yes.includes(ids[0]) || no.includes("word_ids")) throw Error("ids shown");
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(".opt{display:flex;flex-wrap:wrap;", html)
         self.assertRegex(html, r"\.opt small\{[^}]*overflow-wrap:anywhere")

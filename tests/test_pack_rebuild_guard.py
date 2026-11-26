@@ -108,8 +108,13 @@ class Refusal(Base):
         with files("sqlite") as (jp, md, version):
             self.applied_r4(jp, md, version)
             self.save(jp, version, "r4", text="этот")
-            self.assertEqual(self.outcomes(self.apply(jp, md))["r4"]["outcome"], "pending_new")
-            self.assertIn("«Подготовить отмену»", self.refused(jp, "r4"))
+            # К-В3, было: после «Применить» ответ ждал, выход — «Подготовить отмену» → «Применить». Стало: ждёт до
+            # «Применить», выход — оно же или «Вернуть как было»; «Применить» заменяет прежний ответ
+            self.assertEqual(review_pack.answer_states(jp)["r4"]["state"], "pending_new")
+            text = self.refused(jp, "r4")
+            self.assertIn("«Применить сохранённые ответы» или «Вернуть как было»", text)
+            self.assertNotIn("Подготовить отмену", text)
+            self.assertEqual(self.outcomes(self.apply(jp, md))["r4"]["outcome"], "applied")
 
     def test_several_waiting_cards_named_in_card_order(self):
         with files("sqlite") as (jp, _md, version):

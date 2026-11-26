@@ -56,9 +56,9 @@ OUTCOME_REASONS = {
     "applied_open": ("ответ применён, но место осталось открытым: прослушайте отрезок и отметьте, что услышали, "
                      "на обновлённой карточке — или впишите услышанное"),
     "reverted": "ответ отменён, место снова открыто",
-    "pending_new": ("новый ответ сохранён, но не применён: прежний ответ остаётся в стенограмме. "
-                    "Чтобы заменить: «Подготовить отмену» → «Применить сохранённые ответы» → выберите ответ "
-                    "заново → «Применить сохранённые ответы»"),
+    # К-В3: со снимком прежнего «Применить» заменяет его (страница говорит это сама); после «Применить» этот исход
+    # остаётся только у ответа без снимка (В-1) — шаг в уточнении
+    "pending_new": "новый ответ сохранён, но не внесён: прежний ответ остаётся в стенограмме",
     "kept_previous": "применённый ответ оставлен: пропуск и отрицание его не меняют",
     "skipped": "пропущено, стенограмма не менялась",
     "negative": "отрицание: правка не применена, место осталось открытым",
@@ -78,8 +78,7 @@ OUTCOME_REASONS = {
     "hint": "не применён: короткий ответ не понят как слова, место осталось открытым — подсказка ниже",
     # К-23: ответы ноутбука и облака на место расходились, применён более поздний — его проверяет человек
     "applied_check": ("ответ применён к стенограмме, но раньше на это место был другой ответ — проверьте: "
-                      "если ответ верен, нажмите «Ответ верен — оставить», иначе измените ответ или "
-                      "подготовьте отмену"),
+                      "если ответ верен, нажмите «Ответ верен — оставить», иначе — «Изменить ответ»"),
     # К-3/К-4: кнопка прослушивания противоречит словам стенограммы в интервале
     "listen_mismatch": ("не применён: выбранный ответ прослушивания не совпадает со словами стенограммы "
                         "в этом отрезке — исправьте слова или выберите другой ответ"),
@@ -95,6 +94,11 @@ UNDO_UNAVAILABLE = ("Этот ответ со страницы не отмени
 UNDO_LEGACY = ("Ответ внесён до переноса в новую версию программы; со страницы его не заменить. "
                "Если он неверен — скажите Claude: «исправь место карточки {n}»")
 LEGACY_ORIGIN = "legacy_review_pack:"
+# К-В3: новый ответ заменил внесённый в том же «Применить»; замена отказана — прежний ответ на месте
+REPLACED = "прежний ответ заменён"
+REPLACED_NOT_APPLIED = "прежний ответ снят, а новый не внесён — место снова открыто"
+REPLACE_REFUSED = ("прежний ответ не заменён: после него стенограмма менялась. «Вернуть как было» снимет новый "
+                   "ответ; если внесённый ответ неверен — скажите Claude: «исправь место карточки {n}»")
 # К-18: снимок есть, но отмена отказана — после ответа стенограмма менялась
 UNDO_LATER_EDIT = "после этого ответа стенограмма менялась — отмена станет возможной, если отменить более позднюю правку"
 # К-12: голос «повтори» и такой же текст из облака
@@ -127,7 +131,7 @@ REBUILD_GROUPS = {
 REBUILD_EXIT = {
     "saved": "нажмите «Применить сохранённые ответы»",
     "revert_pending": "нажмите «Применить сохранённые ответы» или «Не отменять»",
-    "pending_new": "«Подготовить отмену» → «Применить сохранённые ответы»",
+    "pending_new": "нажмите «Применить сохранённые ответы» или «Вернуть как было»",
 }
 # ждущий новый ответ поверх внесённого без снимка: отменить нечем, выход — вернуть внесённый (В-1)
 REBUILD_EXIT_NO_UNDO = "«Вернуть как было» на карточке"
@@ -145,7 +149,7 @@ OLD_SOURCE_TEXTS = ("недоступна исходная ревизия кар
 
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
-_QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
+_QUIET_OUTCOMES = {"applied", "reverted", "replaced", "skipped", "saved"}
 
 
 def pack_dir(json_path):
@@ -1667,9 +1671,8 @@ def _sig(a):
 def over_applied(answer, applied_sig):
     """Правило замены применённого ответа (одно на сохранение, применение и страницу). -> None, если
     применённого ответа на месте нет; «applied» — это он и есть; «revert» — отменить его; «kept_previous» —
-    пропуск или отрицание его не меняют; «pending_new» — новый ответ ждёт, пока прежний не отменят.
-    Исключение до полной замены ответа: другой ответ (кнопка, свой текст, «Оставить человеку») применённый
-    не заменяет — только явная отмена."""
+    пропуск или отрицание его не меняют; «pending_new» — новый ответ ждёт «Применить»: при снимке отмены
+    прежнего «Применить» заменяет его (К-В3, decisions → replace), без снимка — не заменяет (В-1)."""
     import freeform
     if applied_sig is None:
         return None
@@ -1695,9 +1698,10 @@ def _applied_map(store):
 
 def decisions(json_path):
     """Ответы пакета -> решения для apply_review. -> (decisions, отчёт).
-    Уже применённый и не изменившийся ответ повторно не применяется. Применённый ответ другим ответом не
-    заменяется: новый ответ сохраняется и ждёт (pending_new), пока человек не отменит прежний; пропуск и
-    отрицание оставляют прежний (kept_previous). Только ответ «отменить» откатывает правку по структурному
+    Уже применённый и не изменившийся ответ повторно не применяется. Новый ответ поверх применённого (К-В3):
+    есть снимок отмены прежнего — решение строится как обычно, а id попадает в replace: «Применить» сначала
+    снимает прежний по снимку; снимка нет — новый ждёт (pending_new, В-1). Пропуск и отрицание оставляют
+    прежний (kept_previous). Только ответ «отменить» откатывает правку по структурному
     снимку и снова открывает место; без снимка отмена блокируется конфликтом."""
     import freeform
     import transcript as T
@@ -1711,7 +1715,7 @@ def decisions(json_path):
     conflicted = {c["id"] for c in store.get("conflicts") or []}
     out, rep = [], {"applied_from_answers": 0, "human": [], "free": [], "skipped": [], "unanswered": [],
                     "unchanged": [], "changed": [], "reverted": [], "kept_previous": [], "pending_new": [],
-                    "source_conflict_ids": [], "human_after": [], "confirmed": []}
+                    "replace": [], "source_conflict_ids": [], "human_after": [], "confirmed": []}
     events = store.get("application_events") or []
     if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
         rep["source_conflict"] = "пакет относится к другой стенограмме"
@@ -1745,8 +1749,10 @@ def decisions(json_path):
             if relation == "kept_previous":
                 rep["kept_previous"].append(aid)
             continue
-        if relation in ("kept_previous", "pending_new"):
-            # Старый пакет мог сохранить пропуск поверх применённого ответа; другой ответ ждёт отмены.
+        # К-В3: дальше — как обычный ответ; в replace — только если решение построено (проверки ниже прошли)
+        replacing = relation == "pending_new" and replaceable(store, aid, a, applied.get(aid))
+        if relation in ("kept_previous", "pending_new") and not replacing:
+            # Старый пакет мог сохранить пропуск поверх применённого ответа; ответ без снимка прежнего ждёт.
             rep[relation].append(aid)
             continue
         if relation == "revert":
@@ -1817,6 +1823,8 @@ def decisions(json_path):
         elif k == "free":
             # свободный ответ — правка услышанного в клипе: применяется по словам (apply_free, freeform.py)
             rep["free"].append({"id": aid, "text": a.get("text")})
+            if replacing:
+                rep["replace"].append(aid)
             continue
         elif k == "revert":
             d = {"reopen": True, "note": f"{src}: ответ отменён, место снова открыто"}
@@ -1826,21 +1834,31 @@ def decisions(json_path):
         if k == "revert":                          # отменять нечего: ответ не был применён
             rep["skipped"].append(aid)
             continue
+        if replacing:
+            rep["replace"].append(aid)
         out.append({"id": aid, **d})
     return out, rep
 
 
+def replaceable(store, aid, answer, applied_sig):
+    """К-В3: ответ поверх применённого заменяет его одним «Применить» — у прежнего есть снимок отмены."""
+    return (over_applied(answer, applied_sig) == "pending_new" and
+            bool((store.get("undo_snapshots") or {}).get(aid)))
+
+
 def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}. Отрицание — и после применения (место
-    остаётся с подсказкой, применённая правка не трогается). Ответ с пометкой переноса «место уже решено»
-    (Р-4, legacy_decided) не применяется, как и в decisions."""
+    остаётся с подсказкой, применённая правка не трогается). Свой текст поверх применённого со снимком — тоже
+    (К-В3, replaceable). Ответ с пометкой переноса «место уже решено» (Р-4, legacy_decided) не применяется,
+    как и в decisions."""
     import freeform
     store = _read_answers(json_path, {"answers": {}})
     items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
     applied = _applied_map(store)
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and
             answer_is_current(a, items.get(aid)) and not legacy_decided(store, aid, a) and
-            (aid not in applied or freeform.negative_answer(a.get("text")))}
+            (aid not in applied or freeform.negative_answer(a.get("text")) or
+             replaceable(store, aid, a, applied.get(aid)))}
 
 
 def apply_free(json_path, md_path, free, dry_run=False):
@@ -2100,8 +2118,9 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
     """Запоминает исходы применения без копии текста ответа.
 
     outcomes {id: исход}: «applied» отмечает ответ применённым (подпись ставится только после успеха),
-    «reverted» снимает отметку и снимок только у ответа «отменить», остальные исходы пишут в журнал попытку
-    применения — один раз на ответ: повторный запуск с тем же исходом событий не дописывает.
+    «reverted» снимает отметку и снимок только у ответа «отменить»; «replaced» (К-В3) — у ответа любого вида:
+    прежний ответ места снят по снимку, новый применяется следом как обычный. Остальные исходы пишут в журнал
+    попытку применения — один раз на ответ: повторный запуск с тем же исходом событий не дописывает.
     Без outcomes (прежний вызов) ответы из ids отмечаются по своему виду."""
     store = _read_answers(json_path, {"answers": {}})
     man = manifest(json_path) or {}
@@ -2120,6 +2139,11 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
             m.pop(aid, None)
             store.setdefault("undo_snapshots", {}).pop(aid, None)
             changes.append((aid, "reverted"))
+        elif outcome == "replaced" and aid in m:
+            m.pop(aid, None)
+            store.setdefault("undo_snapshots", {}).pop(aid, None)
+            a.pop("applied_answer", None)         # копия прежнего ответа для «Вернуть как было» больше не нужна
+            changes.append((aid, "replaced"))
         elif outcome == "applied" and a.get("kind") not in ("skip", "repeat", "revert"):
             m[aid] = _sig(a)
             if snapshots and aid in snapshots:
@@ -2214,6 +2238,10 @@ def _answer_state(answer, applied_sig, event, place_event=None):
     if relation == "revert":
         # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
         return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
+    if relation == "pending_new" and (event or {}).get("outcome") in REBUILD_GROUPS["unapplicable"]:
+        # К-В3: замена не состоялась (снять прежний нельзя — undo_conflict, или новый ответ не прошёл проверку до
+        # снятия): прежний ответ на месте, страница показывает исход, как отчёт «Применить»
+        return event["outcome"]
     if relation == "applied" and (event or {}).get("outcome") in ("applied_open", "applied_check"):
         # применён, место открыто (PR 7) или ответ ждёт проверки (К-23): подпись та же, исход последнего применения
         return event["outcome"]

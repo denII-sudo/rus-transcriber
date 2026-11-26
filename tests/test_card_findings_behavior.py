@@ -401,7 +401,7 @@ def page(body):
     script = 'global.location={hostname:"127.0.0.1"};\n' + html.split("  // ответы этой версии вопросов")[0].split(
         "<script>", 1)[1]
     lines = "  function reportLines" + html.split("  function reportLines", 1)[1].split("\n  }\n", 1)[0] + "\n  }\n"
-    return subprocess.run([shutil.which("node"), "-e", script + lines + body + "\n})();\n"],
+    return subprocess.run([shutil.which("node")], input=script + lines + body + "\n})();\n",
                           capture_output=True, text=True, encoding="utf-8")
 
 

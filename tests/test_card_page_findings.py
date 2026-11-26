@@ -175,7 +175,7 @@ def page(body, host="127.0.0.1"):
              'const spoken=[]; global.speechSynthesis={cancel(){}, getVoices(){return []}, speak(u){spoken.push(u.text)}};\n'
              'global.window={speechSynthesis:global.speechSynthesis}; global.SpeechSynthesisUtterance=function(t){this.text=t};\n')
     wrapped = ("(async () => {\n" + body + "\n})().catch(e => { console.error(e && e.message || e); process.exit(1); });\n")
-    return subprocess.run([shutil.which("node"), "-e", stubs + head + send + voice + wrapped + "})();\n"],
+    return subprocess.run([shutil.which("node")], input=stubs + head + send + voice + wrapped + "})();\n",
                           capture_output=True, text=True, encoding="utf-8")
 
 
@@ -223,8 +223,8 @@ class PageParts(unittest.TestCase):
             throw Error(programNote(it, a));
           man.answer_states.r1.state = "applied";
           delete man.answer_states.r1.undo;
-          const b = revertButton(it, a);
-          if (b.disabled || b.label !== "Подготовить отмену") throw Error(JSON.stringify(b));
+          const b = revertButton(it, a);      // К-В3, было «Подготовить отмену»: отмена — в режиме изменения
+          if (b.disabled || b.label !== "Отменить ответ") throw Error(JSON.stringify(b));
           const r = {id: "r1", kind: "revert", ts: "t", source: "local"};
           man.answer_states.r1.state = "undo_conflict";
           if (answerText(r, it) !== "отмена ответа не выполнена") throw Error(answerText(r, it));

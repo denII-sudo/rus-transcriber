@@ -1374,13 +1374,18 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     conflict_was = {c.get("id"): c.get("was") for c in state_before.get("conflicts") or []}
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
+    # К-В3: свой текст поверх применённого — только вместе со снятием прежнего (replace), иначе правка легла бы
+    # поверх прежней; отрицание прежний не трогает
+    free = {aid: answer for aid, answer in free.items() if aid not in applied_before or aid in rep["replace"]
+            or freeform.negative_answer(answer.get("text"))}
     if draft is not None:
         items = {item["id"]: item for item in (P.manifest(jp) or {}).get("items") or []}
         already_applied = P._applied_map(draft["state"])
         now = transcript.load(jp)
         places = {r.get("id"): r for r in now.get("review") or []}
         for aid, answer in free.items():
-            if aid in already_applied or aid in (revision_conflicts or {}):
+            # К-В3: свой текст, заменяющий применённый ответ, проверяется тоже — до снятия прежнего
+            if (aid in already_applied and aid not in rep["replace"]) or aid in (revision_conflicts or {}):
                 continue
             if P.free_outside_card(jp, md, items.get(aid), places.get(aid) or {}, now, aid, answer):
                 revision_conflicts[aid] = P.FREE_OUTSIDE
@@ -1412,6 +1417,23 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                 result["why"] = P.UNDO_LATER_EDIT      # К-18: снимок есть, стенограмма менялась после ответа
             rep.setdefault("undo_conflicts", []).append(result)
             undo_failed.add(d["id"])
+    # К-В3: новый ответ поверх применённого со снимком — прежний снимается здесь, до всех применений (снимок годен,
+    # пока стенограмма не менялась), новый применяется ниже как обычный. Отказ: прежний на месте, новый ждёт.
+    replaced = []
+    numbers = {it.get("id"): n for n, it in enumerate((P.manifest(jp) or {}).get("items") or [], 1)}
+    planned = {d.get("id") for d in decisions} | set(free)
+    for aid in [aid for aid in rep.get("replace") or [] if aid in planned]:
+        result = transcript.undo_answer(jp, md, aid, (state_before.get("undo_snapshots") or {}).get(aid))
+        if result.get("reverted"):
+            replaced.append(aid)
+            P.mark_applied(jp, {aid}, outcomes={aid: "replaced"})
+        else:
+            result["why"] = P.REPLACE_REFUSED.format(n=numbers.get(aid, "?"))
+            rep.setdefault("undo_conflicts", []).append(result)
+            undo_failed.add(aid)
+    decisions = [d for d in decisions if d.get("id") not in undo_failed]
+    free = {aid: answer for aid, answer in free.items() if aid not in undo_failed}
+    rep["replaced"] = replaced
     snapshots, report = {}, {}
     snapshot_bytes = 0
 
@@ -1582,6 +1604,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
 
     for row in rep.get("undo_conflicts") or []:
         add_detail(row.get("id"), row.get("why") or row.get("conflict"))
+    for aid in replaced:        # К-В3: строка этого «Применить» — в отчёте, под карточкой не хранится
+        text = (P.REPLACED if outcomes.get(aid) in ("applied", "applied_open", "applied_check", "left_for_human")
+                else P.REPLACED_NOT_APPLIED)
+        undo_texts.add(text)
+        add_detail(aid, text)
     for conflict in preflight or []:
         for aid in conflict.get("cards") or []:
             others = [states[x]["card"] or x for x in conflict["cards"] if x != aid and x in states]
@@ -1637,9 +1664,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     P.remember_outcome_details(jp, {aid: (stored[aid].get("ts"), stored[aid].get("source"),
                                           [text for text in fresh[aid] if text != P.OUTCOME_REASONS[outcomes[aid]]])
                                     for aid in stored})
-    if undone:
+    if undone or replaced:
         rep["voice_profile_warning"] = {
-            "answer_ids": undone,
+            "answer_ids": undone + replaced,
             "message": ("Если эта запись ранее пополнила голосовой профиль, её прежний вклад мог остаться. "
                         "Профиль не изменён: проверьте вклад и при необходимости отдельно подтвердите "
                         "его обновление или отзыв."),

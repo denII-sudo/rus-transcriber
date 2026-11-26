@@ -1421,9 +1421,11 @@ class BackendSelectionTests(unittest.TestCase):
                     self.assertEqual(human_answer["actor_kind"], "human")
                     self.assertEqual(human_answer["author_ref"]["user_name_snapshot"], "Второй")
                     changed = core.apply_answers_files(jp, md)
-                    # Применённый ответ другим не заменяется: новый ждёт отмены прежнего.
-                    self.assertEqual(changed["pending_new"], ["r1"])
-                    self.assertEqual(transcript.load(jp)["segments"][0]["words"][0]["w"], "тест")
+                    # К-В3, было: новый ответ ждал отмены прежнего (pending_new). Стало: одно «Применить» снимает
+                    # прежний по снимку и вносит новый; отмена ниже снимает уже новый.
+                    self.assertEqual(changed["pending_new"], [])
+                    self.assertEqual(changed["replaced"], ["r1"])
+                    self.assertEqual(transcript.load(jp)["segments"][0]["words"][0]["w"], "другое")
                     review_pack.add_answers(jp, [{"id": "r1", "version": pack["version"],
                                                   "kind": "revert"}], "local", trusted_actor="human")
                     undone = core.apply_answers_files(jp, md)
