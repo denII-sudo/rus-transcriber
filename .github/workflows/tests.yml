@@ -38,6 +38,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2 # the merge commit of a PR and its first parent (main)
+          # The token is not left in .git/config for the steps below (they run PR code). Nothing here fetches from
+          # or pushes to GitHub: git is used only locally (diff, show, status, ls-files); the tests that run
+          # "git fetch/push" do it in temporary repositories with a local bare "origin" (tests/test_agent_workspaces.py).
+          persist-credentials: false
       # Среди тестов от docs/*.md и README.md зависит только test_text_hygiene. Любой другой файл,
       # событие не PR или сбой определения - полный набор.
       - name: Choose the test scope
