@@ -31,7 +31,7 @@ import review_pack  # noqa: E402
 import settings  # noqa: E402
 import transcript  # noqa: E402
 
-BACKENDS = ("legacy_files", "sqlite")
+BACKENDS = ("sqlite",)      # Л-3.2: файловый режим из тестов убран; цикл по одному режиму оставлен ради малого диффа
 SILENCE = "Прослушал: слов нет"
 INTERJECTIONS = "Прослушал: только междометия, не записывать"
 WORDS = "Прослушал: слова в стенограмме верны"
@@ -109,7 +109,9 @@ def questions():
 
 @contextlib.contextmanager
 def files(backend, data=None, qs=None):
-    """Пара файлов стенограммы в выбранном режиме хранения и собранный пакет: (jp, md, версия)."""
+    """Пара файлов стенограммы записи в базе (режим хранения только sqlite) и собранный пакет: (jp, md, версия)."""
+    if backend != "sqlite":
+        raise ValueError(f"режим {backend!r}: файловый режим из тестов убран (Л-3.2), нужен «sqlite»")
     with tempfile.TemporaryDirectory(dir=_TMP) as temp:
         root = Path(temp)
         db, audio = root / "state.sqlite3", root / "sample.wav"
@@ -122,19 +124,15 @@ def files(backend, data=None, qs=None):
         with mock.patch.object(settings.paths, "STATE_DB", db), \
                 mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
             try:
-                if backend == "sqlite":
-                    store = recordings.initialize_store(db, display_name="Тест")
-                    root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
-                    rid = str(uuid.uuid4())
-                    recordings.commit_worker_result(
-                        store, data, audio, root_id, recordings.operation_context(store, "model"),
-                        recording_id=rid, operation_id=str(uuid.uuid4()),
-                        generated_at="2026-11-16T00:00:00Z", document_paths=targets)
-                    recordings.materialize_recording(store, rid)
-                    jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
-                else:
-                    jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
-                    transcript.save(data, jp, md)
+                store = recordings.initialize_store(db, display_name="Тест")
+                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                rid = str(uuid.uuid4())
+                recordings.commit_worker_result(
+                    store, data, audio, root_id, recordings.operation_context(store, "model"),
+                    recording_id=rid, operation_id=str(uuid.uuid4()),
+                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                recordings.materialize_recording(store, rid)
+                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
                 pack = review_pack.build(jp, copy.deepcopy(questions() if qs is None else qs))
                 yield jp, md, pack.get("version")
             finally:
@@ -143,15 +141,10 @@ def files(backend, data=None, qs=None):
 
 
 def old_pack(jp, change):
-    """Пакет, собранный до 6б: change(элемент r1) правит его и в состоянии ответов, и в manifest.json файлов."""
+    """Пакет, собранный до 6б: change(элемент r1) правит его в состоянии ответов записи в базе."""
     state = review_pack.answers_state(jp)
     change(next(i for i in state["manifest"]["items"] if i["id"] == "r1"))
     review_pack._write_answers(jp, state)
-    path = review_pack.pack_dir(jp) / "manifest.json"
-    if recordings.read_review_pack_state(jp) is None and path.exists():
-        man = review_pack._read(path, {})
-        change(next(i for i in man["items"] if i["id"] == "r1"))
-        review_pack._write(path, man)
 
 
 class Case(unittest.TestCase):
@@ -207,7 +200,7 @@ class BuildButtonsTests(Case):
         qs = questions() + [{"id": "r5", "options": [AS_IS]}]
         for inside in (False, True):
             with self.subTest(inside=inside), \
-                    files("legacy_files", result(inside=inside, extra_review=[asr_missed]), qs) as (jp, _md, _v):
+                    files("sqlite", result(inside=inside, extra_review=[asr_missed]), qs) as (jp, _md, _v):
                 items = {i["id"]: i for i in review_pack.manifest(jp)["items"]}
                 want = ([WORDS] if inside else []) + [SILENCE, INTERJECTIONS]
                 self.assertEqual([o["label"] for o in items["r1"]["options"]], want)
@@ -233,7 +226,7 @@ class BuildButtonsTests(Case):
 
     def test_listen_fp_is_the_fingerprint_of_overlapping_words(self):
         """Тест 2: отпечаток — по словам, перекрывающим интервал (их пересверяет сохранение)."""
-        with files("legacy_files") as (jp, _md, _v):
+        with files("sqlite") as (jp, _md, _v):
             item = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1")
             data = transcript.load(jp)
             self.assertEqual(item["listen_fp"],
@@ -241,14 +234,21 @@ class BuildButtonsTests(Case):
             self.assertNotEqual(item["listen_fp"], transcript._listening_fingerprint([]))
 
     def test_gap_place_without_a_good_gap_gets_no_buttons(self):
-        for bad in (None, [2.0, 1.0], [1.0, float("nan")]):
-            data = result(gap_key=False)
-            if bad is not None:
+        # в базе запись с негодной паузой не создаётся (documents._public_review), поэтому сборка пакета без
+        # кнопок проверяется на месте без поля gap, а негодные значения — самим правилом gap_interval
+        data = result(gap_key=False)
+        with files("sqlite", data) as (jp, _md, _v):
+            item = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1")
+            self.assertEqual([o["label"] for o in item["options"]], ["Оставить как есть", "Вписать «ну»"])
+            self.assertNotIn("listen_fp", item)
+        for bad in ([2.0, 1.0], [1.0, float("nan")]):
+            with self.subTest(gap=bad):
+                self.assertIsNone(transcript.gap_interval({"gap": bad}))
+                data = result(gap_key=False)
                 data["review"][0]["gap"] = bad
-            with self.subTest(gap=bad), files("legacy_files", data) as (jp, _md, _v):
-                item = next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1")
-                self.assertEqual([o["label"] for o in item["options"]], ["Оставить как есть", "Вписать «ну»"])
-                self.assertNotIn("listen_fp", item)
+                with self.assertRaises(ValueError), files("sqlite", data):
+                    pass
+        self.assertEqual(transcript.gap_interval({"gap": [1.0, 2.0]}), (1.0, 2.0))
 
 
 class PauseButtonsApplyTests(Case):
@@ -271,7 +271,7 @@ class PauseButtonsApplyTests(Case):
         cases = ((True, "silence"), (True, "interjections"), (False, "words"))
         for inside, listened in cases:
             with self.subTest(inside=inside, listened=listened), \
-                    files("legacy_files", result(inside=inside)) as (jp, md, _v):
+                    files("sqlite", result(inside=inside)) as (jp, md, _v):
                 before = transcript.load(jp)
                 _, rep = transcript.apply_review(jp, md, [{"id": "r1", "listened": listened}], by="human")
                 self.assertEqual(rep["successful_ids"], [])
@@ -288,7 +288,7 @@ class PauseButtonsApplyTests(Case):
             self.assertIn("в паузе есть слова", row.get("detail", ""))
 
     def test_words_button_on_pause_with_words_confirms_them(self):
-        with files("legacy_files", result(inside=True)) as (jp, md, version):
+        with files("sqlite", result(inside=True)) as (jp, md, version):
             self.press(jp, version, WORDS)
             rep = self.apply(jp, md)
             self.assertEqual(self.outcomes(rep)["r1"]["outcome"], "applied", rep.get("outcomes"))
@@ -318,7 +318,7 @@ class PauseButtonsApplyTests(Case):
 
     def test_agent_cannot_press_a_pause_button(self):
         """Тест 6."""
-        with files("legacy_files") as (jp, md, _v):
+        with files("sqlite") as (jp, md, _v):
             before = transcript.load(jp)
             for listened in ("silence", "interjections"):
                 _, rep = transcript.apply_review(jp, md, [{"id": "r1", "listened": listened}], by="claude")
@@ -412,7 +412,7 @@ class PauseButtonsApplyTests(Case):
                                             "at": "2026-11-24T10:00:00Z", "fingerprint": "f" * 64}}]}
         public = documents._public_review(review)
         self.assertEqual(public["review"][0]["listening"], {"result": "interjections"})
-        with files("legacy_files") as (jp, _md, _version):
+        with files("sqlite") as (jp, _md, _version):
             self.assertIn("listen_fp", next(i for i in review_pack.manifest(jp)["items"] if i["id"] == "r1"))
             bundle = review_pack.cloud_bundle(jp)
             cloud = review_pack._read(Path(bundle["base"]) / bundle["files"]["manifest.json"], {})
@@ -427,7 +427,7 @@ class PauseButtonsApplyTests(Case):
         asr = {"id": "r5", "status": "open", "t": 3.0, "t1": 3.0, "t2": 3.2, "gap": [3.0, 3.2],
                "speaker": "Анна", "text": "та", "reasons": ["asr"],
                "asr_problem": {"model": "whisper", "state": "empty_unknown", "words_from": []}}
-        with files("legacy_files", result(extra_review=[asr]),
+        with files("sqlite", result(extra_review=[asr]),
                    questions() + [{"id": "r5", "options": [AS_IS]}]) as (jp, md, _v):
             _, rep = transcript.apply_review(jp, md, [{"id": "r5", "listened": "silence"}], by="human")
             self.assertEqual([c["id"] for c in rep.get("conflicts") or []], ["r5"])
@@ -441,7 +441,7 @@ class PauseButtonsApplyTests(Case):
 
     def test_mark_is_dropped_when_words_appear_in_the_pause(self):
         """Тест 8: слово в паузе после «только междометия» — место открыто, пометки нет."""
-        with files("legacy_files") as (jp, md, version):
+        with files("sqlite") as (jp, md, version):
             self.press(jp, version, INTERJECTIONS)
             core.apply_answers_files(jp, md)
             transcript.edit_span(jp, md, 1.4, 1.6, "ой", speaker="Анна", by="human")
@@ -705,7 +705,7 @@ class ShortAnswersApplyTests(Case):
         data["review"][3]["asr_problem"] = {"model": "whisper", "state": "disagreement",
                                             "words_from": ["primary", "second"]}
         data["review"][3]["gap"] = [3.0, 3.04]
-        with files("legacy_files", data) as (jp, md, version):
+        with files("sqlite", data) as (jp, md, version):
             self.save(jp, version, "r4", text="верно")
             rep = self.apply(jp, md)
             row = self.outcomes(rep)["r4"]

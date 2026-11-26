@@ -7,13 +7,12 @@
 не блокируют, а перечисляются в отчёте; число применённых ответов, которые после пересборки нельзя будет
 отменить со страницы, — `undo_lost`.
 
-Только при хранении записей в базе (указание владельца: новое — без файловой записи); в файловом режиме
-пересборка прежняя. Все данные синтетические.
+Только при хранении записей в базе (указание владельца: новое — без файловой записи; файловая часть убрана
+в Л-3.2). Все данные синтетические.
 """
 import contextlib
 import copy
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import test_pause_buttons_short_answers as six
@@ -241,19 +240,6 @@ class Allowed(Base):
         with files("sqlite") as (jp, _md, _version):
             rep = self.rebuild(jp)
             self.assertEqual((rep["unapplicable"], rep["undo_lost"]), ([], 0))
-
-
-class FilesUnchanged(Base):
-    """Файловый режим (указание владельца): пересборка прежняя — без проверки и без новых полей отчёта."""
-
-    def test_files_rebuild_is_as_before(self):
-        with files("legacy_files") as (jp, _md, version):
-            self.press(jp, version, REPLACE, "r4")
-            rep = self.rebuild(jp)
-            self.assertNotEqual(rep["version"], version)
-            self.assertNotIn("undo_lost", rep)
-            self.assertTrue(Path(review_pack.pack_dir(jp) / f"answers.{version}.json").exists(),
-                            "ответы прежней версии не в архиве")
 
 
 if __name__ == "__main__":

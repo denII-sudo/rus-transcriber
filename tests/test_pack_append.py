@@ -336,14 +336,6 @@ class Entry(Base):
             self.assertIn("другой записи", rep["other_recording"])
             self.assertEqual(ids(jp), ["r3", "r4"])
 
-    def test_files_mode_refuses_without_rebuild(self):
-        with files("legacy_files", qs=first()) as (jp, _md, version):
-            with self.assertRaises(core.CoreError) as caught:
-                self.append(jp)
-            self.assertIn("только при хранении записей в базе", str(caught.exception))
-            self.assertIn("rebuild=true", str(caught.exception))
-            self.assertNotEqual(self.append(jp, rebuild=True)["version"], version)
-
     def test_no_pack_builds(self):
         with files("sqlite", qs=first()) as (jp, _md, _version):
             with mock.patch.object(review_pack, "manifest", return_value=None), \

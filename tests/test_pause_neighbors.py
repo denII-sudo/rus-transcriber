@@ -32,7 +32,7 @@ import transcript  # noqa: E402
 import voices  # noqa: E402
 import workflow  # noqa: E402
 
-BACKENDS = ("legacy_files", "sqlite")
+BACKENDS = ("sqlite",)      # Л-3.2: файловый режим из тестов убран; цикл по одному режиму оставлен ради малого диффа
 
 
 def word(wid, text, s, e=None):
@@ -253,7 +253,9 @@ def pause_questions(r1_decision=None):
 
 @contextlib.contextmanager
 def pause_files(backend, data=None, questions=None):
-    """Пара файлов стенограммы в выбранном режиме хранения и собранный пакет: (jp, md, версия)."""
+    """Пара файлов стенограммы записи в базе (режим хранения только sqlite) и собранный пакет: (jp, md, версия)."""
+    if backend != "sqlite":
+        raise ValueError(f"режим {backend!r}: файловый режим из тестов убран (Л-3.2), нужен «sqlite»")
     with tempfile.TemporaryDirectory(dir=_TMP) as temp:
         root = Path(temp)
         db, audio = root / "state.sqlite3", root / "sample.wav"
@@ -266,19 +268,15 @@ def pause_files(backend, data=None, questions=None):
         with mock.patch.object(settings.paths, "STATE_DB", db), \
                 mock.patch.object(review_pack, "cut_clip", side_effect=lambda _s, t1, _t2, _out: t1):
             try:
-                if backend == "sqlite":
-                    store = recordings.initialize_store(db, display_name="Тест")
-                    root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
-                    rid = str(uuid.uuid4())
-                    recordings.commit_worker_result(
-                        store, data, audio, root_id, recordings.operation_context(store, "model"),
-                        recording_id=rid, operation_id=str(uuid.uuid4()),
-                        generated_at="2026-11-16T00:00:00Z", document_paths=targets)
-                    recordings.materialize_recording(store, rid)
-                    jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
-                else:
-                    jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
-                    transcript.save(data, jp, md)
+                store = recordings.initialize_store(db, display_name="Тест")
+                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                rid = str(uuid.uuid4())
+                recordings.commit_worker_result(
+                    store, data, audio, root_id, recordings.operation_context(store, "model"),
+                    recording_id=rid, operation_id=str(uuid.uuid4()),
+                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                recordings.materialize_recording(store, rid)
+                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
                 pack = review_pack.build(jp, copy.deepcopy(pause_questions() if questions is None else questions))
                 yield jp, md, pack.get("version")
             finally:
@@ -378,21 +376,24 @@ class PauseAsIsTests(PauseCase):
                 self.assertUntouchedNeighbors(jp)
 
     def test_pause_with_bad_time_does_not_stop_the_other_cards(self):
-        """Чек-лист раздела 6: одно место с негодным временем среди годных не роняет сборку и применение."""
-        for backend in ("legacy_files",):       # sqlite такое время не принимает: storage.validate_pair отказывает до записи
-            for bad in ("1", None, 3.0):
-                with self.subTest(backend=backend, t1=bad):
-                    data = pause_result()
-                    data["review"][0] = {"id": "r1", "status": "open", "t": 1.0, "t1": bad, "t2": 2.0, "speaker": "Анна",
-                                         "reasons": ["missed"], "text": ""}
-                    if bad is None:
-                        data["review"][0].pop("t1")
-                    with pause_files(backend, data) as (jp, md, version):
-                        self.save(jp, version, aid="r2", option=0)
-                        rep = self.apply(jp, md)
-                        self.assertEqual(self.outcomes(rep)["r2"]["outcome"], "applied", rep.get("outcomes"))
-                        self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
-                        self.assertEqual(self.place_of(jp, "r1")["status"], "open")
+        """Чек-лист раздела 6: место без t1 среди годных не роняет сборку и применение. Негодное время (строка,
+        t1 > t2) база не принимает: storage.validate_pair отказывает до записи — такого места в базе не бывает."""
+        data = pause_result()
+        data["review"][0] = {"id": "r1", "status": "open", "t": 1.0, "t2": 2.0, "speaker": "Анна",
+                             "reasons": ["missed"], "text": ""}
+        with pause_files("sqlite", data) as (jp, md, version):
+            self.save(jp, version, aid="r2", option=0)
+            rep = self.apply(jp, md)
+            self.assertEqual(self.outcomes(rep)["r2"]["outcome"], "applied", rep.get("outcomes"))
+            self.assertEqual(self.texts(jp), ["начало", "Ну", "дальше"])
+            self.assertEqual(self.place_of(jp, "r1")["status"], "open")
+        for bad in ("1", 3.0):
+            with self.subTest(t1=bad):
+                data = pause_result()
+                data["review"][0] = {"id": "r1", "status": "open", "t": 1.0, "t1": bad, "t2": 2.0, "speaker": "Анна",
+                                     "reasons": ["missed"], "text": ""}
+                with self.assertRaises(ValueError), pause_files("sqlite", data):
+                    pass
 
     def test_build_does_not_give_pause_the_neighbor_word(self):
         for backend in BACKENDS:
