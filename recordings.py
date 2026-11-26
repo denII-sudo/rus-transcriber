@@ -1040,108 +1040,83 @@ def _ensure_ids(transcript, recording_id):
             seen_words.add(ident)
 
 
-# --- База записей на новой установке (шаг «База записей» install.ps1, `rt.py db-init`) ---
+# --- База записей установки (шаг «База записей» install.ps1, `rt.py db-init`) ---
 # Явная операция, которую запускает человек (установщиком или командой); сервер и обычные инструменты базу
 # по-прежнему не создают. Это не перенос: создаётся пустая база, файлы записей не читаются и не меняются.
-LEGACY_MIGRATION_DOC = "docs/legacy-migration.md"
 
 
-def _explicit_backend():
-    """(значение `recording_backend` из config.json или None, читается ли файл)."""
+def _config_readable():
+    """config.json нет или он читается как словарь; иначе дописывание выбора стёрло бы остальные настройки."""
     import paths
     p = Path(paths.CONFIG_FILE)
     if not p.exists():
-        return None, True
+        return True
     try:
-        data = json.loads(p.read_text(encoding="utf-8-sig"))
+        return isinstance(json.loads(p.read_text(encoding="utf-8-sig")), dict)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, False
-    if not isinstance(data, dict):
-        return None, False
-    return data.get("recording_backend"), True
+        return False
 
 
-def _store_is_empty(path):
-    store = open_store(path, readonly=True)
-    try:
-        return all(store.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
-                   for table in ("recordings", "operations"))
-    finally:
-        store.close()
+def prepare_installation_store(check_only=False):
+    """Базы нет — создать её штатно и выбрать `sqlite`; база есть — не трогать, только выбрать `sqlite`.
 
-
-def prepare_new_installation(check_only=False):
-    """Новая установка сразу хранит записи в базе; установку со следами работы в файлах не меняет.
-
-    Случаи (ключ `case`): `new` — следов нет, база создана и выбрана; `finished_switch` — пустая база
-    прошлого запуска, выбор дописан; `sqlite` — база есть и выбрана; `legacy` — работа в файлах, ничего не
-    меняется; `legacy_with_db` — база есть, хранение в файлах (перенос не завершён); `missing_db` — выбрана
-    база, но её нет (новая пустая скрыла бы потерю). `ok=False` — база записей не готова (установщик: код 2).
-    check_only=True — только сказать, что было бы сделано.
+    Существующая база открывается только чтением и проверяется (схема, единственная активная установка);
+    не открывается — `ok=False`, ничего не чинится и не создаётся. Ключ `case`: `created` — база создана и
+    выбрана; `selected` — база была, выбрано хранение в ней; `ready` — база была и уже выбрана; `error` —
+    база записей не готова (установщик: код 2), причина в `message`. check_only=True — только сказать,
+    что было бы сделано.
     """
-    import data_io
     import paths
     import settings
     db = Path(paths.STATE_DB)
-    explicit, config_readable = _explicit_backend()
-    result = {"database": str(db), "check_only": bool(check_only), "changed": [], "traces": []}
+    result = {"database": str(db), "check_only": bool(check_only), "changed": []}
 
-    def done(case, ok, message, **extra):
-        result.update(case=case, ok=ok, message=message, **extra)
+    def done(case, ok, message):
+        result.update(case=case, ok=ok, message=message)
         try:
             result["recording_backend"] = settings.recording_backend()
         except ValueError:
             result["recording_backend"] = None
         return result
 
-    def legacy_message():
-        return ("Найдены записи в файлах рядом с аудио: программа продолжит работать с ними как раньше. "
-                f"Перенос в базу — по желанию, по документу {LEGACY_MIGRATION_DOC}.")
+    def failed(what, ex):
+        return done("error", False, f"База записей не готова: {what} ({type(ex).__name__}: {ex}).")
 
-    if not config_readable:
-        return done("legacy", True, "config.json не читается: база записей не создаётся, настройки не меняются. "
-                    "Исправьте файл и запустите `rt.py db-init` снова.")
-    sidecars = [s for s in ("-wal", "-shm") if db.with_name(db.name + s).exists()]
-    if db.exists():
-        if explicit == "sqlite":
-            return done("sqlite", True, f"База записей есть: {db}. Записи хранятся в базе.")
-        traces = data_io.installation_traces()
-        result["traces"] = traces
-        try:
-            empty = _store_is_empty(db)
-        except (storage.StorageError, sqlite3.Error):
-            empty = False
-        if explicit is None and not traces and empty:
-            if not check_only:
-                try:
-                    settings.set_recording_backend("sqlite")
-                except (OSError, ValueError, RuntimeError, storage.StorageError) as ex:
-                    return done("finished_switch", False, f"База записей не готова: не удалось выбрать базу ({ex}).")
-                result["changed"].append("config.json")
-            return done("finished_switch", True, f"Хранение записей в базе: {db}. Завершено переключение, "
-                        "начатое при прошлой установке.")
-        return done("legacy_with_db", True, f"База записей есть ({db}), но записи пока хранятся в файлах; "
-                    f"переключение — по документу {LEGACY_MIGRATION_DOC}.")
-    if explicit == "sqlite" or sidecars:
-        return done("missing_db", False, f"База записей не готова: выбрано хранение в базе, но базы нет ({db}). "
-                    "Верните базу из резерва (`rt.py db-restore`) или см. документ "
-                    f"{LEGACY_MIGRATION_DOC}. Новая пустая база не создаётся, чтобы не скрыть потерю.")
-    traces = data_io.installation_traces()
-    result["traces"] = traces
-    if explicit is not None or traces:
-        return done("legacy", True, legacy_message())
-    if check_only:
-        return done("new", True, f"Будет создана база записей: {db}.")
+    if not _config_readable():
+        return done("error", False, f"База записей не готова: {paths.CONFIG_FILE} не читается; исправьте или "
+                    "удалите файл и запустите `rt.py db-init` снова. Ничего не изменено.")
     try:
-        initialize_store(db, display_name="").close()
-    except (OSError, ValueError, storage.StorageError) as ex:
-        return done("new", False, f"База записей не готова: не удалось создать {db} ({ex}). "
-                    "Записи будут храниться в файлах рядом с аудио, как раньше.")
-    result["changed"].append("state.sqlite3")
+        selected = settings.recording_backend() == "sqlite"
+    except ValueError:
+        selected = False                  # неверное значение — будет заменено выбором базы
+    created = False
+    if db.exists():
+        try:
+            store = open_store(db, readonly=True)
+            try:
+                store.current_identity()
+            finally:
+                store.close()
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:
+            return failed(f"{db} не открывается; база не изменена, новая не создана", ex)
+        if selected:
+            return done("ready", True, f"База записей есть: {db}. Записи хранятся в базе.")
+        if check_only:
+            return done("selected", True, f"База записей есть: {db}; будет выбрано хранение в ней.")
+    else:
+        if check_only:
+            return done("created", True, f"Будет создана база записей: {db}.")
+        try:
+            initialize_store(db, display_name="").close()
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:
+            return failed(f"не удалось создать {db}", ex)
+        result["changed"].append("state.sqlite3")
+        created = True
     try:
         settings.set_recording_backend("sqlite")
-    except (OSError, ValueError, RuntimeError, storage.StorageError) as ex:
-        return done("new", False, f"База записей создана ({db}), но выбрать её не удалось ({ex}). "
-                    "Запустите `rt.py db-init` снова.")
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, storage.StorageError) as ex:
+        return failed(f"база {db} есть, но выбрать её не удалось; запустите `rt.py db-init` снова", ex)
     result["changed"].append("config.json")
-    return done("new", True, f"База записей создана: {db}. Записи будут храниться в базе.")
+    if created:
+        return done("created", True, f"База записей создана: {db}. Записи будут храниться в базе.")
+    return done("selected", True, f"База записей есть: {db}. Выбрано хранение записей в ней; база не изменена.")

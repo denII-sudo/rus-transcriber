@@ -340,7 +340,7 @@ class ParallelSelfCheckEndToEnd(unittest.TestCase):
 
 
 class InstallerSelfCheckStepTests(unittest.TestCase):
-    """Шаг 10 install.ps1: обещанный предел совпадает с selfcheck, причина без чисел показывается текстом."""
+    """Шаг 11 install.ps1: обещанный предел совпадает с selfcheck, причина без чисел показывается текстом."""
 
     def setUp(self):
         self.text = (Path(__file__).resolve().parent.parent / "install.ps1").read_text(encoding="utf-8-sig")

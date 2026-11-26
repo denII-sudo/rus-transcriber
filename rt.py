@@ -19,8 +19,8 @@
     python rt.py screen [--port 8766]          # локальный экран в браузере (запуск, состояние, резерв)
     python rt.py workflow-list [--limit 20]    # последние запросы workflow
     python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
-    python rt.py db-init [--check]           # новая установка: создать базу записей и выбрать её, если в папке
-        # данных нет следов работы в файлах (иначе ничего не меняется); --check — только сказать, что будет
+    python rt.py db-init [--check]           # базы нет — создать и выбрать; есть — проверить чтением и выбрать;
+        # --check — только сказать, что будет
     python rt.py db-restore РЕЗЕРВ.sqlite3 [--dest ПУТЬ] [--root ID=ПУТЬ]
         # мастер восстановления: новые корни и установка, документы формируются заново,
         # прежняя база сохраняется рядом; спрашивает подтверждение на клавиатуре
@@ -312,7 +312,13 @@ def run(a):
             say("\n".join(warning))
     elif c == "db-init":
         import recordings
-        report = recordings.prepare_new_installation(check_only=a.check)
+        import sqlite3
+        import storage
+        try:
+            report = recordings.prepare_installation_store(check_only=a.check)
+        except (OSError, ValueError, sqlite3.Error, storage.StorageError) as ex:      # причина, не трассировка
+            report = {"ok": False, "case": "error", "changed": [],
+                      "message": f"База записей не готова: {type(ex).__name__}: {ex}."}
         out(report)
         return 0 if report["ok"] else 1
     elif c == "db-restore":
