@@ -27,7 +27,7 @@ class CardStates(unittest.TestCase):
             if (button.disabled || box.hidden) throw Error("report state");
           }).catch(e => { console.error(e); process.exitCode = 1; });
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -63,7 +63,7 @@ class CardStates(unittest.TestCase):
         })();
         '''
         source = stubs + prefix + lines + layer + "  let render;\n" + body
-        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=source, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -103,7 +103,7 @@ class CardStates(unittest.TestCase):
         })();
         """
         source = stubs + prefix + reload + layer + "  let render;\n" + body
-        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=source, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -128,7 +128,7 @@ class CardStates(unittest.TestCase):
           editing.add("r1"); if (appliedCard(one,a)) throw Error("editing card");
         })();
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -143,7 +143,7 @@ class CardStates(unittest.TestCase):
           if (no !== "говорящий → Б; подтвердить говорящего у слов места (2)") throw Error(no);
           if (yes.includes(ids[0]) || no.includes("word_ids")) throw Error("ids shown");
         '''
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(".opt{display:flex;flex-wrap:wrap;", html)
         self.assertRegex(html, r"\.opt small\{[^}]*overflow-wrap:anywhere")

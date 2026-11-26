@@ -343,12 +343,28 @@ class Page(unittest.TestCase):
           editing.delete("r1");
           man.answer_states = st("pending_new", {undo: false});
           if (acts() !== "back") throw Error(acts());
+          // заголовок не обещает замену, которой не будет (найдено на приёмке)
+          if (cardStatus(it, a) !== "новый ответ — не внесётся") throw Error(cardStatus(it, a));
           man.answer_states = st("pending_new");
           if (acts() !== "back,edit") throw Error(acts());
-          if (!STATUS.pending_new.includes("заменит прежний")) throw Error(STATUS.pending_new);
+          if (!cardStatus(it, a).includes("заменит прежний")) throw Error(cardStatus(it, a));
+          if (!programNote(it, a).startsWith("Прежний ответ заменится этим")) throw Error(programNote(it, a));
           man.answer_states = st("undo_conflict");
           if (acts() !== "back,edit") throw Error("отказанная замена: " + acts());
-          if (acts({id: "r1", kind: "revert", ts: "t", source: "local"}) !== "edit") throw Error("отказанная отмена");
+          // отказ замены — не «отмена не выполнена»: человек менял ответ, а не отменял (найдено на приёмке)
+          man.answer_states = st("undo_conflict", {why: "отмена не выполнена: …", detail: "прежний ответ не заменён: …"});
+          if (cardStatus(it, a) !== "новый ответ не внесён — прежний ответ на месте") throw Error(cardStatus(it, a));
+          if (programNote(it, a) !== "прежний ответ не заменён: …") throw Error(programNote(it, a));
+          const revert = {id: "r1", kind: "revert", ts: "t", source: "local"};
+          if (!cardStatus(it, revert).startsWith("отмена не выполнена")) throw Error(cardStatus(it, revert));
+          if (!programNote(it, revert).startsWith("отмена не выполнена: …")) throw Error(programNote(it, revert));
+          const row = {id: "r1", card: 1, outcome: "undo_conflict", why: "отмена не выполнена: …", detail: "прежний ответ не заменён: …"};
+          answers = {r1: a};
+          const line = reportLines({outcomes: [row]}, [it]).join("\n");
+          if (!line.includes("Карточка 1: прежний ответ не заменён") || line.includes("отмена не выполнена")) throw Error(line);
+          answers = {r1: revert};
+          if (!reportLines({outcomes: [row]}, [it]).join("\n").includes("Карточка 1: отмена не выполнена: … — прежний")) throw Error("отмена");
+          if (acts(revert) !== "edit") throw Error("отказанная отмена");
           man.answer_states = st("revert_pending");
           if (acts({id: "r1", kind: "revert", ts: "t", source: "local"}) !== "edit,keep") throw Error("подготовленная отмена");
           man.answer_states = st("applied_check");

@@ -589,7 +589,7 @@ def page_with_answers(host="127.0.0.1"):
 
 def run_page(test, body, host="127.0.0.1"):
     script = page_script(host) + body + "\n})();\n"
-    result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True, encoding="utf-8")
     test.assertEqual(result.returncode, 0, result.stderr)
     return result.stdout
 
@@ -924,7 +924,7 @@ class CloudKeepPath(AnswerOutcomeCase):
         script = page_with_answers("cards.example") + "\n  man = " + text + ";\n  live = {r1: " + \
             json.dumps(keep) + "};\n  const it = man.items.find(x => x.id === \"r1\"), a = merge().r1;\n" + \
             body + "\n})();\n"
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True,
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True,
                                 encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         return text

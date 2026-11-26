@@ -175,7 +175,7 @@ def page(body, host="127.0.0.1"):
              'const spoken=[]; global.speechSynthesis={cancel(){}, getVoices(){return []}, speak(u){spoken.push(u.text)}};\n'
              'global.window={speechSynthesis:global.speechSynthesis}; global.SpeechSynthesisUtterance=function(t){this.text=t};\n')
     wrapped = ("(async () => {\n" + body + "\n})().catch(e => { console.error(e && e.message || e); process.exit(1); });\n")
-    return subprocess.run([shutil.which("node"), "-e", stubs + head + send + voice + wrapped + "})();\n"],
+    return subprocess.run([shutil.which("node")], input=stubs + head + send + voice + wrapped + "})();\n",
                           capture_output=True, text=True, encoding="utf-8")
 
 

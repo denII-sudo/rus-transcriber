@@ -31,7 +31,7 @@ const all = man.items.filter(filter).map(it => it.id);
 console.log(JSON.stringify({open, all}));
 })();
 """ % match.group(1)
-        result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True,
+        result = subprocess.run([shutil.which("node")], input=script, capture_output=True, text=True,
                                 encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"open": ["r2"], "all": ["r1", "r2"]})

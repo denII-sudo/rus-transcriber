@@ -234,7 +234,7 @@ class ClipErrorOnPage(unittest.TestCase):
           if (c.children.length !== 1 || c.children[0].tag !== "p" || c.children[0].textContent !== CLIP_FAILED)
             throw Error("повторная отрисовка показывает плеер");
         """
-        result = subprocess.run([shutil.which("node"), "-e", "(() => {" + script + "})();"], capture_output=True,
+        result = subprocess.run([shutil.which("node")], input="(() => {" + script + "})();", capture_output=True,
                                 text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 

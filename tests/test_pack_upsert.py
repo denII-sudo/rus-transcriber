@@ -537,7 +537,7 @@ class PageRedrawTests(unittest.TestCase):
           global.document = {getElementById: () => el};
         '''
         source = stubs + prefix + layer + redraw + reload + body + "\n})();\n"
-        result = subprocess.run([shutil.which("node"), "-e", source], capture_output=True, text=True,
+        result = subprocess.run([shutil.which("node")], input=source, capture_output=True, text=True,
                                 encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
 

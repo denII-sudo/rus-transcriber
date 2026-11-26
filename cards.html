@@ -329,7 +329,9 @@ audio{width:100%;height:36px}
       const n = ((man.answer_states || {})[it.id] || {}).card || ((man.items || []).indexOf(it) + 1) || "";
       return `${PENDING_NO_UNDO}. Если внесённый ответ неверен — скажите Claude: «исправь место карточки ${n}»`;
     }
-    const reason = cloud || ["applied", "saved"].includes(state) ? "" : whyOf(it);
+    // К-В3: отказ замены — уточнение программы («прежний ответ не заменён: …») само говорит причину и шаг
+    const reason = cloud || ["applied", "saved"].includes(state) || replaceRefused(it, a) ? "" :
+      state === "pending_new" ? PENDING_REPLACE : whyOf(it);
     return [reason, cloud ? "" : detailOf(it)].filter(Boolean).join(" — ");
   }
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
@@ -354,8 +356,16 @@ audio{width:100%;height:36px}
   const cardStatus = (it, a) =>
     staleSaved(it, a) ? STALE_SAVED :
     stateOf(it, a) === "saved" && kindOf(a) === "human" ? "оставлено человеку — ещё не применено" :   // К-9
+    stateOf(it, a) === "pending_new" && undoOf(it) === false ? PENDING_NO_UNDO_STATUS :              // В-1
+    replaceRefused(it, a) ? REPLACE_REFUSED_STATUS :                                                 // К-В3
     STATUS[stateOf(it, a)] || "не применён";
   const CONFLICT_TEXT = "ответы ноутбука и облака расходились — проверьте";
+  const PENDING_NO_UNDO_STATUS = "новый ответ — не внесётся";
+  // К-В3: отказ замены приходит исходом undo_conflict, но человек не отменял ответ, а менял его
+  const replaceRefused = (it, a) => stateOf(it, a) === "undo_conflict" && kindOf(a) !== "revert";
+  const REPLACE_REFUSED_STATUS = "новый ответ не внесён — прежний ответ на месте";
+  // К-В3: новый ответ поверх внесённого со снимком — «Применить» заменит прежний
+  const PENDING_REPLACE = "Прежний ответ заменится этим, когда вы нажмёте «Применить сохранённые ответы»; до этого он остаётся в стенограмме. «Вернуть как было» снимет новый ответ";
   const PENDING_NO_UNDO = "Новый ответ не внесётся: внесённый ответ со страницы не заменить. «Вернуть как было» снимет новый ответ";
   // 9.3: карточка, где ответ не внесётся
   const STALE_TITLE = "Ответ здесь уже не внести";
@@ -404,6 +414,8 @@ audio{width:100%;height:36px}
     // apply_conflict: уточнение программы (версия стенограммы, слова вне места) полнее общей причины — без повтора
     rows.filter(o => !DONE.includes(o.outcome) && !QUIET.includes(o.outcome)).forEach(o =>
       action.push(`${cardName(o.id, o.card)}: ` + (o.outcome === "apply_conflict" && o.detail ? `не применён: ${o.detail}` :
+        // К-В3: отказ замены — без общей причины «отмена не выполнена»: человек менял ответ, а не отменял
+        o.outcome === "undo_conflict" && o.detail && answers[o.id] && kindOf(answers[o.id]) !== "revert" ? o.detail :
         o.why + (o.detail ? ` — ${o.detail}` : ""))));
     (rep.cards_not_replaced || []).forEach(c => action.push(`${cardName(c.id)}: новая редакция карточки не создана` +
       (c.why ? ` (${c.why})` : "") + " — нажмите «Применить сохранённые ответы» ещё раз"));
