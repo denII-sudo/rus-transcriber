@@ -248,10 +248,16 @@ def model_view(task):
                        for point in checked["points"][first - 1:final]]}
 
 
+MAX_LISTED_ERRORS = 20      # версия 4: нарушений в одной ошибке проверки перечисляется не больше
+
+
 def _validate_sections(checked, response, current_revision):
     """Ответ версии 4: разделы с границами пунктов «from»–«to», подряд и без пересечений.
 
     У задания части разделы и отсылки also — только внутри её пунктов: раздел не переходит границу части.
+    Ошибки формата ответа и ревизии — сразу; нарушения по разделам копятся, и ошибка называет все
+    (Ч-0а: запрос исправления должен перечислить модели всё, что нарушено, а не первое).
+    Отсылки also ответ не отвергают: см. _accepted_also; что урезано или отброшено — в also_adjusted.
     """
     points, words = checked["points"], checked["words"]
     start, last = part_range(checked)
@@ -266,44 +272,99 @@ def _validate_sections(checked, response, current_revision):
     def ids(first, final):
         return [word["word_id"] for point in points[first - 1:final] for word in words[point["start"]:point["end"]]]
 
-    sections, following = [], start
+    sections, errors, adjusted, following = [], [], [], start
     for number, section in enumerate(response["sections"], 1):
         if (not isinstance(section, dict) or not {"from", "to", "text"} <= set(section)
                 or set(section) - {"from", "to", "text", "also"}):
-            raise ValueError(f"раздел {number}: нужны поля from, to, text и необязательное also")
+            errors.append(f"раздел {number}: нужны поля from, to, text и необязательное also")
+            following = None                     # где кончается раздел, неизвестно: следующий не сверяется
+            continue
         first, final, text = section["from"], section["to"], section["text"]
         if type(first) is not int or type(final) is not int or not start <= first <= final <= last:
-            raise ValueError(f"раздел {number}: границы — целые номера пунктов от {start} до {last}, "
-                             "from не больше to")
-        if first != following:
-            raise ValueError(f"раздел {number} начинается с пункта {first}, а должен — с пункта {following}, "
-                             "сразу за концом предыдущего раздела (без пропусков и пересечений)")
+            errors.append(f"раздел {number}: границы — целые номера пунктов от {start} до {last}, "
+                          "from не больше to")
+            following = None
+            continue
+        if following is not None and first != following:
+            errors.append(f"раздел {number} начинается с пункта {first}, а должен — с пункта {following}, "
+                          "сразу за концом предыдущего раздела (без пропусков и пересечений)")
+        following = final + 1
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f"раздел {number}: пустой текст")
+            errors.append(f"раздел {number}: пустой текст")
         evidence = ids(first, final)
         if first != final and len(evidence) > MAX_SECTION_WORDS:
-            raise ValueError(f"раздел {number} (пункты {first}–{final}) длиннее {MAX_SECTION_WORDS} слов: "
-                             "разделите его на несколько")
-        also = section.get("also", [])
-        if not isinstance(also, list) or len(also) > MAX_ALSO:
-            raise ValueError(f"раздел {number}: also — список не более чем из {MAX_ALSO} отсылок")
-        refs = []
-        for ref in also:
-            if (not isinstance(ref, list) or len(ref) != 2 or any(type(x) is not int for x in ref)
-                    or not start <= ref[0] <= ref[1] <= last or ref[1] - ref[0] + 1 > MAX_ALSO_POINTS):
-                within = "" if "part" not in checked else f" от {start} до {last} (внутри своей части)"
-                raise ValueError(f"раздел {number}: отсылка also — пара [from, to] номеров пунктов{within}, "
-                                 f"не длиннее {MAX_ALSO_POINTS} пунктов")
-            if ref[0] <= final and ref[1] >= first:
-                raise ValueError(f"раздел {number}: отсылка also должна вести вне своего раздела")
-            refs.append(ids(ref[0], ref[1]))
-        sections.append({"text": text, "evidence": evidence, "also": refs})
-        following = final + 1
-    if following != last + 1:
-        raise ValueError(f"разделы кончаются пунктом {following - 1}, а последний пункт — {last}: "
-                         "последний раздел должен кончаться последним пунктом")
-    return {"source_revision": current_revision, "sections": sections,
-            "actor_kind": "model", "human_verification": "none"}
+            errors.append(f"раздел {number} (пункты {first}–{final}) охватывает {len(evidence)} слов стенограммы, "
+                          f"больше {MAX_SECTION_WORDS}: разделите его на несколько")
+        low, high = _also_range(checked, first, start, last)
+        kept, notes = _accepted_also(section.get("also", []), number, first, final, low, high)
+        adjusted += notes
+        sections.append({"text": text, "evidence": evidence, "also": [ids(a, b) for a, b in kept]})
+    if following is not None and following != last + 1:
+        errors.append(f"разделы кончаются пунктом {following - 1}, а последний пункт — {last}: "
+                      "последний раздел должен кончаться последним пунктом")
+    if errors:
+        raise ValueError(_listed(errors))
+    result = {"source_revision": current_revision, "sections": sections,
+              "actor_kind": "model", "human_verification": "none"}
+    if adjusted:
+        result["also_adjusted"] = adjusted
+    return result
+
+
+def _listed(errors):
+    """Одна ошибка — как есть; несколько — нумерованным списком, не длиннее MAX_LISTED_ERRORS пунктов."""
+    if len(errors) == 1:
+        return errors[0]
+    shown = "; ".join(f"{index}) {error}" for index, error in enumerate(errors[:MAX_LISTED_ERRORS], 1))
+    rest = len(errors) - MAX_LISTED_ERRORS
+    return (f"нарушений в ответе: {len(errors)}, исправьте все — " + shown
+            + (f"; и ещё {rest} — проверьте остальные разделы по тем же правилам" if rest > 0 else ""))
+
+
+def _also_range(checked, first, start, last):
+    """Пункты, куда может вести отсылка раздела: своя часть. У части — её пункты; у всего задания
+    с частями — часть, где начинается раздел (итог, собранный из частей, проверяется так же, как каждая
+    часть); без частей — все пункты."""
+    if "part" in checked or "parts" not in checked:
+        return start, last
+    for low, high in checked["parts"]:
+        if low <= first <= high:
+            return low, high
+    return start, last
+
+
+def _accepted_also(also, number, first, final, low, high):
+    """Отсылки also, принятые к свёртке, и отметки о том, что урезано или отброшено.
+
+    Отсылка — вспомогательное поле (строка «См. также» по времени её начала): ответ из-за неё не
+    отвергается (решение Архитектора по Ч-0, 26.11.2026). Длиннее MAX_ALSO_POINTS пунктов — урезается
+    до первых MAX_ALSO_POINTS (начало и время «См. также» не меняются). Не пара целых, вне своей части,
+    ведущая в свой раздел, повтор, сверх MAX_ALSO — отбрасывается.
+    """
+    if not isinstance(also, list):
+        return [], [{"section": number, "action": "dropped", "reason": "format", "ref": None}]
+    kept, notes = [], []
+    for ref in also:
+        pair = (isinstance(ref, list) and len(ref) == 2 and all(type(x) is int for x in ref))
+        shown = list(ref) if pair else None
+        if not pair:
+            notes.append({"section": number, "action": "dropped", "reason": "format", "ref": None})
+            continue
+        if not low <= ref[0] <= ref[1] <= high:
+            notes.append({"section": number, "action": "dropped", "reason": "outside", "ref": shown})
+            continue
+        item = [ref[0], min(ref[1], ref[0] + MAX_ALSO_POINTS - 1)]
+        if item[0] <= final and item[1] >= first:
+            notes.append({"section": number, "action": "dropped", "reason": "own_section", "ref": shown})
+            continue
+        if item in kept or len(kept) >= MAX_ALSO:
+            notes.append({"section": number, "action": "dropped",
+                          "reason": "repeat" if item in kept else "too_many", "ref": shown})
+            continue
+        if item != shown:
+            notes.append({"section": number, "action": "truncated", "reason": "long", "ref": shown, "kept": item})
+        kept.append(item)
+    return kept, notes
 
 
 def validate(task, response, *, current_revision):
