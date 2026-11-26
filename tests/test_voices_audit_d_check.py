@@ -144,8 +144,7 @@ def run_main(fault=None, pipeline="words", probe=None):
 
         patches = [
             mock.patch.object(settings.paths, "STATE_DB", db),
-            mock.patch.object(sys, "argv", ["worker.py", str(src), "--status", str(status),
-                                            "--storage-backend", "sqlite"]),
+            mock.patch.object(sys, "argv", ["worker.py", str(src), "--status", str(status)]),
             mock.patch.dict(os.environ, {"HF_TOKEN": "synthetic-token", "TEMP": str(root / "tmp"),
                                          "TMP": str(root / "tmp")}),
             mock.patch.object(worker, "wait_slot"),

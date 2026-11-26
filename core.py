@@ -324,25 +324,6 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     if not src.exists():
         raise CoreError(f"Файл не найден: {src}")
     args = (["--speakers", str(num_speakers)] if num_speakers else []) + ([] if emotions else ["--no-emotions"])
-    backend = settings.recording_backend()
-    initial_state = None
-    if backend == "sqlite":
-        import recordings
-        import storage
-        if not recordings.SQLITE_RUNTIME_READY:
-            raise CoreError("SQLite backend ещё не доступен: не все операции записи переведены")
-        try:
-            store = recordings.open_store()
-            try:
-                store.current_identity()
-                initial_state = {"recording_context": workflow_context or recordings.operation_context(store, "model")}
-                if workflow_request_id is not None:
-                    initial_state["workflow_request_id"] = workflow_request_id
-            finally:
-                store.close()
-        except (OSError, storage.StorageError) as ex:
-            raise CoreError("SQLite-хранилище не инициализировано или недоступно") from ex
-        args += ["--storage-backend", "sqlite"]
     if vocab_path:
         args += ["--vocab", vocab_path]
     if group:
@@ -360,14 +341,36 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     names_list = [n.strip() for n in names.replace(";", ",").split(",") if n.strip()]
     if names_list:
         args += ["--names", ",".join(names_list)]
-    if initial_state is not None:
-        if workflow_job_id is None:
-            job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state)
-        else:
-            job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state,
-                            job_id=workflow_job_id)
+    # новые записи хранятся только в базе (Л-4а): проверка — после аргументов и до запуска тяжёлой задачи
+    hint = ("Выберите хранение в базе: `rt.py db-init` (создаст базу, если её нет, и выберет её); "
+            "перенос старых записей — docs/legacy-migration.md.")
+    try:
+        backend = settings.recording_backend()
+    except ValueError as ex:
+        raise CoreError("Неверное значение recording_backend в config.json. " + hint) from ex
+    if backend != "sqlite":
+        raise CoreError("Новые записи хранятся только в базе, а в настройках выбрано хранение в файлах "
+                        "(recording_backend). " + hint)
+    import recordings
+    import storage
+    if not recordings.SQLITE_RUNTIME_READY:
+        raise CoreError("SQLite backend ещё не доступен: не все операции записи переведены")
+    try:
+        store = recordings.open_store()
+        try:
+            store.current_identity()
+            initial_state = {"recording_context": workflow_context or recordings.operation_context(store, "model")}
+            if workflow_request_id is not None:
+                initial_state["workflow_request_id"] = workflow_request_id
+        finally:
+            store.close()
+    except (OSError, storage.StorageError) as ex:
+        raise CoreError("База записей не создана или недоступна. " + hint) from ex
+    if workflow_job_id is None:
+        job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state)
     else:
-        job_id = launch("worker.py", args, src, "transcribe")
+        job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state,
+                        job_id=workflow_job_id)
     return {"job_id": job_id, "file": str(src)}
 
 
