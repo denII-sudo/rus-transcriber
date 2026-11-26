@@ -232,6 +232,17 @@ audio{width:100%;height:36px}
   // ответы, которые ждут «Применить»: их число — на кнопке (КН-10)
   const WAITING = ["saved", "pending_new", "revert_pending"];
   const waitingCount = () => man.items.filter(it => answers[it.id] && WAITING.includes(stateOf(it, answers[it.id]))).length;
+  const applyLabel = () => "Применить сохранённые ответы" + (LOCAL && waitingCount() ? ` (${waitingCount()})` : "");
+  // Кнопки внесённого ответа (строка edit-row): confirm — «Ответ верен — оставить» (applied_check), back — «Вернуть
+  // как было» (В-1: новый ответ поверх внесённого без снимка), edit и revert — «Изменить ответ» и «Подготовить
+  // отмену»/«Не отменять». Без снимка (undo === false) edit и revert нет: ответ со страницы не заменить.
+  const appliedActions = (it, a) => {
+    const st = stateOf(it, a), noUndo = undoOf(it) === false, out = [];
+    if (LOCAL && st === "applied_check" && confirmAnswer(it)) out.push("confirm");
+    if (noUndo && st === "pending_new") out.push("back");
+    if (!noUndo) out.push("edit", "revert");
+    return out;
+  };
   // Пустой список «без ответа»: есть ли что применять
   const emptyText = () => {
     if (!LOCAL) return "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами.";
@@ -725,21 +736,21 @@ audio{width:100%;height:36px}
     const canHear = !man.clips_removed && !!it.clip && !clipFailed.has(listenKey), heardNow = heardOf(it);
     if (holdsApplied(it, a)) {
       const er = document.createElement("div"); er.className = "edit-row";
-      const st = stateOf(it, a), noUndo = undoOf(it) === false;
-      const ok = LOCAL && st === "applied_check" ? confirmAnswer(it) : null;
+      const st = stateOf(it, a), noUndo = undoOf(it) === false, acts = appliedActions(it, a);
+      const ok = acts.includes("confirm") ? confirmAnswer(it) : null;
       if (ok) {         // КН-11: подтверждение — главная кнопка
         const cb = document.createElement("button"); cb.className = "btn primary"; cb.type = "button"; cb.textContent = "Ответ верен — оставить";
         cb.title = "Применённый ответ верен: место закроется вашим подтверждением после «Применить сохранённые ответы».";
         cb.onclick = () => send(it, ok, state);
         er.append(cb);
       }
-      if (noUndo && st === "pending_new") {   // В-1: новый ответ поверх внесённого без снимка — выход: вернуть внесённый
+      if (acts.includes("back")) {   // В-1: новый ответ поверх внесённого без снимка — выход: вернуть внесённый
         const bb = document.createElement("button"); bb.className = "btn primary"; bb.type = "button"; bb.textContent = "Вернуть как было";
         bb.title = "Снять новый ответ: на карточке снова будет внесённый ответ, стенограмма не изменится.";
         bb.onclick = () => send(it, {kind: "keep"}, state);     // тот же путь, что «Не отменять»: внесённый ответ из копии
         er.append(bb);
       }
-      if (!noUndo) {    // В-1: без снимка «Изменить ответ» и отмены нет — строка с шагом уже под ответом
+      if (acts.includes("edit")) {    // В-1: без снимка «Изменить ответ» и отмены нет — строка с шагом уже под ответом
         const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
         eb.onclick = () => { editing.add(it.id); render(); };
         const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
@@ -844,8 +855,7 @@ audio{width:100%;height:36px}
     const list = $("list");
     const done = man.items.filter(it => !needsAnswer(it)).length;
     $("count").textContent = `${done} / ${man.items.length}`;
-    const waiting = LOCAL ? waitingCount() : 0;
-    $("apply").textContent = "Применить сохранённые ответы" + (waiting ? ` (${waiting})` : "");
+    $("apply").textContent = applyLabel();
     $("meter").style.width = `${man.items.length ? 100 * done / man.items.length : 0}%`;
     const show = man.items.filter(it => showAll || needsAnswer(it));
     const active = document.activeElement && document.activeElement.id;

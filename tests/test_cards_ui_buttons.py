@@ -160,6 +160,20 @@ class ApplyAndPreview(Base):
             self.assertEqual(self.outcomes(self.apply(jp, md))["r4"]["detail"], why)
 
 
+    def test_preview_endpoint_runs_guard_first(self):
+        """КН-14: api/preview (review_page.preview_answer) сначала говорит то, что скажет «Применить»."""
+        import review_page
+        with files("sqlite", qs=only("r2")) as (jp, md, _version):
+            self.assertNotIn("guard", review_page.preview_answer(jp, md, "r2", "вот"))
+            self.assertEqual(review_page.preview_answer(jp, md, "r2", "вот другое та"),
+                             {"cards": [], "guard": review_pack.FREE_OUTSIDE})
+        with files("sqlite", qs=only("r4")) as (jp, md, _version):
+            stale(jp)
+            got = review_page.preview_answer(jp, md, "r4", "тот")
+            self.assertEqual(got["cards"], [])
+            self.assertTrue(got["guard"].startswith(review_pack.SOURCE_UNAVAILABLE), got)
+
+
 class Texts(unittest.TestCase):
     ANSWER = {"id": "r1", "option": 0, "ts": "2026-11-26T10:00:00", "source": "local"}
 
@@ -286,6 +300,35 @@ class Page(unittest.TestCase):
           answers.r2 = {id: "r2", ts: "t", source: "local", option: 0};
           t = previewText(it, {cards: [], left_to_human: ["r1"]});
           if (!t.includes("программа не внесёт это сама: место останется вам") || !t.endsWith("другие сохранённые ответы.")) throw Error(t);
+        ''')
+
+    def test_apply_label_counts_waiting_answers(self):
+        """КН-10: на «Применить» — число ответов, ждущих применения; нет таких — без числа."""
+        self.run_page(r'''
+          const st = (s) => ({state: s, ts: "t", source: "local"});
+          man = {items: ["r1", "r2", "r3"].map(id => ({id, options: []})),
+                 answer_states: {r1: st("saved"), r2: st("pending_new"), r3: st("applied")}};
+          answers = {r1: {id: "r1", ts: "t", source: "local", option: 0}, r2: {id: "r2", ts: "t", source: "local", option: 1},
+                     r3: {id: "r3", ts: "t", source: "local", option: 0}};
+          if (applyLabel() !== "Применить сохранённые ответы (2)") throw Error(applyLabel());
+          man.answer_states.r1 = st("applied"); man.answer_states.r2 = st("applied");
+          if (applyLabel() !== "Применить сохранённые ответы") throw Error(applyLabel());
+        ''')
+
+    def test_applied_answer_buttons(self):
+        """В-1: у внесённого ответа без снимка нет «Изменить ответ» и отмены; у нового поверх него — «Вернуть как было»."""
+        self.run_page(r'''
+          const it = {id: "r1", options: [{label: "x"}, {label: "y"}]}, a = {id: "r1", option: 1, ts: "t", source: "local"};
+          const st = (s, extra) => ({r1: {state: s, ts: "t", source: "local", ...extra}});
+          const acts = () => appliedActions(it, a).join();
+          man = {items: [it], answer_states: st("applied"), applied_answers: {r1: ["option", 0, null]}};
+          if (acts() !== "edit,revert") throw Error(acts());
+          man.answer_states = st("applied", {undo: false});
+          if (acts() !== "") throw Error(acts());
+          man.answer_states = st("pending_new", {undo: false});
+          if (acts() !== "back") throw Error(acts());
+          man.answer_states = st("applied_check");
+          if (acts() !== "confirm,edit,revert") throw Error(acts());
         ''')
 
     def test_disabled_button_style(self):
