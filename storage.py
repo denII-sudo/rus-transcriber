@@ -548,6 +548,19 @@ def _release_wal_files(path):
         db.close()
 
 
+def _remove_unpublished(staged):
+    """Удалить неопубликованный временный файл резерва и его служебные -wal/-shm/-journal.
+
+    Только имена этого вызова (`<назначение>.incomplete-<uuid>`). Ошибка удаления (файл держит другая программа)
+    не заменяет исходную ошибку резерва: файл тогда остаётся и готовым резервом не считается.
+    """
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            staged.with_name(staged.name + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _has_table(db, name):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
@@ -831,27 +844,33 @@ class Store:
         staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
         with staged.open("xb"):
             pass
-        target = _connect(staged, "rw")
         try:
-            self.db.backup(target)
-            target.execute("BEGIN IMMEDIATE")
-            target.execute("UPDATE restore_guard SET locked=1 WHERE id=1")
-            target.execute("UPDATE allowed_roots SET requires_remap=1")
-            target.execute("UPDATE installations SET active=0")
-            target.execute("UPDATE workflow_requests SET state='interrupted', job_id=NULL "
-                           "WHERE state IN ('queued', 'starting', 'running')")
-            target.execute("UPDATE workflow_runs SET state='interrupted' WHERE state IN ('queued', 'running')")
-            target.execute("UPDATE workflow_steps SET state='interrupted' WHERE state IN ('queued', 'running')")
-            target.execute("COMMIT")
+            target = _connect(staged, "rw")
+            try:
+                self.db.backup(target)
+                target.execute("BEGIN IMMEDIATE")
+                target.execute("UPDATE restore_guard SET locked=1 WHERE id=1")
+                target.execute("UPDATE allowed_roots SET requires_remap=1")
+                target.execute("UPDATE installations SET active=0")
+                target.execute("UPDATE workflow_requests SET state='interrupted', job_id=NULL "
+                               "WHERE state IN ('queued', 'starting', 'running')")
+                target.execute("UPDATE workflow_runs SET state='interrupted' WHERE state IN ('queued', 'running')")
+                target.execute("UPDATE workflow_steps SET state='interrupted' WHERE state IN ('queued', 'running')")
+                target.execute("COMMIT")
+            except BaseException:
+                if target.in_transaction:
+                    target.execute("ROLLBACK")
+                raise
+            finally:
+                target.close()
+            report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
+            _release_wal_files(staged)
+            os.link(staged, destination)
         except BaseException:
-            if target.in_transaction:
-                target.execute("ROLLBACK")
+            # Ф204-2 (слово владельца 26.11.2026): до публикации убрать только свой временный файл этого вызова;
+            # назначение, база, другие .incomplete-* и резервы не трогаются; не удалось удалить — файл остаётся
+            _remove_unpublished(staged)
             raise
-        finally:
-            target.close()
-        report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
-        _release_wal_files(staged)
-        os.link(staged, destination)
         staged.unlink()
         return report
 

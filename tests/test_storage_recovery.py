@@ -529,13 +529,60 @@ finally:
             with self.assertRaises(storage.StorageError):
                 self.store.backup(target)
         self.assertFalse(target.exists())
-        self.assertEqual(len(list(self.base.glob("bad-backup.sqlite3.incomplete-*"))), 1)
+        self.assertEqual(len(list(self.base.glob("bad-backup.sqlite3.incomplete-*"))), 0)
         target2 = self.base / "bad-init.sqlite3"
         with mock.patch("storage.validate_copy", side_effect=storage.StorageError("injected")):
             with self.assertRaises(storage.StorageError):
                 storage.initialize(target2)
         self.assertFalse(target2.exists())
         self.assertEqual(len(list(self.base.glob("bad-init.sqlite3.incomplete-*"))), 1)
+
+    def test_failed_backup_removes_only_its_own_staged_files(self):
+        """Ф204-2: сбой резерва до публикации убирает свой временный файл и его -wal/-shm/-journal; назначение не
+        появляется; чужой незаконченный файл, готовый резерв и база не меняются."""
+        self.create()
+        foreign = self.base / "bad-backup.sqlite3.incomplete-0123456789abcdef0123456789abcdef"
+        foreign.write_bytes(b"other process")
+        ready = self.base / "ready.sqlite3"
+        self.store.backup(ready)
+        ready_bytes = ready.read_bytes()
+        rows = self.store.db.execute("SELECT COUNT(*) FROM transcript_revisions").fetchone()[0]
+
+        def fail_with_service_files(staged, **_kwargs):
+            for suffix in ("-wal", "-shm", "-journal"):
+                Path(str(staged) + suffix).write_bytes(b"service")
+            raise storage.StorageError("injected")
+
+        target = self.base / "bad-backup.sqlite3"
+        for where, patcher in (
+                ("validate_copy", mock.patch("storage.validate_copy", side_effect=fail_with_service_files)),
+                ("release", mock.patch("storage._release_wal_files", side_effect=OSError("injected"))),
+                ("link", mock.patch("storage.os.link", side_effect=OSError("injected")))):
+            with self.subTest(where=where):
+                with patcher, self.assertRaises((storage.StorageError, OSError)):
+                    self.store.backup(target)
+                self.assertFalse(target.exists())
+                self.assertEqual(sorted(p.name for p in self.base.glob("bad-backup.sqlite3.incomplete-*")),
+                                 [foreign.name])
+                self.assertEqual(foreign.read_bytes(), b"other process")
+                self.assertEqual(ready.read_bytes(), ready_bytes)
+                self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM transcript_revisions").fetchone()[0],
+                                 rows)
+        self.store.backup(target)
+        self.assertTrue(target.is_file())
+        self.assertEqual(sorted(p.name for p in self.base.glob("*.incomplete-*")), [foreign.name])
+
+    def test_failed_cleanup_keeps_backup_error(self):
+        """Удалить временный файл не удалось (его держит другая программа): наружу — исходная ошибка резерва,
+        файл остаётся и готовым резервом не считается."""
+        self.create()
+        target = self.base / "bad-backup.sqlite3"
+        with mock.patch("storage.validate_copy", side_effect=storage.StorageError("injected")), \
+                mock.patch.object(Path, "unlink", side_effect=PermissionError("busy")):
+            with self.assertRaisesRegex(storage.StorageError, "injected"):
+                self.store.backup(target)
+        self.assertFalse(target.exists())
+        self.assertEqual(len(list(self.base.glob("bad-backup.sqlite3.incomplete-*"))), 1)
 
     def test_validate_copy_rejects_document_with_incompatible_pair(self):
         self.create()

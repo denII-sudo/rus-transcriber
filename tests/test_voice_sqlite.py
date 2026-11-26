@@ -470,6 +470,22 @@ class ManualSqlitePath(SyntheticStore):
                 self.assertRaisesRegex(core.CoreError, r"нет единственной копии в базе \(найдено 0\)"):
             core.preview_voice_learning("old-job")
 
+    def test_old_job_number_redirected_by_job_status_keeps_window_note(self):
+        """Ф209-2: номер задачи переадресует core.job_status — окно по-прежнему говорит, как найдена запись."""
+        jobs = self.root / "jobs"
+        jobs.mkdir(exist_ok=True)
+        job_id = "20261126-120000-tbeef1"
+        (jobs / f"{job_id}.json").write_text(json.dumps(
+            {"state": "done", "kind": "transcribe", "file": str(self.audio), "json": str(self.legacy_path)},
+            ensure_ascii=False), encoding="utf-8")
+        with patch.object(settings, "recording_backend", return_value="sqlite"), patch.object(core, "JOBS", jobs):
+            self.assertEqual(core.job_status(job_id)["recording_id"], self.rid)
+            snapshot = core.prepare_voice_action(job_id)
+        self.assertEqual(snapshot["source_ref"], self.ref)
+        self.assertEqual(snapshot["report"]["source"]["redirected_from"], self.legacy_path.name)
+        self.assertIn(f"Источник: запись в базе, ревизия 1, перенесена из {self.legacy_path.name}; её старый ключ "
+                      "в профиле снимается; найдена по старому номеру задачи.", core.voice_action_lines(snapshot))
+
     def test_worker_refuses_record_without_confirmed_snapshot(self):
         before = self.profile_path.read_bytes()
         with self.assertRaisesRegex(RuntimeError, "только после просмотра и подтверждения"):

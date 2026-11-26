@@ -145,7 +145,59 @@ def _job_path(job_id, suffix):
 
 
 def job_status(job_id):
-    """Статус задачи (dict) или None, если такой задачи нет. Если процесс пропал без итога — state=error."""
+    """Статус задачи (dict) или None, если такой задачи нет. Если процесс пропал без итога — state=error.
+
+    Готовая расшифровка старого формата при работе с базой ведёт к перенесённой записи (М-2, `_legacy_redirect`).
+    """
+    s = _read_job_status(job_id)
+    if s and s.get("state") == "done" and s.get("json") and "report" not in s:
+        return _legacy_redirect(job_id, s)
+    return s
+
+
+def _legacy_redirect(job_id, s):
+    """Старая задача после переключения на базу: статус перенесённой записи вместо старого файла.
+
+    Только чтение: база открывается на чтение, файл задачи и старые файлы не меняются. Если единственной
+    перенесённой копии с тем же содержимым нет, статус прежний с `migration_hint`; отказ с той же подсказкой
+    даст `recordings.open_for_document`.
+    """
+    if settings.recording_backend() != "sqlite" or not Path(paths.STATE_DB).is_file():
+        return s
+    import recordings
+    import storage
+    try:
+        store = recordings.open_store(readonly=True)
+    except (storage.StorageError, sqlite3.Error):
+        return s
+    try:
+        if recordings.resolve_document(store, s["json"]) is not None:
+            return s          # задача сделана уже в базе
+        store.current_identity()
+        found = recordings.find_migrated(store, s["json"])
+        if found["state"] != "found":
+            if recordings.document_backend_hint(s["json"]) == "sqlite":
+                return s      # выгрузка записи базы, не старый файл: подсказка о переносе не к месту
+            return {**s, "migration_hint": found["hint"]}
+        rid = found["recording_id"]
+        data = recordings.load_recording(store, rid)
+        out = {**s, "json": data["json"], "markdown": data["markdown"], "recording_id": rid,
+               "recording_ref": "recording:" + rid, "document_sync": data["document_sync"],
+               "legacy_json": s["json"], "legacy_markdown": s.get("markdown"), "redirected_from": job_id,
+               "migration_hint": found["hint"]}
+        variant = recordings.migration_info(store, rid).get("variant") or {}
+        if variant and not variant.get("main"):
+            out["variant_main"] = False
+            out["main_recording_id"] = recordings.main_variant_of(store, rid)
+        return out
+    except (OSError, ValueError, KeyError, sqlite3.Error, storage.StorageError):
+        return s              # прежний путь: отказ и подсказку даст open_for_document
+    finally:
+        store.close()
+
+
+def _read_job_status(job_id):
+    """Статус из файла задачи как есть, без перехода к записи в базе."""
     if not _valid_job_id(job_id):
         return None
     p = _job_path(job_id, ".json")
@@ -363,7 +415,7 @@ def workflow_status(request_id):
     try:
         request = workflow.get(store, request_id)
         if request["state"] in ("starting", "running", "interrupted") and request["job_id"]:
-            request = workflow.observe(store, request_id, job_status(request["job_id"]))
+            request = workflow.observe(store, request_id, _read_job_status(request["job_id"]))
         recording_id = request["recording_id"]
         sync, unresolved, incomplete, has_conspect, unnamed = "not_started", 0, False, False, 1
         source_revision, review_revision, human_verification = None, None, "none"
@@ -699,7 +751,7 @@ def list_jobs(limit=10):
     rows = []
     job_files = [p for p in JOBS.glob("*.json") if not p.name.endswith(".voices_debug.json")]
     for p in sorted(job_files, reverse=True)[:limit]:
-        s = job_status(p.stem) or {}
+        s = _read_job_status(p.stem) or {}
         rows.append({"job_id": p.stem, "kind": s.get("kind"), "state": s.get("state"),
                      "stage": s.get("stage"), "progress": s.get("progress"), "file": s.get("file")})
     return rows
