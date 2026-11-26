@@ -10,6 +10,7 @@
 import argparse
 import json
 import mimetypes
+import re
 import secrets
 import socket
 import sys
@@ -17,8 +18,8 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path, PurePosixPath
+from urllib.parse import parse_qs, unquote, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -112,6 +113,49 @@ def answers_payload(json_path):
     return store
 
 
+def legacy_clip(json_path, rel):
+    """Клип карточки пакета, перенесённого П7, из прежней папки пакета (рядом со старой стенограммой) или None.
+
+    Перенос клипы не копирует (Р-3): у перенесённых карточек ссылка clips/<id>.mp3 указывает в новую папку пакета,
+    а файл остался в прежней. Только чтение: путь должен быть клипом карточки или её истории в текущем manifest,
+    .mp3 без «..», и после resolve() — внутри <прежняя папка пакета>/clips. Прежняя папка — только по
+    legacy_job_json из manifest."""
+    rel = unquote(rel)
+    p = PurePosixPath(rel)
+    if "\\" in rel or p.is_absolute() or ".." in p.parts or p.suffix.lower() != ".mp3" or p.parts[:1] != ("clips",):
+        return None
+    man = P.manifest(json_path) or {}
+    legacy = man.get("legacy_job_json")
+    if not isinstance(legacy, str) or not legacy:
+        return None
+    listed = set()
+    for it in man.get("items") or []:
+        if isinstance(it, dict):
+            listed.update(ref.get("clip") for ref in [it] + [h for h in it.get("history") or [] if isinstance(h, dict)])
+    if rel not in listed:
+        return None
+    old = P.pack_dir(legacy)
+    f = (old / rel).resolve()
+    return f if (old / "clips").resolve() in f.parents and f.is_file() else None
+
+
+def byte_range(header, size):
+    """Один диапазон заголовка Range (bytes=a-b, a-, -n) -> (начало, конец включительно); None — отдать файл
+    целиком (заголовка нет, он непонятен, несколько диапазонов или конец раньше начала); False — диапазон
+    за концом файла (ответ 416)."""
+    m = re.fullmatch(r"bytes=(\d{0,15})-(\d{0,15})", (header or "").strip())
+    if not m or not (m[1] or m[2]):
+        return None
+    if not m[1]:
+        n = int(m[2])
+        return (max(0, size - n), size - 1) if n and size else False
+    start = int(m[1])
+    if start >= size:
+        return False
+    end = min(int(m[2]), size - 1) if m[2] else size - 1
+    return (start, end) if end >= start else None
+
+
 def bind_free_port(start, handler, attempts=20):
     """Первый свободный порт начиная с start -> (сервер, порт) или (None, None)."""
     for port in range(start, start + attempts):
@@ -141,12 +185,14 @@ def main():
             # URL содержит секрет сессии: не записывать запрос целиком в журнал.
             pass
 
-        def _send(self, code, body, ctype="application/json; charset=utf-8", close=False):
+        def _send(self, code, body, ctype="application/json; charset=utf-8", close=False, headers=None):
             b = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             if close:
                 self.send_header("Connection", "close")
                 self.close_connection = True
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b)))
             self.send_header("Cache-Control", "no-store")
@@ -221,8 +267,26 @@ def main():
             if pd.resolve() in f.parents and f.is_file() and (f.parent == pd.resolve() or
                     (pd / "clips").resolve() in f.parents) \
                     and f.name != "answers.json":
-                return self._send(200, f.read_bytes(), mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+                return self._send_file(f)
+            # клип старой карточки перенесённого пакета — из прежней папки пакета, только чтение (Р-3)
+            f = legacy_clip(a.json_path, u)
+            if f is not None:
+                return self._send_file(f)
             self._send(404, {"error": "не найдено"})
+
+        def _send_file(self, f):
+            """Файл пакета; с Range — его часть (206): без этого Chromium не перематывает клип."""
+            data = f.read_bytes()
+            ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+            rng = byte_range(self.headers.get("Range"), len(data))
+            if rng is False:
+                return self._send(416, b"", ctype, headers={"Content-Range": f"bytes */{len(data)}",
+                                                            "Accept-Ranges": "bytes"})
+            if rng is None:
+                return self._send(200, data, ctype, headers={"Accept-Ranges": "bytes"})
+            start, end = rng
+            return self._send(206, data[start:end + 1], ctype, headers={
+                "Content-Range": f"bytes {start}-{end}/{len(data)}", "Accept-Ranges": "bytes"})
 
         def do_POST(self):
             u = self._path(post=True)
