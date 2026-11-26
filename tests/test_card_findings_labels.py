@@ -53,9 +53,10 @@ class Texts(unittest.TestCase):
         """К-7: причина applied_open и LISTEN_STALE не называют «Я прослушал» и «паузу»."""
         why = review_pack.OUTCOME_REASONS["applied_open"]
         self.assertNotIn("Я прослушал", why)
-        self.assertIn("кнопкой прослушивания на карточке", why)
+        self.assertIn("отметьте, что услышали", why)
+        self.assertIn("впишите услышанное", why)          # КН-8: кнопки прослушивания может не быть на виду
         self.assertNotIn("пауз", review_pack.LISTEN_STALE)
-        self.assertIn("интервале прослушивания", review_pack.LISTEN_STALE)
+        self.assertIn("отрезке прослушивания", review_pack.LISTEN_STALE)
 
 
 class RepeatApply(six.Case):

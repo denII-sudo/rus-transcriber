@@ -157,7 +157,7 @@ class CardAnswerDoesNotCloseTests(Base):
                 self.assertIn("r3", [i["id"] for i in transcript.unresolved(data)])
                 self.assertFalse(data["review_done"])
                 self.assertIn("r3", {rid for marks in transcript.doubt_marks(data).values() for rid in marks.values()})
-                self.assertIn("прослушайте интервал", row["why"])
+                self.assertIn("прослушайте отрезок", row["why"])
                 self.assertEqual(row["outcome"], "applied_open")
                 # 13б: страница показывает новую редакцию карточки без ответа, а не прежний ответ
                 self.assertNotIn("r3", review_pack.answer_states(jp))
