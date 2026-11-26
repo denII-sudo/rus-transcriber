@@ -79,34 +79,111 @@ class T(unittest.TestCase):
         self.assertEqual(E.main(args + ["--max-wer", "5"]), 1)
 
 
-    def test_transcribe_builds_worker_command_and_finds_output(self):
+    def fake_runs(self, seen, fail=False):
+        """Подделка двух запусков: создание базы прогона (-c) и worker.py (пишет статус и выгрузку)."""
+        from unittest import mock
+
+        def fake_run(cmd, **kw):
+            seen.setdefault("env", []).append(kw["env"])
+            if "-c" in cmd:
+                return mock.Mock(returncode=0, stdout=json.dumps({"actor_kind": "model"}) + "\n", stderr="")
+            seen.setdefault("cmd", []).append(cmd)
+            status = Path(cmd[cmd.index("--status") + 1])
+            seen["context"] = json.loads(status.read_text(encoding="utf-8"))["recording_context"]
+            if fail:
+                return mock.Mock(returncode=1, stdout="", stderr="boom")
+            audio = Path(cmd[2])
+            out = audio.parent / f"{audio.stem}.rus-transcriber" / f"{audio.stem}.transcript.json"
+            out.parent.mkdir()
+            out.write_text(json.dumps({"passport": {"storage_backend": "sqlite"}, "transcript": {"segments": [
+                {"speaker": "Спикер 1", "words": [{"w": "Мы", "s": 1}]}]}}), encoding="utf-8")
+            status.write_text(json.dumps({"state": "done", "json": str(out),
+                                          "timing": {"total_sec": 7, "realtime_factor": 2.0}}), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_transcribe_runs_in_own_temp_data_dir_without_voices(self):
+        from unittest import mock
+        real = self.d / "real-data"
+        (real / "groups" / "example").mkdir(parents=True)
+        (real / "groups" / "example" / "vocab.json").write_text("{}", encoding="utf-8")
+        (real / "groups" / "example" / "voices.json").write_text("{}", encoding="utf-8")
+        (real / "config.json").write_text(json.dumps({"recording_backend": "sqlite", "device": "cpu"}),
+                                          encoding="utf-8")
+        audio = self.d / "rec.mp3"
+        audio.write_bytes(b"x")
+        before = sorted(p.name for p in self.d.iterdir())
+        seen, data_dirs = {}, []
+
+        def spy(cmd, **kw):
+            data = Path(kw["env"]["RUS_TRANSCRIBER_DATA"])
+            data_dirs.append(data)
+            self.assertNotEqual(data, real)
+            self.assertTrue((data / "groups" / "example" / "vocab.json").exists())
+            self.assertFalse((data / "groups" / "example" / "voices.json").exists())   # биометрия не копируется
+            self.assertNotIn("recording_backend", json.loads((data / "config.json").read_text(encoding="utf-8")))
+            return fake(cmd, **kw)
+        fake = self.fake_runs(seen)
+        case = {"audio": str(audio), "names": "Анна, Борис", "group": "example", "whisper": "doubt"}
+        with mock.patch.dict(E.os.environ, {"RUS_TRANSCRIBER_DATA": str(real)}), \
+                mock.patch.object(E.subprocess, "run", spy):
+            export, timing, kept = E.transcribe(case)
+            E.transcribe(case)
+        self.assertEqual(timing, {"total_sec": 7, "realtime_factor": 2.0})
+        self.assertIsNone(kept)
+        self.assertEqual(E.hypothesis_words(export), [("мы", "Спикер 1", 1)])
+        self.assertEqual(seen["context"], {"actor_kind": "model"})
+        first, second = seen["cmd"]
+        self.assertNotEqual(first[first.index("--tag") + 1], second[second.index("--tag") + 1])
+        self.assertNotEqual(Path(first[2]), audio)                   # прогон идёт по копии аудио
+        self.assertIn("--no-voices", first)
+        self.assertIn("--names", first)
+        self.assertEqual(first[first.index("--group") + 1], "example")
+        self.assertEqual(first[first.index("--whisper") + 1], "doubt")
+        self.assertIn("--no-emotions", first)
+        self.assertFalse(any(d.parent.exists() for d in data_dirs))  # временные папки удалены
+        self.assertEqual(sorted(p.name for p in self.d.iterdir()), before)   # рядом с настоящим аудио — ничего
+        self.assertEqual(sorted(p.name for p in real.rglob("*")), ["config.json", "example", "groups",
+                                                                   "vocab.json", "voices.json"])
+
+    def test_transcribe_failure_removes_temp_dir_unless_kept(self):
         from unittest import mock
         audio = self.d / "rec.mp3"
         audio.write_bytes(b"x")
-        out_dir = self.d / "rec.rus-transcriber"
-        out_dir.mkdir()
-        seen = {}
+        case = {"audio": str(audio)}
+        for keep in (False, True):
+            seen = {}
+            with mock.patch.dict(E.os.environ, {"RUS_TRANSCRIBER_DATA": str(self.d / "real")}), \
+                    mock.patch.object(E.subprocess, "run", self.fake_runs(seen, fail=True)), \
+                    mock.patch.object(E.sys, "stderr"):
+                with self.assertRaises(RuntimeError):
+                    E.transcribe(case, keep=keep)
+            tmp = Path(seen["env"][0]["RUS_TRANSCRIBER_DATA"]).parent
+            self.assertEqual(tmp.exists(), keep)
+            if keep:
+                __import__("shutil").rmtree(tmp)
 
-        def fake_run(cmd, **kw):
-            seen["cmd"] = cmd
-            tag = cmd[cmd.index("--tag") + 1]
-            (out_dir / f"rec.{tag}.transcript.json").write_text("{}", encoding="utf-8")
-            return mock.Mock(returncode=0, stdout="", stderr="")
-        case = {"audio": str(audio), "names": "Анна, Борис", "group": "example", "whisper": "doubt"}
-        with mock.patch.object(E.subprocess, "run", fake_run):
-            first = E.transcribe(case)
-            second = E.transcribe(case)
-            self.assertNotEqual(first, second)
-            self.assertTrue(first.exists())
-            self.assertTrue(second.exists())
-        cmd = seen["cmd"]
-        self.assertIn("--names", cmd)
-        self.assertEqual(cmd[cmd.index("--group") + 1], "example")
-        self.assertEqual(cmd[cmd.index("--whisper") + 1], "doubt")
-        self.assertIn("--no-emotions", cmd)
-        with mock.patch.object(E.subprocess, "run", lambda *a, **k: mock.Mock(returncode=1, stdout="", stderr="boom")):
-            with self.assertRaises(RuntimeError):
-                E.transcribe(case)
+    def test_evaluate_without_voices_does_not_check_voice_threshold(self):
+        from unittest import mock
+        audio = self.d / "rec.mp3"
+        audio.write_bytes(b"x")
+        case = {"audio": str(audio), "reference": str(self.d / "ref.txt"), "max_wer": 100, "min_voice": 90}
+        with mock.patch.dict(E.os.environ, {"RUS_TRANSCRIBER_DATA": str(self.d / "real")}), \
+                mock.patch.object(E.subprocess, "run", self.fake_runs({})):
+            res = E.evaluate(case)
+        self.assertIsNone(res["voice"])
+        self.assertEqual(res["total_sec"], 7)
+        problems, warns = E.verdict(case, res)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(warns), 1)
+
+    def test_score_reads_store_export(self):
+        export = {"passport": {"storage_backend": "sqlite"}, "transcript": {"segments": [
+            {"speaker": "Анна", "words": [{"w": w, "s": 1} for w in "Мы пошли гулять в парк сегодня".split()]}]}}
+        (self.d / "e.json").write_text(json.dumps(export), encoding="utf-8")
+        hyp, _ = E.load_hypothesis(self.d / "e.json")
+        self.assertEqual(hyp[0], ("мы", "Анна", 1))
+        self.assertEqual(E.main(["score", str(self.d / "e.json"), str(self.d / "ref.txt"), "--limit", "3"]), 0)
 
 
 if __name__ == "__main__":

@@ -1231,7 +1231,7 @@ class BackendSelectionTests(unittest.TestCase):
             data = WorkerSnapshotTests().worker_result()
             data["review"][0].pop("word_ids")
             data["_timing"] = {}
-            args = ["worker.py", str(src), "--status", str(status), "--storage-backend", "sqlite", "--no-voices"]
+            args = ["worker.py", str(src), "--status", str(status), "--no-voices"]
             with mock.patch.object(settings.paths, "STATE_DB", db), \
                     mock.patch.object(sys, "argv", args), \
                     mock.patch.dict(os.environ, {"HF_TOKEN": "synthetic-token"}), \
