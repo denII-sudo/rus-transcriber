@@ -369,7 +369,9 @@ audio{width:100%;height:36px}
     if ((r.preflight_conflicts || []).length) return "Этот ответ не внесётся: он затрагивает те же слова, что и сохранённый ответ другой карточки.";
     const one = (r.cards || [])[0];
     const others = man.items.some(x => x.id !== it.id && answers[x.id] && WAITING.includes(stateOf(x, answers[x.id])));
-    return "Предпросмотр (без записи): " + (one && (one.was_now || (one.applied || []).join("; ")) || "автоматических изменений нет") +
+    // «было → стало» без видимой разницы (was_now показывает не всю замену) — показать саму замену
+    const wasNow = one && one.was_now && !/^(.*) → \1$/.test(one.was_now) ? one.was_now : "";
+    return "Предпросмотр (без записи): " + (one && (wasNow || (one.applied || []).join("; ")) || "автоматических изменений нет") +
       ((r.left_to_human || []).length ? "; программа не внесёт это сама: место останется вам" : "") +
       ((r.not_found || []).length ? "; программа не нашла в нынешнем тексте слова этой карточки" : "") + "." +
       (others ? " Результат может измениться: вместе с ним применятся другие сохранённые ответы." : "");
@@ -389,7 +391,9 @@ audio{width:100%;height:36px}
     if (now.length) lines.push(`Применено сейчас: ${now.length} (карточки ${now.map(num).join(", ")})`);
     // уточнение к внесённому (например, В-1: со страницы его не отменить) — строкой под группой
     now.filter(o => o.detail).forEach(o => lines.push(`${cardName(o.id, o.card)}: ${o.detail}`));
-    if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (c.was_now) lines.push(`${cardName(c.id)}: ${c.was_now}`); });
+    // «было → стало» без видимой разницы (was_now показывает не всю замену) — сама замена
+    const shown = (c) => c.was_now && !/^(.*) → \1$/.test(c.was_now) ? c.was_now : (c.applied || []).join("; ");
+    if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (shown(c)) lines.push(`${cardName(c.id)}: ${shown(c)}`); });
     if (quiet.length) lines.push(`Без изменений: ${quiet.length} — применены раньше или пропущены (карточки ${quiet.map(num).join(", ")})`);
     // apply_conflict: уточнение программы (версия стенограммы, слова вне места) полнее общей причины — без повтора
     rows.filter(o => !DONE.includes(o.outcome) && !QUIET.includes(o.outcome)).forEach(o =>

@@ -297,6 +297,12 @@ class Page(unittest.TestCase):
           if (!previewText(it, {preflight_conflicts: [{}]}).startsWith("Этот ответ не внесётся: он затрагивает")) throw Error("preflight");
           let t = previewText(it, {cards: [{was_now: "было → стало"}], not_found: ["r1"]});
           if (t !== "Предпросмотр (без записи): было → стало; программа не нашла в нынешнем тексте слова этой карточки.") throw Error(t);
+          t = previewText(it, {cards: [{was_now: "Анна: восьмое → Анна: восьмое", applied: ["«восьмое» → «восьмое слово»"]}]});
+          if (t !== "Предпросмотр (без записи): «восьмое» → «восьмое слово».") throw Error(t);
+          // то же в итоге «Применить»
+          const lines = reportLines({free_text: {cards: [{id: "r1", was_now: "Анна: восьмое → Анна: восьмое",
+                                                          applied: ["«восьмое» → «восьмое слово»"]}]}}, man.items);
+          if (lines.join() !== "Карточка 1: «восьмое» → «восьмое слово»") throw Error(lines.join());
           answers.r2 = {id: "r2", ts: "t", source: "local", option: 0};
           t = previewText(it, {cards: [], left_to_human: ["r1"]});
           if (!t.includes("программа не внесёт это сама: место останется вам") || !t.endsWith("другие сохранённые ответы.")) throw Error(t);
