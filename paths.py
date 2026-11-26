@@ -52,7 +52,8 @@ GROUPS = DATA_DIR / "groups"
 JOBS = DATA_DIR / "jobs"
 BENCH = DATA_DIR / "bench"
 CONFIG_FILE = DATA_DIR / "config.json"
-STATE_DB = DATA_DIR / "state.sqlite3"  # создаётся только явной операцией initialize_store
+STATE_DB = DATA_DIR / "state.sqlite3"  # создаётся только явной операцией: initialize_recording_store,
+                                       # rt.py db-init или шаг «База записей» install.ps1 (новая установка)
 HYPOTHESES = DATA_DIR / "hypotheses"   # гипотезы моделей (hypstore); создаётся только при первой записи
 for _d in (GROUPS, JOBS, BENCH):
     try:

@@ -535,7 +535,7 @@ finally:
             with self.assertRaises(storage.StorageError):
                 storage.initialize(target2)
         self.assertFalse(target2.exists())
-        self.assertEqual(len(list(self.base.glob("bad-init.sqlite3.incomplete-*"))), 1)
+        self.assertEqual(len(list(self.base.glob("bad-init.sqlite3.incomplete-*"))), 0)   # свой файл убран, как у резерва
 
     def test_failed_backup_removes_only_its_own_staged_files(self):
         """Ф204-2: сбой резерва до публикации убирает свой временный файл и его -wal/-shm/-journal; назначение не

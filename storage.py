@@ -523,11 +523,15 @@ def initialize(path, *, initial_display_name=None):
     if path.exists():
         raise FileExistsError(path)
     staged = path.with_name(path.name + ".incomplete-" + uuid.uuid4().hex)
-    created = _initialize_at(staged, initial_display_name)
-    created.close()
-    validate_copy(staged)
-    _release_wal_files(staged)
-    os.link(staged, path)
+    try:
+        created = _initialize_at(staged, initial_display_name)
+        created.close()
+        validate_copy(staged)
+        _release_wal_files(staged)
+        os.link(staged, path)
+    except BaseException:
+        _remove_unpublished(staged)       # свой незаконченный файл; каждый повтор иначе оставлял бы ещё один
+        raise
     staged.unlink()
     return open_store(path)
 
@@ -549,10 +553,10 @@ def _release_wal_files(path):
 
 
 def _remove_unpublished(staged):
-    """Удалить неопубликованный временный файл резерва и его служебные -wal/-shm/-journal.
+    """Удалить неопубликованный временный файл (резерва или новой базы) и его служебные -wal/-shm/-journal.
 
     Только имена этого вызова (`<назначение>.incomplete-<uuid>`). Ошибка удаления (файл держит другая программа)
-    не заменяет исходную ошибку резерва: файл тогда остаётся и готовым резервом не считается.
+    не заменяет исходную ошибку: файл тогда остаётся и готовым резервом или базой не считается.
     """
     for suffix in ("", "-wal", "-shm", "-journal"):
         try:
