@@ -148,6 +148,7 @@ audio{width:100%;height:36px}
   const HEARD_TOL = 0.2;
   const LISTEN_FIRST = "Сначала прослушайте место целиком — кнопки прослушивания станут доступны (можно частями, перемотка не в счёт)";
   const NO_CLIP_LISTEN = "Звук места недоступен — ответьте своим текстом";
+  const CLIP_FAILED = "Звук места не загрузился: файла клипа нет или он не открывается.";
   const playedSpans = {};          // «id#редакция» → слитые проигранные куски клипа в этой сессии страницы
   const heardHere = new Set();     // «id#редакция»: отрезок места проигран целиком в этой сессии
   const isListen = (o) => !!(o && o.decision && o.decision.listened);
@@ -605,6 +606,10 @@ audio{width:100%;height:36px}
       au.addEventListener("play", () => sendInteraction(it, "audio_play"));
       au.addEventListener("ended", () => sendInteraction(it, "audio_ended"));
       ["timeupdate", "pause", "ended"].forEach(t => au.addEventListener(t, () => trackPlayed(it, au, c)));
+      // звук не загрузился (файла клипа нет или он не открывается): вместо молча посеревшего плеера — надпись
+      au.addEventListener("error", () => {
+        const s = document.createElement("p"); s.className = "side clip-failed"; s.textContent = CLIP_FAILED; au.replaceWith(s);
+      });
       c.append(au);
     }
 
