@@ -300,6 +300,7 @@ def workflow_repair_quotes(request_id, *, via, snapshot=None, allow_cloud_model=
 
 def recording_conspects(recording_id):
     """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
+    import core_conflicts
     import recordings
     store = recordings.open_store()
     try:
@@ -311,7 +312,10 @@ def recording_conspects(recording_id):
             locations = store.db.execute(
                 "SELECT kind, relative_path FROM conspect_file_locations WHERE conspect_id=?",
                 (item["conspect_id"],)).fetchall()
-            files = {loc["kind"]: str(Path(root["path"]) / loc["relative_path"])
+            # база хранит путь корня приведённым к нижнему регистру; для показа берём регистр с диска
+            case_cache = {}
+            files = {loc["kind"]: str(core_conflicts._real_case(Path(root["path"]) / loc["relative_path"],
+                                                                case_cache))
                      for loc in locations} if root else {}
             result.append({"conspect_id": item["conspect_id"], "name": item["name"],
                            "current_revision": item["current_revision"],

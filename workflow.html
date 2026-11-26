@@ -1,19 +1,21 @@
 <style>
-body{padding:12px;max-width:900px;margin:0 auto}
+:root{color-scheme:light;--bg:#fff;--fg:#000;--line:#ddd;--muted:#666;--ok:#0a7d32;--warn:#a05a00;--bad:#b3261e;--code-bg:#f6f6f6}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#1e1f22;--fg:#e6e6e6;--line:#4a4c52;--muted:#a0a3a8;--ok:#5fd38a;--warn:#e0a24a;--bad:#ff8a80;--code-bg:#2a2c30}}
+body{background:var(--bg);color:var(--fg);padding:12px;max-width:900px;margin:0 auto}
 h1{font-size:20px}h2{font-size:16px;margin:18px 0 6px}
-section{border:1px solid #ddd;border-radius:8px;padding:10px;margin-bottom:12px}
+section{border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px}
 button{margin:2px 4px 2px 0;padding:4px 10px;cursor:pointer}
 input,select{padding:4px;margin:2px 0}
 input[type=text]{width:100%;box-sizing:border-box}
 table{border-collapse:collapse;width:100%}
-td,th{border:1px solid #ddd;padding:4px;text-align:left;vertical-align:top;font-size:13px}
-.ok{color:#0a7d32}.warn{color:#a05a00}.bad{color:#b3261e}
-.muted{color:#666;font-size:12px}
-pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overflow-x:auto}
+td,th{border:1px solid var(--line);padding:4px;text-align:left;vertical-align:top;font-size:13px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.muted{color:var(--muted);font-size:12px}
+pre{white-space:pre-wrap;background:var(--code-bg);padding:8px;border-radius:6px;overflow-x:auto}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.conflict{border-top:1px solid #ddd;padding:6px 0}
+.conflict{border-top:1px solid var(--line);padding:6px 0}
 .conflict p{margin:4px 0}
-.ask{border:1px solid #b3261e;border-radius:6px;padding:8px;margin-top:6px}
+.ask{border:1px solid var(--bad);border-radius:6px;padding:8px;margin-top:6px}
 .lines{max-height:240px;overflow:auto}
 details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
 </style>
@@ -148,7 +150,19 @@ async function api(path, body, method) {
 const call = (path, body) => api(path, body);
 const post = (path, body) => api(path, body, "POST");
 
-const fmtTime = iso => (iso || "").replace("T", " ").slice(0, 16);
+// Единый помощник времени: метки с поясом (Z, +00:00) показываем по местным часам компьютера
+// с пометкой пояса; метка без пояса (время записи из файла) — как записана, без выдуманного пояса.
+function fmtTime(iso) {
+  if (!iso) return "";
+  const s = String(iso);
+  if (!/(Z|[+-]\d\d:?\d\d)$/i.test(s)) return s.replace("T", " ").slice(0, 16);
+  const d = new Date(s);
+  if (isNaN(d)) return s.replace("T", " ").slice(0, 16);
+  const p = n => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset(), a = Math.abs(off);
+  const zone = "UTC" + (off < 0 ? "-" : "+") + Math.floor(a / 60) + (a % 60 ? ":" + p(a % 60) : "");
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())} (${zone})`;
+}
 const revName = {transcript: "текст", review: "разбор"};
 
 function renderStatus(s) {
