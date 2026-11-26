@@ -23,10 +23,12 @@ concurrency:
 
 jobs:
   queue:
+    # PR от Dependabot (ветки dependabot/...) в очередь не ставится: их сливает владелец по своему слову.
     if: >-
-      github.event_name == 'pull_request_target' ||
+      !startsWith(github.event.workflow_run.head_branch || github.event.pull_request.head.ref, 'dependabot/') &&
+      (github.event_name == 'pull_request_target' ||
       (github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success')
+      github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-latest
     # watches the queued PR (WATCH_MINUTES) and waits for approved Tests runs
     timeout-minutes: 120

@@ -14,7 +14,8 @@ import check_repo  # noqa: E402
 
 class T(unittest.TestCase):
     def test_no_personal_data_tracked(self):
-        problems, words, _ = check_repo.check()
+        # hide_words: журнал CI публичный, найденное имя пользователя или слово в нём выводить нельзя (файл:строка есть)
+        problems, words, _ = check_repo.check(hide_words=True)
         self.assertEqual(problems, [], "\n".join(f"{w}: {why}" for w, why in problems))
 
     def test_fallback_without_git_skips_environment_and_data_dirs(self):
