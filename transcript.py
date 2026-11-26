@@ -1866,11 +1866,13 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     def who(rows):
         return ", ".join(dict.fromkeys(sp for _, _, sp in rows if sp))
 
-    final = [(w["s"], w["w"], sg["speaker"]) for sg in segs for w in sg["words"]]
+    final = [(w["s"], w["w"], sg["speaker"], w) for sg in segs for w in sg["words"]]
     for card, rg in rep["cards"].items():
         a_, b_ = rg["t1"] - 0.01, rg["t2"] + 0.01
         brows = [r for r in snap if a_ <= r[0] <= b_]
-        arows = [r for r in final if a_ <= r[0] <= b_ + 0.05]
+        # М-2: слово, изменённое или вставленное ответом этой карточки, — в «стало», даже если его время за окном
+        # места (одно слово заменено двумя: второе получает время после начала прежнего, за окном)
+        arows = [r[:3] for r in final if a_ <= r[0] <= b_ + 0.05 or r[3].get("edited") == card]
         bt, at = txt(brows), txt(arows)
         card_seen = [x for x in rep.get("seen_changed", []) if a_ <= x["t"] <= b_]
         c = counts.get(card)

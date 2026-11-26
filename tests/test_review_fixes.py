@@ -607,6 +607,25 @@ class AnswerIntegrity(unittest.TestCase):
         # новый ответ не потерян: он сохранён и ждёт; «Вернуть как было» вернёт внесённый
         self.assertEqual(P._read(pd / "answers.json", {})["answers"]["r1"]["option"], 1)
 
+    def test_was_now_shows_word_inserted_after_place(self):
+        """М-2: одно слово заменено двумя — второе стоит после конца прежнего, вне окна места. Было: «было → стало»
+        без него («восьмое → восьмое»); стало: «стало» со вставленным словом — и в предпросмотре, и при записи."""
+        import review_pack as P
+        for text, now in (("восьмое слово", "Анна: восьмое слово"), ("восьмое слово ещё", "Анна: восьмое слово ещё"),
+                          ("седьмое восьмое", "Анна: седьмое восьмое")):
+            with self.subTest(text=text):
+                c = Case([seg("Анна", W("пятое шестое восьмое девятое", 0.0))],
+                         [item("r1", 0.6, 0.6, "Анна", "восьмое")])
+                pd = P.pack_dir(c.json)
+                pd.mkdir(parents=True, exist_ok=True)
+                P._write(pd / "manifest.json", {"version": "v1", "items": [dict(T.load(c.json)["review"][0],
+                                                                                 options=[])]})
+                preview = P.apply_free(c.json, c.md, {"r1": {"text": text}}, dry_run=True)
+                self.assertEqual(preview["cards"][0]["was_now"], "Анна: восьмое → " + now)
+                applied = P.apply_free(c.json, c.md, {"r1": {"text": text}})
+                self.assertEqual(applied["cards"][0]["was_now"], "Анна: восьмое → " + now)
+                self.assertEqual(T.load(c.json)["edits"][-1]["after"]["text"], now)
+
     def test_free_preview_does_not_write(self):
         import review_pack as P
         c = Case([seg("Анна", W("и он", 0.0)), seg("Борис", W("Ну,", 0.55)),
