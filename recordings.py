@@ -1046,53 +1046,6 @@ def _ensure_ids(transcript, recording_id):
 LEGACY_MIGRATION_DOC = "docs/legacy-migration.md"
 
 
-def _data_dir_has_files(directory):
-    """Есть ли под каталогом хоть один файл (пустые служебные каталоги — не след работы)."""
-    try:
-        return any(p.is_file() for p in Path(directory).rglob("*"))
-    except OSError:
-        return True                       # не прочитать — считать, что следы есть
-
-
-def installation_traces():
-    """Следы прежней работы с записями в папке данных: имена признаков, без содержимого записей.
-
-    Записи файлового режима лежат рядом с аудио, а инструменты программы находят их только по задаче
-    (`jobs/<id>.json`), поэтому признаки берутся из папки данных. Тест скорости (`kind: benchmark`, `bench/`)
-    и служебные файлы любого запуска (`jobs/config.lock`, `jobs/voice-locks`, `jobs/slots`) записей не создают.
-    """
-    import migrate
-    import paths
-    traces = []
-    try:
-        for p in sorted(Path(paths.JOBS).glob("*.json")):
-            try:
-                kind = json.loads(p.read_text(encoding="utf-8")).get("kind")
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-                kind = None               # нечитаемая задача — неясно, что в ней: считать следом
-            if kind != "benchmark":
-                traces.append("jobs")
-                break
-    except OSError:
-        traces.append("jobs")
-    data_dir = Path(paths.DATA_DIR)
-    for name, directory in (("groups", paths.GROUPS), ("hypotheses", paths.HYPOTHESES),
-                            ("exports", data_dir / "exports"), ("_deleted", data_dir / "_deleted")):
-        if _data_dir_has_files(directory):
-            traces.append(name)
-    try:
-        if any(p.name.startswith("_backup") and (p.is_file() or _data_dir_has_files(p)) for p in data_dir.iterdir()):
-            traces.append("_backup")
-    except OSError:
-        traces.append("_backup")
-    try:
-        if migrate.pending():
-            traces.append("legacy_layout")
-    except OSError:
-        traces.append("legacy_layout")
-    return traces
-
-
 def _explicit_backend():
     """(значение `recording_backend` из config.json или None, читается ли файл)."""
     import paths
@@ -1126,6 +1079,7 @@ def prepare_new_installation(check_only=False):
     база, но её нет (новая пустая скрыла бы потерю). `ok=False` — база записей не готова (установщик: код 2).
     check_only=True — только сказать, что было бы сделано.
     """
+    import data_io
     import paths
     import settings
     db = Path(paths.STATE_DB)
@@ -1151,7 +1105,7 @@ def prepare_new_installation(check_only=False):
     if db.exists():
         if explicit == "sqlite":
             return done("sqlite", True, f"База записей есть: {db}. Записи хранятся в базе.")
-        traces = installation_traces()
+        traces = data_io.installation_traces()
         result["traces"] = traces
         try:
             empty = _store_is_empty(db)
@@ -1172,7 +1126,7 @@ def prepare_new_installation(check_only=False):
         return done("missing_db", False, f"База записей не готова: выбрано хранение в базе, но базы нет ({db}). "
                     "Верните базу из резерва (`rt.py db-restore`) или см. документ "
                     f"{LEGACY_MIGRATION_DOC}. Новая пустая база не создаётся, чтобы не скрыть потерю.")
-    traces = installation_traces()
+    traces = data_io.installation_traces()
     result["traces"] = traces
     if explicit is not None or traces:
         return done("legacy", True, legacy_message())
