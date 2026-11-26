@@ -408,7 +408,7 @@ class SqliteEndToEndTests(unittest.TestCase):
                 store.close()
             status = root / "status.json"
             status.write_text(json.dumps({"recording_context": context}), encoding="utf-8")
-            args = ["worker.py", str(src), "--status", str(status), "--storage-backend", "sqlite", "--no-voices"]
+            args = ["worker.py", str(src), "--status", str(status), "--no-voices"]
             with mock.patch.object(settings.paths, "STATE_DB", db), \
                     mock.patch.object(sys, "argv", args), \
                     mock.patch.dict(os.environ, {"HF_TOKEN": "synthetic-token"}), \
