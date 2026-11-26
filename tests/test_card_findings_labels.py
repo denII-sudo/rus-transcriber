@@ -53,9 +53,10 @@ class Texts(unittest.TestCase):
         """К-7: причина applied_open и LISTEN_STALE не называют «Я прослушал» и «паузу»."""
         why = review_pack.OUTCOME_REASONS["applied_open"]
         self.assertNotIn("Я прослушал", why)
-        self.assertIn("кнопкой прослушивания на карточке", why)
+        self.assertIn("отметьте, что услышали", why)
+        self.assertIn("впишите услышанное", why)          # КН-8: кнопки прослушивания может не быть на виду
         self.assertNotIn("пауз", review_pack.LISTEN_STALE)
-        self.assertIn("интервале прослушивания", review_pack.LISTEN_STALE)
+        self.assertIn("отрезке прослушивания", review_pack.LISTEN_STALE)
 
 
 class RepeatApply(six.Case):
@@ -76,8 +77,8 @@ class RepeatApply(six.Case):
                 json.dumps(items, ensure_ascii=False)))
             self.assertEqual(out.returncode, 0, out.stderr)
             lines = json.loads(out.stdout)
-            self.assertEqual(lines[0], "Новых изменений нет")
-            self.assertTrue(any(line.endswith("ответ применён раньше — без изменений") for line in lines), lines)
+            card = next(n for n, it in enumerate(items, 1) if it["id"] == "r4")
+            self.assertEqual(lines, [f"Без изменений: 1 — применены раньше или пропущены (карточки {card})"])
 
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
@@ -121,19 +122,26 @@ class PageLabels(unittest.TestCase):
         ''')
 
     def test_report_unchanged_lines(self):
-        """К-14: строки неменявшихся ответов; «Новых изменений нет» — только если таких все."""
+        """К-14, КН-10 (4.4): итог по группам — применено сейчас, без изменений одной строкой, нужно ваше действие."""
         self.run_page(r'''
           const items = [{id: "r1", t: "00:01"}, {id: "r2", t: "00:02"}, {id: "r3", t: "00:03"}];
           const o = (id, card, outcome) => ({id, card, outcome, why: "исход " + outcome});
-          let lines = reportLines({outcomes: [o("r1", 1, "applied"), o("r2", 2, "applied_check")], unchanged: ["r1", "r2"]}, items);
-          const want = ["Новых изменений нет", "Карточка 1 (00:01): ответ применён раньше — без изменений",
-                        "Карточка 2 (00:02): ответ применён раньше — ждёт вашей проверки"];
-          if (JSON.stringify(lines) !== JSON.stringify(want)) throw Error(JSON.stringify(lines));
-          lines = reportLines({outcomes: [o("r1", 1, "applied"), o("r3", 3, "applied")], unchanged: ["r1"]}, items);
-          if (lines[0] === "Новых изменений нет" || lines[1] !== "Карточка 3 (00:03): исход applied") throw Error(JSON.stringify(lines));
+          const same = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got)); };
+          // проверить применённое человеку — действие, а не «без изменений»
+          same(reportLines({outcomes: [o("r1", 1, "applied"), o("r2", 2, "applied_check")], unchanged: ["r1", "r2"]}, items),
+               ["Без изменений: 1 — применены раньше или пропущены (карточки 1)", "Нужно ваше действие:",
+                "Карточка 2 (00:02): исход applied_check"]);
+          same(reportLines({outcomes: [o("r1", 1, "applied"), o("r3", 3, "applied"), o("r2", 2, "skipped")], unchanged: ["r1"]}, items),
+               ["Применено сейчас: 1 (карточки 3)", "Без изменений: 2 — применены раньше или пропущены (карточки 1, 2)"]);
           // место открыто после прежнего ответа: исход не прячется за «без изменений»
-          lines = reportLines({outcomes: [o("r1", 1, "applied_open")], unchanged: ["r1"]}, items);
-          if (JSON.stringify(lines) !== JSON.stringify(["Карточка 1 (00:01): исход applied_open"])) throw Error(JSON.stringify(lines));
+          same(reportLines({outcomes: [o("r1", 1, "applied_open")], unchanged: ["r1"]}, items),
+               ["Нужно ваше действие:", "Карточка 1 (00:01): исход applied_open"]);
+          // apply_conflict: уточнение полнее общей причины — без повтора «слова изменились»
+          const d = Object.assign(o("r3", 3, "apply_conflict"), {detail: "шаг"});
+          same(reportLines({outcomes: [d]}, items), ["Нужно ваше действие:", "Карточка 3 (00:03): не применён: шаг"]);
+          const n = Object.assign(o("r3", 3, "negative"), {detail: "шаг"});
+          same(reportLines({outcomes: [n]}, items), ["Нужно ваше действие:", "Карточка 3 (00:03): исход negative — шаг"]);
+          same(reportLines({outcomes: []}, items), []);
         ''')
 
     def test_negative_over_applied_names_the_applied_answer(self):

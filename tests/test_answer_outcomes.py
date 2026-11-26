@@ -547,8 +547,10 @@ class ReportDetails(AnswerOutcomeCase):
                 self.check_outcomes(jp, rep)
                 self.assertEqual(self.outcomes(rep)["r1"], "applied")
                 self.assertIn("r1", rep["undo_unavailable"])
-                self.assertIn("нет снимка", self.detail(rep, "r1"))
-                self.assertTrue(any("Карточка 1" in line and "нет снимка" in line for line in self.lines(jp, rep)))
+                # В-1: строка вместо неактивной кнопки — что сделать, с номером карточки
+                self.assertIn("исправь место карточки 1", self.detail(rep, "r1"))
+                self.assertTrue(any("Карточка 1" in line and "со страницы не отменить" in line
+                                    for line in self.lines(jp, rep)))
 
     def test_preflight_conflict_names_other_card(self):
         for backend in BACKENDS:

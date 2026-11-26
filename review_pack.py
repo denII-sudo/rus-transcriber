@@ -52,21 +52,25 @@ OUTCOME_REASONS = {
     "revert_pending": ("отмена подготовлена: нажмите «Применить сохранённые ответы»; до этого прежний ответ "
                        "на месте. Передумали — «Не отменять»"),
     "applied": "ответ применён к стенограмме",
-    "applied_open": ("ответ применён, но место осталось открытым: прослушайте интервал и подтвердите "
-                     "услышанное кнопкой прослушивания на карточке"),
+    # КН-8: кнопки прослушивания может не быть на виду — путь «вписать услышанное» назван тоже
+    "applied_open": ("ответ применён, но место осталось открытым: прослушайте отрезок и отметьте, что услышали, "
+                     "на обновлённой карточке — или впишите услышанное"),
     "reverted": "ответ отменён, место снова открыто",
-    "pending_new": ("новый ответ сохранён, но не применён: применённый ответ этим не заменяется. "
+    "pending_new": ("новый ответ сохранён, но не применён: прежний ответ остаётся в стенограмме. "
                     "Чтобы заменить: «Подготовить отмену» → «Применить сохранённые ответы» → выберите ответ "
                     "заново → «Применить сохранённые ответы»"),
     "kept_previous": "применённый ответ оставлен: пропуск и отрицание его не меняют",
     "skipped": "пропущено, стенограмма не менялась",
     "negative": "отрицание: правка не применена, место осталось открытым",
-    "left_for_human": "требует проверки человеком",
-    "already_decided": "место уже решено; «Оставить человеку» ничего не изменило",
-    "apply_conflict": "не применён: слова карточки изменились после её создания или конфликтуют с прежней правкой",
+    "left_for_human": "оставлено вам: место не подтверждено — выберите ответ",
+    # КН-6: у ответов, помеченных переносом (Р-4), вид любой — не только «Оставить человеку»
+    "already_decided": "место было решено раньше; этот ответ не вносился",
+    "apply_conflict": ("не применён: слова этого места изменились после того, как собрали карточку, "
+                       "или их уже исправила другая правка"),
     "blocked_preflight": "не применён: ответ затрагивает те же слова, что и ответ другой карточки",
-    "undo_conflict": "отмена не выполнена: место изменилось после применения или нет снимка для отмены",
-    "source_conflict": "не применён: стенограмма изменилась после создания карточек или пакет от другой записи",
+    "undo_conflict": "отмена не выполнена: место изменилось после ответа или этот ответ нельзя отменить",
+    "source_conflict": ("не применён: стенограмма изменилась после того, как собрали карточки, "
+                        "или карточки от другой записи"),
     "not_found": "не применён: место карточки не найдено в стенограмме",
     "not_applied": "не применён: автоматическое изменение не получилось",
     "pause_refused": ("не применён: паузу так не закрыть — нажмите кнопку прослушивания паузы "
@@ -78,13 +82,19 @@ OUTCOME_REASONS = {
                       "подготовьте отмену"),
     # К-3/К-4: кнопка прослушивания противоречит словам стенограммы в интервале
     "listen_mismatch": ("не применён: выбранный ответ прослушивания не совпадает со словами стенограммы "
-                        "в интервале — исправьте слова или выберите другой ответ"),
+                        "в этом отрезке — исправьте слова или выберите другой ответ"),
     # раздел 10: кнопка «Я прослушал…» — только после того, как весь отрезок места хотя бы раз проигран
     "not_heard": ("не применён: место не прослушано целиком — проиграйте отрезок места до конца (можно частями, "
                   "перемотка не в счёт) и выберите кнопку прослушивания снова"),
 }
 # Уточнение к применённому ответу, у которого нет снимка для отмены (например, изменение слишком большое).
-UNDO_UNAVAILABLE = "отменить его будет нельзя: нет снимка для отмены"
+# В-1: страница у такого ответа кнопок не показывает — только эту строку с шагом; {n} — номер карточки.
+UNDO_UNAVAILABLE = ("Этот ответ со страницы не отменить и не заменить: изменение было слишком большим. "
+                    "Если он неверен — скажите Claude: «исправь место карточки {n}»")
+# то же у ответа, перенесённого из старых данных (снимки не переносятся, Р-1; origin ставит перенос)
+UNDO_LEGACY = ("Ответ внесён до переноса в новую версию программы; со страницы его не заменить. "
+               "Если он неверен — скажите Claude: «исправь место карточки {n}»")
+LEGACY_ORIGIN = "legacy_review_pack:"
 # К-18: снимок есть, но отмена отказана — после ответа стенограмма менялась
 UNDO_LATER_EDIT = "после этого ответа стенограмма менялась — отмена станет возможной, если отменить более позднюю правку"
 # К-12: голос «повтори» и такой же текст из облака
@@ -96,7 +106,8 @@ NOTE_NOT_WRITTEN = "примечание не записано: ответ не 
 PAUSE_CONFIRM_REFUSAL = ("слова места совпали с ответом, но место не закрылось: {why}; "
                          "прослушайте паузу или место и подтвердите отдельно")
 # годность кнопки прослушивания паузы — по словам её интервала, а не по ревизии всей стенограммы
-LISTEN_STALE = "слова в интервале прослушивания изменились после создания карточек; пересоберите пакет"
+LISTEN_STALE = ("слова в отрезке прослушивания изменились после того, как собрали карточки; "
+                "скажите Claude: «дособери карточки»")
 CONTRADICTION_STALE = ("слова места изменились после показа карточки противоречия; ответ не применён, "
                        "карточка обновлена — выберите заново")
 # PR 17-Б: что пересборка пакета (build) делает с ответом в каждом состоянии. «Ждёт» — пересборка отказывает:
@@ -118,6 +129,20 @@ REBUILD_EXIT = {
     "revert_pending": "нажмите «Применить сохранённые ответы» или «Не отменять»",
     "pending_new": "«Подготовить отмену» → «Применить сохранённые ответы»",
 }
+# ждущий новый ответ поверх внесённого без снимка: отменить нечем, выход — вернуть внесённый (В-1)
+REBUILD_EXIT_NO_UNDO = "«Вернуть как было» на карточке"
+# КН-4, КН-15: ответ карточки не внести — карточку собрали по версии стенограммы, которой нет в базе (у
+# перенесённых — версия 0). Шаг зависит от того, открыто ли место сейчас; {n} — номер карточки.
+SOURCE_UNAVAILABLE = ("карточку собрала прежняя версия программы, слова места с тех пор изменились — "
+                      "ответ здесь уже не внести")
+WORDS_CHANGED = "слова этого места изменились после того, как собрали карточку"
+FREE_OUTSIDE = "ваш ответ меняет слова за пределами места карточки — впишите только слова этого места"
+NEXT_STEP_OPEN = "Скажите Claude: «дособери карточки» — вопрос обновится"
+NEXT_STEP_CLOSED = ("Если текст верен — «Оставить как есть». Решить заново — скажите Claude: "
+                    "«переоткрой место карточки {n} и дособери карточки»")
+# прежние тексты тех же уточнений: они остаются в уточнениях, записанных до этой версии (К-22)
+OLD_SOURCE_TEXTS = ("недоступна исходная ревизия карточки", "слова карточки изменились или недоступна исходная ревизия")
+
 # Исходы, после которых в журнал не пишется попытка применения: успех пишется своим событием,
 # «пропущено» и «сохранено» ничего не пробовали менять.
 _QUIET_OUTCOMES = {"applied", "reverted", "skipped", "saved"}
@@ -462,13 +487,18 @@ def rebuild_group(state):
     return next((name for name, states in REBUILD_GROUPS.items() if state in states), "waiting")
 
 
+def _rebuild_exit(row):
+    if row["state"] == "pending_new" and row.get("undo") is False:
+        return REBUILD_EXIT_NO_UNDO
+    return REBUILD_EXIT.get(row["state"], "примените ответ")
+
+
 class RebuildRefused(RuntimeError):
     """Пересборка пакета отказала: в нём есть ответы, ждущие «Применить». waiting — [{card, id, state}]."""
 
     def __init__(self, waiting):
         self.waiting = waiting
-        rows = "; ".join(f"карточка №{w['card']} ({w['id']}) — {REBUILD_EXIT.get(w['state'], 'примените ответ')}"
-                         for w in waiting)
+        rows = "; ".join(f"карточка №{w['card']} ({w['id']}) — {_rebuild_exit(w)}" for w in waiting)
         super().__init__("Пакет карточек не пересобран: в нём есть ответы, ждущие «Применить», пересборка "
                          f"потеряла бы их. {rows}. Потом соберите пакет снова.")
 
@@ -485,6 +515,8 @@ def rebuild_check(store, man):
             out["undo_lost"] += aid in snapshots
         elif group in ("waiting", "unapplicable"):
             out[group].append({"card": row["card"], "id": aid, "state": row["state"]})
+            if group == "waiting" and row.get("undo") is False:
+                out[group][-1]["undo"] = False      # без снимка: выход из ожидания — «Вернуть как было»
     for rows in (out["waiting"], out["unapplicable"]):
         rows.sort(key=lambda r: (r["card"] is None, r["card"] or 0, str(r["id"])))
     return out
@@ -721,8 +753,223 @@ APPEND_FILES_REFUSAL = ("Дописывание карточек доступн�
 APPEND_CHANGED = "место изменилось во время сборки, повторите порцию"
 
 
-def _append_plan(T, data, man, store, cards, only=None):
-    """Какие карточки дописать или обновить. -> ([(вопрос, карточка, (t1, t2))], skipped)."""
+# В-2: карточка, собранная по версии стенограммы, которой нет в базе (у перенесённых — версия 0), на открытом
+# месте обновляется при дособирании всегда, если на ней нет внесённого или ждущего отмены ответа: её ответ не
+# внесётся никогда (core._answer_revision_conflicts), в том числе после «Пропустить».
+SOURCE_REFRESH_BLOCKED = REBUILD_GROUPS["applied"] | frozenset({"pending_new", "revert_pending", "undo_conflict"})
+
+
+def transcript_revisions(json_path):
+    """Номера версий стенограммы записи в базе; None — файловый режим (там версии карточек не проверяются)."""
+    import recordings
+    store, binding = recordings.open_for_document(json_path, readonly=True)
+    if store is None:
+        return None
+    try:
+        return set(store.list_revisions(binding["recording_id"], "transcript"))
+    finally:
+        store.close()
+
+
+def source_unavailable_ids(man, revisions):
+    """Карточки, версии стенограммы которых (card_source_revision) нет среди revisions. «Применить» ещё и
+    повреждённый снимок версии считает недоступным — такой случай здесь не виден, отказ скажет «Применить»."""
+    if revisions is None:
+        return set()
+    return {it.get("id") for it in (man or {}).get("items") or []
+            if card_source_revision(it, man) not in revisions}
+
+
+def answer_revision_conflicts(current, manifest, state, source, *, sqlite, sources=None):
+    """Карточки, ответ которых «Применить» не внесёт: слова места изменились после сборки карточки или её версии
+    стенограммы нет в базе. -> {id: причина}. Перенесено из core без изменений логики (КН-14: та же проверка
+    в «Предпросмотре»)."""
+    import transcript
+    applied = _applied_map(state)
+    answers = state.get("answers") or {}
+    base_source = source
+
+    def snapshot(word, speaker):
+        return (word.get("word_id"), word.get("w"), word.get("edited"),
+                word.get("provenance") or {}, speaker)
+
+    def select(data, ids):
+        rows = [(word, segment.get("speaker"))
+                for segment in (data or {}).get("segments") or []
+                for word in segment.get("words") or []]
+        positions = [i for i, (word, _) in enumerate(rows) if word.get("word_id") in ids]
+        if (len(set(ids)) != len(ids) or len(positions) != len(ids) or not positions or
+                positions != list(range(positions[0], positions[0] + len(ids))) or
+                [rows[i][0].get("word_id") for i in positions] != ids):
+            return None
+        return [snapshot(*rows[i]) for i in positions]
+
+    def select_by_time(data, item):
+        # Тем же правилом, что и ответ: _find_span по началу слова с допуском 0,01 с.
+        loc = transcript._find_span(data, item)
+        if loc is None:
+            return None
+        si, w1, w2 = loc
+        segment = data["segments"][si]
+        return [snapshot(word, segment.get("speaker"))
+                for word in (segment.get("words") or [])[w1:w2]]
+
+    def select_pause(data, item):
+        # Слова пропуска — начатые в его паузе (transcript.pause_words); пустая пауза — пустой снимок, не None.
+        times = transcript._place_time(item)
+        if times is None:
+            return None
+        return [snapshot(word, data["segments"][si].get("speaker"))
+                for si, _k, word in transcript.pause_words(data, *times)]
+
+    conflicts = {}
+    for item in manifest.get("items") or []:
+        aid = item.get("id")
+        answer = answers.get(aid)
+        gap = transcript.is_gap_place(item)
+        ids = None if gap else item.get("word_ids")      # у пропуска word_ids пакета не читаются
+        if not answer_is_current(answer, item) or aid in applied:
+            continue
+        # Карточка, заменённая или дописанная позже сборки пакета, сверяется с ревизией, по которой собрана.
+        revision = card_source_revision(item, manifest)
+        if sqlite and revision != manifest.get("source_revision"):
+            source = (sources or {}).get(revision)
+        else:
+            source = base_source
+        if sqlite and source is None:
+            conflicts[aid] = SOURCE_UNAVAILABLE
+            continue
+        if not ids:
+            # Старый вид карточки: ответ ищет место по времени. Сравниваем ровно те
+            # слова, которые он перезапишет, включая говорящего и все измерения provenance.
+            if sqlite and (gap or "word_ids" not in item):
+                pick = select_pause if gap else select_by_time
+                actual = pick(current, item)
+                original = pick(source, item)
+                if actual is None or original is None or actual != original:
+                    conflicts[aid] = WORDS_CHANGED
+            continue
+        actual = select(current, ids)
+        original = select(source, ids) if sqlite else actual
+        if actual is None or original is None or actual != original:
+            conflicts[aid] = WORDS_CHANGED
+    return conflicts
+
+
+def source_snapshot(store, recording_id, revision):
+    """Стенограмма версии revision из базы; нет такой версии или снимок повреждён — None."""
+    import storage
+    try:
+        return store.get_revision(recording_id, "transcript", revision)["payload"]
+    except (KeyError, ValueError, storage.StorageError):
+        return None
+
+
+def item_sources(store, recording_id, man, snapshot=None):
+    """{версия: стенограмма} для карточек, заменённых или дописанных по другой версии (upsert_cards).
+    snapshot(версия) — чем читать версию (core подставляет свою функцию)."""
+    snapshot = snapshot or (lambda revision: source_snapshot(store, recording_id, revision))
+    out = {}
+    for item in man.get("items") or []:
+        revision = card_source_revision(item, man)
+        if revision != man.get("source_revision") and revision not in out:
+            out[revision] = snapshot(revision)
+    return out
+
+
+def free_outside_card(json_path, md, item, place, now, aid, answer):
+    """Свободный ответ меняет слова за пределами слов карточки (проверка «Применить» при хранении в базе).
+    Слова карточки — word_ids, у пропуска — слова паузы в нынешней стенограмме now. Нет слов — не проверяется."""
+    import transcript
+    if transcript.is_gap_place(place or {}):
+        # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
+        found = transcript.place_words(now, place)
+        ids = found[0] if found else None
+    else:
+        ids = (item or {}).get("word_ids")
+    if not ids:
+        return False
+    preview = apply_free(json_path, md, {aid: answer}, dry_run=True)
+    return bool(set((preview.get("target_ids") or {}).get(aid) or []) - set(ids))
+
+
+def with_next_step(why, place, card):
+    """КН-15: к причине «слова места изменились» и «версии нет» — что делать, по тому, открыто ли место сейчас."""
+    import transcript
+    if why not in (SOURCE_UNAVAILABLE, WORDS_CHANGED):
+        return why
+    if place and transcript.place_unresolved(place):
+        step = NEXT_STEP_OPEN
+    else:
+        step = NEXT_STEP_CLOSED.format(n=card if card is not None else "?")
+    return f"{why}. {step}"
+
+
+def answer_guard(json_path, md, aid, answer):
+    """КН-14: почему «Применить» не внесёт ответ answer на карточку aid по нынешним данным — или None.
+    Те же проверки, что в core: версия стенограммы карточки и слова места (answer_revision_conflicts), свободный
+    ответ за пределами слов карточки (free_outside_card, только при хранении в базе — как в «Применить»).
+    Только чтение. Ответ поверх внесённого не проверяется (так и в «Применить»: его держит правило over_applied)."""
+    import recordings
+    import transcript
+    man = manifest(json_path) or {}
+    items = {it.get("id"): it for it in man.get("items") or []}
+    item = items.get(aid)
+    if item is None:
+        return None
+    state = dict(answers_state(json_path, {"answers": {}}), answers={aid: dict(answer, rev=card_rev(item))})
+    store, binding = recordings.open_for_document(json_path, readonly=True)
+    if store is None:
+        why = answer_revision_conflicts(transcript.load(json_path), man, state, None, sqlite=False).get(aid)
+        return with_next_step(why, _place(transcript.load(json_path), aid), _card_number(man, aid)) if why else None
+    try:
+        rid = binding["recording_id"]
+        current = recordings.load_recording(store, rid)
+        why = answer_revision_conflicts(current, man, state, source_snapshot(store, rid, man.get("source_revision")),
+                                        sqlite=True, sources=item_sources(store, rid, man)).get(aid)
+    finally:
+        store.close()
+    if why:
+        return with_next_step(why, _place(current, aid), _card_number(man, aid))
+    if answer.get("kind") == "free" and aid not in _applied_map(state) and \
+            free_outside_card(json_path, md, item, _place(current, aid), current, aid, state["answers"][aid]):
+        return FREE_OUTSIDE
+    return None
+
+
+def _place(data, aid):
+    return next((r for r in (data or {}).get("review") or [] if r.get("id") == aid), None)
+
+
+def _card_number(man, aid):
+    return next((n for n, it in enumerate((man or {}).get("items") or [], 1) if it.get("id") == aid), None)
+
+
+def card_conditions(json_path, man=None):
+    """Для страницы (9.3), только чтение: {id: {"place_open", "cannot_apply"}} — место сейчас не решено
+    (открыто или оставлено человеку) и ответ на этой карточке не внесётся (версии стенограммы карточки нет в
+    базе). Признаки зависят только от карточки и места, не от ответа."""
+    import transcript as T
+    man = manifest(json_path) if man is None else man
+    if not man:
+        return {}
+    try:
+        places = {r.get("id"): r for r in T.load(json_path).get("review") or []}
+    except (OSError, ValueError):
+        return {}           # стенограмма не читается: признаков нет, «Применить» само назовёт причину
+    stale = source_unavailable_ids(man, transcript_revisions(json_path))
+    return {it["id"]: {"place_open": it["id"] in places and T.place_unresolved(places[it["id"]]),
+                       "cannot_apply": it["id"] in stale}
+            for it in man.get("items") or [] if it.get("id")}
+
+
+def _source_refresh(T, place, state, aid, stale):
+    return aid in stale and T.place_unresolved(place) and state not in SOURCE_REFRESH_BLOCKED
+
+
+def _append_plan(T, data, man, store, cards, only=None, stale=frozenset()):
+    """Какие карточки дописать или обновить. stale — карточки без версии стенограммы в базе (В-2).
+    -> ([(вопрос, карточка, (t1, t2))], skipped)."""
     review = {it["id"]: it for it in data.get("review") or []}
     in_pack = {it.get("id") for it in man.get("items") or []}
     states = answer_states_of(store, man)
@@ -742,8 +989,9 @@ def _append_plan(T, data, man, store, cards, only=None):
             skipped.append({"id": aid, "why": "карточка повторяется в вызове"})
             continue
         seen.add(aid)
-        if aid in in_pack and not (T.contradiction_pending(it) or
-                                   (states.get(aid) or {}).get("state") in APPEND_REFRESH):
+        state = (states.get(aid) or {}).get("state")
+        if aid in in_pack and not (T.contradiction_pending(it) or state in APPEND_REFRESH or
+                                   _source_refresh(T, it, state, aid, stale)):
             skipped.append({"id": aid, "why": "уже в пакете"})
             continue
         if aid not in in_pack:
@@ -783,7 +1031,8 @@ def append_cards(json_path, cards, *, actor="model"):
     clips_rel = _pack_clips_dir(man, True)
     folder = pd / clips_rel
     src = Path(data.get("file") or "")
-    plan, skipped = _append_plan(T, data, man, answers_state(json_path), cards)
+    plan, skipped = _append_plan(T, data, man, answers_state(json_path), cards,
+                                 stale=source_unavailable_ids(man, transcript_revisions(json_path)))
     parts = []
     try:
         for q, new, times in plan:
@@ -812,7 +1061,9 @@ def _append_locked(json_path, parts, skipped, clips_rel, pd):
     if man.get("recording_id") and man["recording_id"] != data.get("recording_id"):
         raise RuntimeError("пакет относится к другой стенограмме")
     store = _read_answers(json_path, {"version": man["version"], "answers": {}, "conflicts": [], "rejected": []})
-    fresh, late = _append_plan(T, data, man, store, [q for q, *_ in parts], only={n["id"] for _, n, *_ in parts})
+    stale = source_unavailable_ids(man, transcript_revisions(json_path))
+    fresh, late = _append_plan(T, data, man, store, [q for q, *_ in parts], only={n["id"] for _, n, *_ in parts},
+                               stale=stale)
     fresh = {new["id"]: (new, times) for _, new, times in fresh}
     rep = {"added": [], "replaced": [], "unchanged": [], "skipped": list(skipped) + late}
     late = {r["id"] for r in late}
@@ -831,7 +1082,9 @@ def _append_locked(json_path, parts, skipped, clips_rel, pd):
             continue
         new = copy.deepcopy(new)
         old = items[index[aid]] if aid in index else None
-        if old is not None and _same_question(old, new):
+        # В-2: тот же вопрос по версии, которой нет в базе, — всё равно новая редакция с нынешней версией,
+        # иначе карточка так и осталась бы неприменимой
+        if old is not None and _same_question(old, new) and aid not in stale:
             rep["unchanged"].append(aid)
             continue
         new["rev"] = card_rev(old) + 1 if old is not None else 1
@@ -1999,10 +2252,15 @@ def answer_states_of(store, man, outcome_details=True):
         if remembered and remembered.get("ts") == answer.get("ts") and remembered.get("source") == answer.get("source"):
             details.extend(x for x in remembered.get("detail") or [] if x)
         no_snapshot = aid in applied and aid not in snapshots
-        if no_snapshot and state in ("applied", "pending_new", "kept_previous") and UNDO_UNAVAILABLE not in details:
-            details.append(UNDO_UNAVAILABLE)
+        if state == "skipped":
+            # КН-5: уточнение о версии стенограммы, записанное до этой версии под пропуском, — шум
+            details = [x for x in details if x not in OLD_SOURCE_TEXTS]
+        if no_snapshot and state in ("applied", "pending_new", "kept_previous"):
+            text = undo_unavailable_text(answer, applied.get(aid), man, cards.get(aid))
+            if text not in details:
+                details.append(text)
         if no_snapshot:
-            out[aid]["undo"] = False          # К-18: страница показывает неактивную «Отменить нельзя»
+            out[aid]["undo"] = False          # В-1: страница не показывает кнопок замены и отмены — только строку
         # Последний обработанный запрос «Не отменять»: по нему страница узнаёт, что её запрос принят или отклонён.
         accepted, rejected = answer.get("keep_request"), rejected_keeps.get(aid)
         if rejected and (not accepted or rejected["ts"] > accepted.get("ts", "")):
@@ -2014,6 +2272,18 @@ def answer_states_of(store, man, outcome_details=True):
         if details:
             out[aid]["detail"] = " — ".join(details)
     return out
+
+
+def undo_unavailable_text(answer, applied_sig, man, card):
+    """Строка под внесённым ответом без снимка для отмены (В-1): перенесённый из старых данных или нет.
+    Внесённый ответ — сам answer или его копия applied_answer (ответ поверх внесённого); без копии в
+    перенесённом пакете ответ считается перенесённым."""
+    kept = answer if _sig(answer) == applied_sig else answer.get("applied_answer")
+    if kept is not None:
+        legacy = str(kept.get("origin") or "").startswith(LEGACY_ORIGIN)
+    else:
+        legacy = bool((man or {}).get("legacy_job_json"))
+    return (UNDO_LEGACY if legacy else UNDO_UNAVAILABLE).format(n=card if card is not None else "?")
 
 
 def answer_states(json_path, outcome_details=True):

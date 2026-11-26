@@ -1338,96 +1338,21 @@ def _answers_refreshed(store, recording_id, jp, report):
 
 
 def _answer_source_snapshot(store, recording_id, manifest):
-    import storage
-    try:
-        return store.get_revision(recording_id, "transcript", manifest.get("source_revision"))["payload"]
-    except (KeyError, ValueError, storage.StorageError):
-        return None
+    import review_pack
+    return review_pack.source_snapshot(store, recording_id, manifest.get("source_revision"))
 
 
 def _answer_item_sources(store, recording_id, manifest):
     """{ревизия: стенограмма} для карточек, заменённых или дописанных по другой ревизии (upsert_cards)."""
     import review_pack
-    out = {}
-    for item in manifest.get("items") or []:
-        revision = review_pack.card_source_revision(item, manifest)
-        if revision != manifest.get("source_revision") and revision not in out:
-            out[revision] = _answer_source_snapshot(store, recording_id, {"source_revision": revision})
-    return out
+    return review_pack.item_sources(store, recording_id, manifest, snapshot=lambda revision: _answer_source_snapshot(
+        store, recording_id, {"source_revision": revision}))
 
 
 def _answer_revision_conflicts(current, manifest, state, source, *, sqlite, sources=None):
+    """Проверка карточек перед «Применить» — review_pack.answer_revision_conflicts (общая с «Предпросмотром»)."""
     import review_pack
-    import transcript
-    applied = review_pack._applied_map(state)
-    answers = state.get("answers") or {}
-    base_source = source
-
-    def snapshot(word, speaker):
-        return (word.get("word_id"), word.get("w"), word.get("edited"),
-                word.get("provenance") or {}, speaker)
-
-    def select(data, ids):
-        rows = [(word, segment.get("speaker"))
-                for segment in (data or {}).get("segments") or []
-                for word in segment.get("words") or []]
-        positions = [i for i, (word, _) in enumerate(rows) if word.get("word_id") in ids]
-        if (len(set(ids)) != len(ids) or len(positions) != len(ids) or not positions or
-                positions != list(range(positions[0], positions[0] + len(ids))) or
-                [rows[i][0].get("word_id") for i in positions] != ids):
-            return None
-        return [snapshot(*rows[i]) for i in positions]
-
-    def select_by_time(data, item):
-        # Тем же правилом, что и ответ: _find_span по началу слова с допуском 0,01 с.
-        loc = transcript._find_span(data, item)
-        if loc is None:
-            return None
-        si, w1, w2 = loc
-        segment = data["segments"][si]
-        return [snapshot(word, segment.get("speaker"))
-                for word in (segment.get("words") or [])[w1:w2]]
-
-    def select_pause(data, item):
-        # Слова пропуска — начатые в его паузе (transcript.pause_words); пустая пауза — пустой снимок, не None.
-        times = transcript._place_time(item)
-        if times is None:
-            return None
-        return [snapshot(word, data["segments"][si].get("speaker"))
-                for si, _k, word in transcript.pause_words(data, *times)]
-
-    conflicts = {}
-    for item in manifest.get("items") or []:
-        aid = item.get("id")
-        answer = answers.get(aid)
-        gap = transcript.is_gap_place(item)
-        ids = None if gap else item.get("word_ids")      # у пропуска word_ids пакета не читаются
-        if not review_pack.answer_is_current(answer, item) or aid in applied:
-            continue
-        # Карточка, заменённая или дописанная позже сборки пакета, сверяется с ревизией, по которой собрана.
-        revision = review_pack.card_source_revision(item, manifest)
-        if sqlite and revision != manifest.get("source_revision"):
-            source = (sources or {}).get(revision)
-        else:
-            source = base_source
-        if sqlite and source is None:
-            conflicts[aid] = "недоступна исходная ревизия карточки"
-            continue
-        if not ids:
-            # Старый вид карточки: ответ ищет место по времени. Сравниваем ровно те
-            # слова, которые он перезапишет, включая говорящего и все измерения provenance.
-            if sqlite and (gap or "word_ids" not in item):
-                pick = select_pause if gap else select_by_time
-                actual = pick(current, item)
-                original = pick(source, item)
-                if actual is None or original is None or actual != original:
-                    conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
-            continue
-        actual = select(current, ids)
-        original = select(source, ids) if sqlite else actual
-        if actual is None or original is None or actual != original:
-            conflicts[aid] = "слова карточки изменились или недоступна исходная ревизия"
-    return conflicts
+    return review_pack.answer_revision_conflicts(current, manifest, state, source, sqlite=sqlite, sources=sources)
 
 
 def _apply_answers_files_locked(jp, md, revision_conflicts=None):
@@ -1452,19 +1377,10 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         now = transcript.load(jp)
         places = {r.get("id"): r for r in now.get("review") or []}
         for aid, answer in free.items():
-            place = places.get(aid) or {}
-            if transcript.is_gap_place(place):
-                # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
-                found = transcript.place_words(now, place)
-                ids = found[0] if found else None
-            else:
-                ids = (items.get(aid) or {}).get("word_ids")
-            if not ids or aid in already_applied or aid in (revision_conflicts or {}):
+            if aid in already_applied or aid in (revision_conflicts or {}):
                 continue
-            preview = P.apply_free(jp, md, {aid: answer}, dry_run=True)
-            targets = set((preview.get("target_ids") or {}).get(aid) or [])
-            if targets - set(ids):
-                revision_conflicts[aid] = "свободный ответ затрагивает слова вне карточки"
+            if P.free_outside_card(jp, md, items.get(aid), places.get(aid) or {}, now, aid, answer):
+                revision_conflicts[aid] = P.FREE_OUTSIDE
     requested_ids = {d.get("id") for d in decisions if d.get("id")} | set(free)
     preflight = P.preflight_answers(jp, md, decisions, free)
     revision_conflicts = revision_conflicts or {}
@@ -1653,10 +1569,12 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     details = {aid: [states[aid]["detail"]] if states[aid].get("detail") else [] for aid in stored}
     fresh = {aid: [] for aid in stored}      # уточнения этого «Применить» — их же видит карточка (К-22)
 
+    undo_texts = set()        # строка «со страницы не отменить» (В-1) — по состоянию, в уточнениях не хранится
+
     def add_detail(aid, text):
         if aid in details and text and text not in details[aid]:
             details[aid].append(text)
-            if text != P.UNDO_UNAVAILABLE:
+            if text not in undo_texts:
                 fresh[aid].append(text)
 
     for row in rep.get("undo_conflicts") or []:
@@ -1666,8 +1584,11 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             others = [states[x]["card"] or x for x in conflict["cards"] if x != aid and x in states]
             add_detail(aid, "с карточкой " + ", ".join(str(x) for x in others) if others else conflict.get("why"))
     for aid, why in revision_conflicts.items():
-        add_detail(aid, why)
-    items_now = {item.get("id"): item for item in (P.manifest(jp) or {}).get("items") or []}
+        if outcomes.get(aid) != "apply_conflict":
+            continue        # КН-5: пропуск ничего не применял — уточнение о словах карточки ему ни к чему
+        add_detail(aid, P.with_next_step(why, places_now.get(aid), (states.get(aid) or {}).get("card")))
+    manifest_now = P.manifest(jp) or {}
+    items_now = {item.get("id"): item for item in manifest_now.get("items") or []}
     for aid in stored:
         if outcomes[aid] == "applied_check":
             was = conflict_was.get(aid)
@@ -1700,7 +1621,9 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         out = {"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
                "why": P.OUTCOME_REASONS[outcomes[aid]]}
         if outcomes[aid] == "applied" and aid in (rep.get("undo_unavailable") or []):
-            add_detail(aid, P.UNDO_UNAVAILABLE)
+            text = P.undo_unavailable_text(stored[aid], P._sig(stored[aid]), manifest_now, states[aid]["card"])
+            undo_texts.add(text)
+            add_detail(aid, text)
         extra = [text for text in details[aid] if text != out["why"]]
         if extra:
             out["detail"] = "; ".join(extra)

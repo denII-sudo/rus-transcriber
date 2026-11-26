@@ -210,14 +210,20 @@ class PageParts(unittest.TestCase):
         ''', host="example.org")
 
     def test_undo_button_without_snapshot(self):
-        """К-18: неактивная «Отменить нельзя» — только при undo === false; строка undo_conflict без повтора заголовка."""
+        """В-1 (было К-18): у ответа без снимка неактивной «Отменить нельзя» больше нет — кнопок нет совсем (card),
+        признак undo === false; у ждущего нового ответа поверх него — строка «Вернуть как было» вместо рецепта
+        с отменой. Строка undo_conflict без повтора заголовка."""
         self.run_page(r'''
           const a = {id: "r1", option: 1, ts: "t", source: "local"}, it = {id: "r1", options: [{label: "x"}, {label: "y"}]};
-          man = {answer_states: {r1: {state: "applied", ts: "t", source: "local", undo: false}}};
-          let b = revertButton(it, a);
-          if (!b.disabled || b.label !== "Отменить нельзя" || !b.title.startsWith("нет снимка для отмены")) throw Error(JSON.stringify(b));
+          man = {answer_states: {r1: {state: "applied", ts: "t", source: "local", undo: false, detail: "строка В-1"}}};
+          if (undoOf(it) !== false) throw Error("признак");
+          if (programNote(it, a) !== "строка В-1") throw Error(programNote(it, a));
+          man.answer_states.r1.state = "pending_new"; man.answer_states.r1.why = "рецепт с «Подготовить отмену»";
+          if (!programNote(it, a).startsWith(PENDING_NO_UNDO) || programNote(it, a).includes("Подготовить отмену"))
+            throw Error(programNote(it, a));
+          man.answer_states.r1.state = "applied";
           delete man.answer_states.r1.undo;
-          b = revertButton(it, a);
+          const b = revertButton(it, a);
           if (b.disabled || b.label !== "Подготовить отмену") throw Error(JSON.stringify(b));
           const r = {id: "r1", kind: "revert", ts: "t", source: "local"};
           man.answer_states.r1.state = "undo_conflict";

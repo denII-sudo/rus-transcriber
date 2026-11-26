@@ -104,6 +104,8 @@ def answers_payload(json_path):
     store["answer_states"] = P.answer_states_of(store, man)
     # места, уже прослушанные целиком (раздел 10): их кнопки прослушивания доступны сразу
     store["heard_ids"] = P.heard_ids(store, man)
+    # 9.3: место открыто; ответ на карточке не внесётся (версии стенограммы карточки нет в базе) — только чтение
+    store["card_conditions"] = P.card_conditions(json_path, man)
     # По ним страница узнаёт, что карточки заменены или дописаны, и перечитывает manifest.json.
     store["pack_version"], store["pack_rev"] = man.get("version"), man.get("pack_rev", 0)
     if "_expected_versions" in store:
@@ -111,6 +113,24 @@ def answers_payload(json_path):
         store.pop("interaction_events", None)
         store.pop("interaction_events_dropped", None)
     return store
+
+
+def preview_answer(json_path, markdown, aid, text):
+    """Ответ api/preview на свой текст text карточки aid, без записи (вызывать под замком страницы).
+    КН-14: сначала те же проверки, что у «Применить» (answer_guard: версия стенограммы, слова вне карточки) —
+    {"cards": [], "guard": причина}; затем пересечение с другими сохранёнными ответами — preflight_conflicts;
+    иначе — изменение apply_free без записи."""
+    guard = P.answer_guard(json_path, markdown, aid, {"kind": "free", "text": text})
+    if guard:
+        return {"cards": [], "guard": guard}
+    free = P.free_answers(json_path)
+    free[aid] = {"text": text}
+    decisions, _ = P.decisions(json_path)
+    decisions = [d for d in decisions if d.get("id") != aid]
+    conflicts = [c for c in P.preflight_answers(json_path, markdown, decisions, free) if aid in c["cards"]]
+    if conflicts:
+        return {"cards": [], "preflight_conflicts": conflicts}
+    return P.apply_free(json_path, markdown, {aid: free[aid]}, dry_run=True)
 
 
 def legacy_clip(json_path, rel):
@@ -321,17 +341,7 @@ def main():
                     if stale:
                         return self._send(400, {"error": stale})
                     with lock:
-                        aid = obj["id"]
-                        free = P.free_answers(a.json_path)
-                        free[aid] = {"text": obj["text"]}
-                        decisions, _ = P.decisions(a.json_path)
-                        decisions = [d for d in decisions if d.get("id") != aid]
-                        conflicts = [c for c in P.preflight_answers(a.json_path, a.markdown, decisions, free)
-                                     if aid in c["cards"]]
-                        if conflicts:
-                            result = {"cards": [], "preflight_conflicts": conflicts}
-                        else:
-                            result = P.apply_free(a.json_path, a.markdown, {aid: free[aid]}, dry_run=True)
+                        result = preview_answer(a.json_path, a.markdown, obj["id"], obj["text"])
                     return self._send(200, result)
                 if u == "api/apply":
                     obj = json.loads(body.decode("utf-8"))

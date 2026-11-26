@@ -205,27 +205,34 @@ class LegacyClipRules(unittest.TestCase):
 class ClipErrorOnPage(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
     def test_failed_clip_is_replaced_by_a_note(self):
-        """Ошибка загрузки звука: вместо молча посеревшего плеера на карточке надпись (cards.html)."""
+        """Ошибка загрузки звука: вместо молча посеревшего плеера на карточке надпись (cards.html); карточка
+        рисуется заново без кнопок прослушивания (шаг А: canHear после ошибки звука), повторно — сразу надпись."""
         html = (PROJECT / "cards.html").read_text(encoding="utf-8")
-        const = next(line for line in html.splitlines() if line.strip().startswith("const CLIP_FAILED"))
-        block = "    if (!man.clips_removed && it.clip) {" + html.split(
-            "    if (!man.clips_removed && it.clip) {", 1)[1].split("      c.append(au);\n    }\n", 1)[0] \
-            + "      c.append(au);\n    }\n"
-        script = const + r"""
+        consts = "\n".join(line for line in html.splitlines()
+                           if line.strip().startswith(("const CLIP_FAILED", "const clipFailed", "const clipFailedNote")))
+        start = "    const listenKey = `${it.id}#${revOf(it)}`;\n"
+        block = start + html.split(start, 1)[1].split("      c.append(au);\n    }\n", 1)[0] + "      c.append(au);\n    }\n"
+        script = r"""
           const made = [];
           const document = {createElement: tag => { const el = {tag, handlers: {}, addEventListener(t, f) {
             (this.handlers[t] = this.handlers[t] || []).push(f); }, replaceWith(x) { this.replacedBy = x; }};
             made.push(el); return el; }};
           const c = {children: [], append(x) { this.children.push(x); }};
           const man = {}, it = {id: "r1", clip: "clips/r1.mp3"};
-          const sendInteraction = () => {}, trackPlayed = () => {};
-        """ + block + r"""
+          const sendInteraction = () => {}, trackPlayed = () => {}, revOf = () => 1;
+          let rendered = 0; const render = () => rendered++;
+        """ + consts + block + r"""
           const au = c.children[0];
           if (au.tag !== "audio" || au.src !== "clips/r1.mp3") throw Error("плеера нет");
           if (!au.handlers.error) throw Error("нет обработчика error");
           au.handlers.error.forEach(f => f());
           if (!au.replacedBy || au.replacedBy.textContent !== CLIP_FAILED) throw Error("надписи нет");
           if (!CLIP_FAILED.includes("не загрузился")) throw Error("текст надписи");
+          if (!clipFailed.has("r1#1") || rendered !== 1) throw Error("карточка не перерисована без звука");
+          c.children.length = 0;
+          (() => {""" + block + r"""})();
+          if (c.children.length !== 1 || c.children[0].tag !== "p" || c.children[0].textContent !== CLIP_FAILED)
+            throw Error("повторная отрисовка показывает плеер");
         """
         result = subprocess.run([shutil.which("node"), "-e", "(() => {" + script + "})();"], capture_output=True,
                                 text=True, encoding="utf-8")
