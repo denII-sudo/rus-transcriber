@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LAB = ROOT / "lab"
 HAVE_LAB = (LAB / "lab_work.py").is_file()
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 if HAVE_LAB:
     sys.path.insert(0, str(LAB))
     import lab_analyze  # noqa: E402
@@ -38,6 +39,7 @@ import recordings  # noqa: E402
 import review_pack  # noqa: E402
 import settings  # noqa: E402
 import words as W  # noqa: E402
+from lab_snapshot import folder_snapshot  # noqa: E402
 
 SECRET = "Тайнословие"
 PCM = "c0ffee" * 10 + "abcd"            # хэш звука (64 знака): общий у двух записей одного звука
@@ -76,17 +78,6 @@ def result_data(audio, sha):
                        {"id": "r2", "status": "open", "text": "слово", "t": 0.7, "t1": 0.7, "t2": 1.0,
                         "speaker": "Глеб", "word_ids": ["w2"], "reasons": ["asr"]}],
             "review_done": False, "edits": []}
-
-
-def tree_state(root, skip=()):
-    """{путь: (sha256, размер, mtime_ns)} всех файлов под root, кроме верхних папок skip."""
-    out = {}
-    for f in sorted(Path(root).rglob("*")):
-        rel = f.relative_to(root)
-        if f.is_file() and rel.parts[0] not in skip:
-            st = f.stat()
-            out[rel.as_posix()] = (hashlib.sha256(f.read_bytes()).hexdigest(), st.st_size, st.st_mtime_ns)
-    return out
 
 
 def hyp_record(recording_id, sha, heard=True, primary=None):
@@ -263,15 +254,15 @@ class WorkAnalysis(unittest.TestCase):
         sandbox = self.base / "sandbox-ro"
         lab_sandbox.prepare(sandbox, self.src.data, self.program, "skip", env={}, log=lambda *_: None, work=True)
         s, _marker, units = lab_sandbox.load_sandbox(sandbox, env={})
-        data_before = tree_state(self.src.data)
-        sandbox_before = tree_state(s, skip=("results", "export"))
+        data_before = folder_snapshot(self.src.data)
+        sandbox_before = folder_snapshot(s, skip=("results", "export"))
         self.assertTrue(any(k.startswith("source/hypotheses/") for k in sandbox_before), sandbox_before)
         self.assertIn("source/state.sqlite3", sandbox_before)
         for _ in range(2):                       # повторный анализ той же песочницы — тоже без изменений
             analysis = lab_analyze.analyze(s, units, log=lambda *_: None)
             self.assertEqual(analysis["work"]["recordings"]["states"]["ok"], 1)
-            self.assertEqual(tree_state(s, skip=("results", "export")), sandbox_before)
-            self.assertEqual(tree_state(self.src.data), data_before)
+            self.assertEqual(folder_snapshot(s, skip=("results", "export")), sandbox_before)
+            self.assertEqual(folder_snapshot(self.src.data), data_before)
         self.assertTrue((s / "export" / "analysis.json").is_file())
         self.assertTrue((s / "results" / "report.md").is_file())
 
