@@ -322,19 +322,37 @@ class Page(unittest.TestCase):
         ''')
 
     def test_applied_answer_buttons(self):
-        """В-1: у внесённого ответа без снимка нет «Изменить ответ» и отмены; у нового поверх него — «Вернуть как было»."""
+        """В-1: у внесённого ответа без снимка нет «Изменить ответ» и отмены; у нового поверх него — «Вернуть как было».
+        К-В3, было: «Изменить ответ» и «Подготовить отмену» рядом (edit,revert). Стало: одна кнопка «Изменить ответ»,
+        «Отменить ответ» — в режиме изменения (второй явный шаг); «Вернуть как было» — у любого ждущего нового ответа
+        и у отказанной замены; «Не отменять» — при подготовленной отмене."""
         self.run_page(r'''
           const it = {id: "r1", options: [{label: "x"}, {label: "y"}]}, a = {id: "r1", option: 1, ts: "t", source: "local"};
           const st = (s, extra) => ({r1: {state: s, ts: "t", source: "local", ...extra}});
-          const acts = () => appliedActions(it, a).join();
+          const acts = (x) => appliedActions(it, x || a).join();
           man = {items: [it], answer_states: st("applied"), applied_answers: {r1: ["option", 0, null]}};
-          if (acts() !== "edit,revert") throw Error(acts());
+          if (acts() !== "edit") throw Error(acts());
+          if (revertInEdit(it, a)) throw Error("«Отменить ответ» до «Изменить ответ»");
+          editing.add("r1");
+          if (!revertInEdit(it, a) || revertButton(it, a).label !== "Отменить ответ") throw Error("нет «Отменить ответ»");
+          editing.delete("r1");
           man.answer_states = st("applied", {undo: false});
           if (acts() !== "") throw Error(acts());
+          editing.add("r1");
+          if (revertInEdit(it, a)) throw Error("отмена без снимка");
+          editing.delete("r1");
           man.answer_states = st("pending_new", {undo: false});
           if (acts() !== "back") throw Error(acts());
+          man.answer_states = st("pending_new");
+          if (acts() !== "back,edit") throw Error(acts());
+          if (!STATUS.pending_new.includes("заменит прежний")) throw Error(STATUS.pending_new);
+          man.answer_states = st("undo_conflict");
+          if (acts() !== "back,edit") throw Error("отказанная замена: " + acts());
+          if (acts({id: "r1", kind: "revert", ts: "t", source: "local"}) !== "edit") throw Error("отказанная отмена");
+          man.answer_states = st("revert_pending");
+          if (acts({id: "r1", kind: "revert", ts: "t", source: "local"}) !== "edit,keep") throw Error("подготовленная отмена");
           man.answer_states = st("applied_check");
-          if (acts() !== "confirm,edit,revert") throw Error(acts());
+          if (acts() !== "confirm,edit") throw Error(acts());
         ''')
 
     def test_disabled_button_style(self):

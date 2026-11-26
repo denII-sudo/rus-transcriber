@@ -223,8 +223,8 @@ class PageParts(unittest.TestCase):
             throw Error(programNote(it, a));
           man.answer_states.r1.state = "applied";
           delete man.answer_states.r1.undo;
-          const b = revertButton(it, a);
-          if (b.disabled || b.label !== "Подготовить отмену") throw Error(JSON.stringify(b));
+          const b = revertButton(it, a);      // К-В3, было «Подготовить отмену»: отмена — в режиме изменения
+          if (b.disabled || b.label !== "Отменить ответ") throw Error(JSON.stringify(b));
           const r = {id: "r1", kind: "revert", ts: "t", source: "local"};
           man.answer_states.r1.state = "undo_conflict";
           if (answerText(r, it) !== "отмена ответа не выполнена") throw Error(answerText(r, it));

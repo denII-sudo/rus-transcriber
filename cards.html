@@ -234,15 +234,20 @@ audio{width:100%;height:36px}
   const waitingCount = () => man.items.filter(it => answers[it.id] && WAITING.includes(stateOf(it, answers[it.id]))).length;
   const applyLabel = () => "Применить сохранённые ответы" + (LOCAL && waitingCount() ? ` (${waitingCount()})` : "");
   // Кнопки внесённого ответа (строка edit-row): confirm — «Ответ верен — оставить» (applied_check), back — «Вернуть
-  // как было» (В-1: новый ответ поверх внесённого без снимка), edit и revert — «Изменить ответ» и «Подготовить
-  // отмену»/«Не отменять». Без снимка (undo === false) edit и revert нет: ответ со страницы не заменить.
+  // как было» (новый ответ поверх внесённого ждёт «Применить»; К-В3 — и со снимком), edit — «Изменить ответ»,
+  // keep — «Не отменять» при подготовленной отмене. «Отменить ответ» — в режиме изменения (revertInEdit, К-В3).
+  // Без снимка (undo === false) edit нет: ответ со страницы не заменить.
   const appliedActions = (it, a) => {
     const st = stateOf(it, a), noUndo = undoOf(it) === false, out = [];
     if (LOCAL && st === "applied_check" && confirmAnswer(it)) out.push("confirm");
-    if (noUndo && st === "pending_new") out.push("back");
-    if (!noUndo) out.push("edit", "revert");
+    if (st === "pending_new" || (!noUndo && st === "undo_conflict" && kindOf(a) !== "revert")) out.push("back");
+    if (!noUndo) out.push("edit");
+    if (!noUndo && revertButton(it, a).kind === "keep") out.push("keep");
     return out;
   };
+  // К-В3: «Отменить ответ» — второй явный шаг после «Изменить ответ» (затем «Применить»)
+  const revertInEdit = (it, a) => editing.has(it.id) && holdsApplied(it, a) && undoOf(it) !== false &&
+    revertButton(it, a).kind === "revert";
   // Пустой список «без ответа»: есть ли что применять
   const emptyText = () => {
     if (!LOCAL) return "Все места разобраны. Ответы перенесёт на ноутбук Claude — скажите ему «применяй ответы». Нажмите «все», чтобы увидеть карточки с ответами.";
@@ -260,12 +265,13 @@ audio{width:100%;height:36px}
     return null;
   };
   const hasConflict = (it) => (man.conflicts || []).some(c => c.id === it.id);
-  // Вторая кнопка у применённого ответа: при подготовленной отмене — «Не отменять», иначе — «Подготовить отмену».
-  // В-1: без снимка (undo === false) кнопок нет — только строка с шагом (card). К-16: отмена из облака — «Не отменять».
+  // Отмена применённого ответа: при подготовленной отмене — «Не отменять» (строка edit-row), иначе — «Отменить ответ»
+  // (в режиме изменения, К-В3; было — «Подготовить отмену» рядом с «Изменить ответ»). В-1: без снимка (undo === false)
+  // кнопок нет — только строка с шагом (card). К-16: отмена из облака — «Не отменять».
   const revertButton = (it, a) => ["revert_pending", "cloud_revert"].includes(stateOf(it, a)) ?
     {label: "Не отменять", kind: "keep", title: "Оставить применённый ответ; подготовленная отмена снимается."} :
-    {label: "Подготовить отмену", kind: "revert",
-     title: "Затем нажмите «Применить сохранённые ответы». Отмена может быть отклонена, если место изменилось."};
+    {label: "Отменить ответ", kind: "revert",
+     title: "Прежний ответ снимется после «Применить сохранённые ответы», место снова откроется. Отмена может быть отклонена, если место изменилось."};
   const pending = (it, a) => stateOf(it, a) === "pending_new";
   // Что сказано об ответе под заголовком. Ответ «отменить» описывается по состоянию: пока отмена не прошла,
   // прежний ответ на месте, и строка не должна говорить «ответ отменён».
@@ -328,7 +334,7 @@ audio{width:100%;height:36px}
   }
   // Заголовок карточки для каждого исхода программы (OUTCOME_REASONS в review_pack.py) и для ответа из облака.
   // Неуспешные исходы — «не применён — …» с краткой причиной; полная причина — строкой под ответом.
-  const STATUS = {saved: "ответ сохранён", applied: "применён ответ", pending_new: "новый ответ — не применён",
+  const STATUS = {saved: "ответ сохранён", applied: "применён ответ", pending_new: "новый ответ — заменит прежний после «Применить»",
                   applied_open: "применён ответ, место открыто — нужно прослушивание",
                   revert_pending: "отмена подготовлена — нажмите «Применить»; прежний ответ на месте",
                   kept_previous: "применён прежний ответ", reverted: "ответ отменён", skipped: "пропущено",
@@ -748,20 +754,24 @@ audio{width:100%;height:36px}
         cb.onclick = () => send(it, ok, state);
         er.append(cb);
       }
-      if (acts.includes("back")) {   // В-1: новый ответ поверх внесённого без снимка — выход: вернуть внесённый
-        const bb = document.createElement("button"); bb.className = "btn primary"; bb.type = "button"; bb.textContent = "Вернуть как было";
+      if (acts.includes("back")) {   // новый ответ поверх внесённого ждёт — выход: вернуть внесённый (главная — без снимка)
+        const bb = document.createElement("button"); bb.className = noUndo ? "btn primary" : "btn"; bb.type = "button"; bb.textContent = "Вернуть как было";
         bb.title = "Снять новый ответ: на карточке снова будет внесённый ответ, стенограмма не изменится.";
         bb.onclick = () => send(it, {kind: "keep"}, state);     // тот же путь, что «Не отменять»: внесённый ответ из копии
         er.append(bb);
       }
       if (acts.includes("edit")) {    // В-1: без снимка «Изменить ответ» и отмены нет — строка с шагом уже под ответом
         const eb = document.createElement("button"); eb.className = "btn"; eb.type = "button"; eb.textContent = "Изменить ответ";
+        eb.title = "Выберите другой ответ или «Отменить ответ»: прежний ответ заменится после «Применить сохранённые ответы».";
         eb.onclick = () => { editing.add(it.id); render(); };
-        const rb = document.createElement("button"); rb.className = "btn"; rb.type = "button";
-        const second = revertButton(it, a);
-        rb.textContent = second.label; rb.title = second.title;
-        rb.onclick = () => send(it, {kind: second.kind}, state);
-        er.append(eb, rb);
+        er.append(eb);
+      }
+      if (acts.includes("keep")) {    // подготовленная отмена: снять её
+        const kb = document.createElement("button"); kb.className = "btn"; kb.type = "button";
+        const keep = revertButton(it, a);
+        kb.textContent = keep.label; kb.title = keep.title;
+        kb.onclick = () => send(it, {kind: keep.kind}, state);
+        er.append(kb);
       }
       if (er.children.length) c.append(er);
       if (st === "applied_open" && !noUndo && !(it.options.some(isListen) && (canHear || heardNow))) {
@@ -797,6 +807,10 @@ audio{width:100%;height:36px}
     mk("Оставить человеку", () => send(it, {kind: "human"}, state), a && a.kind === "human").title =
       "Место останется вам; это ничего не подтверждает: слова и говорящий не отмечаются как проверенные";
     if (editing.has(it.id)) mk("Не менять", () => { editing.delete(it.id); render(); });
+    if (revertInEdit(it, a)) {        // К-В3: отмена ответа — внутри «Изменить ответ»
+      const rv = revertButton(it, a);
+      mk(rv.label, () => send(it, {kind: rv.kind}, state)).title = rv.title;
+    }
     mk("Пропустить", () => send(it, {kind: "skip", text: "пропущено"}, state), a && a.kind === "skip");
     if ("speechSynthesis" in window) mk("Озвучить вопрос", () => speak(it));
     if (api.voiceMode === "record" && window.MediaRecorder && navigator.mediaDevices) {

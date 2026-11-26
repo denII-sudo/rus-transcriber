@@ -119,7 +119,7 @@ class CardStates(unittest.TestCase):
           if (cardStatus(one,a) !== "применён ответ" || cardStatus(two,a) !== "ответ сохранён") throw Error("status");
           if (cardStatus(two,{kind:"human"}) !== "оставлено человеку — ещё не применено") throw Error("human");   // К-9
           man.answer_states.r1 = {state:"pending_new",ts:"t2",source:"local",why:"ждёт"};
-          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — не применён" || !appliedCard(one,changed)) throw Error("pending");
+          if (!pending(one,changed) || cardStatus(one,changed) !== "новый ответ — заменит прежний после «Применить»" || !appliedCard(one,changed)) throw Error("pending");
           man.answer_states.r1 = {state:"kept_previous",ts:"t2",source:"local",why:"оставлен"};
           if (cardStatus(one,changed) !== "применён прежний ответ" || !appliedCard(one,changed)) throw Error("kept");
           man.answer_states.r1 = {state:"applied",ts:"t1",source:"local"};
