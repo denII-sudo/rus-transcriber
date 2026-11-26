@@ -84,7 +84,8 @@ class AlwaysLayerTests(S.Sandbox):
                 self.assertEqual(worker.pcm_sha256(audio, block=block), (whole, len(audio)))
 
     def test_link_names_the_file_of_hypotheses_written_after_the_result(self):
-        """Как main: слой — до сохранения результата, файл гипотез — после; имя файла совпадает со ссылкой."""
+        """Как main: слой — до сохранения результата, гипотезы — после; строка гипотез базы (Г-1) несёт те же
+        sound_id и run_id, что ссылка (до Г-1 — имя файла <sound_id>/<run_id>.json)."""
         params = dict(G.SCENARIOS["three_models"])
         params["cfg_extra"] = {**params.get("cfg_extra", {}), "save_hypotheses": True}
         data, _calls = G.run_scenario(**params)
@@ -95,14 +96,15 @@ class AlwaysLayerTests(S.Sandbox):
         self.assertEqual(link["sound_id"], run["sound"]["pcm_sha256"][:12])
         self.assertRegex(link["sound_id"], hypstore.UNIT_RE)
         self.assertRegex(link["run_id"] + ".json", hypstore.RUN_RE)
-        self.assertEqual(S.finish(data, {"recording_id": str(uuid.uuid4())}), {"hypotheses_saved": True})
-        files = self.files()
-        self.assertEqual([f"{p.parent.name}/{p.name}" for p in files],
-                         [f"{link['sound_id']}/{link['run_id']}.json"])
-        rec = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(S.finish(data, {"recording_id": self.rec_a}), {"hypotheses_saved": True})
+        records = self.records()
+        self.assertEqual([(row["sound_id"], row["run_id"], row["recording_id"]) for row, _ in records],
+                         [(link["sound_id"], link["run_id"], self.rec_a)])
+        self.assertEqual(self.files(), [])                      # прежних файлов гипотез не пишется
+        rec = records[0][1]
         self.assertEqual(rec["audio"]["pcm_sha256"], run["sound"]["pcm_sha256"])
         self.assertEqual(rec["ids"]["run_id"], link["run_id"])
-        # стенд — тот же, что в файле гипотез и тесте скорости (одна соль bench\testbed.json)
+        # стенд — тот же, что в гипотезах и тесте скорости (одна соль bench\testbed.json)
         self.assertEqual(rec["hardware"]["testbed_id"], run["testbed_id"])
         self.assertEqual(run["testbed_id"], runinfo.testbed_id(paths.BENCH))
         self.assertRegex(run["testbed_id"], r"^[0-9a-f]{16}$")
@@ -182,8 +184,8 @@ class AlwaysLayerTests(S.Sandbox):
             run = worker._always_layer(hyp.audio, hyp.cfg, S.VOCAB, data["quality"], hyp)
         self.assertTrue(hypotheses.is_missing(run["hypotheses"]["sound_id"]))
         self.assertEqual(run["hypotheses"]["run_id"], hyp.run_id)
-        S.finish(data)
-        self.assertEqual([p.stem for p in self.files()], [hyp.run_id])
+        self.assertEqual(S.finish(data, {"recording_id": self.rec_a}), {"hypotheses_saved": True})
+        self.assertEqual([row["run_id"] for row, _ in self.records()], [hyp.run_id])
 
     def test_main_calls_the_layer_before_saving_and_guards_it(self):
         src = Path(worker.__file__).read_text(encoding="utf-8")
@@ -211,7 +213,8 @@ class StoredRecordTests(S.Sandbox):
         super().setUp()
         self.source = self.root / "synthetic.wav"
         self.source.write_bytes(b"synthetic")
-        self.store = storage.initialize(self.root / "state.sqlite3", initial_display_name="Тест")
+        # своя база теста: state.sqlite3 песочницы уже занят базой гипотез (S.Sandbox, Г-1)
+        self.store = storage.initialize(self.root / "layer.sqlite3", initial_display_name="Тест")
         self.addCleanup(self.store.close)
 
     def test_layer_is_in_the_first_revision(self):
