@@ -634,7 +634,7 @@ $insideProfile =$Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::O
 if ($AcceptanceCopyOnly) {
     Write-Host "  режим приёмки: проверки места, Python и ffmpeg пропущены"
 } else {
-Step "1/10" "Проверка места установки"
+Step "1/11" "Проверка места установки"
 if (HasNonAscii $Target) {
     Fail ("В пути есть кириллица или другие не-латинские символы: $Target`n" +
           "Часть библиотек (OpenVINO, PyTorch) с такими путями работает ненадёжно.`n" +
@@ -650,7 +650,7 @@ $free = (Get-PSDrive ($drive.Substring(0,1))).Free / 1GB
 Write-Host ("  свободно на {0} {1:N1} ГБ (нужно около 8)" -f $drive, $free)
 if ($free -lt 8) { Fail "Мало места. Освободите диск или укажите -Target на другом диске." }
 
-Step "2/10" "Поиск установленного Python (подходят 3.11, 3.12, 3.13)"
+Step "2/11" "Поиск установленного Python (подходят 3.11, 3.12, 3.13)"
 # предпочтение: 3.12 (лучше всего с готовыми сборками библиотек), затем 3.11, затем 3.13
 function Get-PyInfo($cmd, $pre) {
     try {
@@ -714,7 +714,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 }
 }
 
-Step "3/10" "Папка программы и права доступа"
+Step "3/11" "Папка программы и права доступа"
 $isNew = -not (Test-Path $Target)
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
 if (-not $insideProfile) {
@@ -738,7 +738,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
     Write-Host "  данные: $DataDir (в вашем профиле)"
 }
 
-Step "4/10" "Копирование файлов программы"
+Step "4/11" "Копирование файлов программы"
 # Use base Python before dependency installation; buildinfo imports only the standard library.
 $manifestPython = $basePyExe
 if (-not $manifestPython) { $manifestPython = (Get-Command python -ErrorAction Stop).Source }
@@ -821,7 +821,7 @@ $env:TORCH_HOME    = Join-Path $Target "cache\torch"
 if ($AcceptanceCopyOnly) {
     Write-Host "  режим приёмки: venv, зависимости и HF-проверки пропущены"
 } else {
-Step "5/10" "Виртуальное окружение"
+Step "5/11" "Виртуальное окружение"
 $py = Join-Path $Target ".venv\Scripts\python.exe"
 # версии установленных пакетов (по имени дистрибутива; пустая строка — не установлен)
 function Get-PkgVersions([string[]]$names) {
@@ -854,7 +854,7 @@ if (Test-Path $py) {
 }
 & $py -m pip install --upgrade pip wheel; Check-Pip "pip"
 
-Step "6/10" "PyTorch (процессор), pyannote, GigaAM, MCP"
+Step "6/11" "PyTorch (процессор), pyannote, GigaAM, MCP"
 & $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu; Check-Pip "PyTorch"
 $step6 = @("pyannote.audio>=4.0", "pytorch-metric-learning==2.9.0", "soundfile", "truststore", "mcp[cli]")
 # GigaAM ставится из архива ветки main и тянет обычный onnxruntime, который ниже всё равно заменяется:
@@ -865,7 +865,7 @@ else { $step6 += "gigaam @ https://github.com/salute-developers/GigaAM/archive/r
 & $py -m pip install @step6; Check-Pip "pyannote/GigaAM"
 # pytorch-metric-learning 3.x требует numpy>=2.5.3, а OpenVINO 2025.4.1 — numpy<2.4.0: держим совместимую 2.9.0
 
-Step "7/10" "OpenVINO для видеокарты Arc"
+Step "7/11" "OpenVINO для видеокарты Arc"
 & $py -m pip install "onnx-asr[hub]" "openvino==2025.4.1"; Check-Pip "onnx-asr/OpenVINO"
 # onnxruntime, onnxruntime-directml и onnxruntime-openvino дают один и тот же модуль:
 # убираем обычные сборки и ставим сборку с OpenVINO последней — только если это нужно
@@ -914,7 +914,34 @@ if ($nonIntel) {
     Write-Host "  Задействовать видеокарту можно через DirectML (пакет onnxruntime-directml) — замена пакета по согласованию: bench.py --only dml-gpu,whisper-dml" -ForegroundColor DarkGray
 }
 
-Step "8/10" "Токен Hugging Face"
+Step "8/11" "База записей"
+# Новая установка (в папке данных нет следов работы с записями) сразу хранит записи в базе state.sqlite3:
+# пустая база создаётся штатно (rt.py db-init). Установка, где уже работали с файлами рядом с аудио, не меняется —
+# перенос в базу человек делает сам по docs/legacy-migration.md. Существующая база и её резервы не меняются.
+$storeOk = $true; $storeMessage = ""
+$prevEnc = [Console]::OutputEncoding
+$prevData = $env:RUS_TRANSCRIBER_DATA; $prevUtf8 = $env:PYTHONUTF8; $prevIo = $env:PYTHONIOENCODING
+try {
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
+    $env:RUS_TRANSCRIBER_DATA = $DataDir; $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
+    $raw = (& $py -B (Join-Path $Target "rt.py") db-init 2>$null) -join "`n"
+} finally {
+    [Console]::OutputEncoding = $prevEnc
+    $env:RUS_TRANSCRIBER_DATA = $prevData; $env:PYTHONUTF8 = $prevUtf8; $env:PYTHONIOENCODING = $prevIo
+}
+$st = $null
+try { $st = $raw | ConvertFrom-Json } catch { }
+if (-not $st) {
+    $storeOk = $false
+    $storeMessage = "команда rt.py db-init не дала результата"
+    Write-Host "  $storeMessage; запустите вручную: `$env:RUS_TRANSCRIBER_DATA='$DataDir'; & '$py' '$Target\rt.py' db-init" -ForegroundColor Yellow
+} else {
+    $storeOk = [bool]$st.ok
+    if ($storeOk) { Write-Host "  $($st.message)" -ForegroundColor Green }
+    else { $storeMessage = [string]$st.message; Write-Host "  $storeMessage" -ForegroundColor Yellow }
+}
+
+Step "9/11" "Токен Hugging Face"
 # при обновлении приложение ИИ-агента уже хранит рабочий токен — второй раз вводить не нужно
 $savedToken = ""
 foreach ($cp in (Find-ClaudeConfig)) {
@@ -954,7 +981,7 @@ if ($Token) {
 }
 }
 
-Step "9/10" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
+Step "10/11" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
 if ($nonInteractive -and -not $SkipClaudeConfig -and (Get-Process -Name "Claude" -ErrorAction SilentlyContinue)) {
     # без терминала некому закрыть приложение и нажать Enter: раньше здесь был бесконечный цикл
     Write-Host ("  пропущено: приложение ИИ-агента запущено, а терминала нет. Если запись нужна — закройте приложение " +
@@ -1000,7 +1027,7 @@ if ($old) {
     $old | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 }
 
-Step "10/10" "Самопроверка (тесты в отдельной временной папке, проверка файлов, морфология)"
+Step "11/11" "Самопроверка (тесты в отдельной временной папке, проверка файлов, морфология)"
 $selfCheckOk = $true
 if ($SkipSelfCheck) {
     Write-Host "  пропущено (-SkipSelfCheck); запустить позже: & '$py' '$Target\selfcheck.py'"
@@ -1044,11 +1071,14 @@ if ($SkipSelfCheck) {
 }
 
 Write-Host "`nГотово. Программа, модели и кэши: $Target" -ForegroundColor Green
-Write-Host "Личные данные: $DataDir (установщик их не трогает; перенос между компьютерами — export_group / import_group)" -ForegroundColor Green
+Write-Host "Личные данные: $DataDir (установщик их не меняет, на новой установке только создаёт пустую базу записей; перенос между компьютерами — export_group / import_group)" -ForegroundColor Green
 Write-Host "Дальше — тест скорости. Попросите ИИ-агента (например, Claude Desktop): «запусти тест скорости на C:\...\запись.mp3»,"
 Write-Host "или вручную:  `$env:HF_TOKEN='hf_...'; & '$py' '$Target\bench.py' 'C:\путь\к\записи.mp3'"
 if ($isUpdate) { Write-Host "После обновления перезапустите приложение ИИ-агента (например, Claude Desktop), чтобы сервер подхватил новые файлы." -ForegroundColor Yellow }
-if (-not $selfCheckOk) {
-    Write-Host "Установка завершена, но самопроверка нашла проблемы (см. шаг 10). Код выхода 2." -ForegroundColor Yellow
-    exit 2
+if ($storeOk -eq $false) {
+    Write-Host "Установка завершена, но база записей не готова (см. шаг 8): $storeMessage Код выхода 2." -ForegroundColor Yellow
 }
+if (-not $selfCheckOk) {
+    Write-Host "Установка завершена, но самопроверка нашла проблемы (см. шаг 11). Код выхода 2." -ForegroundColor Yellow
+}
+if (($storeOk -eq $false) -or -not $selfCheckOk) { exit 2 }

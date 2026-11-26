@@ -296,7 +296,7 @@ class ParallelSelfCheckTests(unittest.TestCase):
 
     def test_installer_shows_launch_problems_and_the_fallback_note(self):
         text = (Path(__file__).resolve().parent.parent / "install.ps1").read_text(encoding="utf-8-sig")
-        step = text[text.index('Step "10/10"'):]
+        step = text[text.index('Step "11/11"'):]
         self.assertIn("$t.run_problems", step)
         self.assertIn("$t.fallback", step)
 
@@ -353,7 +353,7 @@ class InstallerSelfCheckStepTests(unittest.TestCase):
         self.assertLess(self.text.index("Окно не закрывайте"), self.text.index('(Join-Path $Target "selfcheck.py")'))
 
     def test_installer_shows_the_error_instead_of_empty_counts(self):
-        step = self.text[self.text.index('Step "10/10"'):]
+        step = self.text[self.text.index('Step "11/11"'):]
         error_at = step.index("if ($t -and $t.error) {")
         counts_at = step.index("тестов {1}, падений {2}")
         self.assertLess(error_at, step.index("} else {", error_at))

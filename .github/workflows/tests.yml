@@ -131,7 +131,7 @@ jobs:
       # Остальные проверки самопроверки установленной копии (файлы на личные данные, морфология,
       # сведения о сборке) без повторного запуска набора: selfcheck.py без --no-tests прогонял бы
       # те же тесты второй раз (около 2,5 минут). Сама самопроверка с тестами проверяется
-      # tests/test_selfcheck.py и при установке (шаг 10 install.ps1).
+      # tests/test_selfcheck.py и при установке (шаг 11 install.ps1).
       - name: Run self-check checks without repeating the unit tests
         run: python -B rt.py self-check --no-tests
       # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,

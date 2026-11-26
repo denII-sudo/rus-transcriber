@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS_TIMEOUT = 720            # 12 мин: предел, о котором пишет шаг 10 install.ps1 (решение владельца 24.11.2026)
+TESTS_TIMEOUT = 720            # 12 мин: предел, о котором пишет шаг 11 install.ps1 (решение владельца 24.11.2026)
 JOBS_ENV = "RT_SELFCHECK_JOBS"  # число процессов с тестами: 1 — по-старому, одним процессом; без значения — по ядрам (до 4)
 GROUP_MARGIN = 60              # запас: группы запускателя должны закончиться (и быть убиты) раньше предела самопроверки
 MORPH_SAMPLE = ["Если", "Есть", "Тетрадями", "Quartzline", "Москва"]
@@ -156,7 +156,7 @@ def _run_tests_sequential(timeout):
             cmd = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"]
             if sys.version_info >= (3, 12):
                 cmd += ["--durations", "5"]                # самые медленные тесты — в ответ
-            # stdin=DEVNULL: тестам не нужен ввод; из терминала (например, шаг 10 установщика)
+            # stdin=DEVNULL: тестам не нужен ввод; из терминала (например, шаг 11 установщика)
             # тест, ждущий ответа человека, иначе зависал бы на скрытом вопросе
             r = subprocess.run(cmd, cwd=str(HERE), env=env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,

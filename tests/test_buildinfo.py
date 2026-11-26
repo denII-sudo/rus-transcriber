@@ -127,7 +127,7 @@ class BuildTests(unittest.TestCase):
 
     def test_installer_takes_root_list_from_buildinfo(self):
         text = (REPO / "install.ps1").read_text(encoding="utf-8-sig")
-        step = text[text.index('Step "4/10"'):text.index('Step "5/10"')]
+        step = text[text.index('Step "4/11"'):text.index('Step "5/11"')]
         self.assertNotRegex(step, r'@\(\s*"[A-Za-z0-9_]+\.py"', "hard-coded root file list is back")
         listing = step.index('(Join-Path $Source "buildinfo.py") --source $Source --target $Target --list-root')
         self.assertLess(step.index("$manifestPython = $basePyExe"), listing)

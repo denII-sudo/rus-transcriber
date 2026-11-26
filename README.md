@@ -110,6 +110,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 - проверит, что в пути нет кириллицы, папка не лежит в OneDrive и на диске хватает места (около 8 ГБ);
 - поставит окружение Python и библиотеки; все кэши (pip, модели, компиляция под видеокарту) окажутся внутри папки программы;
 - покажет, какие устройства видит OpenVINO. Нужен хотя бы `CPU`; `GPU` (Arc) желателен для ускорения, `NPU` не обязателен — на Meteor Lake он для GigaAM не используется;
+- на новой установке создаст пустую базу записей `<папка данных>\state.sqlite3` и выберет хранение в ней (`rt.py db-init`). Если в папке данных уже есть следы работы с записями в файлах рядом с аудио (задачи, голосовые профили, словари, выгрузки), ничего не меняет: программа работает с файлами как раньше, перенос в базу — по желанию, по [`docs/legacy-migration.md`](docs/legacy-migration.md). Существующую базу и её резервы не трогает; если выбрано хранение в базе, а базы нет, новую не создаёт и завершается с кодом 2;
 - спросит токен Hugging Face (ввод скрыт) и проверит, что он рабочий и что условия pyannote приняты;
 - пропишет сервер в настройки приложения ИИ-агента (например, Claude Desktop), предварительно сделав резервную копию файла настроек. Claude Desktop из Microsoft Store хранит их в `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`, обычная установка — в `%APPDATA%\Claude\claude_desktop_config.json`; установщик пишет во все найденные места.
 
@@ -209,9 +210,9 @@ $env:HF_TOKEN = "hf_ваш_токен"
 `<папка>` — это `%LOCALAPPDATA%\rus-transcriber` или путь из `-Target`. Если переменная `HF_HOME` уже задана в системе, модели Hugging Face будут храниться там.
 
 ## Как пользоваться
-**Сохранённый процесс (режим SQLite):** нужна явно созданная база
-(`initialize_recording_store`) и выбранный режим `recording_backend = "sqlite"`
-(`set_recording_backend`). Тогда `start_workflow` (или `rt.py workflow-start`)
+**Сохранённый процесс (режим SQLite):** нужна созданная база и выбранный режим
+`recording_backend = "sqlite"`. На новой установке их готовит установщик; на установке, где записи уже хранятся
+в файлах, — `initialize_recording_store` и `set_recording_backend` после переноса ([`docs/legacy-migration.md`](docs/legacy-migration.md)). Тогда `start_workflow` (или `rt.py workflow-start`)
 сохраняет процесс и запускает обработку без голосовых профилей; при `require_conspect=true` OpenCode автоматически вызывает
 OpenAI `gpt-6-luna` без открытого чата, **только при явном согласии**: по умолчанию
 `allow_cloud_model=false`, текст никуда не уходит. Согласие — `allow_cloud_model=true` в MCP,
@@ -905,7 +906,7 @@ Microsoft Store) подменяются скрытой папкой внутри
 | `voice_quality_policy_default` | `warn` (по умолчанию) — только предупреждать; `reject_clipping` — не учитывать источник с клиппингом |
 | `confirm_mode` | `auto` (окно, иначе терминал), `dialog`, `terminal`, `off` — подтверждение опасных действий человеком |
 | `confirm_timeout_sec` | сколько секунд ждать ответа в окне подтверждения (по умолчанию 180); нет ответа — отказ |
-| `recording_backend` | где хранить результаты: `legacy_files` (по умолчанию, файлы рядом с аудио) или `sqlite` (база `state.sqlite3`, нужна созданная база; переключение — `set_recording_backend`, старые записи не переносятся) |
+| `recording_backend` | где хранить результаты: `legacy_files` (умолчание в коде, файлы рядом с аудио) или `sqlite` (база `state.sqlite3`, нужна созданная база; переключение — `set_recording_backend`, старые записи не переносятся). Новая установка записывает `sqlite` сама (шаг «База записей» установщика); установки, где уже работали в файлах, остаются на `legacy_files` |
 | `voices` | `false` — не проверять голоса (то же, что `voices=false` в `start_transcription`) |
 | `review_local` | `true` — включить голосовой разбор (`start_voice_review`, `speak`, `play_clip`, `listen_reply`) |
 | `review_missed` | `false` — не предупреждать о возможно пропущенной речи (по умолчанию предупреждения включены) |

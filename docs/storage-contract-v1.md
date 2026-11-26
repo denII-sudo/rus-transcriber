@@ -2,9 +2,12 @@
 
 > **Текущее состояние (21.11.2026).** Действующая схема — v4 (`storage.SCHEMA_VERSION`),
 > формат открытых документов — v2 (`documents.FORMAT_VERSION`). Новая БД создаётся только явно
-> (`initialize_recording_store`, `recordings.initialize_store`); база другой версии схемы не
+> (`initialize_recording_store`, `recordings.initialize_store`, `rt.py db-init`); база другой версии схемы не
 > открывается, функции обновления схемы нет. SQLite-хранилище подключено к программе с П2:
-> его выбирает `recording_backend = "sqlite"` (по умолчанию `legacy_files`). П3 и его
+> его выбирает `recording_backend = "sqlite"` (умолчание в коде — `legacy_files`). С 26.11.2026 новая
+> установка без следов работы в файлах создаёт пустую базу и выбирает `sqlite` шагом установщика
+> «База записей» (`recordings.prepare_new_installation`); это не перенос: файлы записей не читаются, а
+> установки со следами работы в файлах не меняются. Сервер и обычное открытие базу по-прежнему не создают. П3 и его
 > ограничения описаны в [`2026-11-17-p3-workflow-handoff.md`](2026-11-17-p3-workflow-handoff.md).
 > Перенос старых записей в v4 выполняет `tools/import_legacy.py` ([`legacy-migration.md`](legacy-migration.md)),
 > на установке владельца он выполнен (П7).

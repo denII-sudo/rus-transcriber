@@ -1038,3 +1038,156 @@ def _ensure_ids(transcript, recording_id):
                 ident = str(uuid.uuid5(namespace, f"word:{segment_index}:{word_index}"))
                 word["word_id"] = ident
             seen_words.add(ident)
+
+
+# --- База записей на новой установке (шаг «База записей» install.ps1, `rt.py db-init`) ---
+# Явная операция, которую запускает человек (установщиком или командой); сервер и обычные инструменты базу
+# по-прежнему не создают. Это не перенос: создаётся пустая база, файлы записей не читаются и не меняются.
+LEGACY_MIGRATION_DOC = "docs/legacy-migration.md"
+
+
+def _data_dir_has_files(directory):
+    """Есть ли под каталогом хоть один файл (пустые служебные каталоги — не след работы)."""
+    try:
+        return any(p.is_file() for p in Path(directory).rglob("*"))
+    except OSError:
+        return True                       # не прочитать — считать, что следы есть
+
+
+def installation_traces():
+    """Следы прежней работы с записями в папке данных: имена признаков, без содержимого записей.
+
+    Записи файлового режима лежат рядом с аудио, а инструменты программы находят их только по задаче
+    (`jobs/<id>.json`), поэтому признаки берутся из папки данных. Тест скорости (`kind: benchmark`, `bench/`)
+    и служебные файлы любого запуска (`jobs/config.lock`, `jobs/voice-locks`, `jobs/slots`) записей не создают.
+    """
+    import migrate
+    import paths
+    traces = []
+    try:
+        for p in sorted(Path(paths.JOBS).glob("*.json")):
+            try:
+                kind = json.loads(p.read_text(encoding="utf-8")).get("kind")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                kind = None               # нечитаемая задача — неясно, что в ней: считать следом
+            if kind != "benchmark":
+                traces.append("jobs")
+                break
+    except OSError:
+        traces.append("jobs")
+    data_dir = Path(paths.DATA_DIR)
+    for name, directory in (("groups", paths.GROUPS), ("hypotheses", paths.HYPOTHESES),
+                            ("exports", data_dir / "exports"), ("_deleted", data_dir / "_deleted")):
+        if _data_dir_has_files(directory):
+            traces.append(name)
+    try:
+        if any(p.name.startswith("_backup") and (p.is_file() or _data_dir_has_files(p)) for p in data_dir.iterdir()):
+            traces.append("_backup")
+    except OSError:
+        traces.append("_backup")
+    try:
+        if migrate.pending():
+            traces.append("legacy_layout")
+    except OSError:
+        traces.append("legacy_layout")
+    return traces
+
+
+def _explicit_backend():
+    """(значение `recording_backend` из config.json или None, читается ли файл)."""
+    import paths
+    p = Path(paths.CONFIG_FILE)
+    if not p.exists():
+        return None, True
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    return data.get("recording_backend"), True
+
+
+def _store_is_empty(path):
+    store = open_store(path, readonly=True)
+    try:
+        return all(store.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+                   for table in ("recordings", "operations"))
+    finally:
+        store.close()
+
+
+def prepare_new_installation(check_only=False):
+    """Новая установка сразу хранит записи в базе; установку со следами работы в файлах не меняет.
+
+    Случаи (ключ `case`): `new` — следов нет, база создана и выбрана; `finished_switch` — пустая база
+    прошлого запуска, выбор дописан; `sqlite` — база есть и выбрана; `legacy` — работа в файлах, ничего не
+    меняется; `legacy_with_db` — база есть, хранение в файлах (перенос не завершён); `missing_db` — выбрана
+    база, но её нет (новая пустая скрыла бы потерю). `ok=False` — база записей не готова (установщик: код 2).
+    check_only=True — только сказать, что было бы сделано.
+    """
+    import paths
+    import settings
+    db = Path(paths.STATE_DB)
+    explicit, config_readable = _explicit_backend()
+    result = {"database": str(db), "check_only": bool(check_only), "changed": [], "traces": []}
+
+    def done(case, ok, message, **extra):
+        result.update(case=case, ok=ok, message=message, **extra)
+        try:
+            result["recording_backend"] = settings.recording_backend()
+        except ValueError:
+            result["recording_backend"] = None
+        return result
+
+    def legacy_message():
+        return ("Найдены записи в файлах рядом с аудио: программа продолжит работать с ними как раньше. "
+                f"Перенос в базу — по желанию, по документу {LEGACY_MIGRATION_DOC}.")
+
+    if not config_readable:
+        return done("legacy", True, "config.json не читается: база записей не создаётся, настройки не меняются. "
+                    "Исправьте файл и запустите `rt.py db-init` снова.")
+    sidecars = [s for s in ("-wal", "-shm") if db.with_name(db.name + s).exists()]
+    if db.exists():
+        if explicit == "sqlite":
+            return done("sqlite", True, f"База записей есть: {db}. Записи хранятся в базе.")
+        traces = installation_traces()
+        result["traces"] = traces
+        try:
+            empty = _store_is_empty(db)
+        except (storage.StorageError, sqlite3.Error):
+            empty = False
+        if explicit is None and not traces and empty:
+            if not check_only:
+                try:
+                    settings.set_recording_backend("sqlite")
+                except (OSError, ValueError, RuntimeError, storage.StorageError) as ex:
+                    return done("finished_switch", False, f"База записей не готова: не удалось выбрать базу ({ex}).")
+                result["changed"].append("config.json")
+            return done("finished_switch", True, f"Хранение записей в базе: {db}. Завершено переключение, "
+                        "начатое при прошлой установке.")
+        return done("legacy_with_db", True, f"База записей есть ({db}), но записи пока хранятся в файлах; "
+                    f"переключение — по документу {LEGACY_MIGRATION_DOC}.")
+    if explicit == "sqlite" or sidecars:
+        return done("missing_db", False, f"База записей не готова: выбрано хранение в базе, но базы нет ({db}). "
+                    "Верните базу из резерва (`rt.py db-restore`) или см. документ "
+                    f"{LEGACY_MIGRATION_DOC}. Новая пустая база не создаётся, чтобы не скрыть потерю.")
+    traces = installation_traces()
+    result["traces"] = traces
+    if explicit is not None or traces:
+        return done("legacy", True, legacy_message())
+    if check_only:
+        return done("new", True, f"Будет создана база записей: {db}.")
+    try:
+        initialize_store(db, display_name="").close()
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return done("new", False, f"База записей не готова: не удалось создать {db} ({ex}). "
+                    "Записи будут храниться в файлах рядом с аудио, как раньше.")
+    result["changed"].append("state.sqlite3")
+    try:
+        settings.set_recording_backend("sqlite")
+    except (OSError, ValueError, RuntimeError, storage.StorageError) as ex:
+        return done("new", False, f"База записей создана ({db}), но выбрать её не удалось ({ex}). "
+                    "Запустите `rt.py db-init` снова.")
+    result["changed"].append("config.json")
+    return done("new", True, f"База записей создана: {db}. Записи будут храниться в базе.")
