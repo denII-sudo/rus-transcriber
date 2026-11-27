@@ -855,9 +855,14 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing, capture=
     return None
 
 
+REF_MIN_SEC = 3.0   # неопознанный кластер с центром и не меньше стольких секунд речи — опорный голос (Т-1-Н1)
+
+
 def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
     """Опорные голоса -> (refs, found): профили опознанных участников; участники из словаря с профилем,
-    но без кластера (pyannote мог слить ребёнка с другим); крупные неопознанные кластеры — по центру."""
+    но без кластера (pyannote мог слить ребёнка с другим); неопознанные кластеры от REF_MIN_SEC с речи — по
+    центру (центр есть, только если у кластера есть реплики от 1,5 с: voices.centroids). Кластеры без опоры
+    (короче или без центра) называет _without_reference: их слова остаются под меткой разметки."""
     import voices
     pvecs = voice_ctx.get("pvecs") or {}
     cents = voice_ctx.get("cents") or {}
@@ -876,10 +881,15 @@ def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
     for t in turns:
         size[t["label"]] = size.get(t["label"], 0.0) + t["e"] - t["s"]
     for lbl, c in cents.items():
-        if lbl not in label_name and size.get(lbl, 0) >= 10.0:
+        if lbl not in label_name and size.get(lbl, 0) >= REF_MIN_SEC:
             refs[lbl] = c
             found.add(lbl)
     return {k: v for k, v in refs.items() if v is not None}, found
+
+
+def _without_reference(turns, label_name, refs):
+    """Метки разметки, у которых нет опорного голоса: не опознаны (нет в label_name) и не стали опорой."""
+    return {t["label"] for t in turns} - set(label_name) - set(refs)
 
 
 def _apply_vocab(words, vocab, quality):
@@ -1300,6 +1310,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     import hypstore
     hyp = _HypCapture(audio, cfg, a, src) if hypstore.enabled(cfg) else None
     refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed)
+    unref = _without_reference(turns, label_name, refs)
+    if unref or not refs:
+        # голос этих слов назначает программа по разметке pyannote, без сверки отпечатков (Т-1-Н5, Т-1-Н1)
+        quality["voice_refs"] = {"refs": len(refs), "without_reference": sorted(unref), "assigned_by": "diarization"}
     mapping = voice_ctx.get("mapping") or {}
 
     def name_of_label(lbl):   # метка pyannote -> имя (в т.ч. для кластеров, слитых в одного человека)
@@ -1330,7 +1344,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     # голос для каждого слова
     st.set(stage="голос для каждого слова", progress=75)
     t3 = time.time()
-    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found},
+    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found}, unreferenced=unref,
                            win_near_change=float(cfg.get("word_win_near_change", 0) or 0),
                            confusions=voice_ctx.get("confusions"),
                            progress=prog(75, 85, "голос для каждого слова"))

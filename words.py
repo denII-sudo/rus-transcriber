@@ -842,13 +842,42 @@ def _score_words(audio, words, idx, R, names, embedder, win, prior, progress=Non
     return len(need)
 
 
+def _voice_by_diarization(words, prior, labels=None):
+    """Голос слова — метка разметки pyannote (prior), без сверки отпечатков: так подписывает и диаризация.
+    labels=None — все слова (опор нет вовсе); иначе только слова, чья метка разметки в labels (у этих голосов
+    нет опоры, и сверка отдала бы их чужому голосу). Слову вне разметки — голос предыдущего слова, у первых —
+    первая найденная метка, без разметки — «Спикер 1». Отрыв 1,0: новых пометок сомнения это не добавляет.
+    -> сколько слов подписано."""
+    n = 0
+    marks = [prior(w["s"] + WORD_OFFSET) if prior else None for w in words]
+    first = next((m for m in marks if m is not None), "Спикер 1")
+    last = None
+    for w, p in zip(words, marks):
+        if labels is None:
+            w["spk"] = p if p is not None else (last or first)
+            w["margin"] = 1.0
+            w.pop("sims", None)
+            n += 1
+        elif p is not None and p in labels:
+            w["spk"], w["margin"] = p, 1.0
+            n += 1
+        last = w.get("spk") or last
+    return n
+
+
 def assign_voices(audio, words, refs, embedder, prior=None, info=None, progress=None, win_near_change=0.0,
-                  confusions=None):
+                  confusions=None, unreferenced=()):
     """refs: {имя или метка: вектор}; prior(t) -> имя по pyannote или None.
     Пишет в каждое слово spk, margin, sims. -> число окон.
     win_near_change > 0 (например 1.0): слова в пределах 1 с от смены говорящего пересчитываются
-    короткими окнами этой длины — у смены длинное окно захватывает два голоса сразу."""
+    короткими окнами этой длины — у смены длинное окно захватывает два голоса сразу.
+    unreferenced — метки разметки без опорного голоса: их слова остаются под этой меткой, а не уходят
+    ближайшей опоре (Т-1-Н1). Опор нет вовсе — все слова подписываются по разметке (Т-1-Н5)."""
     names = list(refs)
+    if not names:
+        n = _voice_by_diarization(words, prior)
+        _log(f"опорных голосов нет: голос всех слов ({n}) — по разметке pyannote")
+        return 0
     R = np.stack([refs[n] for n in names])
     n_win = _score_words(audio, words, range(len(words)), R, names, embedder, WIN, prior, progress, confusions)
     if win_near_change and win_near_change < WIN:
@@ -876,6 +905,10 @@ def assign_voices(audio, words, refs, embedder, prior=None, info=None, progress=
                     w["margin"] = 0.0
         if weak:
             _log(f"почти без речи и не найдены pyannote, слова переданы другим: {sorted(weak)}")
+    if unreferenced:
+        n = _voice_by_diarization(words, prior, set(unreferenced))
+        if n:
+            _log(f"голоса без опоры {sorted(unreferenced)}: {n} слов оставлены под меткой разметки")
     return n_win
 
 
