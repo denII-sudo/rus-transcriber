@@ -13,6 +13,7 @@ taskkill, powershell, путь с папкой Scripts), и сверяет фа�
 не считаются; считаются имена, атрибуты, импорты, аргументы вызовов и обычные строки.
 """
 import ast
+import json
 import os
 import re
 import unittest
@@ -98,13 +99,33 @@ def hits(source):
     return found
 
 
+def shipped_files():
+    """Поставляемые файлы по build-info.json установленной копии (ключ files); None — это репозиторий.
+
+    Установщик заменяет целиком только tools и tests и не убирает корневые файлы, удалённые из репозитория,
+    поэтому в установке бывают остатки прежних версий: их нет в поставке, и «новым кодом» они не считаются.
+    """
+    info = ROOT / "build-info.json"
+    if not info.is_file():
+        return None
+    try:
+        files = json.loads(info.read_text(encoding="utf-8")).get("files")
+    except (OSError, ValueError):
+        return None
+    return set(files) if isinstance(files, dict) and files else None
+
+
 def python_files():
+    shipped = shipped_files()
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS and not d.startswith("backup-")]
         for name in files:
             path = Path(base) / name
-            if name.endswith(".py") and path.resolve() != SELF:
-                yield path
+            if not name.endswith(".py") or path.resolve() == SELF:
+                continue
+            if shipped is not None and path.relative_to(ROOT).as_posix() not in shipped:
+                continue
+            yield path
 
 
 class PortabilityGuard(unittest.TestCase):
