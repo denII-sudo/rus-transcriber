@@ -306,6 +306,83 @@ class ConspectLinks(Case):
             self.assertEqual(conspect._id_text(data, ["w1", "w2"]), (None, None))
 
 
+def rewrite(data, texts, text, item):
+    """Правка подряд идущих слов texts текстом text, как её вносит ответ: _diff_words и перелинковка мест."""
+    words = data["segments"][0]["words"]
+    pos = [i for i, w in enumerate(words) if w["w"] in texts]
+    i, j = pos[0], pos[-1] + 1
+    old, origin = words[i:j], []
+    new, conflicts, _ = transcript._diff_words(old, text, item, refuse=lambda w: None, origin=origin)
+    assert not conflicts, conflicts
+    transcript._relink_places(data, old, origin)
+    words[i:j] = new
+    return new
+
+
+class Chains(Case):
+    """«Разбили и ответили снова»: ссылка конспекта на слово распознавания покрывает всё, что из него получилось,
+    и после повторных ответов — как на main, где склеенное слово сохраняло ID (part_of — корень, не звено)."""
+
+    LINKS = (["w2"], ["w1", "w2"], ["w2", "w3"])
+
+    def links(self, data):
+        return [conspect._id_text(data, ids)[0] for ids in self.LINKS]
+
+    def test_chains_through_span_edits(self):
+        for backend in BACKENDS:
+            for second, expected in (
+                    ((1.05, 1.4, "у ю"), ["х у ю", "тест х у ю", "х у ю ещё"]),       # слово 2 → два слова
+                    ((0.8, 1.4, "ё"), ["ё", "тест ё", "ё ещё"]),                       # 2 → 1
+                    ((0.8, 1.4, "п р"), ["п р", "тест п р", "п р ещё"])):              # 2 → 2 другими словами
+                with self.subTest(backend=backend, second=second), base.answer_files(backend) as (jp, md, version):
+                    transcript.edit_span(jp, md, 0.8, 1.4, "х у", by="claude")
+                    rep = transcript.edit_span(jp, md, *second, by="human")
+                    data = transcript.load(jp)
+                    self.assertEqual(self.links(data), expected, (rep, [w["w"] for w in self.flat(data)]))
+
+    def test_three_levels_and_removed_root_word(self):
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["у"], "у ю", "a2")                 # вставка внутрь уже разбитого слова
+        rewrite(data, ["ю"], "ю я", "a3")                 # третий уровень
+        rewrite(data, ["я"], "ш щ", "a5")                 # часть, не само слово, заменена 1 → 2
+        rewrite(data, ["х"], "к л", "a4")                 # и первое слово ещё раз
+        self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "к", "л", "у", "ю", "ш", "щ", "ещё", "раз"])
+        self.assertEqual(self.links(data), ["к л у ю ш щ", "тест к л у ю ш щ", "к л у ю ш щ ещё"])
+        self.assertEqual(self.place(data, "r1")["word_ids"], [w["word_id"] for w in self.flat(data)[:7]])
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["х", "у"], "у", "a2")              # слово с самим ID удалено, осталась часть
+        self.assertEqual(self.links(data), ["у", "тест у", "у ещё"])
+
+    def test_insert_before_split_word_inside_it_keeps_order(self):
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["х", "у"], "з х у", "a2")
+        self.assertEqual(self.links(data), ["з х у", "тест з х у", "з х у ещё"])
+
+    def test_link_order_still_checked(self):
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        self.assertEqual(conspect._id_text(data, ["w3", "w2"]), (None, None))
+
+    def test_reanswer_keeps_inserted_and_model(self):
+        """Повторная правка вставки 1 → 1 и 1 → 2 — слова остаются `inserted`; «как распознано» без лишнего пробела."""
+        data = split_data()
+        rewrite(data, ["тест", "слово"], "тест новое слово", "a1")
+        rewrite(data, ["новое"], "другое", "a2")
+        rewrite(data, ["другое"], "ещё одно", "a3")
+        flat = self.flat(data)
+        self.assertEqual([w["w"] for w in flat if w.get("inserted")], ["ещё", "одно"])
+        self.assertTrue(all(0.6 <= w["s"] <= w["e"] <= 0.8 for w in flat if w.get("inserted")))   # в паузе
+        data = split_data()
+        rewrite(data, ["ещё"], "пер вый", "a1")
+        new = rewrite(data, ["пер", "вый"], "а б в", "a2")
+        self.assertEqual([w["model"] for w in new], ["ещё", "", ""])
+        self.assertEqual(review_pack.recognized_text(new), "ещё")
+        self.assertEqual(conspect._id_text(data, ["w3"])[0], "а б в")
+
+
 class Recognized(Case):
     """«Как распознано» на карточке противоречия — из заменённых слов, не из новых."""
 

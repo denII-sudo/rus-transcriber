@@ -1655,36 +1655,57 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
     new = new_text.split()
     sm = difflib.SequenceMatcher(None, [_wkey(w["w"]) for w in old], [_wkey(x) for x in new], autojunk=False)
     out, conflicts, reasons = [], [], []
+    region_roots = {w.get("part_of") or w.get("word_id") for w in old}
+    # правка внутри слова распознавания, уже разбитого прежним ответом: вставка — тоже его часть, как на main
+    # (там такая правка заменяла склеенное слово целиком)
+    region_root = next(iter(region_roots)) if len(region_roots) == 1 and any(w.get("part_of") for w in old) else None
 
-    def mk(text, src, s, e):
+    def root(w):
+        """Корень слова: ID слова распознавания, из которого оно получилось (`part_of`), или своё ID."""
+        return w.get("part_of") or w.get("word_id")
+
+    def heir_of(src):
+        """Слово, чьи ID и отметки наследует первое новое: единственное заменённое или первое из слов, полученных
+        прежде из одного слова (у всех один корень) — повторный ответ не отрывает их от ссылок на это слово."""
+        roots = {root(w) for w in src}
+        return src[0] if len(src) == 1 or (len(roots) == 1 and None not in roots) else None
+
+    def mk(text, src, s, e, heir=None):
         result = {"w": text, "s": s, "e": e, "c": 1.0, "edited": item_id,
-                  "model": " ".join(w.get("model", w.get("raw", w["w"])) for w in src) if src else ""}
-        if len(src) == 1 and src[0].get("word_id"):
-            result["word_id"] = src[0]["word_id"]
-        if len(src) == 1 and src[0].get("provenance"):
-            result["provenance"] = copy.deepcopy(src[0]["provenance"])
+                  "model": " ".join(m for m in (w.get("model", w.get("raw", w["w"])) for w in src) if m)}
+        if heir is not None:
+            for key in ("word_id", "part_of"):
+                if heir.get(key):
+                    result[key] = heir[key]
+            if heir.get("provenance"):
+                result["provenance"] = copy.deepcopy(heir["provenance"])
+        if any(w.get("inserted") for w in src):     # время вставки — оценка и после повторной правки
+            result["inserted"] = True
         return result
 
-    def spread(texts, src, s, e):
+    def spread(texts, src, s, e, part_of=None):
         """Слова texts поровну внутри [s; e]; первое — с источником src (ID и прежнее слово модели). Отметки
-        одного заменённого слова (в том числе подтверждённый говорящий) получают все новые слова, а `part_of` —
-        его ID: ссылка конспекта на это слово покрывает все слова, что из него получились. Без src — вставка:
-        `inserted`, как у вставок apply_word_edits (время — оценка, в материал голосов не идёт). Без времени
-        (старые перенесённые слова) или с концом раньше начала — у всех слов прежние s и e, как у склеенного слова."""
+        заменённого слова (в том числе подтверждённый говорящий) получают все новые слова, а `part_of` — корень
+        его ID: ссылка конспекта на слово распознавания покрывает все слова, что из него получились, и после
+        повторных ответов. Без src — вставка: `inserted`, как у вставок apply_word_edits (время — оценка, в
+        материал голосов не идёт), и `part_of` вставки внутрь одного слова (part_of). Без времени (старые
+        перенесённые слова) или с концом раньше начала — у всех слов прежние s и e, как у склеенного слова."""
         timed = _finite_number(s) and _finite_number(e) and e >= s
         step = (e - s) / len(texts) if timed else 0
         bounds = [s]
         for q in range(1, len(texts)):                  # округление не выводит границу за соседние
             bounds.append(min(max(round(s + step * q, 3), bounds[-1]), e) if timed else s)
         bounds.append(e)
-        words = [mk(x, src if q == 0 else [], bounds[q], bounds[q + 1] if timed else e) for q, x in enumerate(texts)]
-        for w in words[1:]:
-            if len(src) == 1 and src[0].get("provenance"):
-                w["provenance"] = copy.deepcopy(src[0]["provenance"])
-            if len(src) == 1 and src[0].get("word_id"):
-                w["part_of"] = src[0]["word_id"]
-        if not src:
-            for w in words:
+        heir = heir_of(src) if src else None
+        words = [mk(x, src if q == 0 else [], bounds[q], bounds[q + 1] if timed else e, heir if q == 0 else None)
+                 for q, x in enumerate(texts)]
+        whole = root(heir) if heir is not None else part_of
+        for w in words[1 if src else 0:]:
+            if heir is not None and heir.get("provenance"):
+                w["provenance"] = copy.deepcopy(heir["provenance"])
+            if whole:
+                w["part_of"] = whole
+            if not src or any(x.get("inserted") for x in src):
                 w["inserted"] = True
         return words
 
@@ -1712,11 +1733,14 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
             t = out[-1]["e"] if out else (old[0]["s"] if old else 0.0)
             following = old[i1]["s"] if i1 < len(old) else t
             end = following if _finite_number(t) and _finite_number(following) and following > t else t
-            put(spread(new[j1:j2], [], t, end), [])
+            # вставка внутрь слова распознавания: вся правка внутри него или соседи с обеих сторон из него
+            inside = region_root or (out and i1 < len(old) and root(out[-1]) and root(out[-1]) == root(old[i1])
+                                     and root(out[-1]))
+            put(spread(new[j1:j2], [], t, end, inside or None), [])
             continue
         if i2 - i1 == j2 - j1:                          # замена слово в слово
             for w, x in zip(src, new[j1:j2]):
-                put([mk(x, [w], w["s"], w["e"])], [w])
+                put([mk(x, [w], w["s"], w["e"], w)], [w])
         else:
             put(spread(new[j1:j2], src, src[0]["s"], src[-1]["e"]), src)
     return out, sorted(set(conflicts)), reasons
