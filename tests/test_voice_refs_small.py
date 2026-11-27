@@ -218,34 +218,33 @@ RAW_A = [(0.0, 10.0, "SPEAKER_00"), (10.5, 20.5, "SPEAKER_00")]
 
 
 class RunWordsTests(unittest.TestCase):
-    """Через настоящий run_words: участник из профиля без кластера и голос без опоры (профиль есть)."""
+    """Через настоящий run_words, профили есть: участник из профиля без кластера; кластер без опоры — как до
+    Т-1-Н1, по отпечатку к ближайшей опоре (метки «Спикер N» по разметке — только без профилей)."""
 
     def setUp(self):
-        self.raw = RAW_A + [(21.0, 22.2, "SPEAKER_01"), (22.6, 23.8, "SPEAKER_01")]   # B: центра нет, опоры нет
+        self.raw = RAW_A + [(21.0, 22.2, "SPEAKER_01"), (22.6, 23.8, "SPEAKER_01")]   # B: опоры нет
         self.label_name = {S1: "Анна"}
-        self.pvecs = {"Анна": VA, "Борис": VC}           # Борис — в профиле, своего кластера в записи нет
         self.cents = {S1: VA}
 
-    def test_profile_name_not_put_on_unreferenced_label(self):
-        """Имя Бориса (без кластера) не встаёт на метку «Спикер 2» неопознанного голоса B."""
-        data = run_words(self.raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 21.0)
+    def test_profile_name_gets_free_label(self):
+        """Голос B — Борис (в профиле, своего опознанного кластера нет): его слова уходят Борису по отпечатку,
+        и имя встаёт на свободную метку «Спикер 3», а не на метку «Спикер 2» кластера B. Речи у B 4 с: меньше
+        3 с слова отдал бы другому правило слабого голоса (MIN_VOICE_SEC), как и до Т-1-Н1."""
+        raw = RAW_A + [(21.0, 23.0, "SPEAKER_01"), (23.4, 25.4, "SPEAKER_01")]
+        data = run_words(raw, self.label_name, {"Анна": VA, "Борис": VB}, self.cents, ["Анна", "Борис"], 21.0)
         self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, "Анна")})
-        self.assertEqual(spoken_by(data, 21.0, 24.0), {(S2, S2)})
-        self.assertEqual(data.get("speaker_names"), {S1: "Анна"})
-        self.assertEqual(data["speakers"], ["Анна", S2])
-        self.assertEqual(data["quality"].get("voice_refs"),
-                         {"refs": 2, "without_reference": [S2], "assigned_by": "diarization"})
-        self.assertEqual([w for seg in data["segments"] for w in seg["words"] if w.get("margin") != 1.0
-                          and seg["speaker"] == S2], [])
+        self.assertEqual(spoken_by(data, 21.0, 25.4), {("Спикер 3", "Борис")})
+        self.assertEqual(data.get("speaker_names"), {S1: "Анна", "Спикер 3": "Борис"})
+        self.assertNotIn("voice_refs", data["quality"])
 
     def test_tiny_cluster_word_goes_by_fingerprint(self):
-        """Метка, у которой все отрезки короче MIN_SEG (0,3 с; часто ложный крошечный кластер pyannote): в
-        turns её нет, и её слово, как до Т-1-Н1, получает голос по отпечатку — здесь голос Анны, — а не метку
-        «Спикер 3» с отрывом 1,0, которая рвала бы реплику."""
+        """Без профилей. Метка, у которой все отрезки короче MIN_SEG (0,3 с; часто ложный крошечный кластер
+        pyannote): в turns её нет, и её слово, как до Т-1-Н1, получает голос по отпечатку — здесь голос A, —
+        а не метку «Спикер 3» с отрывом 1,0, которая рвала бы реплику."""
         raw = self.raw + [(24.5, 24.75, "SPEAKER_02")]
         tiny = [{"w": "ага", "s": 24.5, "e": 24.7, "c": 1.0, "truth": S1}]
-        data = run_words(raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 99.0, tiny)
-        self.assertEqual(spoken_by(data, 24.4, 24.8), {(S1, "Анна")})
+        data = run_words(raw, {}, {}, {}, [], 99.0, tiny)
+        self.assertEqual(spoken_by(data, 24.4, 24.8), {(S1, S1)})
         self.assertEqual(data["quality"]["voice_refs"]["without_reference"], [S2])
         self.assertNotIn("Спикер 3", data["speaker_labels"])
 
@@ -254,9 +253,9 @@ class RunWordsTests(unittest.TestCase):
         подписаны Борисом под свободной меткой, не под меткой голоса B."""
         raw = [(0.0, 10.0, "SPEAKER_00"), (10.5, 20.5, "SPEAKER_00"), (21.0, 22.2, "SPEAKER_01"),
                (22.6, 23.8, "SPEAKER_01"), (25.0, 31.0, "SPEAKER_00")]
-        # отпечаток: до 25 с — голос A (и у B: его слова всё равно по разметке), после — Борис
+        # отпечаток: до 25 с — голос Анны (и у кластера B: при профилях его слова идут по отпечатку), после — Борис
         data = run_words(raw, self.label_name, {"Анна": VA, "Борис": VB}, self.cents, ["Анна", "Борис"], 25.0)
-        self.assertEqual(spoken_by(data, 21.0, 24.0), {(S2, S2)})
+        self.assertEqual(spoken_by(data, 21.0, 24.0), {(S1, "Анна")})
         self.assertEqual(spoken_by(data, 25.5, 31.0), {("Спикер 3", "Борис")})
         self.assertEqual(data.get("speaker_names"), {S1: "Анна", "Спикер 3": "Борис"})
 
@@ -267,14 +266,21 @@ VA_PROFILE = (VA + 0.6 * VC) / np.linalg.norm(VA + 0.6 * VC)     # профил�
 
 class ProfileShortClusterTests(unittest.TestCase):
     """Перепроверка Opus PR №243, находка 1: при профилях короткий неопознанный кусок речи участника не
-    становится опорой (порог 10 с) и не уводит слова основного кластера участника под «Спикер N»."""
+    становится опорой (порог 10 с) и не уводит слова основного кластера участника под «Спикер N»; его
+    собственные слова, как до Т-1-Н1, идут по отпечатку к ближайшей опоре (решение Архитектора разработки)."""
 
     def test_short_unmatched_part_does_not_take_participant_words(self):
         raw = RAW_A + [(21.0, 24.0, "SPEAKER_01"), (24.5, 27.5, "SPEAKER_01")]      # 6 с той же Анны
         data = run_words(raw, {S1: "Анна"}, {"Анна": VA_PROFILE}, {S1: VA, S2: VA}, ["Анна"], 99.0)
         self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, "Анна")})
-        self.assertEqual(data["quality"]["voice_refs"],
-                         {"refs": 1, "without_reference": [S2], "assigned_by": "diarization"})
+        self.assertNotIn("voice_refs", data["quality"])
+
+    def test_short_cluster_words_go_to_nearest_reference(self):
+        """С профилем: слова короткого неопознанного кластера остаются у ближайшей опоры (как до Т-1-Н1)."""
+        raw = RAW_A + [(21.0, 24.0, "SPEAKER_01"), (24.5, 27.5, "SPEAKER_01")]
+        data = run_words(raw, {S1: "Анна"}, {"Анна": VA_PROFILE}, {S1: VA, S2: VA}, ["Анна"], 99.0)
+        self.assertEqual(spoken_by(data, 21.0, 27.5), {(S1, "Анна")})
+        self.assertEqual(data["speaker_labels"], [S1])
 
     def test_without_profiles_short_voice_still_gets_reference(self):
         """Без профилей порог прежний для Т-1-Н1 — 3 с (сцены Лаборатории без профилей)."""

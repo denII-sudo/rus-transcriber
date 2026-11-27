@@ -859,6 +859,11 @@ REF_MIN_SEC = 3.0   # неопознанный кластер с центром 
 REF_MIN_SEC_PROFILE = 10.0   # то же, когда у участников есть голосовые профили (как до Т-1-Н1)
 
 
+def _has_profiles(voice_ctx, allowed):
+    """Есть ли голосовые профили участников этой записи (без allowed — любой профиль группы)."""
+    return any(not allowed or nm in allowed for nm in (voice_ctx.get("pvecs") or {}))
+
+
 def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed, speech=None):
     """Опорные голоса -> (refs, found): профили опознанных участников; участники из словаря с профилем,
     но без кластера (pyannote мог слить ребёнка с другим); неопознанные кластеры — по центру (центр есть,
@@ -867,10 +872,11 @@ def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed, speech=
     сравнивается по вектору профиля (с другой записи), а короткий неопознанный кусок его же речи — по центру
     из этой записи: такой центр ближе и уводил бы слова участника под «Спикер N».
     speech — секунды речи по меткам (сумма отрезков разметки, без пауз); без него — длина реплик.
-    Кластеры без опоры (короче или без центра) называет _without_reference: их слова остаются под меткой."""
+    Кластеры без опоры (короче или без центра) называет _without_reference: без профилей их слова остаются под
+    меткой разметки; при профилях — как до Т-1-Н1, по отпечатку к ближайшей опоре (run_words)."""
     import voices
     pvecs = voice_ctx.get("pvecs") or {}
-    min_sec = REF_MIN_SEC_PROFILE if any(not allowed or nm in allowed for nm in pvecs) else REF_MIN_SEC
+    min_sec = REF_MIN_SEC_PROFILE if _has_profiles(voice_ctx, allowed) else REF_MIN_SEC
     cents = voice_ctx.get("cents") or {}
     if not cents:
         embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
@@ -1332,7 +1338,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         return (mapping.get(lbl) or (label_name.get(lbl),))[0] or lbl
 
     prior = W.LabelAt([(s, e, name_of_label(order[spk])) for s, e, spk in raw])
-    unref = _without_reference(turns, label_name, refs)
+    # при голосовых профилях — прежнее поведение: слова кластера без опоры идут по отпечатку к ближайшей опоре
+    unref = set() if _has_profiles(voice_ctx, allowed) else _without_reference(turns, label_name, refs)
     if unref or not refs:
         # голос этих слов назначает программа по разметке pyannote, без сверки отпечатков (Т-1-Н5, Т-1-Н1)
         quality["voice_refs"] = {"refs": len(refs), "without_reference": sorted(unref), "assigned_by": "diarization"}
