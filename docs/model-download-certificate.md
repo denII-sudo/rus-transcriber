@@ -157,9 +157,9 @@ https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt
 Если установщик падает на скачивании PyTorch или других пакетов с
 `pypi.org` / `download.pytorch.org`:
 
-1. Проверьте версию: `\.venv\Scripts\python.exe -c "import certifi; print(certifi.__version__)"`.
+1. Проверьте версию: ` .\.venv\Scripts\python.exe -c "import certifi; print(certifi.__version__)"`.
    Она должна быть актуальной; обновление — отдельное действие.
-2. Посмотрите настройки: `\.venv\Scripts\python.exe -m pip config list -v` —
+2. Посмотрите настройки: ` .\.venv\Scripts\python.exe -m pip config list -v` —
    нет ли своего `cert=` или старого bundle.
 3. Проверьте, не перехватывает ли TLS прокси или антивирус: у нормальных
    сайтов цепочка должна быть от GlobalSign / Amazon / Let's Encrypt, а не от
