@@ -301,6 +301,65 @@ class Snapshot(unittest.TestCase):
             self.assertIn("conflict", transcript.undo_answer(self.jp, self.md, "r1", broken))
             self.assertEqual(transcript.load(self.jp), now)
 
+    # Ф234-11: запись в базу убирает из строк мест ссылки на исчезнувшие слова (recordings._prune_missing_word_ids),
+    # снимок снят до записи. Здесь запись в базу изображается той же функцией над файлом стенограммы.
+    def store_as_database(self):
+        data = transcript.load(self.jp)
+        base.recordings._prune_missing_word_ids(data, data)
+        transcript.save(data, self.jp, self.md)
+        return transcript.load(self.jp)
+
+    def two_word_place(self):
+        return self.save([reply("Глеб", word("тест", 0.2, "w1"), word("слово", 0.7, "w2"), word("ещё", 1.2, "w3"))],
+                         [dict(place("r1", 0.2, "тест слово", "Глеб", "w1"), word_ids=["w1", "w2"]),
+                          place("r2", 1.2, "ещё", "Глеб", "w3")])
+
+    def test_word_count_answer_undoes_after_database_dropped_its_references(self):
+        """Ф234-11: два слова → одно; строка места в снимке ссылается на исчезнувшие w1, w2, в базе ссылок нет."""
+        for numbers in (False, True):
+            with self.subTest(snapshot_with_row_numbers=numbers):
+                start = self.two_word_place()
+                snap = self.answer({"id": "r1", "text": "одно"})
+                if numbers:                                   # снимок, внесённый #234 (Ф234-9)
+                    for key in ("segment_patches", "review_patches"):
+                        for patch in snap[key]:
+                            patch.update(start=0, remove=1)
+                stored = self.store_as_database()
+                self.assertNotIn("word_ids", stored["review"][0], "запись в базу убрала ссылки места")
+                self.assertTrue(transcript.undo_answer(self.jp, self.md, "r1", snap).get("reverted"))
+                now = transcript.load(self.jp)
+                self.assertEqual(now["segments"], start["segments"])
+                self.assertEqual(now["review"][0]["word_ids"], ["w1", "w2"])
+                self.assertEqual(now["review"][0]["status"], "open")
+                self.assertEqual(self.store_as_database()["review"][0]["word_ids"], ["w1", "w2"])
+
+    def test_confirm_of_word_count_answer_after_database_dropped_its_references(self):
+        """Ф234-11, К-23: подтверждение в следующем «Применить» видит стенограмму из базы — снимок годен."""
+        start = self.two_word_place()
+        snap = self.answer({"id": "r1", "text": "одно"})
+        before = self.store_as_database()
+        after = copy.deepcopy(before)
+        after["review"][0]["note"] = "подтверждено человеком"
+        kept = transcript.confirm_snapshot(snap, before, after)
+        self.assertIsNotNone(kept, "подтверждение потеряло снимок")
+        transcript.save(after, self.jp, self.md)
+        self.assertTrue(transcript.undo_answer(self.jp, self.md, "r1", kept).get("reverted"))
+        self.assertEqual(transcript.load(self.jp)["segments"], start["segments"])
+
+    def test_place_rows_equal_without_missing_references_refuse(self):
+        """Ф234-11, защита: строки мест без id, одинаковые без ссылок на исчезнувшие слова, — отказ, а не первая."""
+        rows = [{"text": "x", "word_ids": ["w1"]}, {"text": "x"}, {"text": "y"}]
+        patch = {"restore": [{"text": "x", "word_ids": ["w1", "w2"]}],
+                 "after": [{"text": "x", "word_ids": ["w9"]}]}
+        segments = [reply("Глеб", word("тест", 0.2, "w5"))]
+        self.assertIsNone(transcript._restore_regions(rows, [patch], False, transcript._live_word_ids(segments)))
+        rows[1]["text"] = "z"                                 # теперь строка «x» одна — участок найден
+        self.assertEqual(transcript._restore_regions(rows, [patch], False, transcript._live_word_ids(segments)),
+                         [{"text": "x", "word_ids": ["w1", "w2"]}, {"text": "z"}, {"text": "y"}])
+        # ссылка на слово, которое есть в репликах, по-прежнему различает строки
+        live_ref = {"restore": [{"text": "y"}], "after": [{"text": "y", "word_ids": ["w5"]}]}
+        self.assertIsNone(transcript._restore_regions(rows, [live_ref], False, transcript._live_word_ids(segments)))
+
 
 class RollbackInDatabase(base.AnswerOutcomeCase):
     """Ф223-2 (решение владельца 1А): замена, где новый ответ не внёсся, возвращает прежний — при хранении в базе.
@@ -446,6 +505,100 @@ class ConfirmedThenUndoKeepsNeighbour(fcb.Base):
             self.assertEqual(self.place_of(jp, "r3")["status"], "resolved")
             self.assertEqual(self.states(jp)["r3"]["state"], "applied")
             self.assertIn("r3", self.state(jp)["undo_snapshots"])
+
+
+_result_data = base.result_data            # прежние данные: в WordCountAnswer base.result_data подменяется
+
+
+def word_count_data():
+    """Одна реплика «тест слово ещё раз»; r1 — двухсловное место «тест слово», r2 — «ещё»."""
+    words = [word(t, s, f"w{n}") for n, (t, s) in enumerate((("тест", 0.2), ("слово", 0.7), ("ещё", 1.2),
+                                                              ("раз", 1.7)), 1)]
+    data = _result_data()
+    data["segments"] = [dict(reply("Глеб", *words), label="speaker-1")]
+    data["review"] = [dict(place("r1", 0.2, "тест слово", "Глеб", "w1"), t2=1.0, word_ids=["w1", "w2"]),
+                      dict(place("r2", 1.2, "ещё", "Глеб", "w3"), t2=1.5)]
+    return data
+
+
+WORD_COUNT_QUESTIONS = [
+    {"id": "r1", "question": "Проверьте", "recommended": 0, "options": [
+        {"label": "Одно слово", "decision": {"text": "одно"}},
+        {"label": "Три слова", "decision": {"text": "один два три"}},
+        {"label": "Первое слово", "decision": {"text": "тест"}}]},
+    {"id": "r2", "question": "Проверьте", "recommended": 0, "options": [
+        {"label": "Другое слово", "decision": {"text": "иное"}},
+        {"label": "Убрать слово", "decision": {"text": ""}},
+        {"label": "Сказала Вера", "decision": {"speaker": "Вера"}}]},
+]
+
+
+class WordCountAnswer(base.AnswerOutcomeCase):
+    """Ф234-11 (вторая приёмка #234): ответ, менявший число слов места, при хранении в базе нельзя было ни отменить,
+    ни заменить — запись в базу убирает из строки места ссылки на исчезнувшие слова, а участок «после» снимка их
+    хранит. Теперь строки мест сравниваются по тому же правилу, что запись."""
+
+    def setUp(self):
+        for name, value in (("result_data", word_count_data), ("QUESTIONS", WORD_COUNT_QUESTIONS)):
+            patcher = mock.patch.object(base, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def applied(self, jp, md, version, aid, option):
+        self.save(jp, version, aid=aid, option=option)
+        rep = self.apply(jp, md)
+        self.assertEqual(self.outcomes(rep)[aid], "applied", rep.get("outcomes"))
+
+    def reverted(self, jp, md, version, aid, start):
+        self.save(jp, version, aid=aid, kind="revert")
+        rep = self.apply(jp, md)
+        self.assertEqual(self.outcomes(rep)[aid], "reverted", rep.get("undo_conflicts"))
+        now = transcript.load(jp)
+        self.assertEqual(now["segments"], start["segments"])
+        self.assertEqual(now["review"], start["review"])
+
+    def test_answer_changing_word_count_is_undone(self):
+        for backend in BACKENDS:
+            for option, case in enumerate(("два → одно", "два → три", "два → первое из них")):
+                with self.subTest(backend=backend, case=case), base.answer_files(backend) as (jp, md, version):
+                    start = transcript.load(jp)
+                    self.applied(jp, md, version, "r1", option)
+                    self.reverted(jp, md, version, "r1", start)
+
+    def test_answer_changing_word_count_is_replaced(self):
+        with base.answer_files("sqlite") as (jp, md, version):
+            start = transcript.load(jp)
+            self.applied(jp, md, version, "r1", 0)
+            self.save(jp, version, aid="r1", option=1)
+            rep = self.apply(jp, md)
+            self.assertEqual(rep.get("replaced"), ["r1"], rep.get("undo_conflicts"))
+            self.assertEqual(self.outcomes(rep)["r1"], "applied")
+            self.assertEqual(" ".join(self.words(jp)), "один два три ещё раз")
+            self.reverted(jp, md, version, "r1", start)
+
+    def test_word_of_answer_edited_later_refuses(self):
+        """Защита прежняя: слово ответа после него правили — отмена отказывает, правка цела."""
+        with base.answer_files("sqlite") as (jp, md, version):
+            self.applied(jp, md, version, "r1", 0)
+            # слово ответа изменено позже (edit_span над словом человека не пишет, а открывает противоречие)
+            later = transcript.load(jp)
+            later["segments"][0]["words"][0]["w"] = "ручное"
+            transcript.save(later, jp, md)
+            later = transcript.load(jp)
+            self.assertEqual(self.words(jp)[0], "ручное")
+            self.save(jp, version, aid="r1", kind="revert")
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(self.outcomes(rep)["r1"], "undo_conflict")
+            self.assertEqual(transcript.load(jp)["segments"], later["segments"])
+
+    def test_answers_keeping_word_references_undo_as_before(self):
+        """Контроль: одно слово → одно, удаление единственного слова места, смена говорящего — как прежде."""
+        for backend in BACKENDS:
+            for option, case in enumerate(("одно → одно", "удаление слова", "смена говорящего")):
+                with self.subTest(backend=backend, case=case), base.answer_files(backend) as (jp, md, version):
+                    start = transcript.load(jp)
+                    self.applied(jp, md, version, "r2", option)
+                    self.reverted(jp, md, version, "r2", start)
 
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
