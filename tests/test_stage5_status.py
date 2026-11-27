@@ -42,6 +42,20 @@ class StatusTests(unittest.TestCase):
             self.assertIn("пропущено на отрезках с неполным результатом ASR: 1 (около 0,7 с)", md)
             self.assertNotIn("Голосование трёх моделей отключено", md)
 
+    def test_compact_transcript_json_shows_overlap_skip(self):
+        """Т-1, Н-3: read_transcript(fmt="json") показывает, что наложения сочтены эхом или гулом."""
+        skipped = {"share": 0.82, "sec": 22.4}
+        data = {"file": "synthetic.wav", "duration": "00:00:02", "speakers": [], "segments": [],
+                "quality": {"overlap_unmeasured_skipped": skipped}}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "synthetic.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            job = {"json": str(path)}
+            compact = json.loads(core._text_only(job, "json"))
+            self.assertEqual(compact["asr_summary"]["overlap_unmeasured_skipped"], skipped)
+            self.assertNotIn("quality", compact)
+            self.assertIn("одновременную речь на 82 % речи", core._text_only(job, "markdown"))
+
     def test_cli_and_mcp_show_incomplete_result(self):
         status = {"state": "done", "quality": {"asr_incomplete_chunks": 2,
                                                  "vote3_skipped": "whisper_incomplete"}}
