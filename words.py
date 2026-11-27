@@ -987,7 +987,8 @@ def doubt_flags(words, overlaps):
             fl.append("voice")
         t = w["s"] + 0.1
         i = bisect.bisect_right(ov_s, t) - 1
-        if i >= 0 and overlaps[i][0] <= t < overlaps[i][1] and                 (w.get("margin", 1.0) <= 2 * max(thr, 0.05) or w.get("margin_unmeasured")):
+        if i >= 0 and overlaps[i][0] <= t < overlaps[i][1] and \
+                (w.get("margin", 1.0) <= 2 * max(thr, 0.05) or w.get("margin_unmeasured")):
             # наложение помечаем, если голоса близки или их отрыв не измерялся (одна опора, голос по
             # разметке): «не измерено» — не «далеко» (Т-1-Н4)
             fl.append("overlap")
