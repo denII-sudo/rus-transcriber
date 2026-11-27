@@ -54,7 +54,9 @@ rus-transcriber: расшифровка речи на этом компьюте�
 Ненайденные цитаты готовой свёртки модель исправляет только по просьбе человека: workflow_repair_quotes
 (allow_cloud_model=true — лишь при его прямом согласии на эту отправку) или кнопка на локальном экране.
 Для человека есть локальный экран (rt.py screen); он же показывает историю, конфликты и резерв.
-Реальные и старые данные не подключать до отдельной миграции.
+Реальные и старые данные не подключать до отдельной миграции. Старые файлы записи рядом с аудио (прежний
+файловый режим) можно только прочитать: read_legacy_files(path) — стенограмма, ответы человека и что внесло бы
+прежнее «Применить»; в базу это не вносится.
 
 1. Запуск: start_transcription(audio_path, names="Анна, Борис", group="…"). names — участники записи, если известны
    (голоса ищутся только среди них); num_speakers — только если число голосов известно точно; group нужен, когда в
@@ -347,6 +349,23 @@ def read_recording_revision(recording_id: str, kind: str, revision: int) -> str:
         return json.dumps(core.read_recording_revision(recording_id, kind, revision), ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": core.say_error(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def read_legacy_files(path: str, offset: int = 0, limit: int = 40) -> str:
+    """Прочитать старые файлы записи рядом с аудио (прежний файловый режим): path — `<имя>.transcript.json`
+    или `.transcript.md`. Только чтение: ничего не создаёт и не меняет, в базу не вносит. Показывает сводку
+    стенограммы и строки «Говорящий: текст» окном offset/limit, карточки разбора с ответами человека и их
+    состоянием, архивы прежних пакетов и конспекты (с sha256). У ответа, который «Применить» попробовало бы
+    внести (ждёт или прошлое «Применить» его не внесло), would_apply — что сделало бы прежнее «Применить» по
+    правилу слов карточки: yes — внесло бы (preview: было → стало), no — не внесло бы
+    (why_apply), check — решают проверки, которые чтение не повторяет. Это предсказание, не применение и не
+    подтверждение человека."""
+    import legacy_read
+    try:
+        return json.dumps(legacy_read.read(path, offset, limit), ensure_ascii=False)
+    except (ValueError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()

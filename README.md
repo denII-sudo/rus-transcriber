@@ -290,6 +290,15 @@ OpenAI `gpt-6-luna` без открытого чата, **только при я
   `find_recording_results`, `read_recording_result`, `recording_history`, `read_recording_revision`,
   `restore_recording_revision`, `sync_recording_documents`, `list_document_conflicts`, `resolve_document_conflict`,
   `list_conspect_conflicts`, `resolve_conspect_conflict`, `request_review_answer_verification`, `backup_state`;
+- старые файлы записи рядом с аудио (прежний файловый режим): `read_legacy_files(path)` и
+  `python rt.py legacy-read ИМЯ.transcript.json [--offset 0 --limit 40]` — только чтение, ничего не создают и не
+  меняют, в базу не вносят. Показывают сводку стенограммы и её строки окном, карточки разбора с ответами человека и
+  их состоянием, архивы прежних пакетов (`answers.<версия>.json`) и конспекты с sha256. У ответа, который
+  «Применить» попробовало бы внести (ждёт или прошлое «Применить» его не внесло — оно пробует снова), `would_apply` —
+  что сделало бы прежнее «Применить» по правилу слов карточки: `yes` — внесло бы (`preview`: было → стало), `no` —
+  не внесло бы (`why_apply`), `check` — решают проверки, которые чтение не повторяет (прослушивание, пауза,
+  противоречие, свой ответ, отмена или замена по снимку). Прежнее «Применить» сверяло только, что слова карточки на
+  месте и стоят подряд, а не их текст — чтение повторяет это правило как есть;
 - разбор, голоса, конспект и данные — описаны в разделах ниже.
 
 ## Как устроена обработка (pipeline = "words", по умолчанию)

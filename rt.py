@@ -18,6 +18,7 @@
     python rt.py voice-update ЗАДАЧА [--group ИМЯ]   # перед запуском спрашивает подтверждение
     python rt.py screen [--port 8766]          # локальный экран в браузере (запуск, состояние, резерв)
     python rt.py workflow-list [--limit 20]    # последние запросы workflow
+    python rt.py legacy-read ИМЯ.transcript.json [--offset 0 --limit 40]   # старые файлы записи: только чтение
     python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
     python rt.py db-init [--check]           # базы нет — создать и выбрать; есть — проверить чтением и выбрать;
         # --check — только сказать, что будет; базу и настройки не меняет
@@ -210,6 +211,9 @@ def build():
     wa = sub.add_parser("workflow-abandon"); wa.add_argument("request")
     wq = sub.add_parser("workflow-questions"); wq.add_argument("request")
     wl = sub.add_parser("workflow-list"); wl.add_argument("--limit", type=int, default=20)
+    lr = sub.add_parser("legacy-read", help="старые файлы записи рядом с аудио: что в них и что внесло бы прежнее "
+                        "«Применить»; только чтение"); lr.add_argument("path")
+    lr.add_argument("--offset", type=int, default=0); lr.add_argument("--limit", type=int, default=40)
     sc = sub.add_parser("screen"); sc.add_argument("--port", type=int, default=8766)
     sc.add_argument("--hours", type=float, default=6.0)
     s = sub.add_parser("status"); s.add_argument("job"); s.add_argument("--wait", type=int, default=0)
@@ -298,6 +302,13 @@ def run(a):
                                         a.expected_revision))
     elif c == "workflow-questions":
         out(core.workflow_questions(a.request))
+    elif c == "legacy-read":
+        import legacy_read
+        try:
+            out(legacy_read.read(a.path, a.offset, a.limit))
+        except legacy_read.LegacyReadError as ex:
+            say(f"Ошибка: {ex}")
+            return 1
     elif c == "workflow-list":
         out(core.workflow_list(a.limit))
     elif c == "screen":
