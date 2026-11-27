@@ -1,7 +1,7 @@
 """Голоса и записи в базе: страховочная сетка до обучения профилей по SQLite (Г1).
 
 Только синтетические данные во временной папке; модели, настоящие профили и база не используются.
-Закрепляется: (1) запись, перенесённая в базу так же, как `tools/import_legacy.py`, даёт через
+Закрепляется: (1) запись, перенесённая в базу (перенос П7; запись строит `tests/migrated_record.py`), даёт через
 `recordings.load_recording` тот же отбор отрезков, что и старый файл; (2) правка агента и отменённая
 отметка человека не считаются подтверждением человека ни в файле, ни в базе; (3) ручной путь по записи в
 базе (Г2): предпросмотр без записи в базу, подтверждённое обновление и отзыв под резервом, перевязка старого
@@ -20,8 +20,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-import import_legacy as IL  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import migrated_record as MR  # noqa: E402
 import core  # noqa: E402
 import documents  # noqa: E402
 import core_voices  # noqa: E402
@@ -101,7 +101,7 @@ class Status:
 
 
 class SyntheticStore(unittest.TestCase):
-    """Временная база и папка записи; перенос — тем же путём, что у `import_legacy`."""
+    """Временная база и папка записи; перенесённая запись — `tests/migrated_record.py`."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="voice-sqlite-")
@@ -122,12 +122,11 @@ class SyntheticStore(unittest.TestCase):
         """
         audio = audio or self.audio
         legacy_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
-        source = {"path": str(legacy_path), "sha256": IL.sha256_file(legacy_path),
-                  "size": legacy_path.stat().st_size}
-        rid, snapshot, review, _ = IL.build_snapshots(
+        source = MR.source_of(legacy_path)
+        rid, snapshot, review = MR.build_snapshots(
             json.loads(legacy_path.read_text(encoding="utf-8")),
-            recording_id=recording_id or IL.recording_id_for(legacy_path, source["sha256"]), metadata={},
-            field_sources={}, variant={"tag": tag, "main": True}, source=source)
+            recording_id=recording_id or MR.recording_id_for(legacy_path, source["sha256"]),
+            variant={"tag": tag, "main": True}, source=source)
         if not link:
             snapshot["quality"].pop("migration")
             legacy_path.unlink()
@@ -499,9 +498,7 @@ class ManualSqlitePath(SyntheticStore):
     def test_server_tools_change_nothing_without_human_confirmation(self):
         import asyncio
         import confirm
-        import migrate
-        with patch.object(migrate, "run"):
-            import server
+        import server
         before = self.profile_path.read_bytes()
         with patch.object(confirm, "require", side_effect=confirm.NotConfirmed("отказ человека")), \
                 patch.object(core, "launch", side_effect=AssertionError("запуск без подтверждения")):

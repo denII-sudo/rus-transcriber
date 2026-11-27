@@ -684,9 +684,7 @@ class WorkflowTests(unittest.TestCase):
         action.assert_called_once_with("request", {"example": True})
 
     def test_confirmation_off_cannot_mark_human_verified(self):
-        import migrate
-        with mock.patch.object(migrate, "run"):
-            import server
+        import server
         action = mock.Mock(return_value={"ok": True})
         with mock.patch.object(server.confirm, "require", return_value="off"):
             result = asyncio.run(server._gated("test", {}, lambda: ["test"], action, require_human=True))
