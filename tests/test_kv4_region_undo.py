@@ -17,6 +17,7 @@ from unittest import mock
 
 import test_answer_outcomes as base  # noqa: E402  (тот же sandbox и те же правила исходов)
 import test_cards_ui_buttons as ui  # noqa: E402  (страница в Node)
+import test_card_findings_behavior as fcb  # noqa: E402  (К-23: ноутбук и облако расходились)
 
 import core  # noqa: E402
 import review_pack  # noqa: E402
@@ -114,6 +115,14 @@ def place(rid, t, text, speaker, wid):
             "word_ids": [wid]}
 
 
+def format_two_patches(old, new):
+    """Участки снимка формата 2 (до К-В4): номера в new (start/remove) и строки old (restore)."""
+    from difflib import SequenceMatcher
+    codes = [transcript._row_code(x) for x in old], [transcript._row_code(x) for x in new]
+    return [{"start": j1, "remove": j2 - j1, "restore": copy.deepcopy(old[i1:i2])}
+            for tag, i1, i2, j1, j2 in SequenceMatcher(None, *codes, autojunk=False).get_opcodes() if tag != "equal"]
+
+
 class Snapshot(unittest.TestCase):
     """Снимок формата 3 на уровне стенограммы (файловый режим, без пакета карточек)."""
 
@@ -193,6 +202,21 @@ class Snapshot(unittest.TestCase):
                     seg = transcript.load(self.jp)["segments"][0]
                     self.assertEqual((seg["start"], [w["w"] for w in seg["words"]]), expect)
 
+    def test_ambiguous_after_region_refuses(self):
+        """Ф234-1: участок «после» встречается в стенограмме дважды — где вернуть, неясно: отказ, без изменений
+        (а не первое вхождение). На настоящих данных почти недостижимо: строки несут время и ID слов."""
+        self.two_replies()
+        snap = self.answer({"id": "r1", "text": "другое"})
+        now = transcript.load(self.jp)["segments"]
+        self.assertIsNotNone(transcript._restore_regions(now, snap["segment_patches"], True))
+        # Двойник строки «после» (сохранение такую стенограмму не допустит: соседние реплики одного говорящего
+        # сливаются) — проверка на уровне возврата участков, до и после своей строки.
+        for where in (0, len(now)):
+            with self.subTest(where=where):
+                rows = copy.deepcopy(now)
+                rows.insert(where, copy.deepcopy(now[0]))
+                self.assertIsNone(transcript._restore_regions(rows, snap["segment_patches"], True))
+
     def test_deleted_row_returns_between_its_neighbours(self):
         a, x, b = (reply("Глеб", word("тест", 0.2, "w1")), reply("Вера", word("эээ", 2.0, "w2")),
                    reply("Глеб", word("слово", 4.0, "w3")))
@@ -202,7 +226,8 @@ class Snapshot(unittest.TestCase):
         after["segments"] = [after["segments"][0], after["segments"][2]]
         after["review"][0]["status"] = "resolved"
         snap = transcript.answer_snapshot(before, after)
-        self.assertEqual([(p["remove"], len(p["restore"])) for p in snap["segment_patches"]], [(0, 1)])
+        self.assertEqual([(p["after"], len(p["restore"])) for p in snap["segment_patches"]], [([], 1)])
+        self.assertNotIn("start", snap["segment_patches"][0])      # Ф234-9: номеров строк в формате 3 нет
         # позже — другое место: соседи участка те же
         after["segments"].append(reply("Вера", word("потом", 9.0, "w9")))
         transcript.save(after, self.jp, self.md)
@@ -222,14 +247,27 @@ class Snapshot(unittest.TestCase):
         self.two_replies()
         before = transcript.load(self.jp)
         after, _ = transcript.apply_review(self.jp, self.md, [{"id": "r2", "text": "снова"}], by="human")
-        old = {"format": 2, "segment_patches": transcript._patches(before["segments"], after["segments"], False),
-               "review_patches": transcript._patches(before["review"], after["review"], False),
+        old = {"format": 2, "segment_patches": format_two_patches(before["segments"], after["segments"]),
+               "review_patches": format_two_patches(before["review"], after["review"]),
                "edits_before": len(before["edits"]), "after": transcript._undo_fingerprint(after)}
         transcript.edit_span(self.jp, self.md, 0.7, 0.7, "ручное", by="human")    # другое место
         self.assertIn("conflict", transcript.undo_answer(self.jp, self.md, "r2", old))
         transcript.save(after, self.jp, self.md)
         self.assertTrue(transcript.undo_answer(self.jp, self.md, "r2", old).get("reverted"))
         self.assertEqual(transcript.load(self.jp)["segments"], before["segments"])
+
+    def test_format_three_written_with_row_numbers_still_undoes(self):
+        """Ф234-9: снимки формата 3, внесённые до снятия номеров строк (#234), несут лишние start/remove —
+        отмена их не читает и проходит, в том числе после изменения другого места (номера тогда неверны)."""
+        start = self.two_replies()
+        snap = self.answer({"id": "r2", "text": "снова"})
+        with_numbers = copy.deepcopy(snap)
+        for key in ("segment_patches", "review_patches"):
+            for patch in with_numbers[key]:
+                patch.update(start=999, remove=7)
+        transcript.edit_span(self.jp, self.md, 0.7, 0.7, "ручное", by="human")    # другое место
+        self.assertTrue(transcript.undo_answer(self.jp, self.md, "r2", with_numbers).get("reverted"))
+        self.assertEqual(transcript.load(self.jp)["segments"][1], start["segments"][1])
 
     def test_confirm_snapshot_of_format_three(self):
         """К-23: подтверждение меняет только строку места — снимок прежний, отмена вернёт место к состоянию до ответа."""
@@ -333,8 +371,24 @@ class RollbackInDatabase(base.AnswerOutcomeCase):
             view = review_pack.answer_states(jp)["r1"]
             for text in (row["why"], row["detail"], view["why"], view["detail"]):
                 self.assertNotIn("открыт", text)
-            self.assertIn("прежний ответ на месте", row["why"])
             self.assertIn(review_pack.REPLACE_ROLLED_BACK, view["detail"])
+            # Ф234-2: без повторов — о прежнем ответе один раз (строка возврата), в причине и подсказке — ни разу
+            for why, detail in ((row["why"], row["detail"]), (view["why"], view["detail"])):
+                self.assertEqual((why + " — " + detail).count("прежний ответ"), 1, (why, detail))
+            self.assertTrue(row["why"].startswith("не применён: короткий ответ не понят как слова"), row["why"])
+
+    def test_previous_kept_text_drops_open_place_clause(self):
+        """Ф234-2: каждая оговорка «место осталось открытым» из причин и подсказок убирается без следа."""
+        import freeform
+        texts = [review_pack.OUTCOME_REASONS["hint"], review_pack.OUTCOME_REASONS["negative"], freeform.HINT_EVALUATION]
+        self.assertTrue(all("место осталось открытым" in t for t in texts))
+        got = [review_pack.previous_kept_text(t) for t in texts]
+        self.assertEqual(got, ["не применён: короткий ответ не понят как слова — подсказка ниже",
+                               "отрицание: правка не применена",
+                               freeform.HINT_EVALUATION.replace("место осталось открытым; ", "")])
+        self.assertNotIn("  ", "".join(got))
+        self.assertEqual(review_pack.previous_kept_text("место осталось открытым"), "прежний ответ на месте")
+        self.assertIsNone(review_pack.previous_kept_text(None))
 
     def test_back_restores_and_new_answer_drops_the_line(self):
         with base.answer_files("sqlite") as (jp, md, version):
@@ -366,6 +420,32 @@ class RollbackInDatabase(base.AnswerOutcomeCase):
             self.assertNotIn("replace_rolled_back", rep)
             self.assertEqual(rep["replaced"], ["r1"])
             self.assertEqual(self.words(jp), ["тест", "слово"])
+
+
+class ConfirmedThenUndoKeepsNeighbour(fcb.Base):
+    """Ф234-10 (вторая приёмка #234): ответ внесён с пометкой «проверить» (К-23: ноутбук и облако расходились),
+    затем внесён ответ на другое место той же реплики, затем человек подтвердил первый и отменил его. До К-В4 отмена
+    возвращала реплику целиком и молча снимала второй внесённый ответ; теперь — только свои слова."""
+
+    def test_undo_of_confirmed_answer_keeps_other_place_of_same_reply(self):
+        with fcb.files("sqlite") as (jp, md, version):
+            rep = fcb.ConflictOfLaptopAndCloud.conflicted(self, jp, md, version)        # r4: «та» → «тот»
+            self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied_check", rep.get("outcomes"))
+            self.press(jp, version, "«дальнейшем»", "r3")                               # та же реплика, r3
+            rep = self.apply(jp, md)
+            self.assertEqual(self.outcomes(rep)["r3"]["outcome"], "applied", rep.get("outcomes"))
+            self.press(jp, version, fcb.REPLACE, "r4")                                  # подтверждение r4
+            rep = self.apply(jp, md)
+            self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
+            self.assertEqual(len(transcript.load(jp)["segments"]), 1, "r3 и r4 — в одной реплике")
+            self.save(jp, version, "r4", kind="revert")
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "reverted", rep.get("outcomes"))
+            self.assertEqual(self.word(jp, "w5")["w"], "та")
+            self.assertEqual(self.word(jp, "w3")["w"], "дальнейшем", "отмена r4 сняла ответ r3")
+            self.assertEqual(self.place_of(jp, "r3")["status"], "resolved")
+            self.assertEqual(self.states(jp)["r3"]["state"], "applied")
+            self.assertIn("r3", self.state(jp)["undo_snapshots"])
 
 
 @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
