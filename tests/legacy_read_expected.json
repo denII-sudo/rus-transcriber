@@ -19,6 +19,26 @@
    "w5": "конец"
   }
  },
+ "built_agent_edit": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
  "built_archive": {
   "outcomes": {},
   "refused": false,
@@ -36,9 +56,91 @@
    "w5": "конец"
   }
  },
+ "built_bad_option": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_human_edit": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "apply_conflict"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "те",
+   "w5": "конец"
+  }
+ },
  "built_no_actor": {
   "outcomes": {},
   "refused": true,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "built_old_card": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "blocked_preflight",
+   "r5": "blocked_preflight"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "built_overlap": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "blocked_preflight",
+   "r5": "blocked_preflight"
+  },
+  "refused": false,
   "status": {
    "r2": "open",
    "r3": "resolved",

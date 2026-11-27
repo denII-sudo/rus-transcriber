@@ -2,16 +2,23 @@
 
 Старая запись — файлы рядом с аудио: стенограмма `<имя>.transcript.json` (и `.md`), папка разбора
 `<имя>.review/` (вопросы `manifest.json`, ответы человека `answers.json`, архивы прежних пакетов
-`answers.<версия>.json`), конспекты `<имя>.<название>.conspect.json/md`. `read` показывает, что в них лежит
-и что сделало бы с сохранёнными ответами файловое «Применить» — по его правилу слов карточки: слова карточки
-на месте и стоят подряд (их текст файловый режим не сверял). Предсказание — для ответов, которые «Применить»
-попробует внести: ждущих и тех, что прошлое «Применить» не внесло (оно пробует их снова). Где «Применить»
-решает по проверкам, которые чтение не повторяет (прослушивание, пауза, противоречие, свой ответ человека,
-отмена и замена по снимку), исход — «нужна проверка».
+`answers.<версия>.json`), конспекты `<имя>.<название>.conspect.json/md`. `read` показывает, что в них лежит.
+
+У ответа, который прежнее «Применить» попробовало бы внести (ждёт, или прошлое «Применить» его не внесло — оно
+пробует снова), `apply_hint` — подсказка, а не предсказание исхода (Ч-1.1, решение Архитектора 27.11):
+- `words_in_place` — слова карточки на месте и стоят подряд (правило слов файлового режима; их текст он не
+  сверял). Это не обещание, что ответ был бы внесён: отказы «Применить» из-за правки этих слов человеком,
+  прослушивания, пересечения карточек, закрытого или пропавшего места и другие проверки при внесении чтение не
+  повторяет;
+- `not_applied` — прежнее «Применить» этот ответ не внесло бы (`apply_hint_why`);
+- `check` — исход решают проверки, которые чтение не повторяет (прослушивание, пауза, противоречие, свой ответ
+  человека, отмена и замена по снимку, пересечение слов двух ждущих карточек, старая карточка без ID слов,
+  повреждённый номер варианта).
 
 Ничего не создаёт и не меняет: файлы читаются целиком байтами, замок ответов (`answers.lock`) не берётся,
 папка данных программы и база записей не открываются (модули `paths`, `core`, `recordings` не импортируются).
-Вносить прочитанное в базу эта функция не умеет (решение Архитектора 27.11: только чтение).
+Вносить прочитанное в базу эта функция не умеет (решение Архитектора 27.11: только чтение). Если запись
+перенесена в базу, действующее состояние — там, а эти файлы — прежняя копия.
 """
 import hashlib
 import json
@@ -27,7 +34,18 @@ SUFFIX_MD = ".transcript.md"
 TRIED = RP.REBUILD_GROUPS["waiting"] | RP.REBUILD_GROUPS["unapplicable"]
 LINES_LIMIT = 40
 
-YES, NO, CHECK = "yes", "no", "check"
+WORDS_IN_PLACE, NOT_APPLIED, CHECK = "words_in_place", "not_applied", "check"
+WORDS_NOTE = ("слова карточки на месте и стоят подряд — это не обещание, что ответ был бы внесён: отказы «Применить» "
+              "из-за правки этих слов человеком, прослушивания, пересечения карточек, закрытого или пропавшего места "
+              "чтение не повторяет")
+CHECK_BAD_OPTION = ("нужна проверка: повреждённый номер варианта — прежнее «Применить» на нём вносило не тот вариант "
+                    "или падало целиком")
+CHECK_OLD_CARD = ("нужна проверка: старая карточка без ID слов — «Применить» ищет её место и пересечения по времени, "
+                  "чтение этого не повторяет")
+DB_DOCUMENT = ("это документ базы (выгрузка записи из SQLite), а не старый файл: читайте запись из базы — "
+               "find_recording_results, read_recording_result, recording_history")
+MIGRATED_NOTE = ("у записи есть recording_id: если она перенесена в базу, действующее состояние — в базе "
+                 "(find_recording_results, read_recording_result), а эти файлы — прежняя копия")
 CHECK_LISTEN = "нужна проверка: ответ прослушивания — «Применить» сверяет прослушанный отрезок"
 CHECK_CONTRADICTION = "нужна проверка: место с противоречием — «Применить» сверяет слова, показанные на карточке"
 CHECK_FREE = "нужна проверка: свой ответ человека вносится по словам (разбор ответа), чтение его не повторяет"
@@ -144,47 +162,51 @@ def _preview(it, answer, data):
 
 
 def _verdict(it, answer, ctx):
-    """(yes|no|check, почему) для ответа, который «Применить» попробует внести, — что сделало бы с ним файловое
-    «Применить». Порядок проверок — как в review_pack.decisions и core._apply_answers_files_locked."""
+    """(words_in_place|not_applied|check, почему) для ответа, который «Применить» попробует внести. Порядок
+    проверок — как в review_pack.decisions; проверки core._apply_answers_files_locked и transcript.apply_review
+    при внесении (правка человека, пересечения по времени, закрытое место и др.) чтение не повторяет — поэтому
+    words_in_place говорит только о словах карточки."""
     aid = it.get("id")
     if ctx["refusal"]:
-        return NO, ctx["refusal"]
+        return NOT_APPLIED, ctx["refusal"]
     if ctx["other_record"]:
-        return NO, OTHER_RECORD
+        return NOT_APPLIED, OTHER_RECORD
     if RP.legacy_decided(ctx["state"], aid, answer):
-        return NO, RP.OUTCOME_REASONS["already_decided"]
+        return NOT_APPLIED, RP.OUTCOME_REASONS["already_decided"]
     relation = RP.over_applied(answer, ctx["applied"].get(aid))
     if relation == "revert":
-        return (CHECK, CHECK_UNDO) if (ctx["state"].get("undo_snapshots") or {}).get(aid) else (NO, NO_SNAPSHOT)
+        if (ctx["state"].get("undo_snapshots") or {}).get(aid):
+            return CHECK, CHECK_UNDO
+        return NOT_APPLIED, NO_SNAPSHOT
     if relation == "pending_new":
         if RP.replaceable(ctx["state"], aid, answer, ctx["applied"].get(aid)):
             return CHECK, CHECK_REPLACE
-        return NO, RP.OUTCOME_REASONS["pending_new"]
+        return NOT_APPLIED, RP.OUTCOME_REASONS["pending_new"]
     if aid in ctx["conflicts"]:
-        return NO, ctx["conflicts"][aid]
+        return NOT_APPLIED, ctx["conflicts"][aid]
     kind = answer.get("kind")
     if kind == "free":
         if freeform.negative_answer(answer.get("text")):
-            return NO, RP.OUTCOME_REASONS["negative"]
+            return NOT_APPLIED, RP.OUTCOME_REASONS["negative"]
         return CHECK, CHECK_FREE
     if kind == "revert":
-        return NO, RP.OUTCOME_REASONS["skipped"]
+        return NOT_APPLIED, RP.OUTCOME_REASONS["skipped"]
     place = ctx["places"].get(aid) or {}
     if "seen_fp" in it and T.contradiction_pending(place):
         return CHECK, CHECK_CONTRADICTION
     if kind in ("option", "recommended"):
         if ctx["previews"][aid].get("bad_option"):
-            return NO, RP.OUTCOME_REASONS["not_applied"]
+            return CHECK, CHECK_BAD_OPTION
         if (it["options"][answer["option"]].get("decision") or {}).get("listened"):
             return CHECK, CHECK_LISTEN
         if T.is_gap_place(it) or T.is_gap_place(place):
             return CHECK, CHECK_PAUSE
     if aid in ctx["overlaps"]:
         return CHECK, CHECK_OVERLAP
-    if kind == "human":
-        return YES, RP.OUTCOME_REASONS["left_for_human"]
-    if kind in ("option", "recommended"):
-        return YES, RP.OUTCOME_REASONS["applied"]
+    if not it.get("word_ids") and not T.is_gap_place(it):
+        return CHECK, CHECK_OLD_CARD
+    if kind in ("human", "option", "recommended"):
+        return WORDS_IN_PLACE, WORDS_NOTE
     return CHECK, f"нужна проверка: вид ответа «{kind}» чтение не разбирает"
 
 
@@ -255,30 +277,54 @@ def _pack(jp, data):
                              if answer.get(k) is not None}
             row["preview"] = ctx["previews"][aid]
         if row["state"] in TRIED:
-            row["would_apply"], row["why_apply"] = _verdict(it, answer, ctx)
-            counts[row["would_apply"]] = counts.get(row["would_apply"], 0) + 1
+            row["apply_hint"], row["apply_hint_why"] = _verdict(it, answer, ctx)
+            counts[row["apply_hint"]] = counts.get(row["apply_hint"], 0) + 1
         by_state[row["state"]] = by_state.get(row["state"], 0) + 1
         rows.append(row)
     out.update({"version": man.get("version"), "recording_id": man.get("recording_id"),
                 "source_revision": man.get("source_revision"), "cards": len(items), "states": by_state,
-                "waiting": {k: counts.get(k, 0) for k in (YES, NO, CHECK)}, "apply_refused": ctx["refusal"],
+                "apply_hints": {k: counts.get(k, 0) for k in (WORDS_IN_PLACE, NOT_APPLIED, CHECK)},
+                "apply_refused": ctx["refusal"],
                 "items": rows})
     return out
 
 
+def _conspects(jp, stem):
+    """Конспекты рядом: `<имя>.<название>.conspect.json/md`. Имя сравнивается как текст, не как шаблон glob:
+    скобки `[ ]` в имени записи — обычные символы (Ф238-10)."""
+    head = stem + "."
+    names = sorted(p.name for p in jp.parent.iterdir()
+                   if p.name.startswith(head) and p.name[len(head):].endswith((".conspect.json", ".conspect.md"))
+                   and p.is_file())
+    return [info for name in names if (info := _file_info(jp.parent / name))]
+
+
 def read(path, offset=0, limit=LINES_LIMIT):
-    """Что лежит в старых файлах записи и что внёс бы файловый режим. Ничего не пишет.
+    """Что лежит в старых файлах записи и подсказка по ответам, которые попробовало бы внести прежнее «Применить».
+    Ничего не пишет.
 
     path — `<имя>.transcript.json` или `.transcript.md`; offset/limit — окно строк стенограммы «Говорящий: текст».
-    -> {transcript, md, review_pack (None — папки разбора нет), conspects, writes: False}."""
+    -> {transcript, md, review_pack (None — папки разбора нет), conspects, writes: False}; у записи с
+    recording_id — ещё `database_note`. Документ базы и файлы неожиданного вида — LegacyReadError."""
     jp = resolve(path)
     data, sha = _json_file(jp)
     if not isinstance(data, dict):
         raise LegacyReadError(f"стенограмма не читается как JSON: {jp}")
-    offset, limit = max(0, int(offset)), max(0, int(limit))
+    passport = data.get("passport")
+    if isinstance(passport, dict) and passport.get("storage_backend") == "sqlite":
+        raise LegacyReadError(f"{DB_DOCUMENT}: {jp}")
+    try:
+        offset, limit = max(0, int(offset)), max(0, int(limit))
+    except (TypeError, ValueError):
+        raise LegacyReadError("offset и limit — целые числа") from None
     stem = jp.name[:-len(SUFFIX_JSON)]
-    conspects = [info for p in sorted(jp.parent.glob(f"{stem}.*.conspect.*"))
-                 if p.name.endswith((".conspect.json", ".conspect.md")) and (info := _file_info(p))]
-    return {"transcript": _transcript(jp, data, sha, offset, limit),
-            "md": _file_info(jp.with_name(stem + SUFFIX_MD)),
-            "review_pack": _pack(jp, data), "conspects": conspects, "writes": False}
+    try:
+        out = {"transcript": _transcript(jp, data, sha, offset, limit),
+               "md": _file_info(jp.with_name(stem + SUFFIX_MD)),
+               "review_pack": _pack(jp, data), "conspects": _conspects(jp, stem), "writes": False}
+    except (AttributeError, TypeError, KeyError, IndexError) as ex:
+        # строка вместо списка или объекта и т. п.: файлы записи не того вида, что писал файловый режим (Ф238-2)
+        raise LegacyReadError(f"файлы записи неожиданного вида ({type(ex).__name__}: {ex}): {jp}") from None
+    if data.get("recording_id"):
+        out["database_note"] = MIGRATED_NOTE
+    return out
