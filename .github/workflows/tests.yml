@@ -38,6 +38,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2 # the merge commit of a PR and its first parent (main)
+          # The token is not left in .git/config for the steps below (they run PR code). Nothing here fetches from
+          # or pushes to GitHub: git is used only locally (diff, show, status, ls-files); the tests that run
+          # "git fetch/push" do it in temporary repositories with a local bare "origin" (tests/test_agent_workspaces.py).
+          persist-credentials: false
       # Среди тестов от docs/*.md и README.md зависит только test_text_hygiene. Любой другой файл,
       # событие не PR или сбой определения - полный набор.
       - name: Choose the test scope
@@ -137,7 +141,15 @@ jobs:
       # Личные слова (имена, названия групп) хранятся в секрете репозитория RUS_FORBIDDEN_WORDS,
       # по одному в строке. Журнал публичный: --hide-words выводит только файл и строку, без слова.
       # PR из форков секрет не получают — там проверка пропускается с пометкой.
+      # В PR скрипт берётся из базового коммита (первый родитель merge-коммита, HEAD^1), а файлы проверяются
+      # из дерева PR (--root .): автор PR не может подменить сам tools/check_repo.py. Это частичная защита:
+      # для события pull_request GitHub берёт и сам tests.yml из PR, так что правкой этого файла секрет
+      # по-прежнему можно вывести; такие правки закрывает ревью код-владельца (.github/ в CODEOWNERS).
+      # На push, по расписанию и вручную (main) проверка идёт скриптом из дерева, как раньше.
+      # !cancelled(): шаг идёт и после упавших тестов. Иначе автор PR мог бы уронить тест (подменив его и сами
+      # функции проверки) и тем самым не дать защитному шагу запуститься.
       - name: Check tracked files for private words
+        if: ${{ !cancelled() }}
         shell: pwsh
         env:
           FORBIDDEN_WORDS: ${{ secrets.RUS_FORBIDDEN_WORDS }}
@@ -149,7 +161,19 @@ jobs:
           $list = Join-Path $env:RUNNER_TEMP "forbidden-words.txt"
           [IO.File]::WriteAllText($list, $env:FORBIDDEN_WORDS, (New-Object Text.UTF8Encoding $false))
           $env:RUS_FORBIDDEN_WORDS = $list
-          python -B tools/check_repo.py --hide-words
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $baseScript = Join-Path $env:RUNNER_TEMP "base-check-repo.py"
+            # python пишет байты как есть: без перекодировки, которая зависит от версии PowerShell
+            python -B -c "import subprocess, sys; open(sys.argv[2], 'wb').write(subprocess.run(['git', 'show', sys.argv[1]], check=True, capture_output=True).stdout)" "HEAD^1:tools/check_repo.py" $baseScript
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item $list -Force
+              Write-Output "::error::Could not read tools/check_repo.py from the base commit (HEAD^1): private-word check NOT done."
+              exit 1
+            }
+            python -B $baseScript --root . --hide-words
+          } else {
+            python -B tools/check_repo.py --hide-words
+          }
           $code = $LASTEXITCODE
           Remove-Item $list -Force
           exit $code

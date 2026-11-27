@@ -119,9 +119,14 @@ class ConflictOfLaptopAndCloud(Base):
             self.assertEqual(self.outcomes(rep)["r4"]["outcome"], "applied", rep.get("outcomes"))
             self.assertEqual(self.place_of(jp, "r4")["status"], "resolved")
             kept = self.state(jp)["undo_snapshots"]["r4"]
-            # участки снимка прежние; отпечаток «после» — уже с подтверждением (иначе отмена отказала бы)
-            self.assertEqual({k: v for k, v in kept.items() if k != "after"},
-                             {k: v for k, v in snapshot.items() if k != "after"})
+            # участки «до» прежние; «после» у строки места — уже с подтверждением (иначе отмена отказала бы).
+            # К-В4, было: формат 2, менялся только отпечаток «after»; стало: формат 3, строки «после» участков места
+            self.assertEqual(kept["format"], 3)
+            self.assertEqual({k: v for k, v in kept.items() if k != "review_patches"},
+                             {k: v for k, v in snapshot.items() if k != "review_patches"})
+            self.assertEqual([p["restore"] for p in kept["review_patches"]],
+                             [p["restore"] for p in snapshot["review_patches"]])
+            self.assertNotEqual(kept["review_patches"], snapshot["review_patches"])
             self.assertEqual(self.states(jp)["r4"]["state"], "applied")
             self.save(jp, version, "r4", kind="revert")
             core.apply_answers_files(jp, md)

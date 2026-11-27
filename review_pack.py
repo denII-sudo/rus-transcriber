@@ -97,6 +97,16 @@ LEGACY_ORIGIN = "legacy_review_pack:"
 # К-В3: новый ответ заменил внесённый в том же «Применить»; замена отказана — прежний ответ на месте
 REPLACED = "прежний ответ заменён"
 REPLACED_NOT_APPLIED = "прежний ответ снят, а новый не внесён — место снова открыто"
+# К-В4 (решение владельца 1А, 26.11): новый не внёсся — прежний возвращён; строка хранится под карточкой до нового
+# ответа на ней (решение 2А)
+REPLACE_ROLLED_BACK = ("прежний ответ возвращён на место: новый ответ не внесён и ждёт — измените его или "
+                       "нажмите «Вернуть как было»")
+
+
+def previous_kept_text(text):
+    """К-В4: новый ответ не внесён, прежний на месте — причины исхода нового («…место осталось открытым», подсказки)
+    говорят об открытом месте, а оно закрыто прежним ответом (найдено на приёмке)."""
+    return text.replace("место осталось открытым", "прежний ответ на месте") if isinstance(text, str) else text
 REPLACE_REFUSED = ("прежний ответ не заменён: после него стенограмма менялась. «Вернуть как было» снимет новый "
                    "ответ; если внесённый ответ неверен — скажите Claude: «исправь место карточки {n}»")
 # К-18: снимок есть, но отмена отказана — после ответа стенограмма менялась
@@ -2275,6 +2285,9 @@ def answer_states_of(store, man, outcome_details=True):
                               _last_place_event(events, aid))
         out[aid] = {"state": state, "why": OUTCOME_REASONS[state], "card": cards.get(aid),
                     "ts": answer.get("ts"), "source": answer.get("source")}
+        if state in REBUILD_GROUPS["unapplicable"] and over_applied(answer, applied.get(aid)) == "pending_new":
+            out[aid]["previous_kept"] = True     # К-В3/К-В4: новый ответ не внесён, прежний внесённый на месте
+            out[aid]["why"] = previous_kept_text(out[aid]["why"])
         details = []
         remembered = (store.get("outcome_details") or {}).get(aid) if outcome_details else None
         if remembered and remembered.get("ts") == answer.get("ts") and remembered.get("source") == answer.get("source"):

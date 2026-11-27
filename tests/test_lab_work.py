@@ -113,7 +113,8 @@ class Source:
             pass
 
     def recording(self, answers, hyp=True, sha=None, heard=True, hyp_primary=None, edit=None):
-        """Запись с двумя карточками; answers — {id: поля ответа}. -> (recording_id, путь стенограммы)."""
+        """Запись с двумя карточками; answers — {id: поля ответа}. hyp: True — прежний файл гипотез (до Г-1),
+        "db" — строка таблицы гипотез базы (Г-1), "both" — то и другое одним прогоном. -> (recording_id, путь)."""
         self.n += 1
         audio = self.audio_dir / f"rec{self.n}.wav"
         audio.write_bytes(b"synthetic" + bytes([self.n]))
@@ -145,10 +146,13 @@ class Source:
                 core.edit_span_files(jp, md, *edit, by="human")
         if hyp:
             rec = hyp_record(rid, sha, heard=heard, primary=hyp_primary)
-            folder = self.data / "hypotheses" / PCM[:12]
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / f"20261125-1000{self.n:02d}-aaaaaa.json").write_text(json.dumps(rec, ensure_ascii=False),
-                                                                           encoding="utf-8")
+            run = f"20261125-1000{self.n:02d}-aaaaaa"
+            if hyp in (True, "both"):
+                folder = self.data / "hypotheses" / PCM[:12]
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{run}.json").write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+            if hyp in ("db", "both"):
+                self.store.add_hypotheses(run, rid, PCM[:12], rec)
         return rid, jp
 
 
@@ -306,6 +310,23 @@ class WorkAnalysis(unittest.TestCase):
         work = self.analyze()[0]["work"]
         self.assertEqual(work["m1"]["cards"]["agreement_unknown"], 2, work["m1"])
         self.assertEqual(work["roles_matched_human"]["third"], 0)
+
+    def test_hypotheses_from_database_are_read_like_files(self):
+        """С Г-1 гипотезы — строки базы: prepare --work выкладывает их из копии базы песочницы в те же файлы и
+        опись, анализ читает их как прежние файлы. Прогон, взятый и файлом, и строкой, — в описи один раз."""
+        rid_db, _ = self.src.recording({"r1": {"option": 0}, "r2": {"option": 0}}, hyp="db")
+        rid_both, _ = self.src.recording({"r1": {"option": 0}}, hyp="both")
+        a, s = self.analyze()
+        manifest = json.loads((s / "source" / lab_sandbox.HYP_MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual((manifest["from_database"], manifest["database_duplicates_of_files"]), (1, 1))
+        self.assertEqual(manifest["counts"][lab_sandbox.HYP_COPIED], 2)
+        self.assertEqual(sorted(f["origin"] for f in manifest["files"]), ["database", "files"])
+        for f in manifest["files"]:
+            self.assertEqual(f["sha256"], hashlib.sha256((s / "source" / "hypotheses" / f["relative"])
+                                                         .read_bytes()).hexdigest())
+        hyps, orphan = lab_work.read_hypotheses(s / "source" / "hypotheses", manifest)
+        self.assertEqual(({k: len(v) for k, v in hyps.items()}, orphan), ({rid_db: 1, rid_both: 1}, 0))
+        self.assertEqual(a["work"]["recordings"]["states"]["ok"], 2, a["work"]["recordings"])
 
     def test_old_sandbox_without_work_is_not_measured(self):
         self.src.store.close()

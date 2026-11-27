@@ -437,7 +437,7 @@ class AnswerIntegrity(unittest.TestCase):
         before = T.load(c.json)
         after, _ = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
         snapshot = T.answer_snapshot(before, after)
-        self.assertEqual(snapshot["format"], 2)
+        self.assertEqual(snapshot["format"], 3)          # К-В4: было 2
         self.assertEqual(len(snapshot["segment_patches"]), 1)
         self.assertLess(len(json.dumps(snapshot, ensure_ascii=False)),
                         len(json.dumps(before["segments"], ensure_ascii=False)) // 4)
@@ -459,7 +459,7 @@ class AnswerIntegrity(unittest.TestCase):
         before = T.load(c.json)
         after, _ = T.apply_review(c.json, c.md, [{"id": "r1", "text": "другое"}], by="human")
         snapshot = T.answer_snapshot(before, after)
-        snapshot["segment_patches"][0]["start"] = 10000
+        snapshot["segment_patches"][0]["after"] = "x"     # К-В4: место ищется по участку «после», не по номеру
         self.assertIn("conflict", T.undo_answer(c.json, c.md, "r1", snapshot))
         self.assertEqual(T.load(c.json), after)
 

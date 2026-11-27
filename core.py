@@ -10,6 +10,7 @@ rt.py (командная строка) — только вызывают эти
 """
 import bisect
 import collections
+import copy
 import difflib
 import json
 import hashlib
@@ -1417,25 +1418,14 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                 result["why"] = P.UNDO_LATER_EDIT      # К-18: снимок есть, стенограмма менялась после ответа
             rep.setdefault("undo_conflicts", []).append(result)
             undo_failed.add(d["id"])
-    # К-В3: новый ответ поверх применённого со снимком — прежний снимается здесь, до всех применений (снимок годен,
-    # пока стенограмма не менялась), новый применяется ниже как обычный. Отказ: прежний на месте, новый ждёт.
-    replaced = []
-    numbers = {it.get("id"): n for n, it in enumerate((P.manifest(jp) or {}).get("items") or [], 1)}
-    planned = {d.get("id") for d in decisions} | set(free)
-    for aid in [aid for aid in rep.get("replace") or [] if aid in planned]:
-        result = transcript.undo_answer(jp, md, aid, (state_before.get("undo_snapshots") or {}).get(aid))
-        if result.get("reverted"):
-            replaced.append(aid)
-            P.mark_applied(jp, {aid}, outcomes={aid: "replaced"})
-        else:
-            result["why"] = P.REPLACE_REFUSED.format(n=numbers.get(aid, "?"))
-            rep.setdefault("undo_conflicts", []).append(result)
-            undo_failed.add(aid)
-    decisions = [d for d in decisions if d.get("id") not in undo_failed]
-    free = {aid: answer for aid, answer in free.items() if aid not in undo_failed}
-    rep["replaced"] = replaced
     snapshots, report = {}, {}
     snapshot_bytes = 0
+    free_items = []
+    if blocked_free:
+        free_items.append({"conflicts": preflight,
+                           "left_to_human": [{"id": aid, "why": revision_conflicts.get(
+                                               aid, "конфликт с другой карточкой до применения"),
+                                               "answer": answer.get("text")} for aid, answer in blocked_free.items()]})
 
     def remember_snapshot(aid, before, after):
         nonlocal snapshot_bytes
@@ -1450,55 +1440,96 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
         snapshots[aid] = snapshot
         snapshot_bytes += size
 
+    def apply_decision(decision):
+        """Один ответ-вариант: применить, снять снимок, отметить. -> внесён ли."""
+        before = transcript.load(jp)
+        after, result = transcript.apply_review(jp, md, [decision], by="human")
+        for key, value in result.items():
+            if isinstance(value, list) and key != "vocab_suggestions":
+                report.setdefault(key, []).extend(value)
+            elif key in ("applied", "kept", "human"):
+                report[key] = report.get(key, 0) + value
+            else:
+                report[key] = value
+        aid = decision.get("id")
+        if aid in result.get("successful_ids", []) and decision.get("confirm_applied"):
+            # подтверждение человека (К-23): слова те же, снимок прежний — отмена вернёт место к состоянию
+            # до применённого ответа, а не к состоянию после него; отпечаток «после» — с подтверждением
+            kept = transcript.confirm_snapshot(
+                (P.answers_state(jp, {"answers": {}}).get("undo_snapshots") or {}).get(aid), before, after)
+            if kept is not None:
+                snapshots[aid] = kept
+            P.mark_applied(jp, {aid}, snapshots={aid: kept} if kept is not None else None,
+                           outcomes={aid: "applied"})
+        elif aid in result.get("successful_ids", []):
+            # Ответ, применённый с отметкой «проверить человеку» (human_after, К-23), тоже учитывается как
+            # применённый: подпись и снимок отмены ставятся, исход — applied_check.
+            remember_snapshot(aid, before, after)
+            # Без снимка ответ всё равно применён: отметка ставится, отмена сообщит, что снимка нет.
+            P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
+                           outcomes={aid: "applied"})
+        return aid in result.get("successful_ids", [])
+
+    def apply_free_one(aid):
+        """Один свой ответ: применить, снять снимок, отметить. -> внесён ли."""
+        before = transcript.load(jp)
+        part = P.apply_free(jp, md, {aid: free[aid]})
+        free_items.append(part)
+        if aid in part.get("successful_ids", []):
+            remember_snapshot(aid, before, transcript.load(jp))
+            P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
+                           outcomes={aid: "applied"})
+            return True
+        return False
+
+    # К-В3: новый ответ поверх применённого со снимком заменяет его — прежний снимается по снимку и сразу, до
+    # остальных ответов, вносится новый (пара для каждой карточки). Отказ снятия: прежний на месте, новый ждёт.
+    # К-В4 (решение владельца 1А, 26.11): новый не внёсся — при хранении в базе черновик карточки возвращается к
+    # состоянию до снятия: прежний ответ на месте, новый сохранён и ждёт. Файловый режим — как прежде, без возврата.
+    replaced, rolled_back, paired = [], [], set()
+    numbers = {it.get("id"): n for n, it in enumerate((P.manifest(jp) or {}).get("items") or [], 1)}
+    decision_of = {d.get("id"): d for d in decisions}
+    for aid in [aid for aid in rep.get("replace") or [] if aid in decision_of or aid in free]:
+        kept_draft = (copy.deepcopy(draft["data"]), copy.deepcopy(draft["state"])) if draft is not None else None
+        result = transcript.undo_answer(jp, md, aid, (state_before.get("undo_snapshots") or {}).get(aid))
+        if not result.get("reverted"):
+            result["why"] = P.REPLACE_REFUSED.format(n=numbers.get(aid, "?"))
+            rep.setdefault("undo_conflicts", []).append(result)
+            undo_failed.add(aid)
+            continue
+        P.mark_applied(jp, {aid}, outcomes={aid: "replaced"})
+        paired.add(aid)
+        done = apply_decision(decision_of[aid]) if aid in decision_of else apply_free_one(aid)
+        if not done and aid in (rep.get("human") or []):
+            # «Оставить человеку» ничего не вносит, только статус места: замена состоялась, если место отдано ему
+            place = next((r for r in transcript.load(jp).get("review") or [] if r.get("id") == aid), {})
+            done = place.get("status") == "human"
+        if done:
+            replaced.append(aid)
+        elif kept_draft is not None:
+            draft["data"], draft["state"] = kept_draft
+            rolled_back.append(aid)
+        else:
+            replaced.append(aid)
+    decisions = [d for d in decisions if d.get("id") not in undo_failed]
+    free = {aid: answer for aid, answer in free.items() if aid not in undo_failed}
+    rep["replaced"] = replaced
+    if rolled_back:
+        rep["replace_rolled_back"] = rolled_back
     if decisions:
         state = transcript.load(jp)
         order = {it["id"]: it.get("t", 0) for it in state.get("review") or []}
         for decision in sorted(decisions, key=lambda d: -order.get(d.get("id"), 0)):
-            before = transcript.load(jp)
-            after, result = transcript.apply_review(jp, md, [decision], by="human")
-            for key, value in result.items():
-                if isinstance(value, list) and key != "vocab_suggestions":
-                    report.setdefault(key, []).extend(value)
-                elif key in ("applied", "kept", "human"):
-                    report[key] = report.get(key, 0) + value
-                else:
-                    report[key] = value
-            aid = decision.get("id")
-            if aid in result.get("successful_ids", []) and decision.get("confirm_applied"):
-                # подтверждение человека (К-23): слова те же, снимок прежний — отмена вернёт место к состоянию
-                # до применённого ответа, а не к состоянию после него; отпечаток «после» — с подтверждением
-                kept = transcript.confirm_snapshot(
-                    (P.answers_state(jp, {"answers": {}}).get("undo_snapshots") or {}).get(aid), before, after)
-                if kept is not None:
-                    snapshots[aid] = kept
-                P.mark_applied(jp, {aid}, snapshots={aid: kept} if kept is not None else None,
-                               outcomes={aid: "applied"})
-            elif aid in result.get("successful_ids", []):
-                # Ответ, применённый с отметкой «проверить человеку» (human_after, К-23), тоже учитывается как
-                # применённый: подпись и снимок отмены ставятся, исход — applied_check.
-                remember_snapshot(aid, before, after)
-                # Без снимка ответ всё равно применён: отметка ставится, отмена сообщит, что снимка нет.
-                P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
-                               outcomes={aid: "applied"})
-    free_items = []
-    if blocked_free:
-        free_items.append({"conflicts": preflight,
-                           "left_to_human": [{"id": aid, "why": revision_conflicts.get(
-                                               aid, "конфликт с другой карточкой до применения"),
-                                               "answer": answer.get("text")} for aid, answer in blocked_free.items()]})
+            if decision.get("id") not in paired:
+                apply_decision(decision)
     if free:
         # Свободные ответы нередко затрагивают одни и те же слова. Применяем их
         # отдельно, чтобы у каждого успешного ответа был обратимый структурный
         # снимок; это снимает консервативный отказ от пакетной отмены.
         order = {it["id"]: it.get("t1", 0) for it in (P.manifest(jp) or {}).get("items") or []}
         for aid in sorted(free, key=lambda x: -order.get(x, 0)):
-            before = transcript.load(jp)
-            part = P.apply_free(jp, md, {aid: free[aid]})
-            free_items.append(part)
-            if aid in part.get("successful_ids", []):
-                remember_snapshot(aid, before, transcript.load(jp))
-                P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]} if aid in snapshots else None,
-                               outcomes={aid: "applied"})
+            if aid not in paired:
+                apply_free_one(aid)
     if free_items:
         rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
@@ -1609,6 +1640,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
                 else P.REPLACED_NOT_APPLIED)
         undo_texts.add(text)
         add_detail(aid, text)
+    for aid in rolled_back:     # К-В4 (Ф223-4): и в отчёте, и под карточкой — до нового ответа на ней
+        add_detail(aid, P.REPLACE_ROLLED_BACK)
     for conflict in preflight or []:
         for aid in conflict.get("cards") or []:
             others = [states[x]["card"] or x for x in conflict["cards"] if x != aid and x in states]
@@ -1647,9 +1680,15 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
     for aid in rep["notes_not_written"]:
         add_detail(aid, P.NOTE_NOT_WRITTEN)
 
+    for aid in rolled_back:     # К-В4: место не открыто — прежний ответ на месте; причины нового — без «открыто»
+        details[aid] = [P.previous_kept_text(text) for text in details.get(aid) or []]
+        fresh[aid] = [P.previous_kept_text(text) for text in fresh.get(aid) or []]
+
     def row(aid):
         out = {"id": aid, "card": states[aid]["card"], "outcome": outcomes[aid],
                "why": P.OUTCOME_REASONS[outcomes[aid]]}
+        if aid in rolled_back:
+            out["why"] = P.previous_kept_text(out["why"])
         if outcomes[aid] == "applied" and aid in (rep.get("undo_unavailable") or []):
             text = P.undo_unavailable_text(stored[aid], P._sig(stored[aid]), manifest_now, states[aid]["card"])
             undo_texts.add(text)
@@ -1786,6 +1825,11 @@ def legacy_speaker_review(job_id, build_pack=False):
 
 
 # ---------- настройки, группы, профили ----------
+def _hypotheses_summary():
+    import hypstore
+    return hypstore.summary(settings.load_config())
+
+
 def settings_info():
     import recordings
     import storage
@@ -1793,7 +1837,9 @@ def settings_info():
               "overrides": settings.load_overrides(), "effective": settings.load_config(),
               "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
               # старая раскладка данных переносится только явной командой migrate_data
-              "legacy_migration_pending": bool(migrate.pending())}
+              "legacy_migration_pending": bool(migrate.pending()),
+              # объём гипотез моделей (те же числа, что у очистки без отбора): записи с гипотезами, прогоны, байты
+              "hypotheses": _hypotheses_summary()}
     if paths.STATE_DB.is_file():
         try:
             store = recordings.open_store()
@@ -1848,11 +1894,22 @@ def do_cleanup(days=30, apply=False):
     return data_io.cleanup_jobs(days, apply)
 
 
-def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False):
+HYPOTHESES_CLEANUP_LIST_LIMIT = 25     # строк перечня записей в окне подтверждения; в отчёте — все
+
+
+def do_cleanup_hypotheses(unit_id="", older_than_days=None, apply=False, recording_id=""):
+    """Очистка гипотез (data_io.cleanup_hypotheses). В отчёте "recordings" — записи с названием и датой,
+    "recordings_text" — те же записи строками «название — дата (номер)» для человека."""
+    import hypstore
+    import storage
     try:
-        return data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply)
+        report = data_io.cleanup_hypotheses(unit_id or None, older_than_days, apply, recording_id or None)
+        report["recordings_text"] = [hypstore.entry_text(entry) for entry in report.get("recordings") or []]
+        return report
     except ValueError as ex:
         raise CoreError(str(ex)) from ex
+    except storage.StorageError as ex:
+        raise CoreError(f"База записей недоступна: {say_error(ex)}") from ex
 
 
 # ---------- описание действия для человека (без выполнения) ----------
@@ -1889,13 +1946,28 @@ def describe_cleanup(days=30):
     return [f"Удаление статусов и логов задач старше {days} дн.: файлов {r['files']}, {r['bytes'] // 1024} КБ."]
 
 
-def describe_cleanup_hypotheses(unit_id="", older_than_days=None):
-    r = do_cleanup_hypotheses(unit_id, older_than_days, False)
-    scope = f"записи {unit_id}" if unit_id else "всех записей"
+def describe_cleanup_hypotheses(unit_id="", older_than_days=None, recording_id=""):
+    r = do_cleanup_hypotheses(unit_id, older_than_days, False, recording_id)
+    db = r["database"]
+    named = r["recordings_text"]
+    if recording_id:
+        scope = f"записи {named[0]}" if named else f"записи (номер {recording_id})"
+    else:
+        scope = f"звука {unit_id}" if unit_id else "всех записей"
     age = f", старше {older_than_days} дн." if older_than_days is not None else ""
-    return [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
-            f"файлов {r['files']}, записей {r['units']}, {r['bytes'] // 1024} КБ.",
-            "Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить."]
+    lines = [f"Удаление сохранённых гипотез моделей (полный текст записей) {scope}{age}: "
+             f"в базе — прогонов {db['runs']}, записей {db['recordings']}, {db['bytes'] // 1024} КБ."]
+    if not recording_id and named:
+        limit = HYPOTHESES_CLEANUP_LIST_LIMIT
+        shown = named if len(named) <= limit else named[:limit - 1]
+        lines.append("Записи:")
+        lines.extend(f"— {line}" for line in shown)
+        if len(shown) < len(named):
+            lines.append(f"— и ещё записей: {len(named) - len(shown)} (полный перечень — в отчёте без apply)")
+    if r["files"]:
+        lines.append(f"Прежние файлы гипотез: {r['files']}, звуков {r['units']}, {r['bytes'] // 1024} КБ.")
+    lines.append("Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить.")
+    return lines
 
 
 def describe_migrate():

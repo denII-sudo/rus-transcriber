@@ -217,8 +217,10 @@ audio{width:100%;height:36px}
   // applied_open: ответ применён, место осталось открытым (PR 7) — правка на месте, отмена доступна
   // applied_check: применён более поздний из расходившихся ответов ноутбука и облака (К-23) — проверить
   // cloud_revert: отмена сохранена в облаке (К-16) — применённая правка на месте
+  // replaceRefused: новый ответ не внесён, прежний внесённый на месте (К-В3 — отказ снятия, К-В4 — возврат прежнего)
   const holdsApplied = (it, a) => ["applied", "applied_open", "applied_check", "pending_new", "kept_previous",
-                                   "undo_conflict", "revert_pending", "cloud_keep", "cloud_revert"].includes(stateOf(it, a));
+                                   "undo_conflict", "revert_pending", "cloud_keep", "cloud_revert"].includes(stateOf(it, a)) ||
+                                  replaceRefused(it, a);
   // К-13: отвечено — ответ сохранён и не требует действия; эти исходы ждут нового ответа или проверки.
   // В облаке состояния до переноса на ноутбук неизвестны: там отвечено всё, на что есть ответ.
   const NEEDS_ANSWER = ["negative", "hint", "pause_refused", "listen_mismatch", "apply_conflict", "blocked_preflight",
@@ -227,7 +229,8 @@ audio{width:100%;height:36px}
   // карточка, где ответ не внесётся (9.3), — «без ответа», пока её не оставили как есть («Пропустить»)
   const needsAnswer = (it) => {
     const a = answers[it.id];
-    return !a || (LOCAL && (NEEDS_ANSWER.includes(stateOf(it, a)) || (cannotApply(it, a) && kindOf(a) !== "skip")));
+    return !a || (LOCAL && ((NEEDS_ANSWER.includes(stateOf(it, a)) && !replaceRefused(it, a)) ||
+                            (cannotApply(it, a) && kindOf(a) !== "skip")));
   };
   // ответы, которые ждут «Применить»: их число — на кнопке (КН-10)
   const WAITING = ["saved", "pending_new", "revert_pending"];
@@ -240,7 +243,7 @@ audio{width:100%;height:36px}
   const appliedActions = (it, a) => {
     const st = stateOf(it, a), noUndo = undoOf(it) === false, out = [];
     if (LOCAL && st === "applied_check" && confirmAnswer(it)) out.push("confirm");
-    if (st === "pending_new" || (!noUndo && st === "undo_conflict" && kindOf(a) !== "revert")) out.push("back");
+    if (st === "pending_new" || (!noUndo && replaceRefused(it, a))) out.push("back");
     if (!noUndo) out.push("edit");
     if (!noUndo && revertButton(it, a).kind === "keep") out.push("keep");
     return out;
@@ -329,8 +332,9 @@ audio{width:100%;height:36px}
       const n = ((man.answer_states || {})[it.id] || {}).card || ((man.items || []).indexOf(it) + 1) || "";
       return `${PENDING_NO_UNDO}. Если внесённый ответ неверен — скажите Claude: «исправь место карточки ${n}»`;
     }
-    // К-В3: отказ замены — уточнение программы («прежний ответ не заменён: …») само говорит причину и шаг
-    const reason = cloud || ["applied", "saved"].includes(state) || replaceRefused(it, a) ? "" :
+    // К-В3: отказ замены — уточнение программы («прежний ответ не заменён: …») само говорит причину и шаг;
+    // К-В4: возврат прежнего — причина, почему новый не внесён, и строка «прежний ответ возвращён…»
+    const reason = cloud || ["applied", "saved"].includes(state) || (replaceRefused(it, a) && state === "undo_conflict") ? "" :
       state === "pending_new" ? PENDING_REPLACE : whyOf(it);
     return [reason, cloud ? "" : detailOf(it)].filter(Boolean).join(" — ");
   }
@@ -361,8 +365,11 @@ audio{width:100%;height:36px}
     STATUS[stateOf(it, a)] || "не применён";
   const CONFLICT_TEXT = "ответы ноутбука и облака расходились — проверьте";
   const PENDING_NO_UNDO_STATUS = "новый ответ — не внесётся";
-  // К-В3: отказ замены приходит исходом undo_conflict, но человек не отменял ответ, а менял его
-  const replaceRefused = (it, a) => stateOf(it, a) === "undo_conflict" && kindOf(a) !== "revert";
+  // К-В3: отказ замены приходит исходом undo_conflict, но человек не отменял ответ, а менял его. К-В4: новый ответ
+  // не внесён (место не найдено, слова изменились…), прежний возвращён — программа помечает previous_kept.
+  const previousKept = (it, a) => { const st = (man.answer_states || {})[it.id];
+    return !!(a && st && st.previous_kept && st.ts === a.ts && st.source === a.source); };
+  const replaceRefused = (it, a) => !!a && kindOf(a) !== "revert" && (stateOf(it, a) === "undo_conflict" || previousKept(it, a));
   const REPLACE_REFUSED_STATUS = "новый ответ не внесён — прежний ответ на месте";
   // К-В3: новый ответ поверх внесённого со снимком — «Применить» заменит прежний
   const PENDING_REPLACE = "Прежний ответ заменится этим, когда вы нажмёте «Применить сохранённые ответы»; до этого он остаётся в стенограмме. «Вернуть как было» снимет новый ответ";

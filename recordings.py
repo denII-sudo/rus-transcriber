@@ -593,6 +593,31 @@ def ensure_review_events(store):
     return True
 
 
+_HYPOTHESES_BACKUP_DONE = {}
+
+
+def ensure_hypotheses(store):
+    """Г-1: в базе, созданной до Г-1, — резерв базы в db-backups, потом пустая таблица гипотез моделей.
+
+    Ничего не переносит, не переписывает и не удаляет. Резерв не удался — исключение без создания таблицы:
+    гипотезы этого прогона не сохраняются (сбой виден в статусе задачи, hypotheses_error), следующий прогон
+    пробует снова. Резерв удался, а таблица не создалась — следующий вызов только создаёт таблицу."""
+    if store.has_hypotheses():
+        return
+    key = _review_events_key(store)
+    done = _HYPOTHESES_BACKUP_DONE.get(key)
+    if done is None or not done.is_file():
+        folder = review_events_backup_dir(store)
+        folder.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = folder / f"state-before-hypotheses-{stamp}.sqlite3"
+        if target.exists():
+            target = folder / f"state-before-hypotheses-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
+        store.backup(target, allow_damaged_copies=True)
+        _HYPOTHESES_BACKUP_DONE[key] = target
+    store.create_hypotheses_table()
+
+
 def _review_events_key(store):
     """Путь базы и её store_id: восстановленная на том же месте другая база не берёт чужой резерв."""
     row = store.db.execute("SELECT store_id FROM store_meta").fetchone()

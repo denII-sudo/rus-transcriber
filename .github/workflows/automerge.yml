@@ -12,12 +12,23 @@ on:
 
 permissions: {}
 
+# Одно задание на PR за раз: два задания по одному PR (завершение Tests и снятие черновика) не вызывают
+# update-branch и не ждут запуск одновременно. Группа — номер PR (у PR из форков в workflow_run номера нет:
+# тогда номер запуска, то есть без очереди, как раньше). cancel-in-progress: false — идущее задание нельзя
+# обрывать: оно может стоять между update-branch и одобрением запуска Tests, и PR застрял бы в
+# «action_required». Следующее задание ждёт; GitHub держит одно ожидающее, более новое заменяет старое.
+concurrency:
+  group: automerge-${{ github.event.workflow_run.pull_requests[0].number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   queue:
+    # PR от Dependabot (ветки dependabot/...) в очередь не ставится: их сливает владелец по своему слову.
     if: >-
-      github.event_name == 'pull_request_target' ||
+      !startsWith(github.event.workflow_run.head_branch || github.event.pull_request.head.ref, 'dependabot/') &&
+      (github.event_name == 'pull_request_target' ||
       (github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success')
+      github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-latest
     # watches the queued PR (WATCH_MINUTES) and waits for approved Tests runs
     timeout-minutes: 120
