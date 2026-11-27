@@ -846,7 +846,8 @@ def _voice_by_diarization(words, prior, labels=None):
     """Голос слова — метка разметки pyannote (prior), без сверки отпечатков: так подписывает и диаризация.
     labels=None — все слова (опор нет вовсе); иначе только слова, чья метка разметки в labels (у этих голосов
     нет опоры, и сверка отдала бы их чужому голосу). Слову вне разметки — голос предыдущего слова, у первых —
-    первая найденная метка, без разметки — «Спикер 1». Отрыв 1,0: новых пометок сомнения это не добавляет.
+    первая найденная метка, без разметки — «Спикер 1». Отрыв 1,0 с признаком margin_unmeasured (отрыв не
+    измерялся, в порог сомнения не идёт), сходства с опорами снимаются: новых пометок сомнения это не добавляет.
     -> сколько слов подписано."""
     n = 0
     marks = [prior(w["s"] + WORD_OFFSET) if prior else None for w in words]
@@ -855,12 +856,14 @@ def _voice_by_diarization(words, prior, labels=None):
     for w, p in zip(words, marks):
         if labels is None:
             w["spk"] = p if p is not None else (last or first)
-            w["margin"] = 1.0
-            w.pop("sims", None)
-            n += 1
         elif p is not None and p in labels:
-            w["spk"], w["margin"] = p, 1.0
-            n += 1
+            w["spk"] = p
+        else:
+            last = w.get("spk") or last
+            continue
+        w["margin"], w["margin_unmeasured"] = 1.0, True     # отрыв не измерялся: в порог сомнения не идёт
+        w.pop("sims", None)                                  # сходства с чужими опорами к этому слову не относятся
+        n += 1
         last = w.get("spk") or last
     return n
 
@@ -964,7 +967,9 @@ def reply_text(ws):
 
 # ---------- 6. метки сомнения ----------
 def doubt_flags(words, overlaps):
-    margins = sorted(w.get("margin", 1.0) for w in words if w.get("spk"))
+    # отрыв, который не измерялся (голос по разметке), в статистику порога не идёт: иначе он поднимал бы
+    # порог сомнения для слов, где отрыв измерен
+    margins = sorted(w.get("margin", 1.0) for w in words if w.get("spk") and not w.get("margin_unmeasured"))
     thr = min(DOUBT_MAX_MARGIN, margins[int(len(margins) * DOUBT_QUANTILE)] if margins else 0.0)
     ov_s = [s for s, _ in overlaps]
     for w in words:

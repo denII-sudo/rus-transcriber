@@ -147,6 +147,7 @@ class ShortVoiceTests(unittest.TestCase):
         ws, refs, unref = run(A20 + [turn(21.0, 22.2, S2), turn(22.6, 23.8, S2)], 21.0)
         self.assertEqual((sorted(refs), unref), ([S1], {S2}))
         self.assertEqual(by_truth(ws), {S1: {S1}, S2: {S2}})
+        self.assertEqual([w for w in ws if w["truth"] == S2 and "sims" in w], [])    # чужих сходств нет
         W.doubt_flags(ws, [])
         self.assertEqual([w for w in ws if w.get("flags")], [])
 
@@ -192,7 +193,7 @@ def run_words(raw, label_name, pvecs, cents, allowed, border, extra_words=()):
     order = {}
     for _, _, spk in sorted(raw):
         order.setdefault(spk, f"Спикер {len(order) + 1}")
-    turns = [turn(s, e, order[spk]) for s, e, spk in raw if e - s >= worker.MIN_SEG]
+    turns = [turn(s, e, order[spk]) for s, e, spk in worker.build_turns(raw)]      # как в worker.main
     ws = words_in(turns) + [dict(w) for w in extra_words]
     ws.sort(key=lambda w: w["s"])
     dur = max(e for _, e, _ in raw) + 1.0
@@ -237,15 +238,16 @@ class RunWordsTests(unittest.TestCase):
         self.assertEqual([w for seg in data["segments"] for w in seg["words"] if w.get("margin") != 1.0
                           and seg["speaker"] == S2], [])
 
-    def test_label_with_only_tiny_turns_keeps_its_label(self):
-        """Метка, у которой все реплики короче MIN_SEG (0,3 с): в turns её нет, но в разметке есть, и слово
-        под ней не уходит чужой опоре."""
+    def test_tiny_cluster_word_goes_by_fingerprint(self):
+        """Метка, у которой все отрезки короче MIN_SEG (0,3 с; часто ложный крошечный кластер pyannote): в
+        turns её нет, и её слово, как до Т-1-Н1, получает голос по отпечатку — здесь голос Анны, — а не метку
+        «Спикер 3» с отрывом 1,0, которая рвала бы реплику."""
         raw = self.raw + [(24.5, 24.75, "SPEAKER_02")]
-        tiny = [{"w": "ага", "s": 24.5, "e": 24.7, "c": 1.0, "truth": "Спикер 3"}]
-        data = run_words(raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 21.0, tiny)
-        self.assertEqual(spoken_by(data, 24.4, 24.8), {("Спикер 3", "Спикер 3")})
-        self.assertEqual(data["quality"]["voice_refs"]["without_reference"], [S2, "Спикер 3"])
-        self.assertNotIn("Борис", data["speakers"])
+        tiny = [{"w": "ага", "s": 24.5, "e": 24.7, "c": 1.0, "truth": S1}]
+        data = run_words(raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 99.0, tiny)
+        self.assertEqual(spoken_by(data, 24.4, 24.8), {(S1, "Анна")})
+        self.assertEqual(data["quality"]["voice_refs"]["without_reference"], [S2])
+        self.assertNotIn("Спикер 3", data["speaker_labels"])
 
     def test_profile_only_participant_gets_free_label(self):
         """Борис из профиля говорит, но своего кластера у него нет (pyannote слил его с Анной): его слова
@@ -257,6 +259,57 @@ class RunWordsTests(unittest.TestCase):
         self.assertEqual(spoken_by(data, 21.0, 24.0), {(S2, S2)})
         self.assertEqual(spoken_by(data, 25.5, 31.0), {("Спикер 3", "Борис")})
         self.assertEqual(data.get("speaker_names"), {S1: "Анна", "Спикер 3": "Борис"})
+
+
+
+VA_PROFILE = (VA + 0.6 * VC) / np.linalg.norm(VA + 0.6 * VC)     # профиль Анны снят с другой записи: канал иной
+
+
+class ProfileShortClusterTests(unittest.TestCase):
+    """Перепроверка Opus PR №243, находка 1: при профилях короткий неопознанный кусок речи участника не
+    становится опорой (порог 10 с) и не уводит слова основного кластера участника под «Спикер N»."""
+
+    def test_short_unmatched_part_does_not_take_participant_words(self):
+        raw = RAW_A + [(21.0, 24.0, "SPEAKER_01"), (24.5, 27.5, "SPEAKER_01")]      # 6 с той же Анны
+        data = run_words(raw, {S1: "Анна"}, {"Анна": VA_PROFILE}, {S1: VA, S2: VA}, ["Анна"], 99.0)
+        self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, "Анна")})
+        self.assertEqual(data["quality"]["voice_refs"],
+                         {"refs": 1, "without_reference": [S2], "assigned_by": "diarization"})
+
+    def test_without_profiles_short_voice_still_gets_reference(self):
+        """Без профилей порог прежний для Т-1-Н1 — 3 с (сцены Лаборатории без профилей)."""
+        raw = RAW_A + [(21.0, 24.0, "SPEAKER_01"), (24.5, 27.5, "SPEAKER_01")]
+        data = run_words(raw, {}, {}, {}, [], 21.0)
+        self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, S1)})
+        self.assertEqual(spoken_by(data, 21.0, 27.5), {(S2, S2)})
+        self.assertNotIn("voice_refs", data["quality"])
+
+    def test_threshold_counts_speech_not_merged_turns(self):
+        """3 с — речь по отрезкам разметки, без пауз: 1,0 + 0,6 + 0,7 = 2,3 с, склеенная реплика 3,3 с."""
+        raw = RAW_A + [(21.0, 22.0, "SPEAKER_01"), (22.5, 23.1, "SPEAKER_01"), (23.6, 24.3, "SPEAKER_01")]
+        data = run_words(raw, {}, {}, {}, [], 21.0)
+        self.assertEqual(data["quality"].get("voice_refs"),
+                         {"refs": 1, "without_reference": [S2], "assigned_by": "diarization"})
+        self.assertEqual(spoken_by(data, 21.0, 24.3), {(S2, S2)})
+
+
+class DoubtThresholdTests(unittest.TestCase):
+    """Перепроверка Opus PR №243, находка 3: неизмеренный отрыв не поднимает порог сомнения измеренных слов."""
+
+    def test_unmeasured_margins_do_not_raise_threshold(self):
+        def measured():
+            return [{"w": "а", "s": i * 0.1, "e": i * 0.1 + 0.08, "spk": "A", "margin": i / 2000}
+                    for i in range(200)]
+        alone = measured()
+        W.doubt_flags(alone, [])
+        mixed = measured()
+        extra = [{"w": "б", "s": 30 + i * 0.1, "e": 30 + i * 0.1 + 0.08} for i in range(100)]
+        W._voice_by_diarization(extra, W.LabelAt([(29.0, 45.0, "B")]), {"B"})
+        thr = W.doubt_flags(mixed + extra, [])
+        self.assertEqual(sum("voice" in (w.get("flags") or []) for w in mixed),
+                         sum("voice" in (w.get("flags") or []) for w in alone))
+        self.assertLess(thr, 0.05)
+        self.assertEqual([w for w in extra if w.get("flags")], [])
 
 
 if __name__ == "__main__":
