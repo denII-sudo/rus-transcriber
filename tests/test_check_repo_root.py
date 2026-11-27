@@ -104,9 +104,12 @@ class CommandLine(Base):
     def test_code_of_the_checked_folder_is_not_executed(self):
         """Скрипт «из main» читает файлы PR как данные: tools/check_repo.py внутри проверяемой папки не запускается."""
         marker = self.tmp / "executed.marker"
-        planted = f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+        # путь маркера — через переменную окружения, а не в тексте подложенных файлов: временная папка бывает
+        # внутри профиля пользователя, и проверка путей приняла бы текст файла за личный путь
+        planted = "import os\nfrom pathlib import Path\nPath(os.environ['RT_PLANTED_MARKER']).write_text('ran')\n"
         root = self.tree("pr", {"tools/check_repo.py": planted, "conftest.py": planted, "a.py": "x = 1\n"})
-        r = self.run_script("--root", str(root))
+        with patch.dict(os.environ, {"RT_PLANTED_MARKER": str(marker)}):
+            r = self.run_script("--root", str(root))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(marker.exists())
 
