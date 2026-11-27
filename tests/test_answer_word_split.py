@@ -7,6 +7,7 @@
 его ID, у остальных ID новые, и строки мест ссылаются на новые слова. То же — у правки отрезка (`edit_span`) и у
 своего ответа человека (`apply_word_edits`): одно правило на одно действие.
 """
+import copy
 import unittest
 from unittest import mock
 
@@ -394,6 +395,40 @@ class Chains(Case):
         self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "х", "раз"])
         self.assertEqual(self.links(data), [None, None, None])
 
+    def test_later_edits_of_marked_words_keep_link_not_found(self):
+        """Н-7 после предразбора: слова с пометкой правятся снова (1 → 1, 1 → m, слово в слово) — пометка
+        переходит на новые слова, ссылка на слово не находится, а не укорачивается до «ха» или «х1 х2»."""
+        # «х» (0,8–1,1) правится отрезком до начала «э» (1,1); «э» — тем же отрезком 1,05–2,0, что его создал: другой
+        # отрезок по слову, решённому человеком, — противоречие с его решением
+        later = {"1 → 1 оба": [((0.8, 1.05), "ха"), ((1.05, 2.0), "ю")],
+                 "1 → 2, затем «э» удалено": [((0.8, 1.05), "х1 х2"), ((1.05, 2.0), "")],
+                 "1 → 2, удалены «э» и «х1»": [((0.8, 1.05), "х1 х2"), ((1.05, 2.0), ""), ((0.8, 0.9), "")],
+                 "«э» 1 → 2, «х» 1 → 1": [((1.05, 2.0), "ю я"), ((0.8, 1.05), "ха")]}
+        expected = {"1 → 1 оба": "тест ха ю раз", "1 → 2, затем «э» удалено": "тест х1 х2 раз",
+                    "1 → 2, удалены «э» и «х1»": "тест х2 раз",
+                    "«э» 1 → 2, «х» 1 → 1": "тест ха ю я раз"}
+        for backend in BACKENDS:
+            for name, edits in later.items():
+                with self.subTest(backend=backend, later=name), base.answer_files(backend) as (jp, md, version):
+                    transcript.edit_span(jp, md, 0.8, 1.4, "х у", by="claude")
+                    transcript.edit_span(jp, md, 1.05, 2.0, "э", by="human")
+                    for (t1, t2), text in edits:
+                        rep = transcript.edit_span(jp, md, t1, t2, text, by="human")[1]
+                        self.assertNotEqual(rep.get("written"), False, rep)
+                    data = transcript.load(jp)
+                    self.assertEqual(" ".join(w["w"] for w in self.flat(data)), expected[name])
+                    self.assertEqual(self.links(data), [None, None, None])
+                    self.assertEqual(conspect._id_text(data, ["w3"]), (None, None))
+                    self.assertEqual(conspect._id_text(data, ["w1"]), ("тест", "Глеб"))
+                    self.assertEqual(conspect._id_text(data, ["w4"]), ("раз", "Глеб"))
+        data = split_data()                             # слово в слово: «х э» → «ха ю» одной правкой
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["у", "ещё"], "э", "a2")
+        rewrite(data, ["х", "э"], "ха ю", "a3")
+        self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "ха", "ю", "раз"])
+        self.assertEqual(self.links(data), [None, None, None])
+        self.assertEqual(conspect._id_text(data, ["w3"]), (None, None))
+
     def test_link_order_still_checked(self):
         data = split_data()
         rewrite(data, ["слово"], "х у", "a1")
@@ -441,6 +476,27 @@ class PlaceWithoutWords(Case):
                 self.assertEqual([c["id"] for c in rep["conflicts"]], ["r3"])
                 self.assertIn("уже исправлено ответом человека на карточку (r1)", rep["conflicts"][0]["why"])
                 self.assertEqual([w["w"] for w in self.flat(after)], ["один", "два", "три", "ещё", "раз"])
+
+    def test_card_place_gone_outside_card_not_found(self):
+        """Место карточки исчезло правкой, не закрывшей его (`resolve=False`; путём человека не достигается):
+        ответ не вносится, человек видит причину. В файлах — `not_found` («место карточки не найдено»); в базе раньше
+        срабатывает сверка карточки с ревизией: слов места нет — `apply_conflict` («дособери карточки»)."""
+        outcome = {"legacy_files": ("not_found", "место карточки не найдено в стенограмме"),
+                   "sqlite": ("apply_conflict", "слова этого места изменились")}
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), base.answer_files(backend) as (jp, md, version):
+                transcript.edit_span(jp, md, 1.6, 2.0, "", by="claude", resolve=False)
+                data = transcript.load(jp)
+                self.assertEqual(self.place(data, "r2")["status"], "open")
+                self.assertEqual(transcript.place_words(data, self.place(data, "r2"))[0], [])
+                question = [q for q in copy.deepcopy(SPLIT_QUESTIONS) if q["id"] == "r2"]
+                version = review_pack.build(jp, question)["version"]      # карточка — уже без слов места
+                self.save(jp, version, aid="r2", option=1)
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r2"], outcome[backend][0], rep.get("outcomes"))
+                row = next(r for r in rep["outcomes"] if r["id"] == "r2")
+                self.assertIn(outcome[backend][1], row["why"])
+                self.assertEqual(self.words(jp), ["тест", "слово", "раз"])
 
 
 class Recognized(Case):

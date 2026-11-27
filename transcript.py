@@ -1681,6 +1681,9 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
                 result["provenance"] = copy.deepcopy(heir["provenance"])
         if any(w.get("inserted") for w in src):     # время вставки — оценка и после повторной правки
             result["inserted"] = True
+        carried = sorted({x for w in src for x in w.get("merged_from") or []})
+        if carried:                                 # Н-7: пометка переживает повторную правку слова
+            result["merged_from"] = carried
         return result
 
     def spread(texts, src, s, e, part_of=None):
@@ -1701,8 +1704,10 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
                  for q, x in enumerate(texts)]
         whole = root(heir) if heir is not None else part_of
         # Н-7: слова из слов разных корней помнят эти корни (`merged_from`), _relink_places помечает ими и оставшиеся
-        # слова корней — ссылка на такой корень не находится, а не укорачивается до оставшихся частей.
-        merged = sorted({root(w) for w in src if root(w)}) if src and heir is None else []
+        # слова корней — ссылка на такой корень не находится, а не укорачивается до оставшихся частей. Пометку
+        # заменённых слов получают все новые слова: повторная правка её не снимает.
+        merged = sorted(({root(w) for w in src if root(w)} if src and heir is None else set())
+                        | {x for w in src for x in w.get("merged_from") or []})
         for w in words:
             if merged:
                 w["merged_from"] = list(merged)
