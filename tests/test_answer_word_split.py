@@ -361,6 +361,39 @@ class Chains(Case):
         rewrite(data, ["х", "у"], "з х у", "a2")
         self.assertEqual(self.links(data), ["з х у", "тест з х у", "з х у ещё"])
 
+    def test_part_merged_with_neighbour_word_link_not_found(self):
+        """Н-7: «слово» → «х у», затем правка «у ещё» → «э» (части разных корней в одном слове). Ссылка на слово не
+        укорачивается до «х» молча, а не находится — как на main, где склеенное слово заменялось целиком."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), base.answer_files(backend) as (jp, md, version):
+                transcript.edit_span(jp, md, 0.8, 1.4, "х у", by="claude")
+                transcript.edit_span(jp, md, 1.05, 2.0, "э", by="human")
+                data = transcript.load(jp)
+                self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "х", "э", "раз"])
+                self.assertEqual(self.links(data), [None, None, None])
+                self.assertEqual(conspect._id_text(data, ["w3"]), (None, None))
+                self.assertEqual(conspect._id_text(data, ["w1"]), ("тест", "Глеб"))
+                self.assertEqual(conspect._id_text(data, ["w4"]), ("раз", "Глеб"))
+
+    def test_merged_word_keeps_roots_through_later_answers(self):
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["у", "ещё"], "э", "a2")
+        rewrite(data, ["э"], "ю", "a3")                   # 1 → 1
+        self.assertEqual(self.links(data), [None, None, None])
+        rewrite(data, ["ю"], "ю я", "a4")                 # 1 → 2: вставка
+        rewrite(data, ["ю", "я"], "ц ш щ", "a5")          # 2 → 3 одного корня
+        rewrite(data, ["ц"], "", "a6")                    # первое из них удалено
+        self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "х", "ш", "щ", "раз"])
+        self.assertEqual(self.links(data), [None, None, None])
+        self.assertEqual(conspect._id_text(data, ["w1"]), ("тест", "Глеб"))
+        data = split_data()
+        rewrite(data, ["слово"], "х у", "a1")
+        rewrite(data, ["у", "ещё"], "э", "a2")
+        rewrite(data, ["э"], "", "a3")                    # слово, в которое ушла часть, удалено целиком
+        self.assertEqual([w["w"] for w in self.flat(data)], ["тест", "х", "раз"])
+        self.assertEqual(self.links(data), [None, None, None])
+
     def test_link_order_still_checked(self):
         data = split_data()
         rewrite(data, ["слово"], "х у", "a1")
@@ -381,6 +414,33 @@ class Chains(Case):
         self.assertEqual([w["model"] for w in new], ["ещё", "", ""])
         self.assertEqual(review_pack.recognized_text(new), "ещё")
         self.assertEqual(conspect._id_text(data, ["w3"])[0], "а б в")
+
+
+class PlaceWithoutWords(Case):
+    """Н-8: место, все слова которого ушли в слова вместе со словами соседнего места, остаётся без `word_ids`.
+    Карточка такого места адресуется временем, как старые карточки: пакет собирается, ответ не падает, человек
+    видит причину — слово уже исправлено ответом на соседнюю карточку или места нет."""
+
+    def test_sub_place_card_after_answer_over_it(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), mock.patch.object(base, "result_data", with_sub_place), \
+                    base.answer_files(backend) as (jp, md, version):
+                transcript.apply_review(jp, md, [{"id": "r1", "text": "один два три"}], by="human")
+                data = transcript.load(jp)
+                r3 = self.place(data, "r3")
+                self.assertNotIn("word_ids", r3)
+                self.assertEqual(r3["status"], "open")
+                ids, pause = transcript.place_words(data, r3)        # по времени места, не падает
+                self.assertEqual((len(ids), pause), (2, False))
+                self.assertEqual(review_pack._place_words(data, r3), [])
+                question = [{"id": "r3", "question": "Проверьте", "recommended": 0,
+                             "options": [{"label": "Иное", "decision": {"text": "иное"}}]}]
+                self.assertEqual(review_pack.build(jp, question)["items"], 1)
+                after, rep = transcript.apply_review(jp, md, [{"id": "r3", "text": "иное"}], by="human")
+                self.assertEqual(rep["successful_ids"], [])
+                self.assertEqual([c["id"] for c in rep["conflicts"]], ["r3"])
+                self.assertIn("уже исправлено ответом человека на карточку (r1)", rep["conflicts"][0]["why"])
+                self.assertEqual([w["w"] for w in self.flat(after)], ["один", "два", "три", "ещё", "раз"])
 
 
 class Recognized(Case):
