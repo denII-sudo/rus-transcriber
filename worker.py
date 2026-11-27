@@ -856,15 +856,27 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing, capture=
 
 
 REF_MIN_SEC = 3.0   # неопознанный кластер с центром и не меньше стольких секунд речи — опорный голос (Т-1-Н1)
+REF_MIN_SEC_PROFILE = 10.0   # то же, когда у участников есть голосовые профили (как до Т-1-Н1)
 
 
-def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
+def _has_profiles(voice_ctx, allowed):
+    """Есть ли голосовые профили участников этой записи (без allowed — любой профиль группы)."""
+    return any(not allowed or nm in allowed for nm in (voice_ctx.get("pvecs") or {}))
+
+
+def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed, speech=None):
     """Опорные голоса -> (refs, found): профили опознанных участников; участники из словаря с профилем,
-    но без кластера (pyannote мог слить ребёнка с другим); неопознанные кластеры от REF_MIN_SEC с речи — по
-    центру (центр есть, только если у кластера есть реплики от 1,5 с: voices.centroids). Кластеры без опоры
-    (короче или без центра) называет _without_reference: их слова остаются под меткой разметки."""
+    но без кластера (pyannote мог слить ребёнка с другим); неопознанные кластеры — по центру (центр есть,
+    только если у кластера есть реплики от 1,5 с: voices.centroids), если у кластера не меньше REF_MIN_SEC
+    речи, а при голосовых профилях — не меньше REF_MIN_SEC_PROFILE. При профиле опознанный участник
+    сравнивается по вектору профиля (с другой записи), а короткий неопознанный кусок его же речи — по центру
+    из этой записи: такой центр ближе и уводил бы слова участника под «Спикер N».
+    speech — секунды речи по меткам (сумма отрезков разметки, без пауз); без него — длина реплик.
+    Кластеры без опоры (короче или без центра) называет _without_reference: без профилей их слова остаются под
+    меткой разметки; при профилях — как до Т-1-Н1, по отпечатку к ближайшей опоре (run_words)."""
     import voices
     pvecs = voice_ctx.get("pvecs") or {}
+    min_sec = REF_MIN_SEC_PROFILE if _has_profiles(voice_ctx, allowed) else REF_MIN_SEC
     cents = voice_ctx.get("cents") or {}
     if not cents:
         embs = emb.spans(audio, [(t["s"], t["e"]) for t in turns])
@@ -877,21 +889,23 @@ def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
     for nm, v in pvecs.items():
         if (not allowed or nm in allowed) and nm not in refs:
             refs[nm] = v
-    size = {}
-    for t in turns:
-        size[t["label"]] = size.get(t["label"], 0.0) + t["e"] - t["s"]
+    size = speech
+    if size is None:
+        size = {}
+        for t in turns:
+            size[t["label"]] = size.get(t["label"], 0.0) + t["e"] - t["s"]
     for lbl, c in cents.items():
-        if lbl not in label_name and size.get(lbl, 0) >= REF_MIN_SEC:
+        if lbl not in label_name and size.get(lbl, 0) >= min_sec:
             refs[lbl] = c
             found.add(lbl)
     return {k: v for k, v in refs.items() if v is not None}, found
 
 
-def _without_reference(turns, label_name, refs, also=()):
-    """Метки разметки, у которых нет опорного голоса: не опознаны (нет в label_name) и не стали опорой.
-    also — метки разметки pyannote (raw), которых нет в turns: реплики короче MIN_SEG отброшены, а голос слов
-    по разметке берётся и у них."""
-    return ({t["label"] for t in turns} | set(also)) - set(label_name) - set(refs)
+def _without_reference(turns, label_name, refs):
+    """Метки реплик, у которых нет опорного голоса: не опознаны (нет в label_name) и не стали опорой.
+    Метки, у которых все отрезки короче MIN_SEG (в turns их нет, часто ложный крошечный кластер), сюда не
+    входят: их слова, как до Т-1-Н1, получают голос по отпечатку."""
+    return {t["label"] for t in turns} - set(label_name) - set(refs)
 
 
 def _apply_vocab(words, vocab, quality):
@@ -1314,15 +1328,18 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     timing = {}
     import hypstore
     hyp = _HypCapture(audio, cfg, a, src) if hypstore.enabled(cfg) else None
-    refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed)
+    speech = {}
+    for s, e, spk in raw:      # секунды речи по меткам разметки, без пауз между отрезками
+        speech[order[spk]] = speech.get(order[spk], 0.0) + e - s
+    refs, found = _voice_references(audio, turns, emb, label_name, voice_ctx, allowed, speech=speech)
     mapping = voice_ctx.get("mapping") or {}
 
     def name_of_label(lbl):   # метка pyannote -> имя (в т.ч. для кластеров, слитых в одного человека)
         return (mapping.get(lbl) or (label_name.get(lbl),))[0] or lbl
 
     prior = W.LabelAt([(s, e, name_of_label(order[spk])) for s, e, spk in raw])
-    raw_labels = {name_of_label(order[spk]) for _, _, spk in raw}       # метки и имена, как их даёт prior
-    unref = _without_reference(turns, label_name, refs, also=raw_labels - set(label_name.values()))
+    # при голосовых профилях — прежнее поведение: слова кластера без опоры идут по отпечатку к ближайшей опоре
+    unref = set() if _has_profiles(voice_ctx, allowed) else _without_reference(turns, label_name, refs)
     if unref or not refs:
         # голос этих слов назначает программа по разметке pyannote, без сверки отпечатков (Т-1-Н5, Т-1-Н1)
         quality["voice_refs"] = {"refs": len(refs), "without_reference": sorted(unref), "assigned_by": "diarization"}
