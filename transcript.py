@@ -611,7 +611,7 @@ def confirm_snapshot(snapshot, before, after):
         return dict(snapshot, after=_undo_fingerprint(after))
     # формат 3: участки ответа — там, где они сейчас; подтверждение меняет только их строки
     try:
-        spans = _locate_all(old, snapshot["review_patches"])
+        spans = _locate_all(old, snapshot["review_patches"], _live_word_ids(before.get("segments")))
     except (KeyError, TypeError, ValueError):
         return None
     if spans is None:
@@ -627,22 +627,51 @@ def confirm_snapshot(snapshot, before, after):
     return dict(snapshot, review_patches=patches)
 
 
-def _locate(rows, codes, patch):
+def _live_word_ids(segments):
+    """ID слов, которые есть в репликах."""
+    return {w.get("word_id") for s in segments or [] if isinstance(s, dict)
+            for w in s.get("words") or [] if isinstance(w, dict) and w.get("word_id")}
+
+
+def _as_stored(row, live):
+    """Строка места без ссылок на слова, которых нет в репликах (live), — так её хранит запись в базе
+    (`recordings._prune_missing_word_ids`): ссылки не осталось — нет и ключа `word_ids`. live None — строка как есть."""
+    refs = row.get("word_ids") if live is not None and isinstance(row, dict) else None
+    if not isinstance(refs, list):
+        return row
+    kept = [ident for ident in refs if ident in live]
+    row = dict(row)
+    if kept:
+        row["word_ids"] = kept
+    else:
+        row.pop("word_ids", None)
+    return row
+
+
+def _codes(rows, live=None):
+    return [_row_code(_as_stored(x, live)) for x in rows]
+
+
+def _locate(rows, codes, patch, live=None):
     """Где сейчас участок «после» снимка формата 3: (начало, конец) в rows или None — не найден или неоднозначен.
     Участок со строками ищется по содержимому, ровно одно вхождение; участок, который строки только удалил, —
-    по соседям: соседние строки (какие были) стоят рядом, как сразу после ответа."""
+    по соседям: соседние строки (какие были) стоят рядом, как сразу после ответа.
+
+    live (строки мест, Ф234-11): и строки участка, и нынешние строки (codes) сравниваются без ссылок на слова,
+    которых нет в репликах, — по правилу записи в базу. Снимок снят до записи: ответ, менявший число слов места,
+    оставил в участке ссылки на исчезнувшие слова, а запись их убрала."""
     after = patch.get("after")
     if not isinstance(after, list):
         raise ValueError("неверный участок снимка")
     if after:
-        want = [_row_code(x) for x in after]
+        want = _codes(after, live)
         k = len(want)
         hits = [i for i in range(len(codes) - k + 1) if codes[i] == want[0] and codes[i:i + k] == want]
         return (hits[0], hits[0] + k) if len(hits) == 1 else None
     left, right = patch.get("left"), patch.get("right")
     if left is None and right is None:
         return (0, 0) if not rows else None
-    hashes = [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in codes]
+    hashes = [_row_hash(x) for x in rows]      # соседи — как сняты: хэш строки целиком, без приведения
     if left is not None:
         hits = [i for i, h in enumerate(hashes) if h == left]
         if len(hits) != 1:
@@ -655,16 +684,16 @@ def _locate(rows, codes, patch):
     return (pos, pos) if pos < len(rows) and hashes[pos] == right else None
 
 
-def _locate_all(rows, patches):
+def _locate_all(rows, patches, live=None):
     """Места всех участков — по возрастанию и без наложений, иначе None."""
     if not isinstance(patches, list):
         raise ValueError("неверный формат снимка")
-    codes = [_row_code(x) for x in rows]
+    codes = _codes(rows, live)
     spans, end = [], 0
     for patch in patches:
         if not isinstance(patch, dict) or not isinstance(patch.get("restore"), list):
             raise ValueError("неверный участок снимка")
-        span = _locate(rows, codes, patch)
+        span = _locate(rows, codes, patch, live)
         if span is None or span[0] < end:
             return None
         spans.append(span)
@@ -730,17 +759,18 @@ def _word_patch(rows, patch):
     return si, seg
 
 
-def _restore_regions(rows, patches, words_too):
+def _restore_regions(rows, patches, words_too, live=None):
     """Формат 3: вернуть строки «до» на места участков «после»; реплику, которую меняли и после ответа, — по
-    словам (words_too, только реплики). -> новые строки или None: участок не найден или участки наложились."""
+    словам (words_too, только реплики). live — ID слов реплик для поиска строк мест (см. `_locate`); строки «до»
+    возвращаются как есть. -> новые строки или None: участок не найден или участки наложились."""
     if not isinstance(patches, list):
         raise ValueError("неверный формат снимка")
-    codes = [_row_code(x) for x in rows]
+    codes = _codes(rows, live)
     spans = []
     for patch in patches:
         if not isinstance(patch, dict) or not isinstance(patch.get("restore"), list):
             raise ValueError("неверный участок снимка")
-        span = _locate(rows, codes, patch)
+        span = _locate(rows, codes, patch, live)
         if span is not None:
             spans.append((span, copy.deepcopy(patch["restore"])))
             continue
@@ -797,7 +827,8 @@ def undo_answer(json_path, md_path, aid, snapshot):
             return later                  # свои правки журнала с тех пор изменены (отменены, переписаны)
         try:
             segments = _restore_regions(data.get("segments") or [], snapshot.get("segment_patches"), True)
-            review = _restore_regions(data.get("review") or [], snapshot.get("review_patches"), False)
+            review = _restore_regions(data.get("review") or [], snapshot.get("review_patches"), False,
+                                      _live_word_ids(data.get("segments")))
         except (ValueError, TypeError, KeyError, AttributeError):
             return {"id": aid, "conflict": "повреждён структурный снимок"}
         if segments is None or review is None:
