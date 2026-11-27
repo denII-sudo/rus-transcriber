@@ -175,7 +175,7 @@ VA_NEAR = np.array([0.995, 0.0998, 0.0]) / np.linalg.norm([0.995, 0.0998, 0.0]) 
 
 
 class EchoShareTests(unittest.TestCase):
-    """Т-1, Н-3 перепроверки №246: наложения pyannote больше 20 % речи записи (сумма отрезков разметки без
+    """Т-1, Н-3 перепроверки №246: наложения pyannote больше 30 % речи записи (сумма отрезков разметки без
     пауз) — скорее эхо или гул: правило «отрыв не измерен — overlap» не действует, вместо мест — предупреждение;
     пометка при измеренных близких голосах — прежняя."""
 
@@ -191,9 +191,9 @@ class EchoShareTests(unittest.TestCase):
         self.assertIn("Если говорили одновременно — прослушайте.", md)
 
     def test_share_around_threshold(self):
-        """19 % и ровно 20 % речи — ещё не эхо: места наложений ставятся, предупреждения нет; 21 % — мест нет,
+        """29 % и ровно 30 % речи — ещё не эхо: места наложений ставятся, предупреждения нет; 31 % — мест нет,
         есть предупреждение."""
-        for half, places in ((1.9, 2), (2.0, 2), (2.1, 0)):           # два наложения по half с из 20 с речи
+        for half, places in ((2.9, 2), (3.0, 2), (3.1, 0)):           # два наложения по half с из 20 с речи
             with self.subTest(share=2 * half / 20):
                 shadow = [(2.0, 2.0 + half, "SPEAKER_01"), (12.0, 12.0 + half, "SPEAKER_01")]
                 data = run_words(RAW_ONE, RAW_ONE + shadow, 99.0)
@@ -201,7 +201,7 @@ class EchoShareTests(unittest.TestCase):
                 if places:
                     self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
                 else:
-                    self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.21, "sec": 4.2})
+                    self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.31, "sec": 6.2})
 
     def test_measured_close_voices_still_flagged_with_profiles(self):
         """Профили двух участников с близкими голосами (две опоры, отрыв измерен и мал): при той же доле
@@ -217,9 +217,9 @@ class EchoShareTests(unittest.TestCase):
         self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
 
     def test_warning_share_rounds_up_and_bad_field_is_ignored(self):
-        """Доля в предупреждении округляется вверх до десятых: 20,04 % — «20,1 %»; испорченное поле
+        """Доля в предупреждении округляется вверх до десятых: 30,04 % — «30,1 %»; испорченное поле
         не роняет render_md и предупреждения не даёт."""
-        self.assertIn("на 20,1 % речи", transcript.overlap_skipped_note({"share": 0.2004, "sec": 4.0}))
+        self.assertIn("на 30,1 % речи", transcript.overlap_skipped_note({"share": 0.3004, "sec": 6.0}))
         self.assertIn("на 75 % речи", transcript.overlap_skipped_note({"share": 0.75, "sec": 15.0}))
         base = {"file": "synthetic.wav", "duration": "00:00:02", "speakers": [], "segments": []}
         for bad in ("yes", {"share": float("nan"), "sec": 1.0}, {"share": float("inf"), "sec": 1.0},
