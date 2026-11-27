@@ -474,8 +474,7 @@ class Interfaces(Base):
     """Инструмент MCP read_legacy_files и команда rt.py legacy-read отдают то же, что read, и ничего не пишут."""
 
     def test_mcp_tool(self):
-        # пропуск — только без пакета mcp; модуль migrate (уходит в У-1) здесь не нужен: сервер перенос при
-        # импорте не запускает (tests/test_no_auto_migrate.py), а ImportError не должен молча пропускать тест (Ф238-8)
+        # пропуск — только без пакета mcp: ImportError не должен молча пропускать тест (Ф238-8)
         if importlib.util.find_spec("mcp") is None:
             self.skipTest("нет пакета mcp")
         import server

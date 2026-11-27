@@ -889,9 +889,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                         str(uuid.uuid4()), human_context, root_id, "2026-11-16T00:02:00+00:00")
                 self.assertEqual(store.get_current(draft_id)["transcript"]["revision"], 2)
 
-                import migrate
-                with mock.patch.object(migrate, "run"):
-                    import server
+                import server
                 import confirm
                 md_target = root / draft_layout["paths"]["md"]
                 md_target.write_text("external document edit", encoding="utf-8")
@@ -964,9 +962,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     pack = review_pack.build(json_path, [item])
                     self.assertEqual(review_pack.manifest(json_path)["version"], pack["version"])
                     self.assertFalse((review_pack.pack_dir(json_path) / "manifest.json").exists())
-                    import migrate
-                    with mock.patch.object(migrate, "run"):
-                        import server
+                    import server
                     with mock.patch.object(server, "_job_json", return_value=(json_path, None)):
                         info = json.loads(server.review_pack_info("synthetic-job"))
                     self.assertEqual(info["manifest_storage"], "sqlite")
@@ -1280,9 +1276,7 @@ class BackendSelectionTests(unittest.TestCase):
                                      tuple(map(os.path.normcase, (jp, md))))
                     self.assertIsInstance(core.review_items(reference), dict)
                     core.reopen_review(reference, ["r1"])
-                    import migrate
-                    with mock.patch.object(migrate, "run"):
-                        import server
+                    import server
                     import confirm
                     self.assertIn("локальную карточку",
                                   server.edit_span(reference, 0.2, 0.5, "другое", by="human"))
@@ -1364,9 +1358,7 @@ class BackendSelectionTests(unittest.TestCase):
                     self.assertEqual(public_answer["initiated_by"]["user_name_snapshot"], "Первый")
                     with self.assertRaisesRegex(core.CoreError, "неизвестного происхождения"):
                         core.apply_answers_files(jp, md)
-                    import migrate
-                    with mock.patch.object(migrate, "run"):
-                        import server
+                    import server
                     import confirm
                     with mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("отказ")):
                         self.assertIn("отказ", asyncio.run(server.request_review_answer_verification(rid, ["r1"])))

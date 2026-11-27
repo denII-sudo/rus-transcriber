@@ -720,9 +720,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         def refuse(*args, **kwargs):
             raise llm_provider.urllib.error.HTTPError("http://127.0.0.1:9/api/experimental/generate/text",
                                                       status, "err", {}, io.BytesIO(raw))
-        import migrate
-        with mock.patch.object(migrate, "run"):
-            import server
+        import server
         stderr, records = io.StringIO(), []
         handler = logging.Handler()
         handler.emit = records.append

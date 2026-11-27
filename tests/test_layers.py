@@ -214,7 +214,6 @@ class CliTests(unittest.TestCase):
 
     def test_dry_runs_need_no_confirmation(self):
         self.assertEqual(run_rt(["cleanup", "--days", "36500"])[0], 0)
-        self.assertEqual(run_rt(["migrate"])[0], 0)
 
     def test_conspect_confirmation_requires_terminal(self):
         snapshot = {"source_revision": 3}
@@ -248,9 +247,7 @@ class ServerGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            import migrate
-            with mock.patch.object(migrate, "run", return_value={"status": "пропущено в тесте"}):
-                import server     # при импорте сервер запускает перенос данных — в тесте он не нужен
+            import server
         except ImportError:
             raise unittest.SkipTest("нет пакета mcp")
         cls.server = server
@@ -404,7 +401,6 @@ class ServerGateTests(unittest.TestCase):
     def test_read_only_calls_need_no_confirmation(self):
         with mock.patch.object(confirm, "require", side_effect=AssertionError("не должно спрашивать")):
             self.call(self.server.cleanup_jobs, 36500, False)
-            self.call(self.server.migrate_data, True)
 
     def test_import_apply_is_gated_but_report_is_not(self):
         put_group("lay-gate")
@@ -428,8 +424,7 @@ class ServerGateTests(unittest.TestCase):
         with mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as req:
             self.assertEqual(self.call(self.server.export_group, "lay-gate"), "нет")
             self.assertEqual(self.call(self.server.cleanup_jobs, 0, True), "нет")
-            self.assertEqual(self.call(self.server.migrate_data, False), "нет")
-        self.assertEqual(req.call_count, 3)
+        self.assertEqual(req.call_count, 2)
         self.assertFalse(list((paths.DATA_DIR / "exports").glob("*lay-gate*")) if (paths.DATA_DIR / "exports").exists() else [])
 
 

@@ -303,9 +303,7 @@ class FaultTests(unittest.TestCase):
         self.assertIn(FAIL, out.status["quality"]["voices_error"])             # transcription_status
         self.assertIn(FAIL, out.data["quality"]["voices_error"])               # JSON стенограммы
         with mock.patch.object(settings.paths, "STATE_DB", out.db):
-            import migrate
-            with mock.patch.object(migrate, "run"):
-                import server
+            import server
             shown = json.loads(server.read_recording_result(out.status["recording_id"]))
         self.assertIn(FAIL, shown["quality"]["voices_error"])                  # MCP read_recording_result
 

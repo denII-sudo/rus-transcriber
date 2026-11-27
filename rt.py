@@ -36,7 +36,6 @@
     python rt.py delete-group имя [--permanent]
     python rt.py cleanup [--days 30] [--apply]
     python rt.py cleanup-hypotheses [--recording ID] [--unit ID] [--days N] [--apply]   # гипотезы моделей
-    python rt.py migrate [--apply]
     python rt.py approve                                       # разрешить запрос, оставленный MCP-сервером
 
 Код возврата: 0 — готово, 1 — ошибка, 2 — отказ человека или нет терминала для подтверждения.
@@ -272,7 +271,6 @@ def build():
     k = sub.add_parser("cleanup-hypotheses"); k.add_argument("--unit", default=""); k.add_argument("--days", type=float, default=None)
     k.add_argument("--recording", default="")
     k.add_argument("--apply", action="store_true")
-    m = sub.add_parser("migrate"); m.add_argument("--apply", action="store_true")
     return ap
 
 
@@ -464,11 +462,6 @@ def run(a):
         else:
             return gated("Удаление гипотез моделей", core.describe_cleanup_hypotheses(a.unit, a.days, a.recording),
                          lambda: core.do_cleanup_hypotheses(a.unit, a.days, True, a.recording))
-    elif c == "migrate":
-        if not a.apply:
-            out(core.do_migrate(True))
-        else:
-            return gated("Перенос данных", core.describe_migrate(), lambda: core.do_migrate(False))
     return 0
 
 
