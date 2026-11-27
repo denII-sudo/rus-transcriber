@@ -838,7 +838,11 @@ def _score_words(audio, words, idx, R, names, embedder, win, prior, progress=Non
                 order = np.argsort(-adj)
                 w["pair_doubt"] = True
         w["spk"] = names[order[0]]
-        w["margin"] = round(float(adj[order[0]] - adj[order[1]]), 3) if len(names) > 1 else 1.0
+        if len(names) > 1:
+            w["margin"] = round(float(adj[order[0]] - adj[order[1]]), 3)
+        else:
+            # одна опора: сравнить не с чем, отрыв не измерялся — для порога и наложений он неизвестен (Т-1-Н4)
+            w["margin"], w["margin_unmeasured"] = 1.0, True
     return len(need)
 
 
@@ -983,8 +987,10 @@ def doubt_flags(words, overlaps):
             fl.append("voice")
         t = w["s"] + 0.1
         i = bisect.bisect_right(ov_s, t) - 1
-        if i >= 0 and overlaps[i][0] <= t < overlaps[i][1] and w.get("margin", 1.0) <= 2 * max(thr, 0.05):
-            fl.append("overlap")   # наложение помечаем, только если и голоса при этом близки
+        if i >= 0 and overlaps[i][0] <= t < overlaps[i][1] and                 (w.get("margin", 1.0) <= 2 * max(thr, 0.05) or w.get("margin_unmeasured")):
+            # наложение помечаем, если голоса близки или их отрыв не измерялся (одна опора, голос по
+            # разметке): «не измерено» — не «далеко» (Т-1-Н4)
+            fl.append("overlap")
         if fl:
             w["flags"] = fl
     return thr
