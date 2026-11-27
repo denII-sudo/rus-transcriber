@@ -362,6 +362,12 @@ def _seen_fp(data, it):
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def recognized_text(words):
+    """Как распознано: `model` слова или его текст, как прежде. Правленое слово с пустым `model` распознавание не
+    давало (вставка, слова 2..m замены, Ф234-11б): оно в «как распознано» не входит."""
+    return " ".join(w.get("model") or w["w"] for w in words if not (w.get("edited") and w.get("model") == ""))
+
+
 def _contradiction_options(T, data, it):
     """Варианты карточки противоречия (PR 13б): «Оставить подтверждённое», «Принять новое» на каждое
     предложение (последние), «Как распознано» — только если отличается от обоих. Не больше четырёх."""
@@ -369,7 +375,7 @@ def _contradiction_options(T, data, it):
     confirmed = record.get("confirmed") or {}
     proposals = [p for p in record["proposals"] if (p.get("text") or "").strip()]
     words = _place_words(data, it)
-    raw = " ".join(w.get("model") or w["w"] for w in words)
+    raw = recognized_text(words)
     raw_needed = bool(raw) and raw != confirmed.get("text") and raw not in [p["text"] for p in proposals]
     opts = [{"label": f"Оставить подтверждённое: «{confirmed.get('text', '')}» ({_who(T, confirmed)})",
              "decision": {"contradiction": "keep"}}]
@@ -898,9 +904,11 @@ def item_sources(store, recording_id, man, snapshot=None):
     return out
 
 
-def free_outside_card(json_path, md, item, place, now, aid, answer):
+def free_outside_card(json_path, md, item, place, now, aid, answer, replacing=False):
     """Свободный ответ меняет слова за пределами слов карточки (проверка «Применить» при хранении в базе).
-    Слова карточки — word_ids, у пропуска — слова паузы в нынешней стенограмме now. Нет слов — не проверяется."""
+    Слова карточки — word_ids, у пропуска — слова паузы в нынешней стенограмме now. Нет слов — не проверяется.
+    replacing — ответ заменяет применённый (К-В3) и проверяется до его снятия: допустимы и слова, на которые
+    место ссылается сейчас, — слова прежнего ответа этой карточки (Ф234-11б)."""
     import transcript
     if transcript.is_gap_place(place or {}):
         # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
@@ -908,6 +916,8 @@ def free_outside_card(json_path, md, item, place, now, aid, answer):
         ids = found[0] if found else None
     else:
         ids = (item or {}).get("word_ids")
+        if ids and replacing and isinstance((place or {}).get("word_ids"), list):
+            ids = list(ids) + place["word_ids"]
     if not ids:
         return False
     preview = apply_free(json_path, md, {aid: answer}, dry_run=True)
