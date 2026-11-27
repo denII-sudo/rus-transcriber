@@ -558,22 +558,20 @@ def _row_hash(row):
     return hashlib.sha256(_row_code(row).encode("utf-8")).hexdigest()
 
 
-def _patches(old, new, anchors):
-    """Участки, которыми new отличается от old: start/remove — номера в new, restore — строки old.
-    anchors (формат 3): строки «после» (after), а у участка, который строки только удалил, — отпечатки
-    соседних строк left/right (None — края списка)."""
+def _patches(old, new):
+    """Участки формата 3, которыми new отличается от old: restore — строки old, after — строки new; у участка,
+    который строки только удалил, — отпечатки соседних строк left/right (None — края списка). Номеров строк нет
+    (Ф234-9): отмена ищет участок по содержимому; номера start/remove читаются только у старых снимков формата 2."""
     from difflib import SequenceMatcher
     matcher = SequenceMatcher(None, [_row_code(x) for x in old], [_row_code(x) for x in new], autojunk=False)
     out = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
-        patch = {"start": j1, "remove": j2 - j1, "restore": copy.deepcopy(old[i1:i2])}
-        if anchors:
-            patch["after"] = copy.deepcopy(new[j1:j2])
-            if j1 == j2:
-                patch["left"] = _row_hash(new[j1 - 1]) if j1 > 0 else None
-                patch["right"] = _row_hash(new[j1]) if j1 < len(new) else None
+        patch = {"restore": copy.deepcopy(old[i1:i2]), "after": copy.deepcopy(new[j1:j2])}
+        if j1 == j2:
+            patch["left"] = _row_hash(new[j1 - 1]) if j1 > 0 else None
+            patch["right"] = _row_hash(new[j1]) if j1 < len(new) else None
         out.append(patch)
     return out
 
@@ -587,8 +585,8 @@ def answer_snapshot(before, after):
     edits_after = after.get("edits") or []
     n = len(before.get("edits") or [])
     return {"format": 3,
-            "segment_patches": _patches(before.get("segments") or [], after.get("segments") or [], True),
-            "review_patches": _patches(before.get("review") or [], after.get("review") or [], True),
+            "segment_patches": _patches(before.get("segments") or [], after.get("segments") or []),
+            "review_patches": _patches(before.get("review") or [], after.get("review") or []),
             "edits_before": n, "edits": copy.deepcopy(edits_after[n:])}
 
 
@@ -704,7 +702,7 @@ def _word_patch(rows, patch):
         return None
     if old.get("text") != _join_words(ow) or new.get("text") != _join_words(nw):
         return None
-    word_patches = _patches(ow, nw, True)
+    word_patches = _patches(ow, nw)
     found = []
     for si, seg in enumerate(rows):
         if not isinstance(seg, dict) or _segment_header(seg) != header:
