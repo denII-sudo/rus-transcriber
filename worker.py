@@ -855,9 +855,14 @@ def whisper_pass(plan, words, cfg, st, quality, make_asr, prog, timing, capture=
     return None
 
 
+REF_MIN_SEC = 3.0   # неопознанный кластер с центром и не меньше стольких секунд речи — опорный голос (Т-1-Н1)
+
+
 def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
     """Опорные голоса -> (refs, found): профили опознанных участников; участники из словаря с профилем,
-    но без кластера (pyannote мог слить ребёнка с другим); крупные неопознанные кластеры — по центру."""
+    но без кластера (pyannote мог слить ребёнка с другим); неопознанные кластеры от REF_MIN_SEC с речи — по
+    центру (центр есть, только если у кластера есть реплики от 1,5 с: voices.centroids). Кластеры без опоры
+    (короче или без центра) называет _without_reference: их слова остаются под меткой разметки."""
     import voices
     pvecs = voice_ctx.get("pvecs") or {}
     cents = voice_ctx.get("cents") or {}
@@ -876,10 +881,17 @@ def _voice_references(audio, turns, emb, label_name, voice_ctx, allowed):
     for t in turns:
         size[t["label"]] = size.get(t["label"], 0.0) + t["e"] - t["s"]
     for lbl, c in cents.items():
-        if lbl not in label_name and size.get(lbl, 0) >= 10.0:
+        if lbl not in label_name and size.get(lbl, 0) >= REF_MIN_SEC:
             refs[lbl] = c
             found.add(lbl)
     return {k: v for k, v in refs.items() if v is not None}, found
+
+
+def _without_reference(turns, label_name, refs, also=()):
+    """Метки разметки, у которых нет опорного голоса: не опознаны (нет в label_name) и не стали опорой.
+    also — метки разметки pyannote (raw), которых нет в turns: реплики короче MIN_SEG отброшены, а голос слов
+    по разметке берётся и у них."""
+    return ({t["label"] for t in turns} | set(also)) - set(label_name) - set(refs)
 
 
 def _apply_vocab(words, vocab, quality):
@@ -896,9 +908,12 @@ def _apply_vocab(words, vocab, quality):
             quality["vocab_fixes"].append({"t": w["s"], "fixes": fx})
 
 
-def _segments_from_replies(replies, refs, label_name, label_of):
-    """Реплики -> сегменты расшифровки. Голосам без метки (из профиля) даются метки «Спикер N»."""
-    used = set(label_name)
+def _segments_from_replies(replies, refs, label_name, label_of, taken=()):
+    """Реплики -> сегменты расшифровки. Голосам без метки (из профиля) даются метки «Спикер N» — только
+    свободные: не занятые ни опознанным кластером, ни неопознанным (taken — все метки разметки), ни словами
+    реплик; иначе имя участника без кластера оказалось бы на метке чужого кластера."""
+    used = (set(label_name) | set(label_of.values()) | set(taken) | {r["spk"] for r in replies}
+            | {str(x) for x in refs if str(x).startswith("Спикер")})
     for nm in refs:
         if nm not in label_of and not str(nm).startswith("Спикер"):
             k = 1
@@ -1306,6 +1321,11 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         return (mapping.get(lbl) or (label_name.get(lbl),))[0] or lbl
 
     prior = W.LabelAt([(s, e, name_of_label(order[spk])) for s, e, spk in raw])
+    raw_labels = {name_of_label(order[spk]) for _, _, spk in raw}       # метки и имена, как их даёт prior
+    unref = _without_reference(turns, label_name, refs, also=raw_labels - set(label_name.values()))
+    if unref or not refs:
+        # голос этих слов назначает программа по разметке pyannote, без сверки отпечатков (Т-1-Н5, Т-1-Н1)
+        quality["voice_refs"] = {"refs": len(refs), "without_reference": sorted(unref), "assigned_by": "diarization"}
 
     # проходы моделей по длинным кускам -> гипотезы
     regions = W.speech_regions(raw)
@@ -1330,12 +1350,13 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     # голос для каждого слова
     st.set(stage="голос для каждого слова", progress=75)
     t3 = time.time()
-    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found},
+    nwin = W.assign_voices(audio, words, refs, emb, prior=prior, info={"found": found}, unreferenced=unref,
                            win_near_change=float(cfg.get("word_win_near_change", 0) or 0),
                            confusions=voice_ctx.get("confusions"),
                            progress=prog(75, 85, "голос для каждого слова"))
     timing.update(word_voice_sec=round(time.time() - t3, 1), word_windows=nwin)
-    segments = _segments_from_replies(W.build_replies(words), refs, label_name, label_of)
+    segments = _segments_from_replies(W.build_replies(words), refs, label_name, label_of,
+                                      taken={t["label"] for t in turns} | set(order.values()))
     _check_gender(segments, genders_by_name, refs, label_of, quality)
     items, thr, overlaps = _review_places(words, segments, turns, full_ann, cfg, label_name,
                                           fused["evidence"], quality)
