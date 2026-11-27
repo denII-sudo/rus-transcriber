@@ -7,13 +7,12 @@
 не блокируют, а перечисляются в отчёте; число применённых ответов, которые после пересборки нельзя будет
 отменить со страницы, — `undo_lost`.
 
-Только при хранении записей в базе (указание владельца: новое — без файловой записи); в файловом режиме
-пересборка прежняя. Все данные синтетические.
+Только при хранении записей в базе (указание владельца: новое — без файловой записи; файловая часть убрана
+в Л-3.2). Все данные синтетические.
 """
 import contextlib
 import copy
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import test_pause_buttons_short_answers as six
@@ -243,17 +242,45 @@ class Allowed(Base):
             self.assertEqual((rep["unapplicable"], rep["undo_lost"]), ([], 0))
 
 
-class FilesUnchanged(Base):
-    """Файловый режим (указание владельца): пересборка прежняя — без проверки и без новых полей отчёта."""
+class HistoryAfterRebuild(Base):
+    """Т-0 (вместо файлового `FilesUnchanged`, убранного в Л-3.2): в файлах прежние ответы оставались архивом
+    `answers.<версия>.json` рядом с аудио. В базе полная пересборка начинает ответы нового пакета с нуля, а
+    прежние ответы, отметки применения и version остаются в прежней ревизии разбора — человек видит их через
+    историю записи (`recording_history`/`read_recording_revision` в MCP, экран `rt.py screen`). Отказ пересборки
+    при ждущем ответе — классы `Refusal` выше."""
 
-    def test_files_rebuild_is_as_before(self):
-        with files("legacy_files") as (jp, _md, version):
-            self.press(jp, version, REPLACE, "r4")
+    @staticmethod
+    def recording_id():
+        store = six.recordings.open_store(readonly=True)
+        try:
+            (rid,), = store.db.execute("SELECT recording_id FROM recordings").fetchall()
+            return rid
+        finally:
+            store.close()
+
+    def test_previous_answers_stay_readable_in_the_previous_review_revision(self):
+        import core_screen
+        with files("sqlite") as (jp, md, version):
+            self.applied_r4(jp, md, version)
+            old = copy.deepcopy(review_pack.answers_state(jp))
+            self.assertIn("r4", old["answers"])
+            rid = self.recording_id()
+            last = max(row["revision"] for row in core_screen.recording_revisions(rid, "review"))
+
             rep = self.rebuild(jp)
             self.assertNotEqual(rep["version"], version)
-            self.assertNotIn("undo_lost", rep)
-            self.assertTrue(Path(review_pack.pack_dir(jp) / f"answers.{version}.json").exists(),
-                            "ответы прежней версии не в архиве")
+            self.assertEqual(review_pack.answers_state(jp)["answers"], {}, "ответы нового пакета не с нуля")
+            self.assertEqual(max(row["revision"] for row in core_screen.recording_revisions(rid, "review")),
+                             last + 1, "пересборка — одна новая ревизия разбора")
+
+            shown = core_screen.read_recording_revision(rid, "review", last)
+            payload = shown["payload"]
+            pack = payload["undo"]["review_pack"]
+            self.assertEqual(pack["manifest"]["version"], version)
+            self.assertEqual(payload["answers"]["r4"], old["answers"]["r4"])
+            self.assertIn("r4", review_pack._applied_map({"answers": payload["answers"], **{
+                k: pack[k] for k in ("applied_answers", "applied_at") if k in pack}}))
+            self.assertEqual(self.word(jp, "w5")["w"], "тот", "применённое снято пересборкой")
 
 
 if __name__ == "__main__":

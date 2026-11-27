@@ -346,20 +346,6 @@ class OutcomeDetailsOnCard(Base):
             self.assertNotIn("detail", cloud["answer_states"]["r2"])
 
 
-class FileModeKeepsPreviousBehaviour(Base):
-    """Файловый режим: новые уточнения не пишутся, прежние исходы и слова те же (решение владельца)."""
-
-    def test_file_mode(self):
-        with files("legacy_files") as (jp, md, version):
-            self.save(jp, version, "r2", text="да")
-            self.press(jp, version, REPLACE, "r4")
-            rep = core.apply_answers_files(jp, md)
-            self.assertEqual({k: v["outcome"] for k, v in self.outcomes(rep).items()}, {"r2": "hint", "r4": "applied"})
-            self.assertEqual(self.texts(jp), ["начало", "вот", "дальше", "тот"])
-            self.assertNotIn("detail", self.states(jp)["r2"])
-            self.assertNotIn("outcome_details", self.state(jp))
-
-
 class ReplaceAfterFailedReplacement(Base):
     """К-15: сбой замены карточки после applied_open; ответ на старую редакцию — в истории, не за применённый."""
 
