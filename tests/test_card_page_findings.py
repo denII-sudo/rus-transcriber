@@ -153,7 +153,8 @@ class UndoWithoutSnapshot(six.Case):
     def test_later_edit_detail_keeps_the_button(self):
         with files("sqlite") as (jp, md, version):
             self.applied(jp, md, version)
-            core.edit_span_files(jp, md, 2.0, 2.0, "вон", by="human")
+            # К-В4: правка того же места (было — r2), без пересборки карточки
+            transcript.edit_span(jp, md, 3.0, 3.0, "оно", by="human")
             self.save(jp, version, "r4", kind="revert")
             rep = core.apply_answers_files(jp, md)
             row = self.outcomes(rep)["r4"]
