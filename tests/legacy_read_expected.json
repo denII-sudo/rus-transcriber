@@ -1,0 +1,290 @@
+{
+ "built": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_archive": {
+  "outcomes": {},
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_no_actor": {
+  "outcomes": {},
+  "refused": true,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "built_pause": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "built_replace": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальше",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_revert": {
+  "outcomes": {
+   "r3": "reverted",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "open",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальше",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_skip": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "skipped"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "built_tried": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "built_word_missing": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "apply_conflict"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w5": "конец"
+  }
+ },
+ "built_words_changed": {
+  "outcomes": {
+   "r3": "applied",
+   "r4": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "resolved",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "тот",
+   "w5": "конец"
+  }
+ },
+ "waiting": {
+  "outcomes": {
+   "r3": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "waiting_free": {
+  "outcomes": {
+   "r3": "applied"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "resolved",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальнейшем",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "waiting_human": {
+  "outcomes": {
+   "r3": "left_for_human"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "human",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальше",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "waiting_negative": {
+  "outcomes": {
+   "r3": "negative"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "open",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальше",
+   "w4": "та",
+   "w5": "конец"
+  }
+ },
+ "waiting_short": {
+  "outcomes": {
+   "r3": "hint"
+  },
+  "refused": false,
+  "status": {
+   "r2": "open",
+   "r3": "open",
+   "r4": "open",
+   "r5": "open"
+  },
+  "words": {
+   "w1": "начало",
+   "w2": "вот",
+   "w3": "дальше",
+   "w4": "та",
+   "w5": "конец"
+  }
+ }
+}
