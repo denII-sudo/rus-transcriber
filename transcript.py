@@ -550,40 +550,215 @@ def _undo_fingerprint(data):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def answer_snapshot(before, after):
-    """Сохранить только структурные участки, изменённые ответом."""
+def _row_code(row):
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _row_hash(row):
+    return hashlib.sha256(_row_code(row).encode("utf-8")).hexdigest()
+
+
+def _patches(old, new, anchors):
+    """Участки, которыми new отличается от old: start/remove — номера в new, restore — строки old.
+    anchors (формат 3): строки «после» (after), а у участка, который строки только удалил, — отпечатки
+    соседних строк left/right (None — края списка)."""
     from difflib import SequenceMatcher
+    matcher = SequenceMatcher(None, [_row_code(x) for x in old], [_row_code(x) for x in new], autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        patch = {"start": j1, "remove": j2 - j1, "restore": copy.deepcopy(old[i1:i2])}
+        if anchors:
+            patch["after"] = copy.deepcopy(new[j1:j2])
+            if j1 == j2:
+                patch["left"] = _row_hash(new[j1 - 1]) if j1 > 0 else None
+                patch["right"] = _row_hash(new[j1]) if j1 < len(new) else None
+        out.append(patch)
+    return out
 
-    def patches(key):
-        old, new = before.get(key) or [], after.get(key) or []
-        encode = lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        matcher = SequenceMatcher(None, [encode(x) for x in old], [encode(x) for x in new], autojunk=False)
-        return [{"start": j1, "remove": j2 - j1, "restore": copy.deepcopy(old[i1:i2])}
-                for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
 
-    return {"format": 2, "segment_patches": patches("segments"), "review_patches": patches("review"),
-            "edits_before": len(before.get("edits") or []),
-            "after": _undo_fingerprint(after)}
+def answer_snapshot(before, after):
+    """Снимок отмены ответа: только участки, изменённые ответом (формат 3, К-В4).
+
+    Участок «после» (строки, которые внёс ответ) отмена находит в стенограмме по содержимому, а не по номеру
+    строки и не по отпечатку всей стенограммы: изменения других мест отмене не мешают. Свои правки журнала —
+    по номеру первой (журнал только дописывается) и копией: отмена помечает отменёнными только их."""
+    edits_after = after.get("edits") or []
+    n = len(before.get("edits") or [])
+    return {"format": 3,
+            "segment_patches": _patches(before.get("segments") or [], after.get("segments") or [], True),
+            "review_patches": _patches(before.get("review") or [], after.get("review") or [], True),
+            "edits_before": n, "edits": copy.deepcopy(edits_after[n:])}
 
 
 def confirm_snapshot(snapshot, before, after):
     """Снимок отмены ответа после подтверждения человека (К-23): слова и журнал правок те же, изменились только
-    строки мест, которые снимок и так восстанавливает. Тогда снимок прежний, с отпечатком состояния после
-    подтверждения: отмена вернёт место к состоянию до ответа. Иначе снимок не годится — None."""
-    if not snapshot or snapshot.get("format") != 2:
+    строки мест, которые снимок и так восстанавливает. Тогда снимок прежний, с состоянием после подтверждения:
+    отмена вернёт место к состоянию до ответа. Иначе снимок не годится — None."""
+    if not snapshot or snapshot.get("format") not in (2, 3):
         return None
     if before.get("segments") != after.get("segments") or (before.get("edits") or []) != (after.get("edits") or []):
         return None
     old, new = before.get("review") or [], after.get("review") or []
     if len(old) != len(new):
         return None
+    if snapshot["format"] == 2:
+        try:
+            covered = {i for p in snapshot["review_patches"] for i in range(p["start"], p["start"] + p["remove"])}
+        except (KeyError, TypeError):
+            return None
+        if any(a != b and i not in covered for i, (a, b) in enumerate(zip(old, new))):
+            return None
+        return dict(snapshot, after=_undo_fingerprint(after))
+    # формат 3: участки ответа — там, где они сейчас; подтверждение меняет только их строки
     try:
-        covered = {i for p in snapshot["review_patches"] for i in range(p["start"], p["start"] + p["remove"])}
-    except (KeyError, TypeError):
+        spans = _locate_all(old, snapshot["review_patches"])
+    except (KeyError, TypeError, ValueError):
         return None
+    if spans is None:
+        return None
+    covered = {i for a, b in spans for i in range(a, b)}
     if any(a != b and i not in covered for i, (a, b) in enumerate(zip(old, new))):
         return None
-    return dict(snapshot, after=_undo_fingerprint(after))
+    patches = []
+    for patch, (a, b) in zip(snapshot["review_patches"], spans):
+        patch = copy.deepcopy(patch)
+        patch["after"] = copy.deepcopy(new[a:b])
+        patches.append(patch)
+    return dict(snapshot, review_patches=patches)
+
+
+def _locate(rows, codes, patch):
+    """Где сейчас участок «после» снимка формата 3: (начало, конец) в rows или None — не найден или неоднозначен.
+    Участок со строками ищется по содержимому, ровно одно вхождение; участок, который строки только удалил, —
+    по соседям: соседние строки (какие были) стоят рядом, как сразу после ответа."""
+    after = patch.get("after")
+    if not isinstance(after, list):
+        raise ValueError("неверный участок снимка")
+    if after:
+        want = [_row_code(x) for x in after]
+        k = len(want)
+        hits = [i for i in range(len(codes) - k + 1) if codes[i] == want[0] and codes[i:i + k] == want]
+        return (hits[0], hits[0] + k) if len(hits) == 1 else None
+    left, right = patch.get("left"), patch.get("right")
+    if left is None and right is None:
+        return (0, 0) if not rows else None
+    hashes = [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in codes]
+    if left is not None:
+        hits = [i for i, h in enumerate(hashes) if h == left]
+        if len(hits) != 1:
+            return None
+        pos = hits[0] + 1
+    else:
+        pos = 0
+    if right is None:
+        return (pos, pos) if pos == len(rows) else None
+    return (pos, pos) if pos < len(rows) and hashes[pos] == right else None
+
+
+def _locate_all(rows, patches):
+    """Места всех участков — по возрастанию и без наложений, иначе None."""
+    if not isinstance(patches, list):
+        raise ValueError("неверный формат снимка")
+    codes = [_row_code(x) for x in rows]
+    spans, end = [], 0
+    for patch in patches:
+        if not isinstance(patch, dict) or not isinstance(patch.get("restore"), list):
+            raise ValueError("неверный участок снимка")
+        span = _locate(rows, codes, patch)
+        if span is None or span[0] < end:
+            return None
+        spans.append(span)
+        end = span[1]
+    return spans
+
+
+_SEGMENT_DERIVED = ("words", "text", "start", "end")
+
+
+def _join_words(words):
+    return " ".join(str(w.get("w", "")) for w in words)
+
+
+def _segment_header(seg):
+    return {k: v for k, v in seg.items() if k not in _SEGMENT_DERIVED}
+
+
+def _word_patch(rows, patch):
+    """Ответ изменил слова одной реплики, а реплику с тех пор меняли и другие ответы или правки (например, место
+    рядом в той же реплике): вернуть только слова этого ответа. -> (номер реплики, реплика) или None.
+
+    Условия: ответ не менял в реплике ничего, кроме слов (и времени границы, если слово крайнее); текст реплики
+    собран из слов — и до ответа, и после, и сейчас; реплика с теми же полями нашлась одна, и в ней слова «после»
+    каждого участка — ровно по одному разу. Любое сомнение — None (отказ отмены, как прежде)."""
+    old, new = patch["restore"], patch["after"]
+    if len(old) != 1 or len(new) != 1 or not isinstance(old[0], dict) or not isinstance(new[0], dict):
+        return None
+    old, new = old[0], new[0]
+    header = _segment_header(old)
+    if header != _segment_header(new):
+        return None
+    ow, nw = old.get("words"), new.get("words")
+    if not isinstance(ow, list) or not isinstance(nw, list) or not ow or not nw:
+        return None
+    if old.get("text") != _join_words(ow) or new.get("text") != _join_words(nw):
+        return None
+    word_patches = _patches(ow, nw, True)
+    found = []
+    for si, seg in enumerate(rows):
+        if not isinstance(seg, dict) or _segment_header(seg) != header:
+            continue
+        words = seg.get("words")
+        if not isinstance(words, list) or not words or seg.get("text") != _join_words(words):
+            continue
+        spans = _locate_all(words, word_patches)
+        if spans is not None:
+            found.append((si, seg, spans))
+    if len(found) != 1:
+        return None
+    si, seg, spans = found[0]
+    seg = copy.deepcopy(seg)
+    words = copy.deepcopy(seg["words"])
+    for p, (a, b) in reversed(list(zip(word_patches, spans))):
+        words[a:b] = copy.deepcopy(p["restore"])
+    for edge in ("start", "end"):
+        if new.get(edge) == old.get(edge):
+            continue                      # границу ответ не менял — остаётся нынешняя
+        if seg.get(edge) != new.get(edge):
+            return None                   # границу менял и ответ, и кто-то после него
+        seg[edge] = copy.deepcopy(old.get(edge))
+    seg["words"], seg["text"] = words, _join_words(words)
+    return si, seg
+
+
+def _restore_regions(rows, patches, words_too):
+    """Формат 3: вернуть строки «до» на места участков «после»; реплику, которую меняли и после ответа, — по
+    словам (words_too, только реплики). -> новые строки или None: участок не найден или участки наложились."""
+    if not isinstance(patches, list):
+        raise ValueError("неверный формат снимка")
+    codes = [_row_code(x) for x in rows]
+    spans = []
+    for patch in patches:
+        if not isinstance(patch, dict) or not isinstance(patch.get("restore"), list):
+            raise ValueError("неверный участок снимка")
+        span = _locate(rows, codes, patch)
+        if span is not None:
+            spans.append((span, copy.deepcopy(patch["restore"])))
+            continue
+        replaced = _word_patch(rows, patch) if words_too else None
+        if replaced is None:
+            return None
+        si, seg = replaced
+        spans.append(((si, si + 1), [seg]))
+    spans.sort(key=lambda x: x[0])
+    for (a, b), (c, d) in zip([s for s, _ in spans], [s for s, _ in spans][1:]):
+        if c < b or (a, b) == (c, d):
+            return None                   # участки наложились — что возвращать, неясно
+    result = copy.deepcopy(rows)
+    for (a, b), restore in reversed(spans):
+        result[a:b] = restore
+    return result
 
 
 def _restore_patches(rows, patches):
@@ -606,27 +781,47 @@ def _restore_patches(rows, patches):
 
 @recording_locked
 def undo_answer(json_path, md_path, aid, snapshot):
-    """Отменяет ответ только если состояние после него осталось неизменным."""
+    """Отменяет ответ, если его участок с тех пор не меняли (формат 3, К-В4) или — у прежних снимков (формат 2
+    и полный) — если стенограмма после ответа не менялась вовсе."""
     data = load(json_path)
-    if not snapshot or snapshot.get("after") != _undo_fingerprint(data):
-        return {"id": aid, "conflict": "нет снимка или после ответа появились изменения"}
+    later = {"id": aid, "conflict": "нет снимка или после ответа появились изменения"}
+    if not isinstance(snapshot, dict) or not snapshot:
+        return later
     edits = data.get("edits") or []
     n = snapshot.get("edits_before")
     if not isinstance(n, int) or not 0 <= n <= len(edits):
         return {"id": aid, "conflict": "повреждён снимок журнала"}
-    try:
-        if snapshot.get("format") == 2:
-            segments = _restore_patches(data.get("segments") or [], snapshot.get("segment_patches"))
-            review = _restore_patches(data.get("review") or [], snapshot.get("review_patches"))
-        elif "format" not in snapshot and isinstance(snapshot.get("segments"), list) \
-                and isinstance(snapshot.get("review"), list):
-            segments, review = copy.deepcopy(snapshot["segments"]), copy.deepcopy(snapshot["review"])
-        else:
-            raise ValueError("неизвестный формат снимка")
-    except (ValueError, TypeError):
-        return {"id": aid, "conflict": "повреждён структурный снимок"}
+    if snapshot.get("format") == 3:
+        own = snapshot.get("edits")
+        if not isinstance(own, list) or n + len(own) > len(edits):
+            return {"id": aid, "conflict": "повреждён снимок журнала"}
+        if edits[n:n + len(own)] != own:
+            return later                  # свои правки журнала с тех пор изменены (отменены, переписаны)
+        try:
+            segments = _restore_regions(data.get("segments") or [], snapshot.get("segment_patches"), True)
+            review = _restore_regions(data.get("review") or [], snapshot.get("review_patches"), False)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return {"id": aid, "conflict": "повреждён структурный снимок"}
+        if segments is None or review is None:
+            return later                  # участок ответа после него меняли — отменять нельзя
+        reverted = edits[n:n + len(own)]  # КВ4-2: только свои правки, чужие более поздние не трогаем
+    else:
+        if snapshot.get("after") != _undo_fingerprint(data):
+            return later
+        try:
+            if snapshot.get("format") == 2:
+                segments = _restore_patches(data.get("segments") or [], snapshot.get("segment_patches"))
+                review = _restore_patches(data.get("review") or [], snapshot.get("review_patches"))
+            elif "format" not in snapshot and isinstance(snapshot.get("segments"), list) \
+                    and isinstance(snapshot.get("review"), list):
+                segments, review = copy.deepcopy(snapshot["segments"]), copy.deepcopy(snapshot["review"])
+            else:
+                raise ValueError("неизвестный формат снимка")
+        except (ValueError, TypeError):
+            return {"id": aid, "conflict": "повреждён структурный снимок"}
+        reverted = edits[n:]              # стенограмма не менялась: после ответа правок, кроме его, нет
     data["segments"], data["review"] = segments, review
-    for edit in edits[n:]:
+    for edit in reverted:
         if edit.get("by") == "human":
             edit["original_by"] = edit["by"]
             edit["by"] = "reverted"

@@ -149,7 +149,10 @@ class AnswerOutcomeCase(unittest.TestCase):
         self.assertEqual(set(ids), stored, "не у каждого сохранённого ответа есть исход")
         for row in rows:
             self.assertIn(row["outcome"], review_pack.OUTCOME_REASONS)
-            self.assertEqual(row["why"], review_pack.OUTCOME_REASONS[row["outcome"]])
+            why = review_pack.OUTCOME_REASONS[row["outcome"]]
+            if row["id"] in (rep.get("replace_rolled_back") or []):    # К-В4: прежний ответ на месте
+                why = review_pack.previous_kept_text(why)
+            self.assertEqual(row["why"], why)
         # То, что видит человек на странице, совпадает с отчётом применения.
         view = review_pack.answer_states(jp)
         self.assertEqual({aid: v["state"] for aid, v in view.items()}, self.outcomes(rep))
@@ -273,7 +276,9 @@ class ReplaceInOneApply(AnswerOutcomeCase):
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
                 self.save(jp, version, option=0)
                 self.apply(jp, md)
-                core.edit_span_files(jp, md, 0.7, 1.0, "слово два", by="human")   # поздняя правка рядом
+                # К-В4: поздняя правка того же места (было — рядом, на месте r2: теперь она замене не мешает);
+                # правка стенограммы, без пересборки карточки (core.edit_span_files заменил бы карточку)
+                transcript.edit_span(jp, md, 0.2, 0.5, "ручное", by="human")
                 later = transcript.load(jp)
                 self.save(jp, version, option=1)
                 rep = self.apply_once(jp, md)
@@ -290,8 +295,9 @@ class ReplaceInOneApply(AnswerOutcomeCase):
                 self.assertEqual(transcript.load(jp)["segments"], later["segments"])
 
     def test_new_answer_not_applied_after_previous_removed(self):
-        """Прежний снят, новый не внёсся — место открыто, строка словами; страница видит тот же исход."""
-        for backend in BACKENDS:
+        """Файловый режим: прежний снят, новый не внёсся — место открыто, строка словами; страница видит тот же
+        исход. К-В4: в базе прежний ответ теперь возвращается — test_kv4_region_undo.RollbackInDatabase."""
+        for backend in ("legacy_files",):
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
                 self.save(jp, version, option=0)
                 self.apply(jp, md)
@@ -647,7 +653,7 @@ class ReportDetails(AnswerOutcomeCase):
             with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
                 self.save(jp, version, option=0)
                 self.apply(jp, md)
-                transcript.edit_span(jp, md, 0.7, 1.0, "ручной", by="human")
+                transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human")    # К-В4: то же место
                 self.save(jp, version, kind="revert")
                 rep = core.apply_answers_files(jp, md)
                 self.check_outcomes(jp, rep)
