@@ -26,6 +26,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 if "paths" not in sys.modules:
     os.environ["RUS_TRANSCRIBER_DATA"] = _TMP
 
+import transcript  # noqa: E402
 import words as W  # noqa: E402
 import worker  # noqa: E402
 
@@ -122,8 +123,10 @@ class FakeAnnotation:
             yield SimpleNamespace(start=s, end=e), None, lbl
 
 
-def run_words(raw, full_tracks, border):
-    """Настоящий worker.run_words без профилей; места для разбора — настоящие. -> данные расшифровки."""
+def run_words(raw, full_tracks, border, label_name=None, pvecs=None, cents=None, allowed=()):
+    """Настоящий worker.run_words (по умолчанию без профилей); места для разбора — настоящие.
+    -> данные расшифровки."""
+    label_name = dict(label_name or {})
     order = {}
     for _, _, spk in sorted(raw):
         order.setdefault(spk, f"Спикер {len(order) + 1}")
@@ -132,7 +135,8 @@ def run_words(raw, full_tracks, border):
     for t in turns:
         ws += words_between(t["s"], t["e"])
     dur = max(e for _, e, _ in raw) + 1.0
-    voice_ctx = {"pvecs": {}, "cents": {}, "mapping": {}, "confusions": {}}
+    voice_ctx = {"pvecs": dict(pvecs or {}), "cents": dict(cents or {}),
+                 "mapping": {lbl: (nm, 0.9) for lbl, nm in label_name.items()}, "confusions": {}}
     quality = {"vocab": None, "speaker_fixes": [], "vocab_fixes": [], "review": [], "asr_diagnostics": {}}
     fused = {"quality": {}, "evidence": {"whisper": [], "other": []}}
     with mock.patch.object(worker, "primary_pass", return_value=ws), \
@@ -142,7 +146,8 @@ def run_words(raw, full_tracks, border):
             mock.patch.object(worker, "_check_gender"), \
             mock.patch.object(worker, "_interaction_layer"), mock.patch.object(worker, "_emotions"):
         return worker.run_words(audio_for(dur), "synthetic.wav", {}, _Status(), list(raw), order, turns,
-                                FakeAnnotation(full_tracks), FakeEmb(border), {}, {}, voice_ctx, [], {}, None,
+                                FakeAnnotation(full_tracks), FakeEmb(border), dict(label_name),
+                                {nm: lbl for lbl, nm in label_name.items()}, voice_ctx, list(allowed), {}, None,
                                 quality, None, SimpleNamespace(status=""))
 
 
@@ -161,6 +166,56 @@ class RunWordsTests(unittest.TestCase):
         self.assertFalse(any("margin_unmeasured" in w for w in all_words))
         self.assertEqual(len([w for w in all_words if "overlap" in (w.get("flags") or [])]), 4)
         self.assertEqual(data["quality"]["overlaps_sec"], 1.5)
+        self.assertNotIn("overlap_unmeasured_skipped", data["quality"])      # 1,5 с из 20 с речи — 8 %
+
+
+RAW_ONE = [(0.0, 10.0, "SPEAKER_00"), (10.5, 20.5, "SPEAKER_00")]          # 20 с речи без пауз
+SHADOW = [(1.0, 8.0, "SPEAKER_01"), (11.0, 19.0, "SPEAKER_01")]            # «тень» эха: 15 с, 75 % речи
+VA_NEAR = np.array([0.995, 0.0998, 0.0]) / np.linalg.norm([0.995, 0.0998, 0.0])   # голос, близкий к A
+
+
+class EchoShareTests(unittest.TestCase):
+    """Т-1, Н-3 перепроверки №246: наложения pyannote больше 30 % речи записи (сумма отрезков разметки без
+    пауз) — скорее эхо или гул: правило «отрыв не измерен — overlap» не действует, вместо мест — предупреждение;
+    пометка при измеренных близких голосах — прежняя."""
+
+    def test_echo_like_overlaps_give_warning_not_places(self):
+        data = run_words(RAW_ONE, RAW_ONE + SHADOW, 99.0)
+        self.assertEqual([it for it in data["review"] if "overlap" in it.get("reasons", [])], [])
+        self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.75, "sec": 15.0})
+        words_ = [w for seg in data["segments"] for w in seg["words"]]
+        self.assertFalse(any("overlap" in (w.get("flags") or []) for w in words_))
+        self.assertEqual({seg["label"] for seg in data["segments"]}, {S1})       # голос слов прежний
+        md = transcript.render_md(dict(data, file="synthetic.wav", duration="00:00:21"))
+        self.assertIn("одновременную речь на 75 % речи — похоже на эхо или гул", md)
+        self.assertIn("Если говорили одновременно — прослушайте.", md)
+
+    def test_share_at_threshold_keeps_places(self):
+        """Ровно 30 % (6 с из 20 с) — ещё не эхо: места наложений ставятся, предупреждения нет."""
+        data = run_words(RAW_ONE, RAW_ONE + [(2.0, 5.0, "SPEAKER_01"), (12.0, 15.0, "SPEAKER_01")], 99.0)
+        self.assertEqual(len([it for it in data["review"] if "overlap" in it.get("reasons", [])]), 2)
+        self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
+
+    def test_measured_close_voices_still_flagged_with_profiles(self):
+        """Профили двух участников с близкими голосами (две опоры, отрыв измерен и мал): при той же доле
+        наложений 75 % слова в наложениях помечаются, как до №246; предупреждения нет — пропусков нет."""
+        data = run_words(RAW_ONE, RAW_ONE + SHADOW, 99.0, label_name={S1: "Анна"},
+                         pvecs={"Анна": VA, "Борис": VA_NEAR}, cents={S1: VA}, allowed=["Анна", "Борис"])
+        words_ = [w for seg in data["segments"] for w in seg["words"]]
+        self.assertFalse(any("margin_unmeasured" in w for w in words_))
+        in_shadow = [w for w in words_ if any(a <= w["s"] + 0.1 < b for a, b, _ in SHADOW)]
+        self.assertTrue(in_shadow)
+        self.assertTrue(all("overlap" in (w.get("flags") or []) for w in in_shadow))
+        self.assertTrue([it for it in data["review"] if "overlap" in it.get("reasons", [])])
+        self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
+
+    def test_doubt_flags_switch_touches_only_unmeasured(self):
+        """Прямо doubt_flags: unmeasured_overlap=False снимает только пометку неизмеренных слов."""
+        unmeasured = [dict(w, spk=S1, margin=1.0, margin_unmeasured=True) for w in words_between(0.0, 5.0)]
+        close = [dict(w, spk=S2, margin=0.01) for w in words_between(10.0, 15.0)]
+        W.doubt_flags(unmeasured + close, [(1.0, 4.0), (11.0, 14.0)], unmeasured_overlap=False)
+        self.assertEqual(flagged(unmeasured, "overlap"), [])
+        self.assertEqual(flagged(close, "overlap"), inside(close, 11.0, 14.0))
 
 
 if __name__ == "__main__":

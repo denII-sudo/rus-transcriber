@@ -274,6 +274,24 @@ class DocumentTests(unittest.TestCase):
                 documents.prepare(self.recording, 1, 1, 1, dict(self.source, quality={"vote3_partial": bad}),
                                   review, self.ctx, self.ctx, "now")
 
+    def test_overlap_unmeasured_skip_remains_visible(self):
+        """Т-1, Н-3: наложения сочтены эхом или гулом — предупреждение в шапке и публичное поле из двух чисел."""
+        skipped = {"share": 0.82, "sec": 22.4}
+        source = dict(self.source, quality={"overlap_unmeasured_skipped": skipped, "voice_doubt_threshold": 0.0})
+        review = {"review": [], "answers": {}}
+        prepared = documents.prepare(self.recording, 1, 1, 1, source, review, self.ctx, self.ctx, "now")
+        md = prepared["md"].decode()
+        self.assertIn("одновременную речь на 82 % речи — похоже на эхо или гул", md)
+        self.assertIn("Если говорили одновременно — прослушайте.", md)
+        self.assertEqual(json.loads(prepared["json"])["transcript"]["quality"],
+                         {"overlap_unmeasured_skipped": skipped})
+        for bad in ("yes", {"share": 0.82}, {"share": "0.82", "sec": 1.0}, {"share": 0.5, "sec": -1.0},
+                    {"share": True, "sec": 1.0}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                documents.prepare(self.recording, 1, 1, 1,
+                                  dict(self.source, quality={"overlap_unmeasured_skipped": bad}),
+                                  review, self.ctx, self.ctx, "now")
+
     def test_order_speaker_names_and_undo_projection(self):
         source = {"speakers": ["s1", "s2"], "speaker_names": {"s1": "Анна", "s2": "Борис"},
                   "names_source": "voices", "names_confirmed": False, "title": "Тест",

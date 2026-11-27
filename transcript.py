@@ -267,6 +267,14 @@ def _item_line(it, third_name="Whisper", second_name="CTC", data=None, status=Fa
     return s
 
 
+def overlap_skipped_note(info):
+    """Предупреждение Т-1, Н-3: наложения pyannote заняли большую долю речи, места наложений не поставлены."""
+    share = round(float(info.get("share", 0)) * 100)
+    return (f"Внимание: pyannote нашёл одновременную речь на {share} % речи — похоже на эхо или гул; места "
+            "наложений там, где голос слова не сверялся со вторым голосом, не поставлены. Если говорили "
+            "одновременно — прослушайте.")
+
+
 def render_md(data, text_only=False):
     """Стенограмма в markdown. Слова нерешённых мест — в ⟦…⟧. text_only — только шапка и реплики."""
     lines = [f"# Расшифровка: {Path(data['file']).name}", "",
@@ -283,6 +291,8 @@ def render_md(data, text_only=False):
         lines.append(f"_Голосование трёх моделей пропущено на отрезках с неполным результатом ASR: "
                      f"{p.get('spans')} (около {str(p.get('seconds')).replace('.', ',')} с); "
                      "там сверены только две модели._\n")
+    if q0.get("overlap_unmeasured_skipped"):
+        lines.append("_" + overlap_skipped_note(q0["overlap_unmeasured_skipped"]) + "_\n")
     for key in ("asr2_skipped", "asr3_skipped"):
         skipped = q0.get(key)
         note = SKIPPED_RU.get((key, skipped.get("reason"))) if isinstance(skipped, dict) else None

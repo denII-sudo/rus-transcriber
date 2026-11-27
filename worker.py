@@ -996,10 +996,22 @@ def _asr_problem_items(evidence, segments, note):
     return items
 
 
-def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality):
-    """Метки сомнения и места для разбора -> (места, порог сомнения голоса, наложения голосов)."""
+def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality, speech_sec=None):
+    """Метки сомнения и места для разбора -> (места, порог сомнения голоса, наложения голосов).
+    speech_sec — секунды речи записи (сумма отрезков разметки pyannote без пауз): знаменатель доли речи под
+    наложениями; без него доля не считается и правило «отрыв не измерен — overlap» действует всегда."""
     overlaps = W.overlap_regions(full_ann)
-    thr = W.doubt_flags(words, overlaps)
+    ov_sec = sum(e - s for s, e in overlaps)
+    share = ov_sec / speech_sec if speech_sec else 0.0
+    trust = share <= W.OVERLAP_UNMEASURED_MAX_SHARE
+    thr = W.doubt_flags(words, overlaps, unmeasured_overlap=trust)
+    if not trust:
+        skipped = sum(1 for w in words if w.get("margin_unmeasured")
+                      and any(a <= w["s"] + 0.1 < b for a, b in overlaps))
+        if skipped:
+            quality["overlap_unmeasured_skipped"] = {"share": round(share, 2), "sec": round(ov_sec, 1)}
+            W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо или гул): {skipped} слов без "
+                 "измеренного отрыва голосов не помечены как наложение")
     for seg in segments:
         for wd in seg["words"]:
             src_w = wd.pop("_flags_src")
@@ -1376,7 +1388,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                                       taken={t["label"] for t in turns} | set(order.values()))
     _check_gender(segments, genders_by_name, refs, label_of, quality)
     items, thr, overlaps = _review_places(words, segments, turns, full_ann, cfg, label_name,
-                                          fused["evidence"], quality)
+                                          fused["evidence"], quality, speech_sec=sum(speech.values()))
     _interaction_layer(audio, raw, full_ann, overlaps, cfg, quality, timing)
     _emotions(audio, segments, cfg, a, quality, timing)
 
