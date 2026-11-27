@@ -211,8 +211,8 @@ def build():
     wa = sub.add_parser("workflow-abandon"); wa.add_argument("request")
     wq = sub.add_parser("workflow-questions"); wq.add_argument("request")
     wl = sub.add_parser("workflow-list"); wl.add_argument("--limit", type=int, default=20)
-    lr = sub.add_parser("legacy-read", help="старые файлы записи рядом с аудио: что в них и что внесло бы прежнее "
-                        "«Применить»; только чтение"); lr.add_argument("path")
+    lr = sub.add_parser("legacy-read", help="старые файлы записи рядом с аудио: что в них и на месте ли слова "
+                        "карточек (не обещание внесения); только чтение"); lr.add_argument("path")
     lr.add_argument("--offset", type=int, default=0); lr.add_argument("--limit", type=int, default=40)
     sc = sub.add_parser("screen"); sc.add_argument("--port", type=int, default=8766)
     sc.add_argument("--hours", type=float, default=6.0)

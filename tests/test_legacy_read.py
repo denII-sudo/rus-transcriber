@@ -9,13 +9,16 @@
     python -B tests/test_legacy_read.py --freeze     (с RUS_TRANSCRIBER_DATA, TEMP и TMP на песочницу)
 и записать новый sha256 в EXPECTED_SHA256.
 
-Что проверяется: чтение ничего не меняет и не создаёт; «внесёт» ⇔ файловое «Применить» внесло ответ и слова места
-стали теми, что показывает предпросмотр; «не внесёт» ⇔ не внесло, слова места те же; отказ «Применить» целиком
-виден в чтении; модули с побочными эффектами (`paths`, `core`, `recordings`) чтение не импортирует.
+Что проверяется: чтение ничего не меняет и не создаёт; подсказка каждого ответа и исход файлового «Применить»
+закреплены по случаям (`WANT`): `words_in_place` — слова карточки в файле те, что в предпросмотре (внесён ли ответ —
+видно по исходу, внесение не обещано: Ф238-3), `not_applied` — ответ не попал в стенограмму и слова те же,
+`check` — исход закреплён; отказ «Применить» целиком виден в чтении; документ базы и файлы неожиданного вида —
+понятный отказ; модули с побочными эффектами (`paths`, `core`, `recordings`) чтение не импортирует.
 """
 import atexit
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -38,7 +41,7 @@ import legacy_read  # noqa: E402
 import legacy_sample_loader as samples  # noqa: E402
 
 EXPECTED = HERE / "legacy_read_expected.json"
-EXPECTED_SHA256 = "777de51a7cf9753eadd155e63f33a9cb964a29da191b53f12335b40f29a4e1f6"
+EXPECTED_SHA256 = "9b057a2c50f8004c1e755c3861b8e68228cca8073afcec44b59662034ac27584"
 
 
 def _edit_json(path, change):
@@ -83,6 +86,53 @@ def _word_id_dropped(wid):
     return change
 
 
+def _word_edit(wid, text, by):
+    """Слово wid исправлено правкой отрезка автора by (след правки — как у transcript.edit_span)."""
+    def change(side, jp):
+        def edit(data):
+            for s in data["segments"]:
+                for w in s["words"]:
+                    if w.get("word_id") == wid:
+                        w.update({"w": text, "edited": "span@test", "by": by,
+                                  "provenance": {"text": {"by": by, "edit": "span@test", "via": "edit_span"}}})
+        _edit_json(jp, edit)
+    return change
+
+
+def _card(name, base, aid, card, place, answer):
+    """Новая карточка aid — копия карточки base с полями card (None — убрать поле), её место в стенограмме — копия
+    места base с полями place, и ждущий ответ человека с полями answer."""
+    def fields(row, extra):
+        row = {**copy.deepcopy(row), "id": aid}
+        for k, v in extra.items():
+            if v is None:
+                row.pop(k, None)
+            else:
+                row[k] = v
+        return row
+
+    def change(side, jp):
+        pd = side / f"{name}.review"
+
+        def add_item(man):
+            man["items"].append(fields(next(it for it in man["items"] if it["id"] == base), card))
+
+        def add_answer(state):
+            add_item(state["manifest"])
+            a = copy.deepcopy(state["answers"][base])
+            a.update({"id": aid, "ts": "2026-11-20T10:00:03", **answer})
+            state["answers"][aid] = a
+
+        def add_place(data):
+            data["review"] = [r for r in data["review"] if r["id"] != aid]
+            data["review"].append(fields(next(r for r in data["review"] if r["id"] == base), place))
+
+        _edit_json(pd / "manifest.json", add_item)
+        _edit_json(pd / "answers.json", add_answer)
+        _edit_json(jp, add_place)
+    return change
+
+
 def _pause(name, aid):
     """Место aid — пауза (причина «missed») в вопросах пакета и в стенограмме."""
     def change(side, jp):
@@ -121,8 +171,22 @@ CASES = {
     "built": ("built", None),
     "built_archive": ("built_archive", None),
     "waiting": ("waiting", None),
-    # текст слова места r4 изменился после сборки карточки — файловый режим текст не сверяет, ответ вносится
+    # текст слова места r4 изменился после сборки карточки правкой без автора (старые файлы) — файловый режим текст
+    # не сверяет, ответ вносится
     "built_words_changed": ("built", _word("w4", "то")),
+    # слово места r4 исправил человек правкой отрезка — «Применить» не перезаписывает правку человека (отказ),
+    # а слова карточки на месте: подсказка words_in_place не обещает внесения (Ф238-3)
+    "built_human_edit": ("built", _word_edit("w4", "те", "human")),
+    # то же правкой агента — ответ человека её перезаписывает
+    "built_agent_edit": ("built", _word_edit("w4", "те", "claude")),
+    # вторая ждущая карточка r5 на тех же словах, что r4 — «Применить» оставит обе человеку
+    "built_overlap": ("built", _card("встреча", "r4", "r5", {}, {}, {})),
+    # вторая ждущая карточка r5 старого вида без ID слов, по времени перекрывает r4 (Ф238-3)
+    "built_old_card": ("built", _card("встреча", "r4", "r5",
+                                      {"word_ids": None, "t2": 3.8, "text": "та конец"},
+                                      {"word_ids": None, "t2": 3.8, "text": "та конец"}, {})),
+    # повреждённый номер варианта (-1): прежнее «Применить» внесло последний вариант (Ф238-4)
+    "built_bad_option": ("built", _answer("встреча", "r4", option=-1)),
     # слова места r4 нет (ID пропал) — ответ не вносится
     "built_word_missing": ("built", _word_id_dropped("w4")),
     # ответ без автора — «Применить» отказывает целиком
@@ -191,12 +255,25 @@ def freeze_all():
         return {case: file_apply(case, Path(tmp) / case) for case in CASES}
 
 
-def file_code_present():
+def file_code_absent():
+    """Почему файлового «Применить» больше нет (None — оно есть и работает без базы).
+
+    После У-1/У-2 функция может остаться, но отказывать без базы ошибкой хранилища (`StorageError`, не
+    `CoreError`): это тоже «файлового кода нет», а не падение теста (Ф238-8). Любая другая ошибка — падение."""
     try:
         import core
     except ImportError:
-        return False
-    return hasattr(core, "apply_answers_files")
+        return "нет модуля core"
+    if not hasattr(core, "apply_answers_files"):
+        return "нет core.apply_answers_files"
+    with tempfile.TemporaryDirectory(prefix="rt-legacy-read-probe-") as tmp:
+        try:
+            file_apply("built", Path(tmp) / "probe")
+        except Exception as ex:  # noqa: BLE001 — разбирается по имени класса ниже
+            if type(ex).__name__ == "StorageError":
+                return f"файловое «Применить» отказывает без базы: {ex}"
+            raise
+    return None
 
 
 class Base(unittest.TestCase):
@@ -217,66 +294,103 @@ class FrozenFileMode(Base):
     def test_frozen_result_is_recorded_and_matches_file_code(self):
         expected = self.expected()
         self.assertEqual(sorted(expected), sorted(CASES), "случай добавлен или убран без пересборки итога")
-        if not file_code_present():
-            self.skipTest("файлового «Применить» больше нет: сверка только с замороженным итогом")
+        absent = file_code_absent()
+        if absent:
+            self.skipTest(f"файлового «Применить» больше нет ({absent}): сверка только с замороженным итогом")
         self.assertEqual(freeze_all(), expected, "файловое «Применить» даёт не тот итог, что заморожен")
 
 
+# исходы файлового «Применить», при которых ответ попал в стенограмму (словами, статусом места или отменой)
+TOOK_EFFECT = ("applied", "applied_open", "applied_check", "left_for_human", "reverted")
+W, N, C = legacy_read.WORDS_IN_PLACE, legacy_read.NOT_APPLIED, legacy_read.CHECK
+# случай -> {карточка: (подсказка чтения, исход файлового «Применить» из замороженного итога)}. Исход закреплён и у
+# words_in_place, и у check: подсказка не предсказывает его, а таблица показывает, что на деле сделало «Применить».
+WANT = {
+    "built": {"r4": (W, "applied")}, "built_archive": {}, "waiting": {"r3": (W, "applied")},
+    "built_words_changed": {"r4": (W, "applied")}, "built_word_missing": {"r4": (N, "apply_conflict")},
+    "built_no_actor": {"r4": (N, None)}, "built_skip": {},
+    "built_revert": {"r3": (C, "reverted"), "r4": (W, "applied")},
+    "built_replace": {"r3": (C, "applied"), "r4": (W, "applied")},
+    "waiting_human": {"r3": (W, "left_for_human")}, "waiting_free": {"r3": (C, "applied")},
+    "waiting_negative": {"r3": (N, "negative")}, "waiting_short": {"r3": (C, "hint")},
+    "built_tried": {"r4": (W, "applied")}, "built_pause": {"r4": (C, "applied")},
+    "built_human_edit": {"r4": (W, "apply_conflict")}, "built_agent_edit": {"r4": (W, "applied")},
+    "built_overlap": {"r4": (C, "blocked_preflight"), "r5": (C, "blocked_preflight")},
+    "built_old_card": {"r4": (W, "blocked_preflight"), "r5": (C, "blocked_preflight")},
+    "built_bad_option": {"r4": (C, "applied")},
+}
+
+
+def _card_words(side, pack, aid, words):
+    """Слова карточки aid в словаре {word_id: слово}: строка, или None — карточка без ID слов либо слова нет."""
+    man = json.loads((side / Path(pack["folder"]).name / "manifest.json").read_text(encoding="utf-8"))
+    ids = next(it for it in man["items"] if it["id"] == aid).get("word_ids") or []
+    got = [words.get(w) for w in ids]
+    return None if not ids or None in got else " ".join(got)
+
+
 class ReadAgainstFileMode(Base):
-    def test_read_predicts_file_apply(self):
+    def test_read_against_file_apply(self):
+        """Подсказка чтения против итога файлового «Применить» на тех же файлах.
+
+        words_in_place ⇔ слова карточки в файле до «Применить» именно те, что показывает preview.before; если ответ
+        внесён, слова стали preview.after. not_applied ⇔ ответ не попал в стенограмму и слова места те же. check —
+        исход закреплён в WANT. Ответ без подсказки «Применить» не вносит."""
         expected = self.expected()
-        seen = {"yes": 0, "no": 0, "check": 0}
+        seen = {W: 0, N: 0, C: 0}
         for case in CASES:
             with self.subTest(case=case):
                 side, jp = make_case(case, self.root / case)
                 before = snapshot(side)
+                words_before = {w["word_id"]: w["w"] for s in json.loads(jp.read_text(encoding="utf-8"))["segments"]
+                                for w in s["words"] if w.get("word_id")}
                 got = legacy_read.read(jp)
                 self.assertEqual(snapshot(side), before, "чтение изменило или создало файлы")
                 self.assertFalse(got["writes"])
                 frozen = expected[case]
                 pack = got["review_pack"]
                 self.assertEqual(pack["apply_refused"] is not None, frozen["refused"])
+                self.assertEqual({r["id"]: (r["apply_hint"], frozen["outcomes"].get(r["id"]))
+                                  for r in pack["items"] if "apply_hint" in r}, WANT[case])
                 for row in pack["items"]:
                     aid, outcome = row["id"], frozen["outcomes"].get(row["id"])
-                    ids = next(it for it in json.loads((side / Path(pack["folder"]).name / "manifest.json")
-                                                       .read_text(encoding="utf-8"))["items"]
-                               if it["id"] == aid)["word_ids"]
-                    words = [frozen["words"].get(w) for w in ids]
-                    after = None if None in words else " ".join(words)
+                    was = _card_words(side, pack, aid, words_before)
+                    now = _card_words(side, pack, aid, frozen["words"])
                     if row["state"] == "applied":
                         self.assertIn(outcome, (None, "applied"), aid)
-                        self.assertEqual(after, row["preview"]["after"], f"{aid}: внесённый ответ не в словах")
-                    if "would_apply" not in row:
+                        self.assertEqual(now, row["preview"]["after"], f"{aid}: внесённый ответ не в словах")
+                    hint = row.get("apply_hint")
+                    if hint is None:
                         if not frozen["refused"] and row["state"] not in ("applied", "applied_open", "applied_check"):
                             self.assertNotIn(row["state"], legacy_read.TRIED, aid)
-                            self.assertNotIn(outcome, ("applied", "applied_open", "left_for_human", "reverted"),
-                                             f"{aid}: «Применить» внесло ответ, который чтение не предсказывало")
+                            self.assertNotIn(outcome, TOOK_EFFECT,
+                                             f"{aid}: «Применить» внесло ответ, у которого нет подсказки")
                         continue
-                    seen[row["would_apply"]] += 1
-                    if row["would_apply"] == "yes":
-                        # «оставить человеку» вносится статусом места — исход left_for_human
-                        self.assertIn(outcome, ("applied", "left_for_human"), aid)
-                        self.assertEqual(after, row["preview"]["after"], aid)
-                        if row["preview"].get("status"):
-                            self.assertEqual(frozen["status"][aid], row["preview"]["status"], aid)
-                    elif row["would_apply"] == "no":
-                        self.assertNotEqual(outcome, "applied", aid)
-                        self.assertEqual(after, row["preview"]["before"], f"{aid}: слова места изменились")
-        # каждый исход чтения встречается хотя бы раз — иначе случаи ничего не проверяют
+                    seen[hint] += 1
+                    if hint == W:
+                        self.assertIsNotNone(was, aid)
+                        self.assertEqual(was, row["preview"]["before"], f"{aid}: слова карточки не те, что в файле")
+                        if outcome in ("applied", "left_for_human"):
+                            self.assertEqual(now, row["preview"]["after"], aid)
+                            if row["preview"].get("status"):
+                                self.assertEqual(frozen["status"][aid], row["preview"]["status"], aid)
+                        else:
+                            self.assertEqual(now, was, f"{aid}: не внесено, а слова изменились")
+                    elif hint == N:
+                        self.assertNotIn(outcome, TOOK_EFFECT, aid)
+                        self.assertEqual(now, was, f"{aid}: слова места изменились")
+        # каждая подсказка встречается хотя бы раз — иначе случаи ничего не проверяют
         self.assertTrue(all(seen.values()), seen)
+        self.assertEqual(sorted(WANT), sorted(CASES))
 
-    def test_cases_cover_expected_verdicts(self):
-        """Исход чтения по случаям закреплён: правка кода чтения, меняющая их, видна здесь."""
-        want = {"built": {"r4": "yes"}, "built_archive": {}, "waiting": {"r3": "yes"},
-                "built_words_changed": {"r4": "yes"}, "built_word_missing": {"r4": "no"}, "built_no_actor": {"r4": "no"}, "built_skip": {},
-                "built_revert": {"r3": "check", "r4": "yes"}, "built_replace": {"r3": "check", "r4": "yes"},
-                "waiting_human": {"r3": "yes"}, "waiting_free": {"r3": "check"}, "waiting_negative": {"r3": "no"},
-                "waiting_short": {"r3": "check"}, "built_tried": {"r4": "yes"}, "built_pause": {"r4": "check"}}
-        for case, verdicts in want.items():
-            with self.subTest(case=case):
-                _side, jp = make_case(case, self.root / case)
-                items = legacy_read.read(jp)["review_pack"]["items"]
-                self.assertEqual({r["id"]: r["would_apply"] for r in items if "would_apply" in r}, verdicts)
+    def test_words_in_place_does_not_promise_apply(self):
+        """Ф238-3: правка слова человеком — слова на месте, а «Применить» отказывает; подсказка говорит об этом."""
+        side, jp = make_case("built_human_edit", self.root / "h")
+        row = next(r for r in legacy_read.read(jp)["review_pack"]["items"] if r["id"] == "r4")
+        self.assertEqual(row["apply_hint"], W)
+        self.assertIn("не обещание", row["apply_hint_why"])
+        self.assertIn("правки этих слов человеком", row["apply_hint_why"])
+        self.assertEqual(self.expected()["built_human_edit"]["outcomes"]["r4"], "apply_conflict")
 
 
 class ReadOnly(Base):
@@ -305,6 +419,48 @@ class ReadOnly(Base):
             with self.assertRaises(legacy_read.LegacyReadError):
                 legacy_read.read(bad)
 
+    def test_database_document_and_odd_shapes_refused_clearly(self):
+        """Ф238-2: документ базы и файлы неожиданного вида — понятный отказ LegacyReadError, не AttributeError."""
+        v4 = self.root / "d" / "v4"
+        v4.mkdir(parents=True)
+        doc = v4 / "встреча.transcript.json"
+        doc.write_text(json.dumps({"passport": {"storage_backend": "sqlite"}, "transcript": {"segments": []}}),
+                       encoding="utf-8")
+        with self.assertRaisesRegex(legacy_read.LegacyReadError, "документ базы"):
+            legacy_read.read(doc)
+        side, jp = make_case("built", self.root / "e")
+        _edit_json(jp, lambda data: data.update(segments="не список"))
+        with self.assertRaisesRegex(legacy_read.LegacyReadError, "неожиданного вида"):
+            legacy_read.read(jp)
+        side, jp = make_case("built", self.root / "f")
+        _edit_json(side / "встреча.review" / "answers.json", lambda st: st["answers"].update(r4="строка"))
+        with self.assertRaisesRegex(legacy_read.LegacyReadError, "неожиданного вида"):
+            legacy_read.read(jp)
+        with self.assertRaisesRegex(legacy_read.LegacyReadError, "целые числа"):
+            legacy_read.read(jp, offset="abc")
+
+    def test_conspects_found_with_brackets_in_name_and_database_note(self):
+        """Ф238-10: скобки в имени записи — конспекты находятся. Ф238-12: у записи с recording_id сказано, что
+        действующее состояние перенесённой записи — в базе."""
+        side, jp = make_case("built", self.root / "g")
+        name = "встреча [1]"
+        moved = {}
+        for p in list(side.iterdir()):
+            if p.name.startswith("встреча."):
+                moved[p.name] = p.rename(side / (name + p.name[len("встреча"):]))
+        jp = side / f"{name}.transcript.json"
+        for suffix in (".итоги.conspect.json", ".итоги.conspect.md"):
+            (side / (name + suffix)).write_text("{}", encoding="utf-8")
+        (side / "встреча 1.итоги.conspect.json").write_text("{}", encoding="utf-8")   # чужая запись
+        before = snapshot(side)
+        got = legacy_read.read(jp)
+        self.assertEqual(snapshot(side), before)
+        self.assertEqual(sorted(Path(c["file"]).name for c in got["conspects"]),
+                         [name + ".итоги.conspect.json", name + ".итоги.conspect.md"])
+        self.assertIn("в базе", got["database_note"])
+        _edit_json(jp, lambda data: data.pop("recording_id"))
+        self.assertNotIn("database_note", legacy_read.read(jp))
+
     def test_import_has_no_side_effect_modules(self):
         code = ("import sys, legacy_read; "
                 "print([m for m in ('paths', 'core', 'recordings', 'storage', 'settings', 'jobslots') if m in sys.modules])")
@@ -318,18 +474,21 @@ class Interfaces(Base):
     """Инструмент MCP read_legacy_files и команда rt.py legacy-read отдают то же, что read, и ничего не пишут."""
 
     def test_mcp_tool(self):
-        try:
-            import migrate
-            with mock.patch.object(migrate, "run", return_value={"status": "пропущено в тесте"}):
-                import server
-        except ImportError:
+        # пропуск — только без пакета mcp; модуль migrate (уходит в У-1) здесь не нужен: сервер перенос при
+        # импорте не запускает (tests/test_no_auto_migrate.py), а ImportError не должен молча пропускать тест (Ф238-8)
+        if importlib.util.find_spec("mcp") is None:
             self.skipTest("нет пакета mcp")
+        import server
         side, jp = make_case("built", self.root / "m")
         before = snapshot(side)
         got = json.loads(server.read_legacy_files(str(jp), 0, 5))
         self.assertEqual(got, json.loads(json.dumps(legacy_read.read(jp, 0, 5), ensure_ascii=False)))
         self.assertEqual(snapshot(side), before)
         self.assertIn("error", json.loads(server.read_legacy_files(str(self.root / "нет.transcript.json"))))
+        _edit_json(jp, lambda data: data.update(segments="не список"))
+        self.assertIn("неожиданного вида", json.loads(server.read_legacy_files(str(jp)))["error"])
+        self.assertIn("apply_hint", server.read_legacy_files.__doc__)
+        self.assertNotIn("would_apply", server.read_legacy_files.__doc__)
 
     def test_rt_command(self):
         side, jp = make_case("waiting", self.root / "r")
@@ -343,7 +502,7 @@ class Interfaces(Base):
         self.assertEqual(out.returncode, 0, out.stderr)
         got = json.loads(out.stdout)
         self.assertFalse(got["writes"])
-        self.assertEqual(got["review_pack"]["waiting"], {"yes": 1, "no": 0, "check": 0})
+        self.assertEqual(got["review_pack"]["apply_hints"], {W: 1, N: 0, C: 0})
         self.assertEqual(snapshot(side), before)
         bad = subprocess.run([sys.executable, "-B", str(PROJECT / "rt.py"), "legacy-read", str(self.root / "x.txt")],
                              cwd=PROJECT, capture_output=True, text=True, encoding="utf-8", env=env, timeout=300)
