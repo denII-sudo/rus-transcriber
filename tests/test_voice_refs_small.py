@@ -2,7 +2,8 @@
 
 Только синтетика: звук — тишина, отпечаток голоса подменён по времени (голос A до границы, B после),
 модели не загружаются. Работают настоящие worker._voice_references, worker._without_reference,
-words.assign_voices, words.build_replies, words.doubt_flags и voices._spans.
+words.assign_voices, words.build_replies, words.doubt_flags и voices._spans; RunWordsTests — настоящий
+worker.run_words, у которого подменены только проходы моделей, места для разбора, слой разговора и эмоции.
 
 Было: опор нет — np.stack падает (ValueError, стенограммы нет); голос короче 10 с без профиля молча
 отдавался ближайшей опоре. Стало: опора — неопознанный кластер от 3 с с центром; слова голосов без опоры
@@ -16,6 +17,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -177,6 +180,83 @@ class ProfileTests(unittest.TestCase):
         report = {}
         self.assertEqual(voices._spans({"segments": segments, "names_confirmed": True}, True, report), [])
         self.assertEqual(report.get("unknown_speaker"), 2)
+
+
+class _Status:
+    def set(self, **_):
+        pass
+
+
+def run_words(raw, label_name, pvecs, cents, allowed, border, extra_words=()):
+    """Настоящий worker.run_words: проходы моделей подменены словами по репликам raw. -> данные расшифровки."""
+    order = {}
+    for _, _, spk in sorted(raw):
+        order.setdefault(spk, f"Спикер {len(order) + 1}")
+    turns = [turn(s, e, order[spk]) for s, e, spk in raw if e - s >= worker.MIN_SEG]
+    ws = words_in(turns) + [dict(w) for w in extra_words]
+    ws.sort(key=lambda w: w["s"])
+    dur = max(e for _, e, _ in raw) + 1.0
+    audio = np.zeros(int(dur * W.SR), dtype=np.float32)
+    mapping = {lbl: (nm, 0.9) for lbl, nm in label_name.items()}
+    voice_ctx = {"pvecs": pvecs, "cents": cents, "mapping": mapping, "confusions": {}}
+    quality = {"vocab": None, "speaker_fixes": [], "vocab_fixes": [], "review": [], "asr_diagnostics": {}}
+    fused = {"quality": {}, "evidence": {"whisper": [], "other": []}}
+    with mock.patch.object(worker, "primary_pass", return_value=ws),             mock.patch.object(worker, "second_pass", return_value=None),             mock.patch.object(worker, "whisper_plan", return_value={"model": None}),             mock.patch.object(worker.W, "combine_hypotheses", return_value=fused),             mock.patch.object(worker, "_check_gender"),             mock.patch.object(worker, "_review_places", return_value=([], 0.5, [])),             mock.patch.object(worker, "_interaction_layer"), mock.patch.object(worker, "_emotions"):
+        return worker.run_words(audio, "synthetic.wav", {}, _Status(), list(raw), order, turns, None,
+                                FakeEmb(border), dict(label_name), {nm: lbl for lbl, nm in label_name.items()},
+                                voice_ctx, allowed, {}, None, quality, None, SimpleNamespace(status=""))
+
+
+def spoken_by(data, t1, t2):
+    """{(метка, подпись)} слов в отрезке [t1, t2)."""
+    return {(seg["label"], seg["speaker"]) for seg in data["segments"] for w in seg["words"] if t1 <= w["s"] < t2}
+
+
+VC = np.array([0.0, 0.0, 1.0])
+RAW_A = [(0.0, 10.0, "SPEAKER_00"), (10.5, 20.5, "SPEAKER_00")]
+
+
+class RunWordsTests(unittest.TestCase):
+    """Через настоящий run_words: участник из профиля без кластера и голос без опоры (профиль есть)."""
+
+    def setUp(self):
+        self.raw = RAW_A + [(21.0, 22.2, "SPEAKER_01"), (22.6, 23.8, "SPEAKER_01")]   # B: центра нет, опоры нет
+        self.label_name = {S1: "Анна"}
+        self.pvecs = {"Анна": VA, "Борис": VC}           # Борис — в профиле, своего кластера в записи нет
+        self.cents = {S1: VA}
+
+    def test_profile_name_not_put_on_unreferenced_label(self):
+        """Имя Бориса (без кластера) не встаёт на метку «Спикер 2» неопознанного голоса B."""
+        data = run_words(self.raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 21.0)
+        self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, "Анна")})
+        self.assertEqual(spoken_by(data, 21.0, 24.0), {(S2, S2)})
+        self.assertEqual(data.get("speaker_names"), {S1: "Анна"})
+        self.assertEqual(data["speakers"], ["Анна", S2])
+        self.assertEqual(data["quality"].get("voice_refs"),
+                         {"refs": 2, "without_reference": [S2], "assigned_by": "diarization"})
+        self.assertEqual([w for seg in data["segments"] for w in seg["words"] if w.get("margin") != 1.0
+                          and seg["speaker"] == S2], [])
+
+    def test_label_with_only_tiny_turns_keeps_its_label(self):
+        """Метка, у которой все реплики короче MIN_SEG (0,3 с): в turns её нет, но в разметке есть, и слово
+        под ней не уходит чужой опоре."""
+        raw = self.raw + [(24.5, 24.75, "SPEAKER_02")]
+        tiny = [{"w": "ага", "s": 24.5, "e": 24.7, "c": 1.0, "truth": "Спикер 3"}]
+        data = run_words(raw, self.label_name, self.pvecs, self.cents, ["Анна", "Борис"], 21.0, tiny)
+        self.assertEqual(spoken_by(data, 24.4, 24.8), {("Спикер 3", "Спикер 3")})
+        self.assertEqual(data["quality"]["voice_refs"]["without_reference"], [S2, "Спикер 3"])
+        self.assertNotIn("Борис", data["speakers"])
+
+    def test_profile_only_participant_gets_free_label(self):
+        """Борис из профиля говорит, но своего кластера у него нет (pyannote слил его с Анной): его слова
+        подписаны Борисом под свободной меткой, не под меткой голоса B."""
+        raw = [(0.0, 10.0, "SPEAKER_00"), (10.5, 20.5, "SPEAKER_00"), (21.0, 22.2, "SPEAKER_01"),
+               (22.6, 23.8, "SPEAKER_01"), (25.0, 31.0, "SPEAKER_00")]
+        # отпечаток: до 25 с — голос A (и у B: его слова всё равно по разметке), после — Борис
+        data = run_words(raw, self.label_name, {"Анна": VA, "Борис": VB}, self.cents, ["Анна", "Борис"], 25.0)
+        self.assertEqual(spoken_by(data, 21.0, 24.0), {(S2, S2)})
+        self.assertEqual(spoken_by(data, 25.5, 31.0), {("Спикер 3", "Борис")})
+        self.assertEqual(data.get("speaker_names"), {S1: "Анна", "Спикер 3": "Борис"})
 
 
 if __name__ == "__main__":
