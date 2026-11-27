@@ -80,15 +80,12 @@ from urllib.parse import unquote, urlsplit
 import confirm
 import core
 import documents
-import migrate
 import paths
 import recordings
+import server
 import settings
 import storage
 import workflow_page
-
-with mock.patch.object(migrate, "run"):
-    import server
 
 PROJECT = Path(__file__).resolve().parent.parent
 SCOPES = ("document", "conspect")

@@ -1,7 +1,7 @@
 """М-2: старый номер задачи после переключения на базу ведёт к перенесённой записи (В-2, «Переадресация»).
 
-Только синтетические данные во временной папке. Перенос — тем же путём, что `tools/import_legacy.py`
-(`build_snapshots`, `recording_id_for`, `sha256_file`), как в `tests/test_voice_sqlite.py`. Закрепляется:
+Только синтетические данные во временной папке. Перенесённую запись строит `tests/migrated_record.py` (инструмент
+переноса удалён в У-1, перенесённые им записи в базах остаются), как в `tests/test_voice_sqlite.py`. Закрепляется:
 переадресация по единственной копии с тем же содержимым и по тому же пути (в любом написании); отказы с
 подсказкой (не перенесена, изменена после переноса, файла нет, файла нет и по его пути ничего не переносили,
 несколько копий, копия файла по другому пути); не основной вариант; без изменений — задачи, сделанные уже в
@@ -22,9 +22,9 @@ if "paths" not in sys.modules:
     os.environ["RUS_TRANSCRIBER_DATA"] = tempfile.mkdtemp(prefix="rt-legacy-redirect-data-")
     atexit.register(shutil.rmtree, os.environ["RUS_TRANSCRIBER_DATA"], ignore_errors=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import import_legacy as IL  # noqa: E402
+import migrated_record as MR  # noqa: E402
 import core  # noqa: E402
 import documents  # noqa: E402
 import paths  # noqa: E402
@@ -87,12 +87,11 @@ class Fixture(unittest.TestCase):
     def migrate(self, path=None, tag="", main=True, recording_id=None):
         """Перенести старый файл в базу как П7; -> recording_id."""
         path = path or self.legacy
-        source = {"path": str(path), "sha256": IL.sha256_file(path), "size": path.stat().st_size}
+        source = MR.source_of(path)
         legacy = json.loads(path.read_text(encoding="utf-8"))
-        rid = recording_id or IL.recording_id_from(legacy, path, source["sha256"])[0]
-        rid, snapshot, review, _ = IL.build_snapshots(
-            legacy, recording_id=rid, metadata={}, field_sources={},
-            variant={"tag": tag, "main": main}, source=source)
+        rid = recording_id or MR.recording_id_from(legacy, path, source["sha256"])
+        rid, snapshot, review = MR.build_snapshots(legacy, recording_id=rid, variant={"tag": tag, "main": main},
+                                                   source=source)
         layout = recordings.document_layout(self.audio, tag)
         layout["root"].mkdir(exist_ok=True)
         root_id = self.store.get_or_register_root(layout["root"])
@@ -160,7 +159,7 @@ class Redirect(Fixture):
             self.assertEqual(recordings.find_migrated(self.store, self.legacy)["recording_id"], rid)
         other = self.write_legacy(legacy_data(self.audio, "другой вариант"), self.root / "meeting.b.transcript.json")
         rid_b = self.migrate(other, tag="b", main=False)
-        self.assertEqual(rid_b, IL.recording_id_for(other, IL.sha256_file(other)))
+        self.assertEqual(rid_b, MR.recording_id_for(other, MR.sha256_file(other)))
         with patch.object(recordings, "migrated_copies", wraps=recordings.migrated_copies) as scan:
             self.assertEqual(recordings.find_migrated(self.store, other)["recording_id"], rid_b)
         self.assertEqual(scan.call_count, 1)
@@ -218,6 +217,10 @@ class Refusals(Fixture):
         s = core.job_status(JOB)
         self.assertEqual(s["json"], str(self.legacy))
         self.assertIn("не перенесена в базу", s["migration_hint"])
+        # переносить нечем (У-1): подсказка ведёт к чтению старых файлов, не к переносу и не к legacy_files
+        self.assertIn("read_legacy_files", s["migration_hint"])
+        for advice in ("import_legacy", "legacy-migration", "режим legacy_files", "перенесите"):
+            self.assertNotIn(advice, s["migration_hint"])
         self.refused("not registered in the active store; эта стенограмма не перенесена в базу")
         self.assertEqual(self.operations(), ops)
 
@@ -267,7 +270,7 @@ class Refusals(Fixture):
         self.migrate()
         copy = self.root / "copy.transcript.json"
         copy.write_bytes(self.legacy.read_bytes())
-        self.assertEqual(IL.sha256_file(copy), IL.sha256_file(self.legacy))
+        self.assertEqual(MR.sha256_file(copy), MR.sha256_file(self.legacy))
         self.job(copy)
         s = core.job_status(JOB)
         self.assertEqual(s["json"], str(copy))

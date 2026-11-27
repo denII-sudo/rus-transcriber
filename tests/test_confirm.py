@@ -149,9 +149,7 @@ class NoSelfApproveTests(unittest.TestCase):
     def test_no_mcp_tool_can_approve(self):
         """Ни один инструмент MCP не выдаёт разрешение: модель не может подтвердить за человека."""
         try:
-            import migrate
-            with mock.patch.object(migrate, "run", return_value={"status": "пропущено в тесте"}):
-                import server
+            import server
         except ImportError:
             self.skipTest("нет пакета mcp")
         names = [t.name for t in server.mcp._tool_manager.list_tools()] if hasattr(server.mcp, "_tool_manager") else None

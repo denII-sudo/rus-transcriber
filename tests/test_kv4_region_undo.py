@@ -309,6 +309,18 @@ class Snapshot(unittest.TestCase):
         transcript.save(data, self.jp, self.md)
         return transcript.load(self.jp)
 
+    def as_before_f234_11b(self, snap):
+        """Состояние до Ф234-11б: в черновике строка места ещё ссылалась на заменённые w1, w2 (так снят снимок),
+        запись в базу эти ссылки убрала. Теперь ответ сразу ссылает место на новые слова — висячие ссылки
+        задаются здесь явно, как у снимков, записанных до исправления."""
+        for patch in snap["review_patches"]:
+            for row in patch["after"]:
+                if row.get("id") == "r1":
+                    row["word_ids"] = ["w1", "w2"]
+        data = transcript.load(self.jp)
+        data["review"][0].pop("word_ids")
+        transcript.save(data, self.jp, self.md)
+
     def two_word_place(self):
         return self.save([reply("Глеб", word("тест", 0.2, "w1"), word("слово", 0.7, "w2"), word("ещё", 1.2, "w3"))],
                          [dict(place("r1", 0.2, "тест слово", "Глеб", "w1"), word_ids=["w1", "w2"]),
@@ -320,6 +332,7 @@ class Snapshot(unittest.TestCase):
             with self.subTest(snapshot_with_row_numbers=numbers):
                 start = self.two_word_place()
                 snap = self.answer({"id": "r1", "text": "одно"})
+                self.as_before_f234_11b(snap)
                 if numbers:                                   # снимок, внесённый #234 (Ф234-9)
                     for key in ("segment_patches", "review_patches"):
                         for patch in snap[key]:
@@ -337,6 +350,7 @@ class Snapshot(unittest.TestCase):
         """Ф234-11, К-23: подтверждение в следующем «Применить» видит стенограмму из базы — снимок годен."""
         start = self.two_word_place()
         snap = self.answer({"id": "r1", "text": "одно"})
+        self.as_before_f234_11b(snap)
         before = self.store_as_database()
         after = copy.deepcopy(before)
         after["review"][0]["note"] = "подтверждено человеком"

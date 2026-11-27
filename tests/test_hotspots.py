@@ -441,9 +441,7 @@ class SqliteEndToEndTests(unittest.TestCase):
                 for fmt in ("md", "json"):
                     self.assertNotIn("rms_db", core.read_transcript(reference, fmt))
                     self.assertNotIn("rms_db", core.read_transcript(reference, fmt, extra=True))
-                import migrate
-                with mock.patch.object(migrate, "run"):
-                    import server
+                import server
                 shown = json.loads(server.read_recording_result(result["recording_id"]))
                 self.assertEqual(shown["quality"]["interaction"], {"omitted": "см. conversation_hotspots"})
                 self.assertEqual(json.loads(server.conversation_hotspots(reference, limit=1))["total"], 3)

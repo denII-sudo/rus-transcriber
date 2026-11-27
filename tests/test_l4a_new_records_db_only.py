@@ -61,7 +61,8 @@ class StartTranscriptionRefusesWithoutStore(unittest.TestCase):
 
     def assert_refused_with_hint(self, ctx):
         self.assertIn("rt.py db-init", str(ctx.exception))
-        self.assertIn("docs/legacy-migration.md", str(ctx.exception))
+        self.assertIn("rt.py legacy-read", str(ctx.exception))       # переноса нет (У-1), только чтение
+        self.assertNotIn("legacy-migration", str(ctx.exception))
         self.launch.assert_not_called()
 
     def test_legacy_files_choice_is_refused_before_launch(self):

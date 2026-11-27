@@ -804,8 +804,7 @@ if ($Source -ne $Target) {
         Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
-    # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает;
-    # старые profiles\, config.json, jobs\ из папки программы переносит явная команда migrate_data (или migrate.py)
+    # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
 # Generate provenance from the checked source, not from a nonexistent .git in the installation.
 $buildSummary = & $manifestPython -B (Join-Path $Target "buildinfo.py") --source $Source --target $Target

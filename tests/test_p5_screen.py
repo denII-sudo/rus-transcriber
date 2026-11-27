@@ -321,7 +321,8 @@ class ScreenRecordingListTests(unittest.TestCase):
             listed = core_screen.recording_list()
         self.assertEqual((listed["available"], listed["items"], listed["total"]), (False, [], 0))
         self.assertIn("Базы записей ещё нет", listed["reason"])
-        self.assertIn("legacy-migration", listed["reason"])
+        self.assertIn("rt.py legacy-read", listed["reason"])          # переноса нет (У-1), только чтение
+        self.assertNotIn("legacy-migration", listed["reason"])
         with mock.patch.object(settings, "recording_backend", return_value="sqlite"):
             self.assertNotIn("в файлах", core_screen.recording_list()["reason"])
 
