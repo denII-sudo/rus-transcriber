@@ -115,8 +115,9 @@ class CardAnswers(Case):
                 self.assertEqual(words[0]["word_id"], "w3")
                 self.assertNotIn("w3", [w["word_id"] for w in words[1:]])
                 self.assertEqual(self.place(data, "r2")["word_ids"], [w["word_id"] for w in words])
-                # ссылка конспекта на прежний ID ведёт к первому из новых слов
-                self.assertEqual(conspect._id_text(data, ["w3"]), ("первый", "Глеб"))
+                # ссылка конспекта на прежний ID покрывает все слова, что из него получились (part_of)
+                self.assertEqual(conspect._id_text(data, ["w3"]), ("первый второй третий", "Глеб"))
+                self.assertEqual([w.get("part_of") for w in words], [None, "w3", "w3"])
 
     def test_words_inserted_inside_place(self):
         for backend in BACKENDS:
@@ -222,6 +223,123 @@ class CardAnswers(Case):
                 self.assertEqual(self.place(data, "r1")["word_ids"], ["w1", "w2"])
 
 
+def with_sub_place():
+    """Те же данные и место r3 — только на слове «слово» (w2), внутри r1."""
+    data = split_data()
+    data["review"].append({"id": "r3", "status": "open", "text": "слово", "t": 0.8, "t1": 0.8, "t2": 1.4,
+                           "speaker": "Глеб", "word_ids": ["w2"]})
+    return data
+
+
+class PlaceRows(Case):
+    """Строки мест после перелинковки не пересекаются заново и отменяются вместе с ответом (#242)."""
+
+    def test_answer_over_place_with_sub_place(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), mock.patch.object(base, "result_data", with_sub_place), \
+                    base.answer_files(backend) as (jp, md, version):
+                start = transcript.load(jp)
+                data = self.applied(jp, md, version, "r1", 0)
+                ids = self.ids_of(data, ["один", "два", "три"])
+                self.assertEqual(self.place(data, "r1")["word_ids"], ids)
+                # новые слова получены из слов двух мест — частично покрытому r3 не достаются
+                self.assertNotIn("word_ids", self.place(data, "r3"))
+                self.save(jp, version, aid="r1", kind="revert")
+                rep = self.apply(jp, md)
+                self.assertEqual(self.outcomes(rep)["r1"], "reverted", rep.get("undo_conflicts"))
+                now = transcript.load(jp)
+                self.assertEqual(now["segments"], start["segments"])
+                self.assertEqual(now["review"], start["review"])
+
+    def test_one_word_of_sub_place_split_stays_in_both(self):
+        """1 → 2 внутри r3: слова получены целиком из его слова — их получают и r3, и охватывающее r1."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), mock.patch.object(base, "result_data", with_sub_place), \
+                    base.answer_files(backend) as (jp, md, version):
+                data, rep = transcript.apply_review(jp, md, [{"id": "r1", "text": "тест сло во"}], by="human")
+                self.assertEqual(rep["applied"], 1, rep)
+                ids = self.ids_of(data, ["тест", "сло", "во"])
+                self.assertEqual(self.place(data, "r1")["word_ids"], ids)
+                self.assertEqual(self.place(data, "r3")["word_ids"], ids[1:])
+
+    def test_span_over_two_places_mixing_their_words(self):
+        """Правка отрезка заменяет слово r1 и слово r2 тремя словами: ни одно не достаётся ни r1, ни r2."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), base.answer_files(backend) as (jp, md, version):
+                transcript.edit_span(jp, md, 0.8, 2.0, "икс игрек зет", by="claude")
+                data = transcript.load(jp)
+                self.assertEqual(self.words(jp), ["тест", "икс", "игрек", "зет", "раз"])
+                self.assertEqual(self.place(data, "r1")["word_ids"], ["w1"])
+                self.assertNotIn("word_ids", self.place(data, "r2"))
+
+    def test_gap_place_rows_are_not_relinked(self):
+        data = split_data()
+        data["review"].append({"id": "g1", "reasons": ["missed"], "status": "open", "t": 0.6, "t1": 0.6, "t2": 0.8,
+                               "word_ids": ["w2"]})
+        old = [w for w in self.flat(data) if w["word_id"] in ("w1", "w2")]
+        origin = []
+        transcript._diff_words(old, "один два три", "r1", origin=origin)
+        transcript._relink_places(data, old, origin)
+        self.assertEqual(self.place(data, "g1")["word_ids"], ["w2"], "строку пропуска трогать нельзя")
+        self.assertEqual(len(self.place(data, "r1")["word_ids"]), 3)
+
+
+class ConspectLinks(Case):
+    """Ссылки конспекта по ID на слово, которое ответ заменил несколькими словами (1 → m), не усекаются."""
+
+    def test_links_over_split_word(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), base.answer_files(backend) as (jp, md, version):
+                before = transcript.load(jp)
+                self.assertEqual(conspect._id_text(before, ["w1", "w2"]), ("тест слово", "Глеб"))
+                transcript.edit_span(jp, md, 0.8, 1.4, "сло во", by="claude")
+                data = transcript.load(jp)
+                for ids, text in ((["w2"], "сло во"), (["w1", "w2"], "тест сло во"), (["w2", "w3"], "сло во ещё"),
+                                  (["w1", "w2", "w3"], "тест сло во ещё")):
+                    self.assertEqual(conspect._id_text(data, ids), (text, "Глеб"), ids)
+
+    def test_link_over_two_replaced_words_as_before(self):
+        """2 → 3: у двух заменённых слов нет наследника ID — ссылка не находится, как и на main (склеенное слово
+        получало новый ID)."""
+        with base.answer_files("sqlite") as (jp, md, version):
+            data = self.applied(jp, md, version, "r1", 0)
+            self.assertEqual(conspect._id_text(data, ["w1", "w2"]), (None, None))
+
+
+class Recognized(Case):
+    """«Как распознано» на карточке противоречия — из заменённых слов, не из новых."""
+
+    def test_recognized_text_after_split_and_insert(self):
+        for option in (0, 2):
+            with self.subTest(option=option), base.answer_files("sqlite") as (jp, md, version):
+                data = self.applied(jp, md, version, "r1", option)
+                words = review_pack._place_words(data, self.place(data, "r1"))
+                self.assertEqual(review_pack.recognized_text(words), "тест слово")
+
+
+class Inserts(Case):
+    def test_inserted_words_are_marked_and_not_voice_material(self):
+        """Вставка внутри места — `inserted`: в подтверждённой расшифровке её оценённое время в «авто» не идёт."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), base.answer_files(backend) as (jp, md, version):
+                data = self.applied(jp, md, version, "r1", 2)
+                inserted = [w for w in self.flat(data) if w["w"] in ("новое", "лишнее")]
+                self.assertTrue(all(w.get("inserted") for w in inserted), inserted)
+                self.assertFalse(any(w.get("inserted") for w in self.flat(data) if w["w"] not in ("новое", "лишнее")))
+                for s, e in [(s, e) for _n, s, e, _h in voices._spans(data, True)]:
+                    self.assertFalse([w for w in inserted if s <= w["s"] < e], (s, e))
+
+    def test_inserts_at_edges_and_between_adjacent_words_are_zero_length(self):
+        old = [{"w": "тест", "s": 0.2, "e": 0.6, "word_id": "w1"}, {"w": "слово", "s": 0.6, "e": 1.4, "word_id": "w2"}]
+        for text, inserted in (("в начале тест слово", ["в", "начале"]), ("тест слово в конце", ["в", "конце"]),
+                               ("тест между вплотную слово", ["между", "вплотную"])):
+            with self.subTest(text=text):
+                out, _, _ = transcript._diff_words([dict(w) for w in old], text, "r1")
+                self.assertEqual([w["w"] for w in out], text.split())
+                new = [w for w in out if w["w"] in inserted]
+                self.assertTrue(all(w["inserted"] and w["s"] == w["e"] for w in new), new)
+
+
 class WordEdits(Case):
     """Правка отрезка и свой ответ человека идут через apply_word_edits — то же правило."""
 
@@ -293,6 +411,14 @@ class DiffWords(unittest.TestCase):
         old = [{"w": "тест", "s": 0.12345, "e": 0.9}]
         out, _, _ = transcript._diff_words(old, "раз два", "r1")
         self.assertEqual([(w["s"], w["e"]) for w in out], [(0.12345, 0.512), (0.512, 0.9)])
+
+    def test_very_short_word_split_keeps_order(self):
+        old = [{"w": "а", "s": 1.0006, "e": 1.0009, "word_id": "w1"}]
+        for text in ("б в", "б в г д"):
+            out, _, _ = transcript._diff_words([dict(w) for w in old], text, "r1")
+            times = [t for w in out for t in (w["s"], w["e"])]
+            self.assertEqual(times, sorted(times), out)
+            self.assertEqual((out[0]["s"], out[-1]["e"]), (1.0006, 1.0009))
 
     def test_one_word_to_two_inherits_id_and_provenance(self):
         old = [{"w": "ещё", "s": 1.6, "e": 2.0, "word_id": "w3", "provenance": {"text": {"by": "model"}}}]

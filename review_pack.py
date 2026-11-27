@@ -362,6 +362,12 @@ def _seen_fp(data, it):
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def recognized_text(words):
+    """Как распознано: `model` слова или его текст, как прежде. Правленое слово с пустым `model` распознавание не
+    давало (вставка, слова 2..m замены, Ф234-11б): оно в «как распознано» не входит."""
+    return " ".join(w.get("model") or w["w"] for w in words if not (w.get("edited") and w.get("model") == ""))
+
+
 def _contradiction_options(T, data, it):
     """Варианты карточки противоречия (PR 13б): «Оставить подтверждённое», «Принять новое» на каждое
     предложение (последние), «Как распознано» — только если отличается от обоих. Не больше четырёх."""
@@ -369,7 +375,7 @@ def _contradiction_options(T, data, it):
     confirmed = record.get("confirmed") or {}
     proposals = [p for p in record["proposals"] if (p.get("text") or "").strip()]
     words = _place_words(data, it)
-    raw = " ".join(w.get("model") or w["w"] for w in words)
+    raw = recognized_text(words)
     raw_needed = bool(raw) and raw != confirmed.get("text") and raw not in [p["text"] for p in proposals]
     opts = [{"label": f"Оставить подтверждённое: «{confirmed.get('text', '')}» ({_who(T, confirmed)})",
              "decision": {"contradiction": "keep"}}]

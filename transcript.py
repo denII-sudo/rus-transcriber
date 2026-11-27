@@ -1667,15 +1667,25 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
 
     def spread(texts, src, s, e):
         """Слова texts поровну внутри [s; e]; первое — с источником src (ID и прежнее слово модели). Отметки
-        одного заменённого слова (в том числе подтверждённый говорящий) получают все новые слова. Без времени
+        одного заменённого слова (в том числе подтверждённый говорящий) получают все новые слова, а `part_of` —
+        его ID: ссылка конспекта на это слово покрывает все слова, что из него получились. Без src — вставка:
+        `inserted`, как у вставок apply_word_edits (время — оценка, в материал голосов не идёт). Без времени
         (старые перенесённые слова) или с концом раньше начала — у всех слов прежние s и e, как у склеенного слова."""
         timed = _finite_number(s) and _finite_number(e) and e >= s
         step = (e - s) / len(texts) if timed else 0
-        bounds = [s] + [round(s + step * q, 3) if timed else s for q in range(1, len(texts))] + [e]
+        bounds = [s]
+        for q in range(1, len(texts)):                  # округление не выводит границу за соседние
+            bounds.append(min(max(round(s + step * q, 3), bounds[-1]), e) if timed else s)
+        bounds.append(e)
         words = [mk(x, src if q == 0 else [], bounds[q], bounds[q + 1] if timed else e) for q, x in enumerate(texts)]
         for w in words[1:]:
             if len(src) == 1 and src[0].get("provenance"):
                 w["provenance"] = copy.deepcopy(src[0]["provenance"])
+            if len(src) == 1 and src[0].get("word_id"):
+                w["part_of"] = src[0]["word_id"]
+        if not src:
+            for w in words:
+                w["inserted"] = True
         return words
 
     def put(words, src):
@@ -1715,21 +1725,23 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
 def _relink_places(data, old, origin):
     """Ф234-11б: строки мест, ссылавшиеся на слова old, ссылаются на слова, которые из них получились
     (origin из _diff_words). Новые слова сразу получают ID — иначе строке не на что сослаться. Место на всех словах
-    old получает все новые слова, в том числе вставленные; место на части — слова из своих и вставленные между
-    ними. Ссылок не осталось (слова удалены) — ключ убирается, как при записи в базу."""
+    old получает все новые слова, в том числе вставленные. Место на части слов old — только слова, целиком
+    полученные из его слов, и вставленные между ними: слово из слов двух мест не достаётся ни одному, новых
+    пересечений мест нет. Ссылок не осталось — ключ убирается, как при записи в базу. Строки пропусков не
+    трогаются: их word_ids место не задают (place_words), как и прежде."""
     for word, _src in origin:
         if not isinstance(word.get("word_id"), str) or not word["word_id"]:
             word["word_id"] = uuid.uuid4().hex
     old_ids = {w["word_id"] for w in old if w.get("word_id")}
     for row in data.get("review") or []:
         refs = row.get("word_ids")
-        hit = old_ids & set(refs) if isinstance(refs, list) else None
+        hit = old_ids & set(refs) if isinstance(refs, list) and not is_gap_place(row) else None
         if not hit:
             continue
         if hit == old_ids:
             chosen = [w["word_id"] for w, _src in origin]
         else:
-            own = [k for k, (_w, src) in enumerate(origin) if hit & set(src)]
+            own = [k for k, (_w, src) in enumerate(origin) if src and set(src) <= hit]
             chosen = [w["word_id"] for k, (w, src) in enumerate(origin)
                       if k in own or (not src and own and own[0] < k < own[-1])]
         relinked, placed = [], False

@@ -224,7 +224,15 @@ def _clean(s):
 
 
 def _id_text(data, ids):
-    """Разрешить точные ID, не прибегая к временным окнам или порядку хранения."""
+    """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова, которое ответ заменил
+    несколькими словами (Ф234-11б), покрывает и их: у слов 2..m — `part_of` с этим ID."""
+    parts = {}
+    for seg in data.get("segments") or []:
+        for word in seg.get("words") or []:
+            if word.get("part_of") and word.get("word_id"):
+                parts.setdefault(word["part_of"], []).append(word["word_id"])
+    if ids and parts:
+        ids = list(dict.fromkeys(x for wid in ids for x in [wid] + parts.get(wid, [])))
     by_id = {}
     order = []
     for seg in data.get("segments") or []:
