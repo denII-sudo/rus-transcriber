@@ -318,5 +318,58 @@ class DoubtThresholdTests(unittest.TestCase):
         self.assertEqual([w for w in extra if w.get("flags")], [])
 
 
+def segments(start, n, dur, gap, label):
+    """n отрезков разметки по dur с паузами gap (меньше MERGE_GAP — build_turns склеит их в одну реплику)."""
+    return [(round(start + i * (dur + gap), 2), round(start + i * (dur + gap) + dur, 2), label) for i in range(n)]
+
+
+class ProfileSpeechBorderTests(unittest.TestCase):
+    """Перепроверка Opus №245/№246, Н-1: при профилях порог опоры 10 с — по чистой речи (сумма отрезков
+    разметки), а не по длине склеенных реплик, как было до №243. Тесты фиксируют текущее поведение."""
+
+    def test_eleven_seconds_of_turns_nine_of_speech_is_not_reference(self):
+        """Реплики кластера B — 11 с (9 отрезков по 1 с, паузы 0,25 с), речи 9 с: опорой не становится, его
+        слова идут по отпечатку к ближайшей опоре — здесь к единственной, Анне."""
+        raw = RAW_A + segments(21.0, 9, 1.0, 0.25, "SPEAKER_01")
+        self.assertIn([21.0, 32.0, "SPEAKER_01"], [list(t) for t in worker.build_turns(raw)])   # реплика 11 с
+        data = run_words(raw, {S1: "Анна"}, {"Анна": VA_PROFILE}, {S1: VA, S2: VB}, ["Анна"], 21.0)
+        self.assertEqual(spoken_by(data, 21.0, 32.0), {(S1, "Анна")})
+        self.assertEqual(data["speaker_labels"], [S1])
+
+    def test_ten_and_half_seconds_of_speech_is_reference(self):
+        """Речи 10,5 с (7 отрезков по 1,5 с): кластер B — опора, его слова под своей меткой."""
+        raw = RAW_A + segments(21.0, 7, 1.5, 0.25, "SPEAKER_01")
+        data = run_words(raw, {S1: "Анна"}, {"Анна": VA_PROFILE}, {S1: VA, S2: VB}, ["Анна"], 21.0)
+        self.assertEqual(spoken_by(data, 0.0, 20.5), {(S1, "Анна")})
+        self.assertEqual(spoken_by(data, 21.0, 33.0), {(S2, S2)})
+
+
+class HasProfilesTests(unittest.TestCase):
+    """Перепроверка Opus №245/№246, Н-2: что считается «профили есть» (порог 10 с вместо 3 с). Кластер
+    «Спикер 2» — 6 с речи; тесты фиксируют текущее поведение worker._has_profiles и _voice_references."""
+
+    TURNS = [turn(0.0, 10.0, S1), turn(10.5, 20.5, S1), turn(21.0, 24.0, S2), turn(24.5, 27.5, S2)]
+    SPEECH = {S1: 20.0, S2: 6.0}
+
+    def refs(self, pvecs, allowed):
+        audio = np.zeros(int(28.5 * W.SR), dtype=np.float32)
+        ctx = {"pvecs": pvecs, "cents": {S1: VA, S2: VB}}
+        refs, _ = worker._voice_references(audio, self.TURNS, FakeEmb(21.0), {}, ctx, allowed, speech=self.SPEECH)
+        return set(refs), worker._has_profiles(ctx, allowed)
+
+    def test_profile_key_without_vector_counts_as_profile(self):
+        """Ключ профиля участника с вектором None сейчас считается профилем: порог 10 с, 6 с речи — не опора;
+        сам None в опоры не попадает."""
+        self.assertEqual(self.refs({"Борис": None}, ["Борис"]), ({S1}, True))
+
+    def test_group_profile_of_non_participant_is_ignored(self):
+        """Профиль группы не у участника записи: ветка без профилей (порог 3 с), чужой профиль не опора."""
+        self.assertEqual(self.refs({"Вера": VC}, ["Анна", "Борис"]), ({S1, S2}, False))
+
+    def test_without_participant_list_any_group_profile_counts(self):
+        """Без списка участников любой профиль группы — «профили есть» и опора."""
+        self.assertEqual(self.refs({"Вера": VC}, []), ({S1, "Вера"}, True))
+
+
 if __name__ == "__main__":
     unittest.main()
