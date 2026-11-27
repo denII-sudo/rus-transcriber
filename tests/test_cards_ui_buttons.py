@@ -63,11 +63,6 @@ class Conditions(Base):
             stale(jp)
             self.assertTrue(all(v["cannot_apply"] for v in review_pack.card_conditions(jp).values()))
 
-    def test_file_storage_has_no_revision_check(self):
-        with files("legacy_files") as (jp, _md, _version):
-            stale(jp)
-            self.assertFalse(any(v["cannot_apply"] for v in review_pack.card_conditions(jp).values()))
-
 
 class SourceRefresh(Base):
     """В-2: дособирание обновляет карточку без версии стенограммы на открытом месте."""

@@ -376,15 +376,6 @@ class DoubtsSectionTests(Base):
             self.assertTrue(all("r3" not in x for x in gap_lines), gap_lines)
             self.assertTrue(any("r1" in x and "00:00:01" in x for x in gap_lines), gap_lines)
 
-    def test_legacy_doubts(self):
-        with files("legacy_files", result(state="empty_unknown")) as (jp, md, version):
-            self.save(jp, version, "r3", text="дальше пойдём")
-            core.apply_answers_files(jp, md)
-            section = md.read_text(encoding="utf-8").split("## Сомнительные места", 1)[1]
-            line = next(x for x in section.splitlines() if "00:00:02" in x and "пойдём" in x)
-            self.assertIn("«дальше пойдём»", line)
-            self.assertIn("открыто", line)
-
 
 class CardQuestionTests(Base):
     """Т9: вопрос карточки места asr_problem по-русски; название состояния (латиница) не выводится."""

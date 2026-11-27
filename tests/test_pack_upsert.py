@@ -34,7 +34,7 @@ import review_pack  # noqa: E402
 import settings  # noqa: E402
 import transcript  # noqa: E402
 
-BACKENDS = ("legacy_files", "sqlite")
+BACKENDS = ("sqlite",)      # Л-3.2: файловый режим из тестов убран; цикл по одному режиму оставлен ради малого диффа
 AS_IS = {"label": "Оставить как есть", "decision": {}}
 FIRST = ("вот", "дальше", "та")
 
@@ -66,7 +66,9 @@ def fake_clip(_src, t1, _t2, out):
 
 @contextlib.contextmanager
 def files(backend, data=None, qs=None):
-    """Пара файлов стенограммы в выбранном режиме хранения и собранный пакет: (jp, md, версия)."""
+    """Пара файлов стенограммы записи в базе (режим хранения только sqlite) и собранный пакет: (jp, md, версия)."""
+    if backend != "sqlite":
+        raise ValueError(f"режим {backend!r}: файловый режим из тестов убран (Л-3.2), нужен «sqlite»")
     with tempfile.TemporaryDirectory(dir=_TMP) as temp:
         root = Path(temp)
         db, audio = root / "state.sqlite3", root / "sample.wav"
@@ -79,19 +81,15 @@ def files(backend, data=None, qs=None):
         with mock.patch.object(settings.paths, "STATE_DB", db), \
                 mock.patch.object(review_pack, "cut_clip", side_effect=fake_clip):
             try:
-                if backend == "sqlite":
-                    store = recordings.initialize_store(db, display_name="Тест")
-                    root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
-                    rid = str(uuid.uuid4())
-                    recordings.commit_worker_result(
-                        store, data, audio, root_id, recordings.operation_context(store, "model"),
-                        recording_id=rid, operation_id=str(uuid.uuid4()),
-                        generated_at="2026-11-16T00:00:00Z", document_paths=targets)
-                    recordings.materialize_recording(store, rid)
-                    jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
-                else:
-                    jp, md = layout["root"] / layout["paths"]["json"], layout["root"] / layout["paths"]["md"]
-                    transcript.save(data, jp, md)
+                store = recordings.initialize_store(db, display_name="Тест")
+                root_id, targets = recordings.prepare_new_layout(store, layout["root"], layout["paths"])
+                rid = str(uuid.uuid4())
+                recordings.commit_worker_result(
+                    store, data, audio, root_id, recordings.operation_context(store, "model"),
+                    recording_id=rid, operation_id=str(uuid.uuid4()),
+                    generated_at="2026-11-16T00:00:00Z", document_paths=targets)
+                recordings.materialize_recording(store, rid)
+                jp, md = layout["root"] / targets["json"], layout["root"] / targets["md"]
                 qs = [question("r1", "вон"), question("r3", "тот")] if qs is None else qs
                 pack = review_pack.build(jp, copy.deepcopy(qs))
                 yield jp, md, pack["version"]
@@ -325,26 +323,26 @@ class ClipTests(Case):
                     review_pack.build(jp, [question("r1", "вон")])
 
     def test_new_revision_clip_does_not_overwrite_previous(self):
-        """Тест 7: клип новой редакции — отдельный файл; архивный manifest файлового режима читается."""
-        with files("legacy_files") as (jp, _md, _version):
+        """Тест 7: клип новой редакции — отдельный файл."""
+        with files("sqlite") as (jp, _md, _version):
             pd = review_pack.pack_dir(jp)
             first = self.item(jp, "r1")["clip"]
             review_pack.upsert_cards(jp, [question("r1", "вам")], why="тест")
             second = self.item(jp, "r1")["clip"]
-            self.assertEqual((first, second), ("clips/r1.mp3", "clips/r1.r2.mp3"))
+            # в базе клипы лежат в папке пакета clips/<id пакета>/: новая редакция — рядом, под своим именем
+            self.assertNotEqual(first, second)
+            self.assertEqual(Path(second).name, "r1.r2.mp3")
+            self.assertEqual(Path(first).parent, Path(second).parent)
             self.assertEqual(self.item(jp, "r1")["history"][0]["clip"], first)
             self.assertEqual((pd / second).read_text(encoding="utf-8"), "r1.r2.mp3@0.5")
-            # пересборка (новая version): архив прежнего manifest и его клипы на месте
-            old_version = review_pack.manifest(jp)["version"]
+            # пересборка (новая version): клипы прежней сборки на месте
             review_pack.build(jp, [question("r1", "вон", "Другая сборка"), question("r3", "тот")])
-            archived = review_pack._read(pd / f"manifest.{old_version}.json", None)
-            self.assertEqual(next(i for i in archived["items"] if i["id"] == "r1")["clip"], second)
             self.assertTrue((pd / second).exists())
             # та же редакция в новой сборке: имя занято архивом — прежний файл не затирается
             review_pack.upsert_cards(jp, [question("r1", "вам", "Снова")], why="тест")
             third = self.item(jp, "r1")["clip"]
             self.assertNotEqual(third, second)
-            self.assertTrue(third.startswith("clips/r1.r2."))
+            self.assertTrue(Path(third).name.startswith("r1.r2."))
             self.assertEqual((pd / second).read_text(encoding="utf-8"), "r1.r2.mp3@0.5")
 
     def test_sqlite_clip_goes_to_the_pack_clip_folder(self):
@@ -398,16 +396,8 @@ class OldPackTests(Case):
                 state = review_pack.answers_state(jp)
                 strip(state["manifest"])
                 review_pack._write_answers(jp, state)
-                path = review_pack.pack_dir(jp) / "manifest.json"
-                if backend == "legacy_files":
-                    man = review_pack._read(path, {})
-                    strip(man)
-                    review_pack._write(path, man)
-                    raw = path.read_bytes()
                 self.assertEqual(self.save(jp, version, "r1", option=1)["accepted"][0]["id"], "r1")
                 self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "saved")
-                if backend == "legacy_files":
-                    self.assertEqual(path.read_bytes(), raw, "чтение и ответ не должны переписывать manifest")
                 self.assertNotIn("rev", review_pack.answers_state(jp)["answers"]["r1"])
                 self.assertEqual(self.outcomes(core.apply_answers_files(jp, md))["r1"], "applied")
                 rep = review_pack.upsert_cards(jp, [question("r3", "тут")], why="тест")
@@ -418,7 +408,7 @@ class OldPackTests(Case):
 
 class EventTests(Case):
     def test_interaction_event_checks_revision(self):
-        with files("legacy_files") as (jp, _md, version):
+        with files("sqlite") as (jp, _md, version):
             review_pack.upsert_cards(jp, [question("r1", "вам")], why="тест")
             for rev in (1, None):
                 with self.subTest(rev=rev), self.assertRaisesRegex(ValueError, review_pack.REV_STALE):
