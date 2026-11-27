@@ -227,14 +227,18 @@ def _id_text(data, ids):
     """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
     ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
     (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
-    оставшиеся."""
-    parts, present = {}, set()
+    оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
+    находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний."""
+    parts, present, merged = {}, set(), set()
     for seg in data.get("segments") or []:
         for word in seg.get("words") or []:
+            merged.update(word.get("merged_from") or [])
             if word.get("word_id"):
                 present.add(word["word_id"])
                 if word.get("part_of"):
                     parts.setdefault(word["part_of"], []).append(word["word_id"])
+    if any(wid in merged for wid in ids or []):
+        return None, None
     if ids and parts:
         rank = {wid: i for i, wid in enumerate(w.get("word_id") for seg in data.get("segments") or []
                                                for w in seg.get("words") or [])}

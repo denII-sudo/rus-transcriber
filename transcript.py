@@ -1712,6 +1712,9 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
                 result["provenance"] = copy.deepcopy(heir["provenance"])
         if any(w.get("inserted") for w in src):     # время вставки — оценка и после повторной правки
             result["inserted"] = True
+        carried = sorted({x for w in src for x in w.get("merged_from") or []})
+        if carried:                                 # Н-7: пометка переживает повторную правку слова
+            result["merged_from"] = carried
         return result
 
     def spread(texts, src, s, e, part_of=None):
@@ -1731,6 +1734,14 @@ def _diff_words(old, new_text, item_id, refuse=None, origin=None):
         words = [mk(x, src if q == 0 else [], bounds[q], bounds[q + 1] if timed else e, heir if q == 0 else None)
                  for q, x in enumerate(texts)]
         whole = root(heir) if heir is not None else part_of
+        # Н-7: слова из слов разных корней помнят эти корни (`merged_from`), _relink_places помечает ими и оставшиеся
+        # слова корней — ссылка на такой корень не находится, а не укорачивается до оставшихся частей. Пометку
+        # заменённых слов получают все новые слова: повторная правка её не снимает.
+        merged = sorted(({root(w) for w in src if root(w)} if src and heir is None else set())
+                        | {x for w in src for x in w.get("merged_from") or []})
+        for w in words:
+            if merged:
+                w["merged_from"] = list(merged)
         for w in words[1 if src else 0:]:
             if heir is not None and heir.get("provenance"):
                 w["provenance"] = copy.deepcopy(heir["provenance"])
@@ -1783,10 +1794,19 @@ def _relink_places(data, old, origin):
     old получает все новые слова, в том числе вставленные. Место на части слов old — только слова, целиком
     полученные из его слов, и вставленные между ними: слово из слов двух мест не достаётся ни одному, новых
     пересечений мест нет. Ссылок не осталось — ключ убирается, как при записи в базу. Строки пропусков не
-    трогаются: их word_ids место не задают (place_words), как и прежде."""
+    трогаются: их word_ids место не задают (place_words), как и прежде. Корни из `merged_from` новых слов
+    помечаются и на оставшихся словах этих корней (Н-7)."""
     for word, _src in origin:
         if not isinstance(word.get("word_id"), str) or not word["word_id"]:
             word["word_id"] = uuid.uuid4().hex
+    # Н-7: корни, части которых ушли в слово вместе со словами другого корня, помечаются и на оставшихся своих
+    # словах — пометка переживает удаление слова, в которое ушла часть
+    broken = {x for word, _src in origin for x in word.get("merged_from") or []}
+    for seg in data.get("segments") or [] if broken else []:
+        for word in seg.get("words") or []:
+            key = word.get("part_of") or word.get("word_id")
+            if key in broken and key not in (word.get("merged_from") or []):
+                word["merged_from"] = sorted({*(word.get("merged_from") or []), key})
     old_ids = {w["word_id"] for w in old if w.get("word_id")}
     for row in data.get("review") or []:
         refs = row.get("word_ids")
