@@ -1388,7 +1388,8 @@ def _apply_answers_files_locked(jp, md, revision_conflicts=None):
             # К-В3: свой текст, заменяющий применённый ответ, проверяется тоже — до снятия прежнего
             if (aid in already_applied and aid not in rep["replace"]) or aid in (revision_conflicts or {}):
                 continue
-            if P.free_outside_card(jp, md, items.get(aid), places.get(aid) or {}, now, aid, answer):
+            if P.free_outside_card(jp, md, items.get(aid), places.get(aid) or {}, now, aid, answer,
+                                   replacing=aid in rep["replace"]):
                 revision_conflicts[aid] = P.FREE_OUTSIDE
     requested_ids = {d.get("id") for d in decisions if d.get("id")} | set(free)
     preflight = P.preflight_answers(jp, md, decisions, free)

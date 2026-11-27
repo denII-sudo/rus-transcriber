@@ -1639,11 +1639,14 @@ def _span_overlaps(spans, t1, t2):
                for a, b, gap in spans)
 
 
-def _diff_words(old, new_text, item_id, refuse=None):
+def _diff_words(old, new_text, item_id, refuse=None, origin=None):
     """Правка текста места по словам: меняются только отличающиеся слова, у остальных сохраняются время,
     уверенность и прежние правки (на время слов опираются ссылки конспекта). Слово с прежней правкой,
     которую нельзя перезаписать (refuse(слово) -> причина или None; по умолчанию — любая другая
     правка), не перезаписывается — оно возвращается в списке конфликтов.
+    Замена n слов на m (n ≠ m) и вставка дают m отдельных слов (Ф234-11б): время заменённого отрезка делится
+    поровну, вставка — в паузе за предыдущим словом. При n = 1 первое новое слово наследует ID заменённого.
+    origin — список: в него дописывается (новое слово, [ID слов, из которых оно получилось]) для каждого слова.
     -> (новые слова, [id правок, которые сохранены вместо этой], [причины])."""
     import difflib
     if refuse is None:
@@ -1662,29 +1665,85 @@ def _diff_words(old, new_text, item_id, refuse=None):
             result["provenance"] = copy.deepcopy(src[0]["provenance"])
         return result
 
+    def spread(texts, src, s, e):
+        """Слова texts поровну внутри [s; e]; первое — с источником src (ID и прежнее слово модели). Отметки
+        одного заменённого слова (в том числе подтверждённый говорящий) получают все новые слова. Без времени
+        (старые перенесённые слова) или с концом раньше начала — у всех слов прежние s и e, как у склеенного слова."""
+        timed = _finite_number(s) and _finite_number(e) and e >= s
+        step = (e - s) / len(texts) if timed else 0
+        bounds = [s] + [round(s + step * q, 3) if timed else s for q in range(1, len(texts))] + [e]
+        words = [mk(x, src if q == 0 else [], bounds[q], bounds[q + 1] if timed else e) for q, x in enumerate(texts)]
+        for w in words[1:]:
+            if len(src) == 1 and src[0].get("provenance"):
+                w["provenance"] = copy.deepcopy(src[0]["provenance"])
+        return words
+
+    def put(words, src):
+        out.extend(words)
+        if origin is not None:
+            origin.extend((w, [x["word_id"] for x in src if x.get("word_id")]) for w in words)
+
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         src = old[i1:i2]
         if op == "equal":
             for w, x in zip(src, new[j1:j2]):          # пунктуация и регистр — из правки
-                out.append(w if w["w"] == x else {**w, "w": x, "edited": w.get("edited", item_id)})
+                put([w if w["w"] == x else {**w, "w": x, "edited": w.get("edited", item_id)}], [w])
             continue
         refused = [(w["edited"], why) for w in src for why in [refuse(w)] if why]
         if refused:
             conflicts += [edit for edit, _ in refused]
             reasons += [why for _, why in refused if why not in reasons]
-            out.extend(src)
+            for w in src:
+                put([w], [w])
             continue
         if op == "delete":
             continue
         if op == "insert":
             t = out[-1]["e"] if out else (old[0]["s"] if old else 0.0)
-            out.append(mk(" ".join(new[j1:j2]), [], t, t))
+            following = old[i1]["s"] if i1 < len(old) else t
+            end = following if _finite_number(t) and _finite_number(following) and following > t else t
+            put(spread(new[j1:j2], [], t, end), [])
             continue
         if i2 - i1 == j2 - j1:                          # замена слово в слово
-            out.extend(mk(x, [w], w["s"], w["e"]) for w, x in zip(src, new[j1:j2]))
+            for w, x in zip(src, new[j1:j2]):
+                put([mk(x, [w], w["s"], w["e"])], [w])
         else:
-            out.append(mk(" ".join(new[j1:j2]), src, src[0]["s"], src[-1]["e"]))
+            put(spread(new[j1:j2], src, src[0]["s"], src[-1]["e"]), src)
     return out, sorted(set(conflicts)), reasons
+
+
+def _relink_places(data, old, origin):
+    """Ф234-11б: строки мест, ссылавшиеся на слова old, ссылаются на слова, которые из них получились
+    (origin из _diff_words). Новые слова сразу получают ID — иначе строке не на что сослаться. Место на всех словах
+    old получает все новые слова, в том числе вставленные; место на части — слова из своих и вставленные между
+    ними. Ссылок не осталось (слова удалены) — ключ убирается, как при записи в базу."""
+    for word, _src in origin:
+        if not isinstance(word.get("word_id"), str) or not word["word_id"]:
+            word["word_id"] = uuid.uuid4().hex
+    old_ids = {w["word_id"] for w in old if w.get("word_id")}
+    for row in data.get("review") or []:
+        refs = row.get("word_ids")
+        hit = old_ids & set(refs) if isinstance(refs, list) else None
+        if not hit:
+            continue
+        if hit == old_ids:
+            chosen = [w["word_id"] for w, _src in origin]
+        else:
+            own = [k for k, (_w, src) in enumerate(origin) if hit & set(src)]
+            chosen = [w["word_id"] for k, (w, src) in enumerate(origin)
+                      if k in own or (not src and own and own[0] < k < own[-1])]
+        relinked, placed = [], False
+        for ref in refs:
+            if ref not in hit:
+                relinked.append(ref)
+            elif not placed:
+                relinked += chosen
+                placed = True
+        relinked = list(dict.fromkeys(relinked))
+        if relinked:
+            row["word_ids"] = relinked
+        else:
+            row.pop("word_ids", None)
 
 
 def _common_word(w):
@@ -1914,6 +1973,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                          for wid in list(e.get("word_ids") or []) + [e.get("word_id")] if wid}
                 listen[card] = ({f["w"]["word_id"]: f["w"]["w"] for f in flat if f["w"].get("word_id") in ids},
                                 bool(aimed & ids))
+    relinks = []                        # (слова места до правки, что из них получилось) — для строк мест
     for card, eds in groups.items():
         why = check(eds)
         if why:
@@ -1945,7 +2005,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
                     after_words += toks
                     continue
                 old = [flat[k]["w"] for k in ks]
-                new_ws, _, _ = _diff_words(old, e["text"], card, refuse(e))
+                origin = []
+                new_ws, _, _ = _diff_words(old, e["text"], card, refuse(e), origin)
+                relinks.append((old, origin))
                 old_text = {w.get("word_id"): w["w"] for w in old if w.get("word_id")}
                 speaker_changed = bool(e.get("speaker") and any(flat[k]["spk"] != e["speaker"] for k in ks))
                 changed_new, kept = 0, set()
@@ -2149,6 +2211,9 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
             if by == "human" and not via:
                 if settle_contradiction(it, "own", by, note=human_notes.get(card)) and human_notes.get(card):
                     rep.setdefault("notes_written", []).append(card)
+    # строки мест — на новые слова; после touched(): тот узнаёт вставленные карточкой слова по отсутствию ID
+    for old_ws, origin in relinks:
+        _relink_places(data, old_ws, origin)
     for d in rep["proposed_delete"]:
         it = items.get(d["card"])
         if it:
@@ -2321,8 +2386,9 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         new_text = d.get("text")
         if new_text and new_text != before["text"]:
             model = [w.get("raw", w["w"]) for w in ws[w1:w2]]
+            origin = []
             new_ws, conflicts, why = _diff_words(
-                ws[w1:w2], new_text, it["id"], lambda w: overwrite_refusal(w, data, by, it["id"]))
+                ws[w1:w2], new_text, it["id"], lambda w: overwrite_refusal(w, data, by, it["id"]), origin)
             if conflicts:
                 report.setdefault("conflicts", []).append({"id": it["id"], "kept_edits": conflicts,
                                                            "why": "; ".join(why)})
@@ -2331,6 +2397,7 @@ def apply_review(json_path, md_path, decisions, by="claude"):
             for w in new_ws:
                 if not w.get("word_id") or original_text.get(w["word_id"]) != w["w"]:
                     _mark_provenance(w, "text", by, it["id"], CONTRADICTION if d.get(CONTRADICTION) else None)
+            _relink_places(data, ws[w1:w2], origin)
             ws[w1:w2] = new_ws
             w2 = w1 + len(new_ws)
             # одиночная замена слова на имя собственное — подсказка для словаря

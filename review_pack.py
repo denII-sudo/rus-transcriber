@@ -898,9 +898,11 @@ def item_sources(store, recording_id, man, snapshot=None):
     return out
 
 
-def free_outside_card(json_path, md, item, place, now, aid, answer):
+def free_outside_card(json_path, md, item, place, now, aid, answer, replacing=False):
     """Свободный ответ меняет слова за пределами слов карточки (проверка «Применить» при хранении в базе).
-    Слова карточки — word_ids, у пропуска — слова паузы в нынешней стенограмме now. Нет слов — не проверяется."""
+    Слова карточки — word_ids, у пропуска — слова паузы в нынешней стенограмме now. Нет слов — не проверяется.
+    replacing — ответ заменяет применённый (К-В3) и проверяется до его снятия: допустимы и слова, на которые
+    место ссылается сейчас, — слова прежнего ответа этой карточки (Ф234-11б)."""
     import transcript
     if transcript.is_gap_place(place or {}):
         # пропуск: слова карточки — слова паузы; word_ids старого пакета (ID соседа) не читаются (PR 6а)
@@ -908,6 +910,8 @@ def free_outside_card(json_path, md, item, place, now, aid, answer):
         ids = found[0] if found else None
     else:
         ids = (item or {}).get("word_ids")
+        if ids and replacing and isinstance((place or {}).get("word_ids"), list):
+            ids = list(ids) + place["word_ids"]
     if not ids:
         return False
     preview = apply_free(json_path, md, {aid: answer}, dry_run=True)
