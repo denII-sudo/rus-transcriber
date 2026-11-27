@@ -175,7 +175,7 @@ VA_NEAR = np.array([0.995, 0.0998, 0.0]) / np.linalg.norm([0.995, 0.0998, 0.0]) 
 
 
 class EchoShareTests(unittest.TestCase):
-    """Т-1, Н-3 перепроверки №246: наложения pyannote больше 30 % речи записи (сумма отрезков разметки без
+    """Т-1, Н-3 перепроверки №246: наложения pyannote больше 20 % речи записи (сумма отрезков разметки без
     пауз) — скорее эхо или гул: правило «отрыв не измерен — overlap» не действует, вместо мест — предупреждение;
     пометка при измеренных близких голосах — прежняя."""
 
@@ -190,11 +190,18 @@ class EchoShareTests(unittest.TestCase):
         self.assertIn("одновременную речь на 75 % речи — похоже на эхо или гул", md)
         self.assertIn("Если говорили одновременно — прослушайте.", md)
 
-    def test_share_at_threshold_keeps_places(self):
-        """Ровно 30 % (6 с из 20 с) — ещё не эхо: места наложений ставятся, предупреждения нет."""
-        data = run_words(RAW_ONE, RAW_ONE + [(2.0, 5.0, "SPEAKER_01"), (12.0, 15.0, "SPEAKER_01")], 99.0)
-        self.assertEqual(len([it for it in data["review"] if "overlap" in it.get("reasons", [])]), 2)
-        self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
+    def test_share_around_threshold(self):
+        """19 % и ровно 20 % речи — ещё не эхо: места наложений ставятся, предупреждения нет; 21 % — мест нет,
+        есть предупреждение."""
+        for half, places in ((1.9, 2), (2.0, 2), (2.1, 0)):           # два наложения по half с из 20 с речи
+            with self.subTest(share=2 * half / 20):
+                shadow = [(2.0, 2.0 + half, "SPEAKER_01"), (12.0, 12.0 + half, "SPEAKER_01")]
+                data = run_words(RAW_ONE, RAW_ONE + shadow, 99.0)
+                self.assertEqual(len([it for it in data["review"] if "overlap" in it.get("reasons", [])]), places)
+                if places:
+                    self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
+                else:
+                    self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.21, "sec": 4.2})
 
     def test_measured_close_voices_still_flagged_with_profiles(self):
         """Профили двух участников с близкими голосами (две опоры, отрыв измерен и мал): при той же доле
