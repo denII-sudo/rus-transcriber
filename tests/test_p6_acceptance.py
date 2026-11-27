@@ -291,9 +291,7 @@ class P6InterfaceParityTests(unittest.TestCase):
                         rt.run(args)
                     from_cli = json.loads(cli_output.getvalue())
 
-                    import migrate
-                    with mock.patch.object(migrate, "run"):
-                        import server as mcp_server
+                    import server as mcp_server
                     from_mcp = json.loads(mcp_server.workflow_list())
 
                     server, url, _ = workflow_page.make_server(0)

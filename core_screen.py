@@ -134,7 +134,7 @@ def recording_list():
         reason = "Базы записей ещё нет: показывать нечего."
         if backend != "sqlite":
             reason += (" Программа сейчас хранит записи в файлах вне базы: такие записи здесь не видны. "
-                       "Как перенести их в базу — docs/legacy-migration.md.")
+                       "В базу они не переносятся; их файлы можно прочитать: rt.py legacy-read.")
         return {"available": False, "items": [], "total": 0, "truncated": False, "reason": reason,
                 "backend": backend}
     store = recordings.open_store(readonly=True)    # только чтение (query_only)

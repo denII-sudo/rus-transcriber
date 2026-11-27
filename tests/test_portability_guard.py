@@ -34,7 +34,6 @@ ALLOWED = {
     "core.py": "kernel32, taskkill, creationflags при запуске задач",
     "documents.py": "msvcrt.locking",
     "jobslots.py": "msvcrt.locking",
-    "migrate.py": "msvcrt.locking",
     "llm_provider.py": "iphlpapi/kernel32, taskkill, creationflags",
     "review_pack.py": "creationflags (с условием os.name)",
     "runinfo.py": "winreg, kernel32, PowerShell для сведений о железе",

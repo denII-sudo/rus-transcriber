@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import core
-import migrate
 import rt
 
 
@@ -52,8 +51,7 @@ class StatusTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 rt.run(rt.build().parse_args(["status", "synthetic"]))
             self.assertEqual(json.loads(out.getvalue())["quality"], status["quality"])
-            with patch.object(migrate, "run", return_value={"status": "test"}):
-                import server
+            import server
             result = asyncio.run(server.transcription_status("synthetic", 0))
             self.assertEqual(json.loads(result)["quality"], status["quality"])
 

@@ -28,7 +28,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402  (дочерние процессы унаследуют HF_HOME и др.)
 import settings  # noqa: E402
-import migrate  # noqa: E402
 import data_io  # noqa: E402
 
 JOBS = paths.JOBS
@@ -344,7 +343,7 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
         args += ["--names", ",".join(names_list)]
     # новые записи хранятся только в базе (Л-4а): проверка — после аргументов и до запуска тяжёлой задачи
     hint = ("Выберите хранение в базе: `rt.py db-init` (создаст базу, если её нет, и выберет её); "
-            "перенос старых записей — docs/legacy-migration.md.")
+            "старые записи в базу не переносятся, их файлы можно прочитать: rt.py legacy-read.")
     try:
         backend = settings.recording_backend()
     except ValueError as ex:
@@ -1837,8 +1836,6 @@ def settings_info():
     result = {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
               "overrides": settings.load_overrides(), "effective": settings.load_config(),
               "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
-              # старая раскладка данных переносится только явной командой migrate_data
-              "legacy_migration_pending": bool(migrate.pending()),
               # объём гипотез моделей (те же числа, что у очистки без отбора): записи с гипотезами, прогоны, байты
               "hypotheses": _hypotheses_summary()}
     if paths.STATE_DB.is_file():
@@ -1857,21 +1854,6 @@ def settings_info():
 
 
 # ---------- данные: выполнение (решение человека принимает слой управления) ----------
-def do_migrate(dry_run=True):
-    out = {"data_dir": str(paths.DATA_DIR), "old_data_dirs": [str(p) for p in paths.old_default_dirs()],
-           "env": {k: os.environ.get(k) for k in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "RUS_TRANSCRIBER_DATA")},
-           "home": str(Path.home())}
-    try:
-        out["result"] = migrate.run(dry=dry_run)
-    except Exception as ex:
-        out["error"] = f"{type(ex).__name__}: {ex}"
-    try:
-        out["log_tail"] = migrate.LOG.read_text(encoding="utf-8").splitlines()[-12:]
-    except OSError:
-        out["log_tail"] = []
-    return out
-
-
 def _data(fn, *a):
     try:
         return fn(*a)
@@ -1969,13 +1951,6 @@ def describe_cleanup_hypotheses(unit_id="", older_than_days=None, recording_id="
         lines.append(f"Прежние файлы гипотез: {r['files']}, звуков {r['units']}, {r['bytes'] // 1024} КБ.")
     lines.append("Стенограммы, конспекты, аудио и статусы задач не затрагиваются. Удалённое не восстановить.")
     return lines
-
-
-def describe_migrate():
-    r = do_migrate(True)
-    res = r.get("result")
-    return ["Перенос данных в папку данных из прежних мест.", f"Папка данных: {r['data_dir']}",
-            f"План: {json.dumps(res, ensure_ascii=False)[:300] if res is not None else r.get('error', '—')}"]
 
 
 # ---------- голоса: перенесены в core_voices.py, имена прежние ----------

@@ -44,8 +44,8 @@ def _data_dir():
 
 
 # Задана ли папка данных явно — запоминается ОДИН раз при загрузке модуля. Позже переменную могут снять или
-# подменить (тесты, дочерний процесс), но решение «это не стандартное место» уже принято: иначе настоящая папка
-# данных выглядела бы «прежним местом по умолчанию» и переносилась бы в другую (случай 09.11.2026).
+# подменить (тесты, дочерний процесс), но решение «это не стандартное место» уже принято (случай 09.11.2026:
+# прежний перенос старой раскладки принял настоящую папку данных за «прежнее место» и перенёс её).
 EXPLICIT = bool(os.environ.get("RUS_TRANSCRIBER_DATA", "").strip())
 DATA_DIR = _data_dir()
 GROUPS = DATA_DIR / "groups"
@@ -60,30 +60,6 @@ for _d in (GROUPS, JOBS, BENCH):
         _d.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-
-# прежняя раскладка внутри папки программы — только источник миграции (migrate.py)
-LEGACY_PROFILES = HERE / "profiles"
-LEGACY_JOBS = HERE / "jobs"
-LEGACY_CONFIG = HERE / "config.json"
-
-
-def old_default_dirs():
-    """Прежнее место по умолчанию (%LOCALAPPDATA%\\rus-transcriber-data, в том числе внутри пакета Store-версии
-    Claude) — только если папка данных не задана явно; источник переноса в DATA_DIR."""
-    if EXPLICIT:                 # папка данных задана явно — «прежнего места по умолчанию» нет
-        return []
-    out = []
-    for p in (Path(os.environ.get("LOCALAPPDATA") or "") / "rus-transcriber-data",
-              Path.home() / "AppData" / "Local" / "rus-transcriber-data",
-              Path(os.environ.get("APPDATA") or "") / "rus-transcriber-data",
-              Path.home() / "rus-transcriber-data"):
-        if str(p) != "rus-transcriber-data":
-            try:
-                if p.is_dir() and p.resolve() != DATA_DIR and p.resolve() not in out:
-                    out.append(p.resolve())
-            except OSError:
-                pass
-    return out
 
 
 def safe_group(group):
