@@ -267,6 +267,34 @@ def _item_line(it, third_name="Whisper", second_name="CTC", data=None, status=Fa
     return s
 
 
+def overlap_skipped_info(info):
+    """Поле quality.overlap_unmeasured_skipped -> {share, sec} или None, если поле испорчено: доля — конечное
+    число от 0 до 1, секунды — конечное неотрицательное число (bool не число)."""
+    if not isinstance(info, dict):
+        return None
+    share, sec = info.get("share"), info.get("sec")
+    for x in (share, sec):
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+            return None
+    if share > 1:
+        return None
+    return {"share": share, "sec": sec}
+
+
+def overlap_skipped_note(info):
+    """Предупреждение Т-1, Н-3: наложения pyannote заняли большую долю речи, места наложений не поставлены.
+    -> строка или None, если поле испорчено. Доля округляется вверх до десятых процента: 30,04 % — «30,1 %», а не
+    «30 %», которое читалось бы как граничный случай."""
+    info = overlap_skipped_info(info)
+    if info is None:
+        return None
+    pct = math.ceil(info["share"] * 1000 - 1e-6) / 10
+    share = f"{pct:g}".replace(".", ",")
+    return (f"Внимание: pyannote нашёл одновременную речь на {share} % речи — похоже на эхо или гул; места "
+            "наложений там, где голос слова не сверялся со вторым голосом, не поставлены. Если говорили "
+            "одновременно — прослушайте.")
+
+
 def render_md(data, text_only=False):
     """Стенограмма в markdown. Слова нерешённых мест — в ⟦…⟧. text_only — только шапка и реплики."""
     lines = [f"# Расшифровка: {Path(data['file']).name}", "",
@@ -283,6 +311,9 @@ def render_md(data, text_only=False):
         lines.append(f"_Голосование трёх моделей пропущено на отрезках с неполным результатом ASR: "
                      f"{p.get('spans')} (около {str(p.get('seconds')).replace('.', ',')} с); "
                      "там сверены только две модели._\n")
+    note = overlap_skipped_note(q0.get("overlap_unmeasured_skipped"))
+    if note:
+        lines.append("_" + note + "_\n")
     for key in ("asr2_skipped", "asr3_skipped"):
         skipped = q0.get(key)
         note = SKIPPED_RU.get((key, skipped.get("reason"))) if isinstance(skipped, dict) else None
