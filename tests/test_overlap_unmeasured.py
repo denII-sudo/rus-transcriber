@@ -216,6 +216,19 @@ class EchoShareTests(unittest.TestCase):
         self.assertTrue([it for it in data["review"] if "overlap" in it.get("reasons", [])])
         self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
 
+    def test_warning_share_rounds_up_and_bad_field_is_ignored(self):
+        """Доля в предупреждении округляется вверх до десятых: 20,04 % — «20,1 %»; испорченное поле
+        не роняет render_md и предупреждения не даёт."""
+        self.assertIn("на 20,1 % речи", transcript.overlap_skipped_note({"share": 0.2004, "sec": 4.0}))
+        self.assertIn("на 75 % речи", transcript.overlap_skipped_note({"share": 0.75, "sec": 15.0}))
+        base = {"file": "synthetic.wav", "duration": "00:00:02", "speakers": [], "segments": []}
+        for bad in ("yes", {"share": float("nan"), "sec": 1.0}, {"share": float("inf"), "sec": 1.0},
+                    {"share": 1.5, "sec": 1.0}, {"share": "0.5", "sec": 1.0}, {"share": True, "sec": 1.0}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(transcript.overlap_skipped_note(bad))
+                md = transcript.render_md(dict(base, quality={"overlap_unmeasured_skipped": bad}))
+                self.assertNotIn("похоже на эхо или гул", md)
+
     def test_doubt_flags_switch_touches_only_unmeasured(self):
         """Прямо doubt_flags: unmeasured_overlap=False снимает только пометку неизмеренных слов."""
         unmeasured = [dict(w, spk=S1, margin=1.0, margin_unmeasured=True) for w in words_between(0.0, 5.0)]

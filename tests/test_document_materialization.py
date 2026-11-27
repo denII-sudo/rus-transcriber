@@ -286,11 +286,16 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(json.loads(prepared["json"])["transcript"]["quality"],
                          {"overlap_unmeasured_skipped": skipped})
         for bad in ("yes", {"share": 0.82}, {"share": "0.82", "sec": 1.0}, {"share": 0.5, "sec": -1.0},
-                    {"share": True, "sec": 1.0}):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                documents.prepare(self.recording, 1, 1, 1,
-                                  dict(self.source, quality={"overlap_unmeasured_skipped": bad}),
-                                  review, self.ctx, self.ctx, "now")
+                    {"share": True, "sec": 1.0}, {"share": 1.5, "sec": 1.0}):
+            # NaN и inf в источник не попадут: storage.validate_pair отклоняет их во всём JSON; render_md — в
+            # tests/test_overlap_unmeasured.py
+            with self.subTest(bad=bad):       # испорченное поле не роняет документ: поля и предупреждения нет
+                doc = documents.prepare(self.recording, 1, 1, 1,
+                                        dict(self.source, quality={"overlap_unmeasured_skipped": bad}),
+                                        review, self.ctx, self.ctx, "now")
+                self.assertNotIn("overlap_unmeasured_skipped",
+                                 json.loads(doc["json"])["transcript"].get("quality") or {})
+                self.assertNotIn("похоже на эхо или гул", doc["md"].decode())
 
     def test_order_speaker_names_and_undo_projection(self):
         source = {"speakers": ["s1", "s2"], "speaker_names": {"s1": "Анна", "s2": "Борис"},

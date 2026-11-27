@@ -1009,7 +1009,7 @@ def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, 
         skipped = sum(1 for w in words if w.get("margin_unmeasured")
                       and any(a <= w["s"] + 0.1 < b for a, b in overlaps))
         if skipped:
-            quality["overlap_unmeasured_skipped"] = {"share": round(share, 2), "sec": round(ov_sec, 1)}
+            quality["overlap_unmeasured_skipped"] = {"share": round(share, 4), "sec": round(ov_sec, 1)}
             W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо или гул): {skipped} слов без "
                  "измеренного отрыва голосов не помечены как наложение")
     for seg in segments:

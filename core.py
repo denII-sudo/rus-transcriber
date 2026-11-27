@@ -786,7 +786,7 @@ def _text_only(s, key):
         return body
     quality = data.get("quality") or {}
     summary = {k: quality[k] for k in ("asr_incomplete_chunks", "vote3_skipped", "vote3_partial",
-                                       "asr2_skipped", "asr3_skipped")
+                                       "asr2_skipped", "asr3_skipped", "overlap_unmeasured_skipped")
                if quality.get(k)}
     if summary:
         data["asr_summary"] = summary

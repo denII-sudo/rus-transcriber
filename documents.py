@@ -887,13 +887,10 @@ def _public_transcript(transcript):
                 raise ValueError("invalid public field: vote3_partial")
             result["quality"]["vote3_partial"] = partial
         if "overlap_unmeasured_skipped" in quality:     # Т-1, Н-3: наложения сочтены эхом или гулом
-            skipped = quality["overlap_unmeasured_skipped"]
-            if not isinstance(skipped, dict):
-                raise ValueError("invalid public field: overlap_unmeasured_skipped")
-            skipped = _select_scalars(skipped, {"share": (int, float), "sec": (int, float)})
-            if len(skipped) != 2 or skipped["share"] < 0 or skipped["sec"] < 0:
-                raise ValueError("invalid public field: overlap_unmeasured_skipped")
-            result["quality"]["overlap_unmeasured_skipped"] = skipped
+            import transcript as transcript_text         # испорченное поле не роняет документ: его просто нет
+            skipped = transcript_text.overlap_skipped_info(quality["overlap_unmeasured_skipped"])
+            if skipped is not None:
+                result["quality"]["overlap_unmeasured_skipped"] = skipped
     result["segments"] = []
     for segment in transcript.get("segments", []):
         public = _select_scalars(segment, {"segment_id": (str,), "speaker": (str, type(None)),
@@ -1175,7 +1172,9 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
                       f"распознавания: {partial['spans']} (около {str(partial['seconds']).replace('.', ',')} с).", ""])
     if quality.get("overlap_unmeasured_skipped"):
         import transcript as transcript_text     # одна формулировка предупреждения для обоих видов стенограммы
-        lines.extend([transcript_text.overlap_skipped_note(quality["overlap_unmeasured_skipped"]), ""])
+        note = transcript_text.overlap_skipped_note(quality["overlap_unmeasured_skipped"])
+        if note:
+            lines.extend([note, ""])
     refs = {}
     for ref in _author_refs(payload):
         if ref["user_id"] is not None:
