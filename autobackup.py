@@ -27,6 +27,9 @@
 
 Неудачи (3.1) — в auto/status.json (вид и время, без путей и содержимого); полоса экрана и self_check держат их до
 следующего удачного шага. Повреждённая база (quick_check, dbguard) — шага нет и ничего не удаляется.
+
+Копия на другом диске (В-2) — automirror: после шага, под тем же замком и в том же потоке; если основной шаг не
+нужен (копия дня уже есть), копия на другом диске всё равно догоняется — например, когда диск подключили позже.
 """
 import hashlib
 import json
@@ -426,18 +429,25 @@ def start_daily(path=None, *, now=None, tz=None, background=True, config=None):
         folder.unlock()
         folder.record_failure("manifest" if isinstance(exc, ManifestError) else "error", now)
         return {"state": "failed", "kind": "manifest" if isinstance(exc, ManifestError) else "error"}
-    if plan["state"] != "snapshot":
+    import automirror
+    mirror = automirror.configured(config) is not None or "mirror" in folder.load_status()
+    if plan["state"] != "snapshot" and not mirror:
         folder.unlock()
         return plan
 
     def finish():
         try:
-            return _finish(folder, plan, config, now, tz)
+            result = _finish(folder, plan, config, now, tz) if plan["state"] == "snapshot" else dict(plan)
+            if mirror and result.get("kind") != "manifest":
+                result.update(automirror.run(folder, config, now, tz))
+            return result
         finally:
             folder.unlock()
     if not background:
         return finish()
     threading.Thread(target=finish, name="autobackup", daemon=True).start()
+    if plan["state"] != "snapshot":
+        return {**plan, "mirror": "started"}
     return {"state": "started", "name": plan["name"]}
 
 
@@ -620,23 +630,33 @@ def answer(choice, limit_gb=None, path=None):
                 raise ValueError(f"новый предел должен быть больше нынешнего ({current:g} ГБ)")
             settings.update(db_backup_max_gb=float(limit_gb))
         else:
+            import automirror
+            import settings
             manifest = folder.load_manifest()
             manifest["thin_done"], manifest["thin_pointer"] = False, 1
             folder.save_manifest(manifest)
+            try:
+                automirror.reset_thinning(settings.load_config())
+            except (OSError, storage.StorageError):
+                pass                              # другой диск отключён: его вопрос повторится при следующем шаге
         status = folder.load_status()
         status.pop("question", None)
+        if isinstance(status.get("mirror"), dict):
+            status["mirror"].pop("question", None)
         folder.save_status(status)
         return {"answered": choice}
     finally:
         folder.unlock()
 
 
-def status_view(path=None):
-    """Для экрана, self_check и журнала: {"lines": [...], "question": {...}|None, "last_success": ...}; без путей."""
+def status_view(path=None, now=None, tz=None):
+    """Для экрана, self_check и журнала: {"lines": [...], "question": {...}|None, "last_success": ...}; без путей.
+    Вопрос о пределе — один на оба места (предел общий): сначала этого диска, иначе другого (В-2)."""
+    import automirror
     path = _store_path(path)
     folder = Folder(path)
     if not folder.path.is_dir():
-        return {"lines": [], "question": None, "last_success": None, "copies": 0}
+        return {"lines": [], "question": None, "last_success": None, "copies": 0, "mirror": {"enabled": False}}
     status = folder.load_status()
     lines = []
     failure = status.get("last_failure")
@@ -654,18 +674,21 @@ def status_view(path=None):
                          f"около {question['needed_gb']:g} ГБ), проредить ещё раз (интервал между старыми копиями "
                          "станет вдвое больше) или оставить как есть — спрошу при следующем запуске. Отвечает человек "
                          "на экране программы.")
+    mirror_lines, mirror_question = automirror.view(status, now, tz)
+    lines.extend(mirror_lines)
     try:
         copies = len(folder.load_manifest()["copies"])
     except (ManifestError, OSError):
         copies = None
-    return {"lines": lines, "question": question, "last_success": status.get("last_success"), "copies": copies}
+    return {"lines": lines, "question": question or mirror_question, "last_success": status.get("last_success"),
+            "copies": copies, "mirror": automirror.self_check_part(status)}
 
 
 def self_check_report(path=None, now=None, tz=None):
     """Часть самопроверки: последний удачный шаг, последняя неудача, вопрос; давность резерва (3.1)."""
-    view = status_view(path)
+    view = status_view(path, now, tz)
     out = {"copies": view["copies"], "last_success": view["last_success"], "lines": list(view["lines"]),
-           "question": view["question"]}
+           "question": view["question"], "mirror": view["mirror"]}
     path = _store_path(path)
     if path.is_file() and view["copies"]:
         try:

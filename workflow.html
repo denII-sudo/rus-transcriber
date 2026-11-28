@@ -143,6 +143,14 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
     <input type="text" id="backup-dest" placeholder="C:\резервы\state-2026-11-17.sqlite3"></label>
   <button id="backup">Создать резерв</button>
   <div id="backup-report"></div>
+  <h3>Копия на другом диске</h3>
+  <p class="muted">Программа сама делает резерв базы раз в день. Если указать папку на другом диске (например,
+  на внешнем), туда будет копироваться самый свежий проверенный резерв, а старые копии там программа удалит по тому же
+  правилу. Папку создайте сами; другие файлы в ней программа не трогает. Пустое поле — копия выключена.</p>
+  <label>Папка на другом диске:
+    <input type="text" id="mirror-dir" placeholder="E:\резервы программы"></label>
+  <button id="mirror-save">Сохранить папку</button>
+  <div id="mirror-report"></div>
 </section>
 
 <script>
@@ -1030,6 +1038,26 @@ function limitAnswers(q) {
   box.append(...buttons);
   return box;
 }
+// Копия на другом диске (В-2): папку указывает человек; сохранение сразу запускает копирование в фоне.
+async function loadMirror() {
+  try {
+    const m = await call("api/autobackup/mirror");
+    $("mirror-dir").value = m.dir || "";
+    $("mirror-report").replaceChildren(node("p", !m.dir ? "Копия на другом диске выключена."
+      : m.last_success ? `Последняя проверка копии: ${String(m.last_success.at || "").slice(0, 16).replace("T", " ")} UTC.`
+      : "Копий на другом диске ещё нет.", "muted"));
+  } catch (ex) { /* нет связи — об этом скажут другие части страницы */ }
+}
+$("mirror-save").onclick = async () => {
+  try {
+    const d = await post("api/autobackup/mirror", {dir: $("mirror-dir").value});
+    $("mirror-report").replaceChildren(node("p", !d.dir ? "Копия на другом диске выключена."
+      : d.step === "started" ? "Папка сохранена, копирование идёт в фоне." : "Папка сохранена, копия будет при следующем запуске программы.", "ok"),
+      ...(d.warnings || []).map(line => node("p", line, "warn")));
+    setTimeout(loadHealth, 3000);
+  } catch (ex) { $("mirror-report").replaceChildren(node("p", ex.message, "bad")); }
+};
+loadMirror();
 loadHealth();
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
 loadConflicts();

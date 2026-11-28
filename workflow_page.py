@@ -298,6 +298,9 @@ def make_server(port):
                     return self._send(200, {"path": pick_audio_path()})
                 if u == "api/health":
                     return self._send(200, health())
+                if u == "api/autobackup/mirror":     # папка копии на другом диске (В-2): только свой экран
+                    import automirror
+                    return self._send(200, automirror.screen_view())
                 if u == "api/backup/status":
                     return self._send(200, backups.status(q.get("task_id", "")))
                 if u == "api/requests":
@@ -397,6 +400,12 @@ def make_server(port):
                     import autobackup
                     limit = body.get("limit_gb")
                     return self._send(200, autobackup.answer(str(body.get("choice", "")), limit))
+                if u == "api/autobackup/mirror":     # человек указывает или выключает папку на другом диске (В-2)
+                    import automirror
+                    folder = str(body.get("dir", "")).strip()
+                    if len(folder) > 300:
+                        return self._send(400, {"error": "слишком длинный путь"})
+                    return self._send(200, automirror.set_dir(folder))
                 if u == "api/backup/start":          # то же в фоне с ходом (БД-7): страница спрашивает api/backup/status
                     destination = str(body.get("destination", "")).strip()
                     if not destination or len(destination) > 300:
