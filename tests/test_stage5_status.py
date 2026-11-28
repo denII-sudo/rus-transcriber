@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,9 @@ from unittest.mock import patch
 import core
 import rt
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_record as DB  # noqa: E402  (У-2а: запись в базе вместо файла без базы)
+
 
 class StatusTests(unittest.TestCase):
     def test_compact_transcript_keeps_warning_without_diagnostic_details(self):
@@ -18,8 +22,7 @@ class StatusTests(unittest.TestCase):
                 "quality": {"asr_incomplete_chunks": 2, "vote3_skipped": "asr_incomplete",
                             "asr_diagnostics": {"large": "hidden"}}}
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "synthetic.json"
-            path.write_text(json.dumps(data), encoding="utf-8")
+            path, _, _ = DB.new_record(self, data, folder, "synthetic")
             job = {"json": str(path)}
             compact = json.loads(core._text_only(job, "json"))
             self.assertEqual(compact["asr_summary"]["asr_incomplete_chunks"], 2)
@@ -33,8 +36,7 @@ class StatusTests(unittest.TestCase):
         data = {"file": "synthetic.wav", "duration": "00:00:02", "speakers": [], "segments": [],
                 "quality": {"asr_incomplete_chunks": 1, "vote3_partial": partial}}
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "synthetic.json"
-            path.write_text(json.dumps(data), encoding="utf-8")
+            path, _, _ = DB.new_record(self, data, folder, "synthetic")
             job = {"json": str(path)}
             compact = json.loads(core._text_only(job, "json"))
             self.assertEqual(compact["asr_summary"]["vote3_partial"], partial)
@@ -48,8 +50,7 @@ class StatusTests(unittest.TestCase):
         data = {"file": "synthetic.wav", "duration": "00:00:02", "speakers": [], "segments": [],
                 "quality": {"overlap_unmeasured_skipped": skipped}}
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "synthetic.json"
-            path.write_text(json.dumps(data), encoding="utf-8")
+            path, _, _ = DB.new_record(self, data, folder, "synthetic")
             job = {"json": str(path)}
             compact = json.loads(core._text_only(job, "json"))
             self.assertEqual(compact["asr_summary"]["overlap_unmeasured_skipped"], skipped)

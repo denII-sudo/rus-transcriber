@@ -37,7 +37,7 @@ import review_pack  # noqa: E402
 import settings  # noqa: E402
 import transcript  # noqa: E402
 
-BACKENDS = ("legacy_files", "sqlite")
+BACKENDS = ("sqlite",)      # У-2а-1: файловый режим из тестов убран; цикл по одному режиму оставлен ради малого диффа
 
 
 def result_data():
@@ -294,32 +294,6 @@ class ReplaceInOneApply(AnswerOutcomeCase):
                 self.assertEqual(review_pack.answer_states(jp)["r1"]["state"], "applied")
                 self.assertEqual(transcript.load(jp)["segments"], later["segments"])
 
-    def test_new_answer_not_applied_after_previous_removed(self):
-        """Файловый режим: прежний снят, новый не внёсся — место открыто, строка словами; страница видит тот же
-        исход. К-В4: в базе прежний ответ теперь возвращается — test_kv4_region_undo.RollbackInDatabase."""
-        for backend in ("legacy_files",):
-            with self.subTest(backend=backend), answer_files(backend) as (jp, md, version):
-                self.save(jp, version, option=0)
-                self.apply(jp, md)
-                self.save(jp, version, option=1)
-                original = transcript.apply_review
-
-                def fails(json_path, md_path, decisions, **kw):
-                    return transcript.load(json_path), {"successful_ids": [], "not_found": [d["id"] for d in decisions]}
-
-                with mock.patch.object(transcript, "apply_review", side_effect=fails):
-                    rep = self.apply_once(jp, md)
-                self.assertIs(transcript.apply_review, original)
-                row = next(r for r in rep["outcomes"] if r["id"] == "r1")
-                self.assertEqual(row["outcome"], "not_found")
-                self.assertIn(review_pack.REPLACED_NOT_APPLIED, row["detail"])
-                self.assertEqual(self.words(jp), ["тест", "слово"])
-                self.assertNotIn("r1", self.pack_state(jp).get("applied_answers") or {})
-                self.assertEqual(transcript.load(jp)["review"][0]["status"], "open")
-                # следующее «Применить» — обычный ответ на открытое место
-                self.assertEqual(self.outcomes(self.apply(jp, md))["r1"], "applied")
-                self.assertEqual(self.words(jp), ["третье", "слово"])
-
     def test_answer_saved_during_apply_is_not_lost_or_applied_twice(self):
         """Гонка: пока «Применить» заменяет ответ, страница сохраняет на ту же карточку ещё один (sqlite: другой
         поток, без черновика). Итог: последний ответ сохранён и внесён один раз, прежние сняты по одному разу."""
@@ -453,7 +427,7 @@ class EveryAnswerHasOutcome(AnswerOutcomeCase):
                 self.assertEqual(self.words(jp), ["ручной", "новое"])
 
     def test_report_numbers_cards(self):
-        with answer_files("legacy_files") as (jp, md, version):
+        with answer_files("sqlite") as (jp, md, version):
             self.save(jp, version, aid="r2", option=0)
             rep = self.apply(jp, md)
             self.assertEqual(rep["outcomes"], [{"id": "r2", "card": 2, "outcome": "applied",
@@ -563,7 +537,7 @@ class PageStateFromPython(unittest.TestCase):
         self.assertIn("answer_states", html)
 
     def test_cloud_bundle_carries_states(self):
-        with answer_files("legacy_files") as (jp, md, version):
+        with answer_files("sqlite") as (jp, md, version):
             review_pack.add_answers(jp, [{"id": "r1", "version": version, "option": 0}], "local",
                                     trusted_actor="human")
             core.apply_answers_files(jp, md)
@@ -723,7 +697,7 @@ class PreparedRevert(AnswerOutcomeCase):
                     self.assertEqual(transcript.load(jp)["segments"], applied["segments"])
 
     def test_keep_without_applied_answer_is_rejected(self):
-        with answer_files("legacy_files") as (jp, md, version):
+        with answer_files("sqlite") as (jp, md, version):
             rep = self.save(jp, version, kind="keep")
             self.assertEqual(rep["rejected"][0]["id"], "r1")
             self.assertNotIn("r1", review_pack.answers_state(jp).get("answers") or {})
@@ -786,7 +760,7 @@ class KeepRestoresWholeAnswer(AnswerOutcomeCase):
                 self.assertNotIn("applied_answer", json.dumps(rep, ensure_ascii=False))
 
     def test_cloud_bundle_does_not_carry_copy(self):
-        with answer_files("legacy_files") as (jp, md, version):
+        with answer_files("sqlite") as (jp, md, version):
             self.applied_with_heard(jp, md, version)
             self.save(jp, version, kind="revert")
             self.assertIn("applied_answer", review_pack.answers_state(jp)["answers"]["r1"])

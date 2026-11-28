@@ -9,16 +9,22 @@ import core
 import data_io
 import paths
 import voices
+import core_voices
+
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_record as DB  # noqa: E402  (У-2а: источник голоса — запись в базе, не файл без базы)
 
 
-def recording(root, group="demo-group"):
-    audio = root / "demo.wav"
-    audio.touch()
-    source = root / "demo.transcript.json"
-    source.write_text(json.dumps({"file": str(audio), "group": group, "names_confirmed": True,
-                                  "segments": [{"speaker": "Анна", "words": [{"s": 0, "e": 3}]}]}),
-                      encoding="utf-8")
-    return audio, source
+def recording(test, root, group="demo-group"):
+    source, _, _ = DB.new_record(test, {"group": group, "names_confirmed": True,
+                                  "segments": [{"speaker": "Анна", "words": [{"s": 0, "e": 3}]}]}, root, "demo")
+    return root / "demo.wav", source
+
+
+def source_token(source):
+    """Отпечаток источника, с которым программа сверяет снимок (для записи в базе — её ревизия, не хеш файла)."""
+    return core_voices._open_voice_source(source).token
 
 
 def profile(version=None, sources=None, speakers=None):
@@ -59,7 +65,7 @@ class VoiceProfileCompat(unittest.TestCase):
             "Анна": {"parts": {str(audio.resolve()): {"vec": [1], "sec": 30}}}}), ensure_ascii=False)
 
     def test_preview_refuses_incompatible_and_corrupt_profile_without_writing(self):
-        audio, source = recording(self.root)
+        audio, source = recording(self, self.root)
         corrupt = [self.legacy_content(audio), '{bad json', json.dumps(profile(sources=[]))]
         for content in corrupt:
             with self.subTest(content=content):
@@ -73,10 +79,10 @@ class VoiceProfileCompat(unittest.TestCase):
                 self.assertFalse((self.group_dir() / "voice-backups").exists())
 
     def test_revoke_refuses_incompatible_profile_without_backup(self):
-        audio, source = recording(self.root)
+        audio, source = recording(self, self.root)
         target = self.write_profile(self.legacy_content(audio))
         before = target.read_bytes()
-        snapshot = {"group": "demo-group", "json": str(source), "source_hash": core._voice_hash(source),
+        snapshot = {"group": "demo-group", "json": str(source), "source_hash": source_token(source),
                     "profile_hash": core._voice_hash(target), "audio_hash": "absent",
                     "report": {"existing_contributions": ["Анна"]}}
         with self.assertRaises(core.CoreError) as ctx:
@@ -86,7 +92,7 @@ class VoiceProfileCompat(unittest.TestCase):
         self.assertFalse((self.group_dir() / "voice-backups").exists())
 
     def test_voice_profiles_reports_error_instead_of_sufficiency(self):
-        audio, _ = recording(self.root)
+        audio, _ = recording(self, self.root)
         target = self.write_profile(self.legacy_content(audio))
         before = target.read_bytes()
         report = core.voice_profiles()["profiles"][0]
@@ -97,7 +103,7 @@ class VoiceProfileCompat(unittest.TestCase):
         self.assertEqual(target.read_bytes(), before)
 
     def test_import_merge_leaves_incompatible_profile_untouched(self):
-        audio, _ = recording(self.root)
+        audio, _ = recording(self, self.root)
         valid = profile(speakers={"Анна": {"parts": {"demo.wav": {"vec": [1, 0], "sec": 40}}}})
         self.write_profile(json.dumps(valid, ensure_ascii=False))
         archive = data_io.export_data(dest_dir=self.root / "out", group="demo-group")["zip"]
@@ -111,7 +117,7 @@ class VoiceProfileCompat(unittest.TestCase):
         self.assertTrue(any("не изменён" in warning for warning in report["warnings"]))
 
     def test_import_replace_still_replaces_with_backup(self):
-        audio, _ = recording(self.root)
+        audio, _ = recording(self, self.root)
         valid = profile(speakers={"Анна": {"parts": {"demo.wav": {"vec": [1, 0], "sec": 40}}}})
         self.write_profile(json.dumps(valid, ensure_ascii=False))
         archive = data_io.export_data(dest_dir=self.root / "out", group="demo-group")["zip"]
@@ -125,12 +131,12 @@ class VoiceProfileCompat(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["version"], voices.PROFILE_VERSION)
 
     def test_missing_profile_is_still_previewed_and_revoke_reports_absent(self):
-        audio, source = recording(self.root)
+        audio, source = recording(self, self.root)
         with patch.object(core, "job_json", return_value=(str(source), None)):
             preview = core.preview_voice_learning("demo")
         self.assertEqual(preview["existing_contributions"], [])
         self.assertFalse((self.group_dir() / "voices.json").exists())
-        snapshot = {"group": "demo-group", "json": str(source), "source_hash": core._voice_hash(source),
+        snapshot = {"group": "demo-group", "json": str(source), "source_hash": source_token(source),
                     "profile_hash": "absent", "report": {"existing_contributions": []}}
         with self.assertRaises(core.CoreError) as ctx:
             core.revoke_voice_source(snapshot)

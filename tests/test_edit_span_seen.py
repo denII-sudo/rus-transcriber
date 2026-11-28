@@ -237,12 +237,11 @@ class AgentChangesSeenWords(unittest.TestCase):
 
 
 class WhatTheFilesShow(unittest.TestCase):
-    def test_legacy_files_show_mark_and_counts(self):
-        with files("legacy_files") as (jp, md):
+    def test_counts_in_note_line_and_edit(self):
+        # У-2а-1: файловый режим убран; отметка «видел» в самом файле — только файловый путь, в базе её место —
+        # снимок (test_sqlite_keeps_mark_in_snapshot_but_not_in_public_document); числа и строки — те же.
+        with files("sqlite") as (jp, md):
             transcript.edit_span(jp, md, 0.2, 1.5, "тест словно дальше", by="human")
-            on_disk = json.loads(jp.read_text(encoding="utf-8"))
-            words = [w for s in on_disk["segments"] for w in s["words"]]
-            self.assertEqual([w.get("seen") for w in words], [SEEN_1, None, SEEN_1, None])
             data = transcript.load(jp)
             self.assertIn("(человек, правка отрезка; изменено 1, видел 2)",
                           transcript.render_md({**data, "review_done": True}))
@@ -252,14 +251,14 @@ class WhatTheFilesShow(unittest.TestCase):
             self.assertEqual(data["edits"][-1]["seen"], 2)
 
     def test_agent_line_names_how_many_changed_words_were_seen(self):
-        with files("legacy_files") as (jp, md):
+        with files("sqlite") as (jp, md):
             human_sees_all(jp, md)
             transcript.edit_span(jp, md, 0.2, 1.5, "тесто слово дальше", by="claude")
             line = transcript.render_md({**transcript.load(jp), "review_done": True})
             self.assertIn("(агент, правка отрезка; изменено 1, из них видел человек 1)", line)
 
     def test_no_counts_when_nothing_was_only_seen(self):
-        with files("legacy_files") as (jp, md):
+        with files("sqlite") as (jp, md):
             transcript.edit_span(jp, md, 0.2, 0.5, "тесть", by="human")
             self.assertEqual(hc.item(jp, "r1")["note"], "решено правкой отрезка span@0.20 (человек)")
             self.assertIn("(человек, правка отрезка)",

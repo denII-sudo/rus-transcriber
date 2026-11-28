@@ -9,6 +9,10 @@ import numpy as np
 
 import voices
 
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_record as DB  # noqa: E402  (У-2а: источник голоса — запись в базе, не файл без базы)
+
 
 def recording(word=None, **segment_fields):
     segment = {"speaker": "Анна", "start": 0.0, "end": 3.0,
@@ -29,13 +33,12 @@ class VoiceOverlapSelection(unittest.TestCase):
             audio = root / "demo.wav"
             audio.write_bytes(b"synthetic audio")
             stale_vocab = root / "removed-vocab.json"
-            source = root / "demo.transcript.json"
             data = {"file": str(audio), "names_confirmed": True,
                     "quality": {"vocab": str(stale_vocab)},
                     "segments": [
                         {"speaker": "Анна", "words": [{"s": 0.0, "e": 3.0, "w": "привет"}]},
                         {"speaker": "Чужое имя", "words": [{"s": 4.0, "e": 7.0, "w": "слово"}]}]}
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             source_before = source.read_bytes()
             group_vocab = group / "vocab.json"
             vocab_data = {"group": "demo-group", "participants": [{"name": "Анна", "gender": "ж"}]}
@@ -100,9 +103,8 @@ class VoiceOverlapSelection(unittest.TestCase):
             group.mkdir(parents=True)
             audio = root / "demo.wav"
             audio.write_bytes(b"synthetic audio")
-            source = root / "demo.transcript.json"
             data = {"file": str(audio), "segments": []}
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             group_vocab = group / "vocab.json"
             group_vocab.write_text(json.dumps({"group": "demo-group", "participants": []}), encoding="utf-8")
             with patch.object(core, "job_json", return_value=(str(source), None)), \
@@ -358,8 +360,7 @@ class VoiceOverlapSelection(unittest.TestCase):
             audio.touch()
             data = recording({"s": 0.0, "e": 3.0})
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             profile = {"version": voices.PROFILE_VERSION,
                        "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [0.1, 0.2], "sec": 1}}}},
                        "sources": {}}
@@ -386,8 +387,7 @@ class VoiceOverlapSelection(unittest.TestCase):
             data = recording({"s": 0.0, "e": 1.0})
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": False,
                          "edits": [{"by": "human", "reverted": True}]})
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             key = str(audio.resolve())
             profile = {"version": voices.PROFILE_VERSION, "speakers": {"Анна": {"parts": {key: {"vec": [1], "sec": 1},
                                                         "other": {"vec": [2], "sec": 2}}}},
@@ -416,15 +416,14 @@ class VoiceOverlapSelection(unittest.TestCase):
             audio.touch()
             data = recording({"s": 0.0, "e": 3.0})
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             target = group / "voices.json"
             target.write_text(json.dumps({"version": voices.PROFILE_VERSION,
                 "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1], "sec": 1}}}}, "sources": {}}), encoding="utf-8")
             before = target.read_bytes()
             with patch.object(core, "job_json", return_value=(str(source), None)), patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs):
                 snapshot = core.prepare_voice_action("demo")
-                source.write_text(json.dumps({**data, "revision": 2}), encoding="utf-8")
+                DB.put(source, {**data, "duration": "00:00:09"})   # стенограмма изменилась (поля «revision» база не берёт)
                 with self.assertRaises(core.CoreError):
                     core.revoke_voice_source(snapshot)
             self.assertEqual(target.read_bytes(), before)
@@ -441,8 +440,7 @@ class VoiceOverlapSelection(unittest.TestCase):
             audio.write_bytes(b"first")
             data = recording({"s": 0.0, "e": 3.0})
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             with patch.object(core, "job_json", return_value=(str(source), None)), patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), patch.object(core, "launch") as launch:
                 snapshot = core.prepare_voice_action("demo")
                 audio.write_bytes(b"other")
@@ -460,9 +458,8 @@ class VoiceOverlapSelection(unittest.TestCase):
             group.mkdir(parents=True)
             audio = root / "demo.wav"
             audio.write_bytes(b"synthetic audio")
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps({"file": str(audio), "group": "demo-group",
-                                          "names_confirmed": True, "segments": []}), encoding="utf-8")
+            source, _, _ = DB.new_record(self, {"file": str(audio), "group": "demo-group",
+                                          "names_confirmed": True, "segments": []}, root, "demo")
             target = group / "voices.json"
             profile = {"version": voices.PROFILE_VERSION, "speakers": {}, "sources": {}}
             target.write_text(json.dumps(profile), encoding="utf-8")
@@ -487,8 +484,7 @@ class VoiceOverlapSelection(unittest.TestCase):
             audio.touch()
             data = recording({"s": 0.0, "e": 3.0})
             data.update({"file": str(audio), "group": "demo-group", "names_confirmed": True})
-            source = root / "demo.transcript.json"
-            source.write_text(json.dumps(data), encoding="utf-8")
+            source, _, _ = DB.new_record(self, data, root, "demo")
             profile = {"version": voices.PROFILE_VERSION,
                        "speakers": {"Анна": {"parts": {str(audio.resolve()): {"vec": [1], "sec": 1}}}}, "sources": {}}
             target = group / "voices.json"

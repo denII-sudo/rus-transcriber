@@ -99,7 +99,7 @@ class AnswerRevisionGuardTests(unittest.TestCase):
                 self.assertTrue(result.get("revision_conflicts"))
 
     def test_missing_id_blocks_without_retargeting(self):
-        for backend in ("sqlite", "legacy_files"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             helper, data = self.fixture()
             with self.subTest(backend=backend), helper.answer_files(backend, data) as (jp, md):
                 pack = self.build(jp)
@@ -447,7 +447,7 @@ class WorkerSnapshotTests(unittest.TestCase):
             ("не Спикер 1: тест", "unmatched", None),
             ("Спикер 3: тест", "unmatched", None),
         ]
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             with self.subTest(backend=backend), self.answer_files(backend) as (jp, _md):
                 loaded = transcript.load(jp)
                 man = {"items": [dict(loaded["review"][0])]}
@@ -470,7 +470,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     "не Анна: тест", "нет, Анна: тест", "Спикер 3: тест"]
         # Файловый режим (legacy_files) уходит: в нём остаются два представителя — имя и «оставить человеку»; sqlite — все.
         files_named, files_to_human = {"Анна"}, {"это не Анна"}
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             for ids in (False, True):
                 for text, speaker in named:
                     if backend == "legacy_files" and text not in files_named:
@@ -496,7 +496,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                      "это неверно", "нет, неверно", "не согласен с этим")
         item = {"id": "r1", "options": [{"label": "верный вариант", "decision": {"text": "другое"}}],
                 "recommended": 0}
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             with self.subTest(backend=backend), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 db = root / "state.sqlite3"
@@ -558,7 +558,7 @@ class WorkerSnapshotTests(unittest.TestCase):
         data["review"][0].pop("word_ids", None)
         # Файловый режим (legacy_files) уходит: в нём остаются две формулировки (оба способа ввода); sqlite — все.
         files_texts = ("неверно", "неверно: слово")
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             for text, mode in ((text, mode) for text in ("неверно", "не верно", "неправильно", "не согласен",
                                                          "это неверно", "нет, неверно", "не согласен с этим",
                                                          "неверно: слово")
@@ -591,7 +591,7 @@ class WorkerSnapshotTests(unittest.TestCase):
     def test_negative_answers_keep_place_open_in_both_modes(self):
         # Файловый режим (legacy_files) уходит: в нём остаются три формулировки (обычная, с «:», регистр и «!»); sqlite — все.
         files_texts = ("неверно", "не согласен: слово", "Неверно!")
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             for text in self.NEGATIVES:
                 if backend == "legacy_files" and text not in files_texts:
                     continue
@@ -604,7 +604,7 @@ class WorkerSnapshotTests(unittest.TestCase):
 
     def test_negative_then_correct_answer_in_both_modes(self):
         # Файловый режим (legacy_files) уходит: в нём остаётся одна формулировка (текстом и вариантом); sqlite — все.
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             for negative in ("неверно", "совсем не верно", "неверно: слово"):
                 if backend == "legacy_files" and negative != "неверно":
                     continue
@@ -669,7 +669,7 @@ class WorkerSnapshotTests(unittest.TestCase):
         # Файловый режим (legacy_files) уходит: в нём остаются пять представителей — подсказка, свой текст, подтверждение,
         # человеку, выбор варианта (печать и голос расходятся); sqlite — все 41.
         files_texts = ("согласен", "принимаю", "верно", "Борис Иванович", "вариант 2: да")
-        for backend in ("legacy_files", "sqlite"):
+        for backend in ("sqlite",):           # У-2а-1: файловый режим убран
             for text, typed, voice in self.AS_BEFORE:
                 if backend == "legacy_files" and text not in files_texts:
                     continue
