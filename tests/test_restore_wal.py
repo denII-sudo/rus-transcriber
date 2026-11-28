@@ -10,6 +10,7 @@
 import atexit
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -331,6 +332,37 @@ class RefusalAfterCopyTests(RestoreCase):
         self.assert_names_staged(message)
         self.assertFalse(self.db.exists())
         self.assertEqual(self.counted(self.base / saved[0]), (1, "ok"))      # ничего не удалено
+
+    def test_foreign_empty_database_at_the_name_says_what_to_rename(self):
+        """Р258-10: сторонняя программа SQLite («создать, если нет») между переименованием и публикацией создаёт
+        пустую базу на месте рабочей. Отказ говорит, какой файл во что переименовать; по его словам база
+        возвращается. Окно кодом не закрывается."""
+        original = core_conflicts._move_aside
+
+        def move_aside(destination):
+            moved = original(destination)
+            sqlite3.connect(destination).close()     # пустой файл на месте базы
+            return moved
+        with mock.patch.object(core_conflicts, "_move_aside", side_effect=move_aside):
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        message = str(caught.exception)
+        self.assertIn("появился чужой файл", message)
+        self.assert_names_staged(message)
+        self.assertEqual(self.db.stat().st_size, 0)
+        saved = [name for name in self.names() if ".before-restore-" in name]
+        self.assertEqual(len(saved), 1)
+        quoted = re.findall(r"«([^»]+)»", message.split("Осталось:")[0])
+        foreign = str(self.db) + ".foreign-"
+        steps = [(a, b) for a, b in zip(quoted[1::2], quoted[2::2])]
+        self.assertEqual(quoted[0], str(self.db))
+        self.assertEqual(steps[0][0], str(self.db))
+        self.assertTrue(steps[0][1].startswith(foreign))
+        self.assertEqual(steps[1], (str(self.base / saved[0]), str(self.db)))
+        for source, target in steps:                 # человек делает, что сказано
+            os.rename(source, target)
+        self.assertEqual(self.counted(self.db), (1, "ok"))
+        self.assertEqual(Path(steps[0][1]).stat().st_size, 0)
 
     def test_second_name_left_after_publish_is_a_strong_warning(self):
         original = Path.unlink

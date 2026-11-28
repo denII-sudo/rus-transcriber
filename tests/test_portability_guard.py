@@ -39,7 +39,7 @@ ALLOWED = {
     "review_pack.py": "creationflags (с условием os.name)",
     "runinfo.py": "winreg, kernel32, PowerShell для сведений о железе",
     "selfcheck.py": "taskkill, creationflags (с условием os.name)",
-    "storage.py": "GetDriveTypeW: проверка локального диска",
+    "storage.py": "GetDriveTypeW: проверка локального диска; CreateFileW: удержание FileHold при восстановлении",
     "voice_io.py": "winmm, creationflags (только Windows)",
     "workflow_page.py": "creationflags без условия (на POSIX ошибка)",
     # тексты с путём .venv\Scripts

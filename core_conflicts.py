@@ -1245,6 +1245,8 @@ def _move_aside(destination):
 def _move_back(moved):
     """Шаг 5: вернуть набор на место — служебные файлы раньше основного (пока основного нет, базу никто не
     откроет без её -wal). -> пары, которые вернуть не удалось."""
+    if moved and os.path.lexists(moved[0][0]):
+        return list(moved)    # на месте базы чужой файл: служебные файлы к нему не возвращать, набор не разлучать
     left = []
     for original, renamed in reversed(moved):
         try:
@@ -1255,9 +1257,25 @@ def _move_back(moved):
 
 
 def _not_returned(left):
+    """Что переименовать во что, чтобы вернуть прежнюю базу. Р258-10: если её имя заняла чужая база (сторонняя
+    программа SQLite в режиме «создать, если нет» создаёт пустой файл, пока прежняя отложена), текст сначала
+    называет, куда отложить чужой файл, — иначе вернуть имя нельзя. Код сам ничего не переименовывает и не удаляет."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    ours = {original for original, _ in left}
+    steps = []
+    for original, renamed in left:
+        if os.path.lexists(original):
+            aside = original.name + ".foreign-" + stamp
+            foreign = [original] + [side for side in _side_files(original) if side not in ours]
+            moves = ", ".join(f"«{item}» в «{item.with_name(aside + item.name[len(original.name):])}»"
+                              for item in foreign)
+            steps.append(f"на месте «{original}» появился чужой файл — его создала другая программа, пока прежняя "
+                         f"база была отложена; сначала переименуйте {moves}, затем «{renamed}» — в «{original}»")
+        else:
+            steps.append(f"«{renamed}» должен называться «{original}»")
     return ("восстановление не выполнено, и прежнюю базу не удалось вернуть на место. Ничего не удалено: "
-            + "; ".join(f"«{renamed}» должен называться «{original}»" for original, renamed in left)
-            + ". Закройте программу и переименуйте эти файлы обратно вручную")
+            + "; ".join(steps) + ". Закройте программу и другие программы, открывающие эту папку, и переименуйте "
+            "эти файлы вручную в указанном порядке")
 
 
 def _publish(staged, destination):
