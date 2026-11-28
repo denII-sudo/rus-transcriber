@@ -1074,7 +1074,6 @@ def inspect_backup(backup_path):
 
 
 _SIDE_SUFFIXES = ("-wal", "-shm", "-journal")     # служебные файлы SQLite рядом с базой: набор с ней одно целое
-_HELD_ERRORS = (32, 33)                            # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _REPLACE_SUPPORTED = os.name == "nt"               # замена открытой базы проверяется переименованием: только Windows
 _BUSY_HINT = ("закройте программу (сервер в приложении ИИ-агента, экран rt.py screen, идущую обработку) "
@@ -1087,21 +1086,8 @@ def _side_files(path):
 
 
 def _held_elsewhere(path):
-    """Windows: файл сейчас открыт другой программой (или этим процессом). Файл не меняется: проба — открытие
-    только на чтение без совместного доступа, сразу закрывается. Иная ошибка открытия — не «занят»: её покажет
-    следующий шаг."""
-    import ctypes
-    from ctypes import wintypes
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    handle = kernel32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, OPEN_EXISTING
-    if handle is None or handle == wintypes.HANDLE(-1).value:
-        return ctypes.get_last_error() in _HELD_ERRORS
-    kernel32.CloseHandle(handle)
-    return False
+    """Файл набора сейчас открыт другой программой (проба в core.file_held_elsewhere, файл не меняется)."""
+    return core.file_held_elsewhere(path)
 
 
 def _check_destination_free(destination, replace):
