@@ -1,5 +1,6 @@
 """Чистая подготовка синтетического комплекта документов П1б, без записи файлов."""
 
+import copy
 import hashlib
 import html
 import json
@@ -861,6 +862,8 @@ def _public_transcript(transcript):
                                           for k, v in names.items()):
         raise ValueError("invalid speaker names")
     result["speaker_names"] = dict(names)
+    if "speaker_naming" in transcript:
+        result["speaker_naming"] = copy.deepcopy(storage.validate_speaker_naming(transcript["speaker_naming"]))
     speakers = transcript.get("speakers", [])
     if not isinstance(speakers, list) or any(not isinstance(s, str) for s in speakers):
         raise ValueError("invalid speakers")
