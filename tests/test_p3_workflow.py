@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import shutil
 import tempfile
@@ -62,7 +63,63 @@ class WorkflowTests(unittest.TestCase):
         self.store.close()
         self.store = storage.open_store(self.root / "state.sqlite3")
         self.assertEqual(workflow.get(self.store, ident)["job_id"], job)
+        # Без файла статуса и до срока подтверждения запуска (БД-10) состояние прежнее: «starting».
+        # Раньше этот ассерт не зависел от времени; теперь он сохранён только для запроса моложе срока,
+        # а запрос старше срока без статуса задачи — «interrupted» (см. test_launch_without_status_*).
         self.assertEqual(workflow.observe(self.store, ident, None)["state"], "starting")
+
+    def age_request(self, request, seconds):
+        """Сдвинуть `updated_at` запроса в прошлое: так выглядит запрос, запущенный `seconds` секунд назад."""
+        old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)).isoformat()
+        with self.store._transaction():
+            self.store.db.execute("UPDATE workflow_requests SET updated_at=? WHERE request_id=?", (old, request))
+
+    def test_launch_without_status_is_interrupted_after_timeout_without_restart(self):
+        request = workflow.create(self.store, self.source)
+        job = workflow.claim_start(self.store, request)
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC - 60)
+        self.assertEqual(workflow.observe(self.store, request, None)["state"], "starting")   # ещё рано
+        self.assertIsNone(workflow.get(self.store, request)["launch_note"])
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC + 60)
+        observed = workflow.observe(self.store, request, None)
+        self.assertEqual(observed["state"], "interrupted")
+        self.assertEqual(observed["job_id"], job)
+        self.assertIn("не подтвердился", observed["launch_note"])
+        self.assertEqual({item["state"] for item in observed["runs"] if item["kind"] == "asr"}, {"interrupted"})
+        self.assertEqual({item["state"] for item in observed["steps"]}, {"interrupted"})
+        # Повторного запуска нет: резерв job ID не выдаётся второй раз, наблюдение состояние не меняет.
+        with self.assertRaises(storage.Conflict):
+            workflow.claim_start(self.store, request)
+        self.assertEqual(workflow.observe(self.store, request, None)["state"], "interrupted")
+        self.assertEqual(workflow.get(self.store, request)["job_id"], job)
+
+    def test_launch_with_status_is_not_interrupted_by_timeout(self):
+        request = workflow.create(self.store, self.source)
+        workflow.claim_start(self.store, request)
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC * 4)
+        self.assertEqual(workflow.observe(self.store, request, {"state": "queued"})["state"], "running")
+
+    def test_late_status_after_interrupted_launch_still_recovers(self):
+        # Если worker всё же запустился после срока, его результат принимается как раньше (interrupted разрешён).
+        request = workflow.create(self.store, self.source)
+        workflow.claim_start(self.store, request)
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC + 60)
+        self.assertEqual(workflow.observe(self.store, request, None)["state"], "interrupted")
+        self.assertEqual(workflow.observe(self.store, request, {"state": "running"})["state"], "running")
+
+    def test_timeout_does_not_touch_request_changed_meanwhile(self):
+        request = workflow.create(self.store, self.source)
+        workflow.claim_start(self.store, request)
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC + 60)
+        stale = workflow.get(self.store, request)
+        workflow.observe(self.store, request, {"state": "running"})     # другой процесс увидел статус первым
+        result = workflow._interrupt_unconfirmed_launch(self.store, stale)
+        self.assertEqual(result["state"], "running")
+
+    def test_queued_request_without_launch_is_not_interrupted(self):
+        request = workflow.create(self.store, self.source)
+        self.age_request(request, workflow.LAUNCH_CONFIRM_SEC * 4)
+        self.assertEqual(workflow.observe(self.store, request, None)["state"], "queued")
 
     def test_model_result_materializes_and_replay_does_not_duplicate(self):
         request = workflow.create(self.store, self.source, {"require_conspect": True})

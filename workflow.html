@@ -193,10 +193,54 @@ function renderStatus(s) {
   const dclass = r.deliverable === "blocked" ? "bad" : (r.deliverable === "ready_for_request" ? "ok" : "warn");
   const failure = s.model_failure ? `<p class="bad">Модельный шаг: ${esc(s.model_failure.message || s.model_failure.code)}</p>` : "";
   const sync = s.policy && s.policy.require_conspect ? `<p>Конспект заказан${s.model_task ? "" : " (ещё не создан)"}</p>` : "";
-  return `<p>Состояние: <b>${esc(s.state_ru || s.state)}</b></p>${failure}${sync}
+  return `<p>Состояние: <b>${esc(s.state_ru || s.state)}</b></p>${launchBox(s)}${failure}${sync}
     <p>Готовность: <b class="${dclass}">${esc(deliverable)}</b></p>
     ${blockers ? `<ul>${blockers}</ul>` : ""}${limits ? `<ul>${limits}</ul>` : ""}
     <p class="muted">Источник: ${esc(s.source || "")}</p>`;
+}
+
+// БД-10: запуск, который не подтвердился (запрос «прервано», записи нет). Текст — от программы (`launch_note`),
+// кнопки ведут на уже существующие действия: «Запустить снова» — обычный запуск (api/start) с теми же
+// файлом и настройками, «Отменить» — отказ от запуска (api/abandon/*) после вашего подтверждения.
+// Сама программа ничего не повторяет.
+function launchBox(s) {
+  if (!s || !s.launch_note || s.recording_id) return "";
+  return `<div id="launch-box"><p class="warn">${esc(s.launch_note)}</p>
+    <div class="bar"><button id="launch-again">Запустить снова</button>
+    <button id="launch-cancel">Отменить</button></div><div id="launch-confirm"></div></div>`;
+}
+
+const POLICY_KEYS = ["require_conspect", "allow_cloud_model", "participation", "goal", "question_budget",
+  "speaker_hints"];
+function launchAgainBody(s) {
+  const body = {audio: s.source};
+  POLICY_KEYS.forEach(key => { if (s.policy && s.policy[key] !== undefined && s.policy[key] !== null) body[key] = s.policy[key]; });
+  return body;
+}
+
+function bindLaunchBox(s) {
+  const again = $("launch-again"), cancel = $("launch-cancel");
+  if (!again || !cancel) return;
+  again.onclick = async () => {
+    try {
+      const d = await post("api/start", launchAgainBody(s));
+      say(`Запрос сохранён заново: ${d.request_id}. Прежний запрос остался как был; если он вам не нужен, отмените его.`);
+      openRequest(d.request_id); loadRequests();
+    } catch (ex) { say(ex.message, true); }
+  };
+  cancel.onclick = async () => {
+    const box = $("launch-confirm");
+    try {
+      const snap = await post("api/abandon/prepare", {request_id: requestId});
+      box.innerHTML = `<p>Отказаться от запуска? Файл: <code>${esc(snap.source)}</code>. Если прежний запуск всё же
+        работает, он больше не сможет сохранить результат; программа его процесс не останавливает. Для новой
+        попытки понадобится новый запрос.</p><button id="launch-cancel-yes">Да, отменить запуск</button>`;
+      $("launch-cancel-yes").onclick = async () => {
+        try { await post("api/abandon/confirm", {snapshot: snap}); say("Запуск отменён."); loadStatus(); loadRequests(); }
+        catch (ex) { say(ex.message, true); }
+      };
+    } catch (ex) { say(ex.message, true); }
+  };
 }
 
 async function showVerify() {
@@ -777,6 +821,7 @@ async function loadStatus() {
     if (gen !== detailGen) return;
     $("req-id").textContent = requestId;
     $("status").innerHTML = renderStatus(s);
+    bindLaunchBox(s);
     const result = await call(`api/result?request_id=${encodeURIComponent(requestId)}`);
     if (gen !== detailGen) return;
     showVerify(); renderResult(result);
@@ -904,7 +949,7 @@ async function loadRequests() {
     const table = $("requests");
     table.innerHTML = "<tr><th>Запущен</th><th>Состояние</th><th>Запись</th><th></th></tr>" +
       d.requests.map(r => `<tr><td>${esc(fmtTime(r.created_at))}</td>
-        <td>${esc(stateRu(r.state))}</td><td class="muted">${esc((r.source || "").split("\\").pop())}</td>
+        <td>${esc(r.abandoned && r.state === "failed" ? "запуск отменён" : stateRu(r.state))}</td><td class="muted">${esc((r.source || "").split("\\").pop())}</td>
         <td><button data-id="${r.request_id}">открыть</button></td></tr>`).join("");
     table.querySelectorAll("button").forEach(b => b.onclick = () => openRequest(b.dataset.id));
   } catch (ex) { say(ex.message, true); }

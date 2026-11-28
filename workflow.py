@@ -1,6 +1,7 @@
 """Сохранённые запросы П3. Исполнение вызывается сервисом, не при импорте."""
 
 import copy
+import datetime
 import itertools
 import json
 import math
@@ -14,6 +15,12 @@ import product_policy
 import recordings
 import storage
 import transcript
+
+# БД-10: запрос в «starting» без файла статуса задачи дольше этого срока считается прерванным. Решение сессии
+# линии БД 28.11.2026: срок 15 минут из плана (владелец ответил «решай сам»). Повторного запуска нет.
+LAUNCH_CONFIRM_SEC = 15 * 60
+LAUNCH_UNCONFIRMED_NOTE = ("Запуск не подтвердился или был прерван: можно запустить обработку снова "
+                           "(новым запросом) или отменить; автоматического повтора нет.")
 
 
 def create(store, source, policy=None):
@@ -42,9 +49,14 @@ def create(store, source, policy=None):
 def list_recent(store, limit=20):
     """Короткий список последних запросов для локального экрана."""
     limit = max(0, min(int(limit), 100))
-    return [dict(row) for row in store.db.execute(
-        "SELECT request_id, state, source, recording_id, policy_revision, created_at, updated_at "
+    rows = [dict(row) for row in store.db.execute(
+        "SELECT request_id, state, source, recording_id, policy_revision, created_at, updated_at, "
+        "EXISTS(SELECT 1 FROM workflow_runs r WHERE r.request_id=workflow_requests.request_id "
+        "AND r.kind='asr' AND r.state='abandoned') AS abandoned "
         "FROM workflow_requests ORDER BY updated_at DESC LIMIT ?", (limit,))]
+    for row in rows:
+        row["abandoned"] = bool(row["abandoned"])     # человек отказался от запуска: экран пишет «запуск отменён»
+    return rows
 
 
 def policy_head(store, request_id):
@@ -63,6 +75,8 @@ def get(store, request_id):
     for name in ("policy", "context", "model_task", "model_result"):
         value = result.pop(name + "_json")
         result[name] = storage._loads(value) if value is not None else None
+    result["launch_note"] = (LAUNCH_UNCONFIRMED_NOTE
+                             if result["state"] == "interrupted" and not result["recording_id"] else None)
     result["runs"] = [dict(item) for item in store.db.execute(
         "SELECT * FROM workflow_runs WHERE request_id=? ORDER BY created_at", (request_id,))]
     result["steps"] = [dict(item) for item in store.db.execute(
@@ -259,6 +273,30 @@ def link_worker_result(store, request_id, recording_id):
                      (storage._json({"recording_id": recording_id}), now, request_id))
 
 
+def _launch_overdue(request):
+    """Запрос в «starting» старше срока подтверждения запуска (по `updated_at`, его ставит claim_start)."""
+    try:
+        started = datetime.datetime.fromisoformat(request["updated_at"])
+    except (TypeError, ValueError):
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=datetime.timezone.utc)
+    age = datetime.datetime.now(datetime.timezone.utc) - started
+    return age >= datetime.timedelta(seconds=LAUNCH_CONFIRM_SEC)
+
+
+def _interrupt_unconfirmed_launch(store, request):
+    """Прервать неподтверждённый запуск, только если запрос всё ещё тот же «starting»; повтора запуска нет."""
+    with store._transaction():
+        store.current_identity()
+        row = store.db.execute("SELECT state, job_id, updated_at, recording_id FROM workflow_requests "
+                               "WHERE request_id=?", (request["request_id"],)).fetchone()
+        if (row is not None and row["state"] == "starting" and row["job_id"] == request["job_id"]
+                and row["updated_at"] == request["updated_at"] and row["recording_id"] is None):
+            mark_launch_interrupted(store, request["request_id"])
+    return get(store, request["request_id"])
+
+
 def observe(store, request_id, job):
     """Зафиксировать наблюдаемый результат, не повторяя завершённое распознавание."""
     request = get(store, request_id)
@@ -279,7 +317,10 @@ def observe(store, request_id, job):
             pass
         job = {"state": "done", "recording_id": request["recording_id"]}
     if not job:
-        # Другой процесс ещё может запускать worker; неизвестный исход не повторяем.
+        # Другой процесс ещё может запускать worker; неизвестный исход не повторяем. Но запуск без файла статуса
+        # дольше срока (БД-10) не должен висеть в «starting» вечно: он прерван, решает человек.
+        if request["state"] == "starting" and _launch_overdue(request):
+            return _interrupt_unconfirmed_launch(store, request)
         return request
     elif job.get("state") in ("queued", "running"):
         state, step = "running", "running"

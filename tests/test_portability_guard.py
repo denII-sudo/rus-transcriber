@@ -54,6 +54,7 @@ ALLOWED = {
     "tests/run_parallel.py": "taskkill, creationflags (с условием os.name)",
     "tests/test_conflict_replace.py": "msvcrt.locking в проверке блокировки",
     "tests/test_download_hint.py": "путь .venv\\Scripts в ожидаемом тексте",
+    "tests/test_move_data_guard.py": "поиск PowerShell для проверки tools/move_data.ps1 (пропускается без него)",
     "tests/test_install_uninstall.py": "поиск PowerShell для install.ps1",
     "tests/test_install_update.py": "поиск PowerShell для install.ps1",
     "tests/test_install_stale.py": "поиск PowerShell для install.ps1",

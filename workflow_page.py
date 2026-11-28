@@ -119,7 +119,10 @@ def _shown_files(files):
             for kind, path in files.items()}
 
 
-def state_ru(state):
+def state_ru(state, request=None):
+    """Состояние словами. Запрос, от запуска которого человек отказался (ASR-запуск `abandoned`), — «отменён»."""
+    if state == "failed" and request and any(run.get("state") == "abandoned" for run in request.get("runs") or []):
+        return "запуск отменён"
     return {"queued": "в очереди", "starting": "запуск", "running": "выполняется",
             "processed": "обработано", "waiting_model": "ожидает конспект от модели",
             "completed": "завершено", "failed": "ошибка модельного шага",
@@ -233,7 +236,8 @@ def make_server(port):
                     request = status["request"]
                     return self._send(200, {
                         "request_id": q.get("request_id"), "state": request["state"],
-                        "state_ru": state_ru(request["state"]),
+                        "state_ru": state_ru(request["state"], request),
+                        "launch_note": request.get("launch_note"),
                         "source": request["source"], "recording_id": request["recording_id"],
                         "policy_revision": request["policy_revision"],
                         "policy": request["policy"], "model_task": request["model_task"],
@@ -322,6 +326,10 @@ def make_server(port):
                     if not destination or len(destination) > 300:
                         return self._send(400, {"error": "укажите путь к новому файлу резерва"})
                     return self._send(200, core.backup_store(destination))
+                if u == "api/abandon/prepare":
+                    return self._send(200, core.workflow_abandon_snapshot(str(body.get("request_id", ""))))
+                if u == "api/abandon/confirm":
+                    return self._send(200, core.workflow_abandon(body.get("snapshot")))
                 if u == "api/verify/prepare":
                     return self._send(200, core.workflow_verification_snapshot(
                         str(body.get("request_id", ""))))
