@@ -12,32 +12,32 @@ if "RUS_TRANSCRIBER_DATA" not in os.environ:
     atexit.register(shutil.rmtree, os.environ["RUS_TRANSCRIBER_DATA"], ignore_errors=True)
 import core
 import rt
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_record as DB  # noqa: E402  (У-2а: запись в базе вместо несуществующего demo.json)
+
+
+def demo_record(test):
+    """Пути синтетической записи в базе (У-2а): режим хранения выбирает сама запись, не умолчание."""
+    folder = Path(tempfile.mkdtemp(prefix="review_cli_rec_"))
+    test.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+    jp, md, _ = DB.new_record(test, {"file": "x", "duration": "00:00:02", "speakers": [], "segments": []}, folder, "demo")
+    return str(jp), str(md)
 
 
 class ReviewCLI(unittest.TestCase):
-    def test_only_successful_answers_are_marked_applied(self):
-        with patch.object(core, "job_json", return_value=("demo.json", "demo.md")), \
-                patch("conspect.write_lock", return_value=nullcontext()), \
-                patch("review_pack._answers_lock", return_value=nullcontext()), \
-                patch("review_pack.decisions", return_value=([{"id": "r1"}, {"id": "r2"}], {"human": []})), \
-                patch("transcript.load", return_value={"review": []}), \
-                patch("transcript.answer_snapshot", return_value={"snapshot": True}), \
-                patch("transcript.apply_review", side_effect=[({}, {"successful_ids": ["r1"]}),
-                                                               ({}, {"successful_ids": [], "not_found": ["r2"]})]), \
-                patch("review_pack.free_answers", return_value={}), \
-                patch("review_pack.mark_applied") as mark:
-            core.apply_answers("demo")
-        self.assertEqual(mark.call_args_list[0].args, ("demo.json", {"r1"}))
-        self.assertEqual(mark.call_args_list[0].kwargs,
-                         {"snapshots": {"r1": {"snapshot": True}}, "outcomes": {"r1": "applied"}})
-        self.assertEqual(mark.call_args_list[1].args, ("demo.json", set()))
-        self.assertEqual(mark.call_args_list[1].kwargs, {"outcomes": {"r2": "not_found"}})
+    # У-2а-1: test_only_successful_answers_are_marked_applied удалён — файловый путь внесения на подменах;
+    # в базе исход каждой карточки проверяет test_answer_outcomes.EveryAnswerHasOutcome.
+
 
     def test_neutral_questions(self):
         data = {"review": [{"id": "r1", "status": "open"},
                            {"id": "r2", "status": "resolved"},
                            {"id": "r3", "status": "human"}]}
-        with patch.object(core, "_done_json", return_value={"json": "demo.json"}), \
+        jp, _ = demo_record(self)
+        with patch.object(core, "_done_json", return_value={"json": jp}), \
                 patch("transcript.load", return_value=data), patch("review_pack.build", return_value={}) as build:
             core.build_review_pack("demo")
         items = build.call_args.args[1]

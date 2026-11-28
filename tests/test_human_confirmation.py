@@ -274,8 +274,8 @@ class LeaveToHuman(base.AnswerOutcomeCase):
                 rep = self.apply(jp, md)
                 self.assertEqual(item(jp, "r1")["status"], "resolved", "повтор вернул место человеку")
                 reps[backend] = self.outcomes(rep)["r1"]
-        # Различие режимов: в sqlite правку после сборки карточек ловит сверка ревизий раньше разбора мест.
-        self.assertEqual(reps, {"legacy_files": "already_decided", "sqlite": "apply_conflict"})
+        # Файловый режим убран (У-2а-1); в sqlite правку после сборки карточек ловит сверка ревизий раньше разбора мест.
+        self.assertEqual(reps, {"sqlite": "apply_conflict"})
 
     def test_already_decided_has_reason_and_page_label(self):
         self.assertIn("already_decided", review_pack.OUTCOME_REASONS)

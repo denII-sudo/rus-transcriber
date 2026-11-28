@@ -136,27 +136,9 @@ class SlotRenderTests(unittest.TestCase):
         md, _ = conspect.render(obj, data, update_last=False)
         self.assertIn("Итог: в тексте {{u:1}} (не найдено в стенограмме).", md)
 
-    def test_file_mode_rerender_writes_the_same_marks(self):
-        tmp = Path(tempfile.mkdtemp(prefix="quote-slots-file-"))
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        json_path, md_path = tmp / "x.transcript.json", tmp / "x.transcript.md"
-        segments = [{"speaker": "Анна", "label": "Анна", "start": 0.0, "end": 4.5, "text": "",
-                     "words": [{"w": w, "s": float(i), "e": i + 0.5, "c": 0.9}
-                               for i, w in enumerate(["мы", "решили", "перенести", "срок", "релиза"])]}]
-        T.save({"file": "C:/rec/x.mp3", "duration": "00:01:00", "speakers": ["Анна"], "segments": segments,
-                "review": [], "edits": []}, json_path, md_path)
-        data = T.load(json_path)
-        ids = [word["word_id"] for word in data["segments"][0]["words"]]
-        obj, _ = conspect.link("Итог: «решили перенести» и «нет такого».", data, unlinked="slot", labels=True)
-        obj.update(name="модель", job_json=str(json_path), quote_policy=1, provenance="model",
-                   speaker_labels=[{"label": "Участник 1", "word_ids": [ids[0]]}])
-        cj, cm = conspect.path_for(json_path, "модель")
-        cj.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-        conspect.rerender(json_path)
-        text = cm.read_text(encoding="utf-8")
-        self.assertIn("Итог: Участник 1: «решили перенести» и нет такого (не найдено в стенограмме).", text)
-        self.assertNotIn("{{u:", text)
-        self.assertEqual(json.loads(cj.read_text(encoding="utf-8"))["unlinked"][0]["quote"], "нет такого")
+    # У-2а-1: test_file_mode_rerender_writes_the_same_marks удалён — файловый конспект рядом со стенограммой
+    # без базы; в базе метки слотов проверяет SqliteSlotTests.
+
 
 
 class ThresholdTests(unittest.TestCase):

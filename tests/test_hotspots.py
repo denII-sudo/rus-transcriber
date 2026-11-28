@@ -24,6 +24,9 @@ import transcript
 import words
 import worker
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_record as DB  # noqa: E402  (У-2а: запись в базе вместо файла без базы)
+
 SR = 16000
 VOICES = {"Анна": (120.0, 0.05), "Борис": (220.0, 0.2)}   # обычные высота (Гц) и амплитуда
 
@@ -250,12 +253,12 @@ class NoDataTests(unittest.TestCase):
 
 
 class CoreLegacyFileTests(unittest.TestCase):
-    """Показ по запросу в файловом хранилище: стенограмма читается через transcript.load."""
+    """Показ по запросу: стенограмма читается через transcript.load. У-2а-1: прежде файл без базы, теперь
+    запись в базе (имя класса оставлено ради малого диффа), ассерты те же."""
 
     def run_core(self, data, **kwargs):
         with tempfile.TemporaryDirectory() as directory:
-            jp = Path(directory) / "demo.transcript.json"
-            jp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            jp, _, _ = DB.new_record(self, data, directory, "demo")
             with mock.patch.object(core, "_done_json", return_value={"json": str(jp)}):
                 return core.conversation_hotspots("demo", **kwargs)
 

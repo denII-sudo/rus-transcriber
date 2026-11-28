@@ -18,6 +18,7 @@ from unittest import mock
 import test_answer_outcomes as base  # noqa: E402  (тот же sandbox и те же правила исходов)
 import test_cards_ui_buttons as ui  # noqa: E402  (страница в Node)
 import test_card_findings_behavior as fcb  # noqa: E402  (К-23: ноутбук и облако расходились)
+import db_record as DB  # noqa: E402  (У-2а: запись в базе вместо файлов без базы)
 
 import core  # noqa: E402
 import review_pack  # noqa: E402
@@ -124,18 +125,29 @@ def format_two_patches(old, new):
 
 
 class Snapshot(unittest.TestCase):
-    """Снимок формата 3 на уровне стенограммы (файловый режим, без пакета карточек)."""
+    """Снимок формата 3 на уровне стенограммы (запись в базе, без пакета карточек)."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(dir=base._TMP))
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
-        self.jp, self.md = self.dir / "t.json", self.dir / "t.md"
+        self.jp = self.md = None                    # запись в базе создаётся первым save (У-2а)
 
     def save(self, segments, review, edits=()):
         data = base.result_data()
         data.update(segments=copy.deepcopy(segments), review=copy.deepcopy(review), edits=list(edits))
-        transcript.save(data, self.jp, self.md)
+        if self.jp is None:
+            self.jp, self.md, _ = DB.new_record(self, data, self.dir, "t")
+        else:
+            self.put(data)                          # повторная подготовка — поверх записи в базе
         return transcript.load(self.jp)
+
+    def put(self, data):
+        """Вернуть стенограмму к состоянию `data`. В базе это новая ревизия поверх текущей (У-2а): ревизии и ID
+        записи берутся из текущей, остальное — из `data`; в файловом режиме было просто `transcript.save(data)`."""
+        current = transcript.load(self.jp)
+        data = copy.deepcopy(data)
+        data.update({k: current.get(k) for k in ("recording_id", "source_revision", "review_revision")})
+        transcript.save(data, self.jp, self.md)
 
     def answer(self, decision):
         before = transcript.load(self.jp)
@@ -191,7 +203,7 @@ class Snapshot(unittest.TestCase):
                 seg["words"][1]["w"], seg["text"] = "ручное", "другое ручное"
                 if moved is not None:
                     seg["start"] = moved
-                transcript.save(now, self.jp, self.md)
+                self.put(now)
                 now = transcript.load(self.jp)
                 result = transcript.undo_answer(self.jp, self.md, "r1", snap)
                 if expect is None:
@@ -230,7 +242,7 @@ class Snapshot(unittest.TestCase):
         self.assertNotIn("start", snap["segment_patches"][0])      # Ф234-9: номеров строк в формате 3 нет
         # позже — другое место: соседи участка те же
         after["segments"].append(reply("Вера", word("потом", 9.0, "w9")))
-        transcript.save(after, self.jp, self.md)
+        self.put(after)
         after = transcript.load(self.jp)
         self.assertTrue(transcript.undo_answer(self.jp, self.md, "r1", snap).get("reverted"))
         self.assertEqual([s["text"] for s in transcript.load(self.jp)["segments"]], ["тест", "эээ", "слово", "потом"])
@@ -238,7 +250,7 @@ class Snapshot(unittest.TestCase):
         changed = copy.deepcopy(after)
         changed["segments"][1]["words"][0]["w"] = "слова"
         changed["segments"][1]["text"] = "слова"
-        transcript.save(changed, self.jp, self.md)
+        self.put(changed)
         self.assertIn("conflict", transcript.undo_answer(self.jp, self.md, "r1", snap))
         self.assertEqual(transcript.load(self.jp)["segments"], changed["segments"])
 
@@ -252,7 +264,7 @@ class Snapshot(unittest.TestCase):
                "edits_before": len(before["edits"]), "after": transcript._undo_fingerprint(after)}
         transcript.edit_span(self.jp, self.md, 0.7, 0.7, "ручное", by="human")    # другое место
         self.assertIn("conflict", transcript.undo_answer(self.jp, self.md, "r2", old))
-        transcript.save(after, self.jp, self.md)
+        self.put(after)
         self.assertTrue(transcript.undo_answer(self.jp, self.md, "r2", old).get("reverted"))
         self.assertEqual(transcript.load(self.jp)["segments"], before["segments"])
 
@@ -283,7 +295,7 @@ class Snapshot(unittest.TestCase):
         moved = copy.deepcopy(after)
         moved["segments"][0]["words"][1]["w"] = "иначе"
         self.assertIsNone(transcript.confirm_snapshot(snap, before, moved), "слова изменились — снимок не годится")
-        transcript.save(after, self.jp, self.md)
+        self.put(after)
         self.assertIn("conflict", transcript.undo_answer(self.jp, self.md, "r1", snap), "старый снимок после подтверждения")
         self.assertTrue(transcript.undo_answer(self.jp, self.md, "r1", kept).get("reverted"))
         now = transcript.load(self.jp)
@@ -306,7 +318,7 @@ class Snapshot(unittest.TestCase):
     def store_as_database(self):
         data = transcript.load(self.jp)
         base.recordings._prune_missing_word_ids(data, data)
-        transcript.save(data, self.jp, self.md)
+        self.put(data)
         return transcript.load(self.jp)
 
     def as_before_f234_11b(self, snap):
@@ -319,7 +331,7 @@ class Snapshot(unittest.TestCase):
                     row["word_ids"] = ["w1", "w2"]
         data = transcript.load(self.jp)
         data["review"][0].pop("word_ids")
-        transcript.save(data, self.jp, self.md)
+        self.put(data)
 
     def two_word_place(self):
         return self.save([reply("Глеб", word("тест", 0.2, "w1"), word("слово", 0.7, "w2"), word("ещё", 1.2, "w3"))],
@@ -356,7 +368,7 @@ class Snapshot(unittest.TestCase):
         after["review"][0]["note"] = "подтверждено человеком"
         kept = transcript.confirm_snapshot(snap, before, after)
         self.assertIsNotNone(kept, "подтверждение потеряло снимок")
-        transcript.save(after, self.jp, self.md)
+        self.put(after)
         self.assertTrue(transcript.undo_answer(self.jp, self.md, "r1", kept).get("reverted"))
         self.assertEqual(transcript.load(self.jp)["segments"], start["segments"])
 
@@ -487,12 +499,8 @@ class RollbackInDatabase(base.AnswerOutcomeCase):
             self.assertNotIn("replace_rolled_back", rep)
             self.assertEqual(self.words(jp), ["тест", "слово"])
 
-    def test_file_mode_has_no_rollback(self):
-        with base.answer_files("legacy_files") as (jp, md, version):
-            _, rep = self.failing(jp, md, version, option=1)
-            self.assertNotIn("replace_rolled_back", rep)
-            self.assertEqual(rep["replaced"], ["r1"])
-            self.assertEqual(self.words(jp), ["тест", "слово"])
+    # У-2а-1: test_file_mode_has_no_rollback удалён — только файловый режим (там отката не было); в базе откат
+    # проверяют тесты этого класса.
 
 
 class ConfirmedThenUndoKeepsNeighbour(fcb.Base):
