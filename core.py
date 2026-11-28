@@ -828,8 +828,11 @@ def _text_only(s, key):
         return body
     quality = data.get("quality") or {}
     summary = {k: quality[k] for k in ("asr_incomplete_chunks", "vote3_skipped", "vote3_partial",
-                                       "asr2_skipped", "asr3_skipped", "overlap_unmeasured_skipped")
+                                       "asr2_skipped", "asr3_skipped")
                if quality.get(k)}
+    skipped = transcript.overlap_skipped_summary(quality.get("overlap_unmeasured_skipped"))
+    if skipped:             # проверенное поле, отрезков не больше десяти (Р255-5)
+        summary["overlap_unmeasured_skipped"] = skipped
     if summary:
         data["asr_summary"] = summary
     if quality.get("voices_error"):

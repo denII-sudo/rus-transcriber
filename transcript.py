@@ -267,9 +267,20 @@ def _item_line(it, third_name="Whisper", second_name="CTC", data=None, status=Fa
     return s
 
 
+OVERLAP_NOTE_SPANS = 5          # сколько отрезков пропущенных наложений перечислять в предупреждении
+
+
+def _span_ok(span):
+    return (isinstance(span, (list, tuple)) and len(span) == 2
+            and all(not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x) and x >= 0
+                    for x in span) and span[0] < span[1])
+
+
 def overlap_skipped_info(info):
-    """Поле quality.overlap_unmeasured_skipped -> {share, sec} или None, если поле испорчено: доля — конечное
-    число от 0 до 1, секунды — конечное неотрицательное число (bool не число)."""
+    """Поле quality.overlap_unmeasured_skipped -> {share, sec[, spans]} или None, если поле испорчено: доля —
+    конечное число от 0 до 1, секунды — конечное неотрицательное число (bool не число). spans — отрезки
+    [начало, конец] пропущенных наложений (Н28-1; в записях до него их нет); испорченный отрезок
+    отбрасывается, годные остаются (Р255-2); нет годных — ключа spans нет, предупреждение остаётся."""
     if not isinstance(info, dict):
         return None
     share, sec = info.get("share"), info.get("sec")
@@ -278,7 +289,46 @@ def overlap_skipped_info(info):
             return None
     if share > 1:
         return None
-    return {"share": share, "sec": sec}
+    out = {"share": share, "sec": sec}
+    spans = info.get("spans")
+    good = [[x[0], x[1]] for x in spans if _span_ok(x)] if isinstance(spans, list) else []
+    if good:
+        out["spans"] = good
+    return out
+
+
+def overlap_skipped_summary(info, limit=10):
+    """Поле для сводок (статус задачи, JSON read_transcript): проверенное overlap_skipped_info, первые limit
+    отрезков и число остальных (spans_more) — длинная запись с эхом не раздувает ответ. None — поля нет или
+    оно испорчено."""
+    info = overlap_skipped_info(info)
+    if info is None:
+        return None
+    spans = info.pop("spans", [])
+    if spans:
+        info["spans"] = spans[:limit]
+    if len(spans) > limit:
+        info["spans_more"] = len(spans) - limit
+    return info
+
+
+def overlap_skipped_word(data, word, spans=None):
+    """Отрезок пропущенного наложения, который задевает слово: «overlap_skipped:N» (N — номер отрезка),
+    «overlap_skipped» — у слова нет времени, None — не задевает (отрезков нет, слово вне их или его тронул
+    человек). Правило попадания — как у words.doubt_flags: начало слова + 0,1 с внутри [начало, конец)."""
+    spans = overlap_skipped_spans(data) if spans is None else spans
+    if not spans or human_touched(word):
+        return None
+    start = word.get("s")
+    if not _finite_number(start):
+        return "overlap_skipped"
+    return next((f"overlap_skipped:{n}" for n, (a, b) in enumerate(spans) if a <= start + 0.1 < b), None)
+
+
+def overlap_skipped_spans(data):
+    """Отрезки пропущенных наложений записи [(начало, конец)]; пусто — нет поля, отрезков или поле испорчено."""
+    info = overlap_skipped_info((data.get("quality") or {}).get("overlap_unmeasured_skipped"))
+    return [tuple(x) for x in (info or {}).get("spans", [])]
 
 
 def overlap_skipped_note(info):
@@ -290,9 +340,16 @@ def overlap_skipped_note(info):
         return None
     pct = math.ceil(info["share"] * 1000 - 1e-6) / 10
     share = f"{pct:g}".replace(".", ",")
-    return (f"Внимание: pyannote нашёл одновременную речь на {share} % речи — похоже на эхо или гул; места "
-            "наложений там, где голос слова не сверялся со вторым голосом, не поставлены. Если говорили "
-            "одновременно — прослушайте.")
+    spans = info.get("spans") or []
+    where = ""
+    if spans:
+        shown = ", ".join(f"{hms(a)}–{hms(math.ceil(b))}" for a, b in spans[:OVERLAP_NOTE_SPANS])
+        more = len(spans) - OVERLAP_NOTE_SPANS
+        where = f": {shown}" + (f" и ещё {more}" if more > 0 else "")
+    # текст выбрал владелец 28.11.2026 (вариант «Короче, без «pyannote»»)
+    return (f"Внимание: на {share} % речи звучит больше одного голоса сразу (эхо, гул или разговор "
+            "вперебивку). Там не сверено, чей голос у слова, поэтому цитаты оттуда не считаются проверенными. "
+            f"Прослушайте{where}.")
 
 
 def render_md(data, text_only=False):
