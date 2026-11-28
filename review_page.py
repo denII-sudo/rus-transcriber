@@ -269,6 +269,14 @@ def main():
             return u.path[len(prefix):]
 
         def do_GET(self):
+            # И2: ошибка чтения — ответ 500 с понятным текстом, а не обрыв соединения
+            try:
+                return self._get()
+            except Exception as ex:
+                print(f"[page] ошибка запроса: {type(ex).__name__}", file=sys.stderr, flush=True)
+                return self._send(500, {"error": safe_error(ex)})
+
+        def _get(self):
             u = self._path()
             if u is None:
                 return
