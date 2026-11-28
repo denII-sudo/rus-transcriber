@@ -665,13 +665,13 @@ def _author_of(obj, data):
     return author
 
 
-def render(obj, data, update_last=True, _body=None):
+def render(obj, data, update_last=True, _parts=None):
     """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания.
 
     Свёртка с quote_policy 1 («цитаты по одной», РАР-7, 7.5): автора пишет программа, цитата в «» только
     если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
     с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
-    _body — список-приёмник: туда кладётся текст без шапки (для render_body).
+    _parts — словарь-приёмник: туда кладутся шапка и тело отдельно (для render_parts).
     """
     hdr = {"speaker_changes": 0, "speaker_unknown": False}
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
@@ -768,6 +768,8 @@ def render(obj, data, update_last=True, _body=None):
             stats["quoted"] += 1
             return f"{author}: «{body}»"
         stats["marked"] += 1
+        if any(str(blocker["id"]).startswith("overlap_skipped") for blocker in blockers):
+            rep.setdefault("overlap_unchecked", []).append(key)      # как у конспекта агента: сигнал для conspect_render
         unheard = all(blocker["reason"] == "unheard" for blocker in blockers)
         stats["unheard"] += unheard
         found = [starts[wid] for wid in ids if wid in starts]
@@ -789,8 +791,8 @@ def render(obj, data, update_last=True, _body=None):
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
                    + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
-    if _body is not None:
-        _body.append(body_md)
+    if _parts is not None:
+        _parts.update(header=header, body=body_md)
     md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
@@ -800,14 +802,15 @@ def render(obj, data, update_last=True, _body=None):
     return md, rep
 
 
-def render_body(obj, data):
-    """Текст свёртки без шапки — так, как его печатает render в файл, но ничего не пишет и obj не меняет.
+def render_parts(obj, data):
+    """-> (шапка, тело) свёртки так, как их печатает render в файл, но ничего не пишет и obj не меняет.
 
-    Для локального экрана: те же кавычки, пометки «по распознаванию, не проверено» и метки участников, что в файле.
+    Для локального экрана: те же кавычки, пометки «по распознаванию, не проверено», метки участников и расшифровка
+    меток, что в файле. Шапка — как в файле (в ней служебная строка-маркер, которую экран убирает сам).
     """
-    sink = []
-    render(copy.deepcopy(obj), data, update_last=False, _body=sink)
-    return sink[0]
+    parts = {}
+    render(copy.deepcopy(obj), data, update_last=False, _parts=parts)
+    return parts["header"], parts["body"]
 
 
 def confirm_analysis(obj, data):

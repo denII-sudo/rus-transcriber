@@ -320,6 +320,13 @@ async function loadConspects() {
           div.appendChild(why);
         }
       }
+      if (c.header) {
+        const head = document.createElement("p");
+        head.className = "muted";
+        head.style.whiteSpace = "pre-wrap";
+        head.textContent = c.header;
+        div.appendChild(head);
+      }
       for (const s of c.sections || []) {
         const p = document.createElement("p");
         p.textContent = s.text || "";

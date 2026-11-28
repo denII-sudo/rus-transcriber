@@ -226,32 +226,40 @@ def read_recording_revision(recording_id, kind, revision):
         store.close()
 
 
-def _conspect_screen_sections(payload, data_of=None):
-    """Разделы конспекта для экрана. Прежнее поле `sections` отдаётся как есть.
+def _conspect_screen_text(payload, data_of=None):
+    """-> (шапка, разделы) конспекта для экрана.
 
-    Свёртка исполнителя (есть `evidence`, `template` и `quotes`) показывается так, как её печатает файл:
-    conspect.render_body при текущей стенограмме — кавычки только у проверенных цитат, остальные с пометкой
-    «по распознаванию, не проверено» и метками участников. Сырой ответ модели в `evidence` не показывается
-    (О255-М1). data_of() — текущая стенограмма с разбором (читается один раз на запись). Если собрать не вышло,
-    вместо текста — сообщение, а не сырой ответ. Без data_of и у остальных конспектов берутся тексты из `evidence`.
+    Всё, у чего есть `template` (свёртка исполнителя и конспект агента), показывается так, как его печатает файл:
+    conspect.render_parts при текущей стенограмме — кавычки только у проверенных цитат, остальные с пометкой
+    «по распознаванию, не проверено» и метками участников; шапка — расшифровка меток, статус проверки, строка о
+    цитатах. Прежние поля `sections` и `evidence` приоритета не имеют: их тексты — слова модели с кавычками без проверки
+    (О255-М1, T263-1/2). Если собрать не вышло, вместо текста — сообщение, а не сырой ответ. Только у конспекта без
+    шаблона (формат до связывания цитат) берутся готовые `sections`, а при их отсутствии — тексты из `evidence`.
     """
-    sections = payload.get("sections")
-    if isinstance(sections, list):
-        return sections
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, list):
-        return []
-    if data_of is not None and isinstance(payload.get("template"), str) and isinstance(payload.get("quotes"), dict):
+    if data_of is not None and isinstance(payload.get("template"), str):
         import conspect
         import storage
         try:
-            body = conspect.render_body(payload, data_of())
+            header, body = conspect.render_parts({**payload, "quotes": payload.get("quotes") or {}}, data_of())
         except (KeyError, ValueError, TypeError, IndexError, storage.StorageError):
-            return [{"text": "Не удалось собрать текст свёртки для показа. Сырой ответ модели не показан: в нём "
-                             "цитаты стоят в кавычках без проверки. Откройте файл свёртки."}]
-        return [{"text": part} for part in body.split("\n\n") if part.strip()]
-    return [{"text": item["text"]} for item in evidence
-            if isinstance(item, dict) and isinstance(item.get("text"), str)]
+            return "", [{"text": "Не удалось собрать текст свёртки для показа. Сырой ответ модели не показан: в нём "
+                                 "цитаты стоят в кавычках без проверки. Откройте файл свёртки."}]
+        lines = [line for line in header.splitlines() if not line.startswith("<!--")]
+        lines = [line[2:] if line.startswith("# ") else line for line in lines]
+        return "\n".join(lines).strip(), [{"text": part} for part in body.split("\n\n") if part.strip()]
+    sections = payload.get("sections")
+    if isinstance(sections, list):
+        return "", sections
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, list):
+        return "", []
+    return "", [{"text": item["text"]} for item in evidence
+                if isinstance(item, dict) and isinstance(item.get("text"), str)]
+
+
+def _conspect_screen_sections(payload, data_of=None):
+    """Разделы конспекта для экрана (см. _conspect_screen_text)."""
+    return _conspect_screen_text(payload, data_of)[1]
 
 
 def quote_repair_view(payload):
@@ -338,10 +346,11 @@ def recording_conspects(recording_id):
             files = {loc["kind"]: str(core_conflicts._real_case(Path(root["path"]) / loc["relative_path"],
                                                                 case_cache))
                      for loc in locations} if root else {}
+            shown = _conspect_screen_text(item["payload"], data_of)
             result.append({"conspect_id": item["conspect_id"], "name": item["name"],
                            "current_revision": item["current_revision"],
                            "source_revision": item["source_revision"],
-                           "sections": _conspect_screen_sections(item["payload"], data_of),
+                           "header": shown[0], "sections": shown[1],
                            "quote_repair": (None if quote_repair_view(item["payload"]) is None else
                                             {**quote_repair_view(item["payload"]),
                                              **quote_repair_state(store, item["name"])}),

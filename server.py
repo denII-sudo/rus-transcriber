@@ -747,7 +747,10 @@ def conspect_link(job_id: str, conspect_text: str, name: str = "конспект
     conspect_text — конспект в markdown (как он пойдёт в документ). name — название (несколько конспектов
     к одной записи различаются названием). Создаёт в папке результатов <имя>.<name>.conspect.json и .md.
     Возвращает, сколько цитат связано, какие не найдены, и проверку цитат собранного конспекта.
-    Составные, приблизительные и неоднозначные цитаты остаются несвязанными."""
+    Составные, приблизительные и неоднозначные цитаты остаются несвязанными (unlinked, варианты — candidates):
+    в файле они стоят в «» как написаны и проверенными не считаются. Как читать ответ: check считается по уже
+    собранному файлу, а цитата из слов под наложением печатается там без кавычек, поэтому check.in_doubt = 0 не
+    значит, что кавычки не сняты; снятые названы в overlap_unchecked (номера связанных цитат; ключа нет, если не снимали)."""
     import conspect
     s = _status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
@@ -806,6 +809,8 @@ async def conspect_link_selected(job_id: str, conspect_text: str, selections: di
 
     selections: {номер цитаты: {recording_id, source_revision, word_ids}} из conspect_candidates.
     Существующий конспект не перезаписывается; отказ без новой просьбы не повторять.
+    В ответе: unlinked/candidates — цитаты без выбранного места: в файле они остаются в «» и проверенными не
+    считаются; overlap_unchecked — связанные цитаты, у которых кавычки сняты из-за наложения (ключа нет, если не снимали).
     """
     try:
         snapshot, report = core.prepare_selected_conspect(job_id, name, conspect_text, selections)
