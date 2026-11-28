@@ -135,7 +135,8 @@ class MoveDataPowerShellGuardTests(unittest.TestCase):
         self.env = dict(os.environ, APPDATA=str(home / "r"), LOCALAPPDATA=str(home / "l"), USERPROFILE=str(home))
         # Окружение CI запускает тесты из PowerShell 7: его PSModulePath ломает автозагрузку модулей у Windows
         # PowerShell 5.1 (Get-FileHash «не найден»). Своё окружение 5.1 строит сам.
-        self.env.pop("PSModulePath", None)
+        for key in [key for key in self.env if key.lower() == "psmodulepath"]:      # на Windows ключи — ЗАГЛАВНЫМИ
+            del self.env[key]
         self.src = self.tmp / "src"
         self.dest = self.tmp / "dest"
         self.src.mkdir()
