@@ -54,6 +54,7 @@ ALLOWED = {
     "tests/test_download_hint.py": "путь .venv\\Scripts в ожидаемом тексте",
     "tests/test_install_uninstall.py": "поиск PowerShell для install.ps1",
     "tests/test_install_update.py": "поиск PowerShell для install.ps1",
+    "tests/test_install_stale.py": "поиск PowerShell для install.ps1",
     "tests/test_text_hygiene.py": "сообщение о файлах PowerShell без BOM",
     "tests/test_p6_acceptance.py": "поиск powershell.exe",
 }
