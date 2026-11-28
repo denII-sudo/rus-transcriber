@@ -1001,7 +1001,34 @@ async function loadHealth() {
     const lines = (h.lines || []).filter(Boolean);
     $("db-health").hidden = !lines.length;
     $("db-health").replaceChildren(...lines.map(line => node("p", line, "bad")));
+    if (h.question) $("db-health").append(limitAnswers(h.question));
   } catch (ex) { /* нет связи — об этом скажут другие части страницы */ }
+}
+// Вопрос о пределе резервов (БД-4(б)): отвечает человек; «оставить» — спросим при следующем запуске программы.
+function limitAnswers(q) {
+  const box = node("div", "");
+  const size = document.createElement("input");
+  size.type = "number";
+  size.value = String(q.needed_gb || Math.ceil((q.limit_gb || 1) * 2));
+  const answer = async (choice, extra) => {
+    try {
+      await post("api/autobackup/answer", {choice, ...(extra || {})});
+      box.replaceChildren(node("p", choice === "keep" ? "Хорошо, спрошу при следующем запуске." : "Ответ записан.", "ok"));
+    } catch (ex) { box.append(node("p", ex.message, "bad")); }
+  };
+  const raise = node("button", "Поднять предел до (ГБ):");
+  raise.onclick = () => answer("raise", {limit_gb: Number(size.value)});
+  const buttons = [raise, size];
+  if (q.kind === "limit") {
+    const thin = node("button", "Проредить ещё раз");
+    thin.onclick = () => answer("thin");
+    buttons.push(thin);
+  }
+  const keep = node("button", "Оставить как есть");
+  keep.onclick = () => answer("keep");
+  buttons.push(keep);
+  box.append(...buttons);
+  return box;
 }
 loadHealth();
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
