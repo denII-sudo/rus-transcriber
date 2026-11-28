@@ -180,6 +180,21 @@ def write_manifest(source, target):
     if (not files or any(name not in copied for name in required)
             or any(copied[name] != digest for name, digest in files.items())):
         raise ValueError("copied payload differs from source")
+    # A stale file of the previous build that is still here and unchanged (kept by -KeepStaleFiles,
+    # read-only, a failed copy) stays in the manifest: its origin must not be lost, the next
+    # update offers it for removal again. A changed file is the user's now and is not kept.
+    previous = _manifest(target)
+    if previous:
+        shipped = {n.casefold() for n in wanted}
+        for name, digest in previous["files"].items():
+            if name in files or name.casefold() in shipped or name.startswith("docs/"):
+                continue
+            path = _inside(target, name)
+            try:
+                if path is not None and _regular_file(path) and file_hash(path) == digest:
+                    files[name] = digest
+            except (OSError, ValueError):
+                pass
     info = identity(source)
     data = {"schema": 1, "release": release(source), "commit": info["commit"],
             "source_state": info["source_state"], "payload_sha256": payload_hash(files),
@@ -403,15 +418,23 @@ def main():
     p.add_argument("--shown-stdin", action="store_true",
                    help="with --prune: the --stale-report JSON shown to the person, read from stdin; "
                         "only names present in it are deleted")
+    p.add_argument("--shown-file",
+                   help="the same, from a file (install.ps1 uses this: a console with code page 65001 "
+                        "puts a BOM at the start of piped input)")
     a = p.parse_args()
     if a.stale_report or a.prune:
         if not a.target:
             p.exit(2, "Build identity: --target is required.\n")
         try:
             if a.prune:
-                if not a.shown_stdin:
-                    p.exit(2, "Build identity: --prune requires --shown-stdin.\n")
-                shown = json.loads(sys.stdin.read())
+                if not (a.shown_stdin or a.shown_file):
+                    p.exit(2, "Build identity: --prune requires --shown-stdin or --shown-file.\n")
+                if a.shown_file:
+                    raw = Path(a.shown_file).read_bytes()
+                else:
+                    raw = sys.stdin.buffer.read()
+                # a leading BOM (Windows PowerShell with code page 65001) is not part of the JSON
+                shown = json.loads(raw.decode("utf-8-sig"))
                 if not isinstance(shown, dict):
                     raise ValueError("shown list")
                 removed, failed, skipped, gone = prune(a.source, a.target, a.prune, shown)

@@ -23,15 +23,23 @@
                              которого нет в origin/main и на котором нет тега
       -SkipSelfCheck         не запускать самопроверку в конце
       -KeepStaleFiles        не удалять устаревшие файлы прежней сборки (по умолчанию они удаляются
-                             сами, список печатается до копирования): оставить и только показать
+                             сами, список печатается до копирования): оставить и только показать.
+                             Оставленные (и не удалённые из-за ошибки: файл только для чтения, сбой
+                             копирования) остаются в build-info.json новой сборки, поэтому при
+                             следующем обновлении их предложат удалить снова
       -ExtraFiles <режим>    что делать с файлами в tools/tests/examples, которых нет в комплекте и
                              которых прежняя сборка не ставила (возможно, ваши): Show — показать и
                              оставить (умолчание без терминала), Delete — удалить, Keep — оставить
-                             без списка. В терминале без параметра установщик спрашивает; пустой
-                             ответ — «оставить». Файлы, которые ставила прежняя сборка (список в
+                             без списка. В терминале без параметра установщик спрашивает; удалить —
+                             только ответ y, yes, д или да, всё остальное, в том числе пустой
+                             ответ, — «оставить». Файлы, которые ставила прежняя сборка (список в
                              build-info.json), не изменились и пропали из комплекта, удаляются
                              сами и перечисляются; изменённые вами и файлы корня вне списка не
-                             удаляются никогда — только показываются
+                             удаляются никогда — только показываются. Без прежнего build-info.json
+                             устаревшие файлы определить нельзя и автоматически ничего не удаляется
+                             (удаляет только явный -ExtraFiles Delete или ответ «да»).
+      Код выхода 2 — установка выполнена, но что-то не удалось: ошибка копирования файла, удаление
+      устаревшего файла (например, только для чтения) или самопроверка.
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptanceCopyOnly -Target <sandbox>\program
       -DataDir <sandbox>\data -SkipClaudeConfig
@@ -177,9 +185,10 @@ function Get-ExtraFilesMode([string]$mode, [bool]$noTerminal) {
     if ($noTerminal) { return "Show" }
     return "Ask"
 }
-# Ответ на вопрос «Удалить эти файлы?»: удалить только по явному «y» или «д»; пустой ответ — оставить.
+# Ответ на вопрос «Удалить эти файлы?»: удалить только по явному «y», «yes», «д» или «да» (целым словом);
+# пустой ответ и любое другое слово («дальше», «yellow», «n») — оставить.
 function Get-ExtraFilesAnswer([string]$answer) {
-    if ($answer -match '^\s*(y|д)') { return "Delete" }
+    if ($answer -match '^\s*(y|yes|д|да)\s*$') { return "Delete" }
     return "Keep"
 }
 # Печатает имена файлов отступом, не больше 20 строк.
@@ -198,7 +207,49 @@ function Copy-Checked([string]$Path, [string]$Destination, [switch]$Literal, [sw
         else { Copy-Item -Path $Path -Destination $Destination -Force -ErrorAction Stop }
     } catch {
         $script:CopyFailed = $true
+        $script:InstallProblems += "не удалось скопировать $Path"
         Write-Host "  не удалось скопировать $Path : $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+# Что не удалось в ходе установки (ошибка копирования, удаление устаревшего): установка продолжается,
+# но завершается кодом 2 и перечисляет эти пункты в конце.
+$script:InstallProblems = @()
+# Копирует папку по файлам: ошибка одного файла не останавливает остальные (иначе копирование на
+# первой ошибке оставляло бы часть папки), но запоминается (Copy-Checked) и ведёт к коду выхода 2.
+function Copy-Tree([string]$From, [string]$To) {
+    New-Item -ItemType Directory -Path $To -Force | Out-Null
+    $prefix = $From.TrimEnd("\") + "\"
+    foreach ($d in @(Get-ChildItem -LiteralPath $From -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
+        New-Item -ItemType Directory -Path (Join-Path $To $d.FullName.Substring($prefix.Length)) -Force | Out-Null
+    }
+    foreach ($f in @(Get-ChildItem -LiteralPath $From -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        Copy-Checked $f.FullName (Join-Path $To $f.FullName.Substring($prefix.Length)) -Literal
+    }
+}
+# Windows не меняет написание имени существующего файла при копировании поверх: если в новой версии файл
+# называется иначе только регистром (Foo.py -> foo.py), в установленной копии остаётся старое имя, и сборка
+# выглядит изменённой. Имя сравнивается по точному написанию (-cne), а не через Test-Path.
+function Sync-NameCase([string]$FromDir, [string]$ToDir, [string[]]$Only = @()) {
+    if (-not (Test-Path -LiteralPath $ToDir -PathType Container)) { return }
+    $have = @(Get-ChildItem -LiteralPath $ToDir -Force -ErrorAction SilentlyContinue)
+    foreach ($s in @(Get-ChildItem -LiteralPath $FromDir -Force -ErrorAction SilentlyContinue)) {
+        if ($Only.Count -and $Only -cnotcontains $s.Name) { continue }
+        $hit = $have | Where-Object { $_.Name -ieq $s.Name -and $_.Name -cne $s.Name } | Select-Object -First 1
+        $name = $s.Name
+        if ($hit -and -not ($hit.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            $tmp = $hit.Name + ".rename-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+            try {
+                Rename-Item -LiteralPath $hit.FullName -NewName $tmp -ErrorAction Stop
+                Rename-Item -LiteralPath (Join-Path $ToDir $tmp) -NewName $s.Name -ErrorAction Stop
+                Write-Host "  имя приведено к написанию новой версии: $($hit.Name) -> $($s.Name)" -ForegroundColor DarkGray
+            } catch {
+                $script:InstallProblems += "не удалось сменить регистр имени $($hit.Name)"
+                Write-Host "  не удалось сменить регистр имени $($hit.Name) -> $($s.Name): $($_.Exception.Message)" -ForegroundColor Red
+                if (Test-Path -LiteralPath (Join-Path $ToDir $tmp)) { Rename-Item -LiteralPath (Join-Path $ToDir $tmp) -NewName $hit.Name -ErrorAction SilentlyContinue }
+                $name = $hit.Name
+            }
+        }
+        if ($s.PSIsContainer -and -not ($s.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Sync-NameCase $s.FullName (Join-Path $ToDir $name) }
     }
 }
 # Разница двух списков pip freeze: какие пакеты добавлены, удалены или сменили версию.
@@ -815,10 +866,10 @@ if ($Source -ne $Target) {
     # Прежний установщик стирал такие папки целиком; теперь они не стираются, поэтому отказ до копирования.
     $linkList = @($stale.links)
     if ($linkList.Count) {
-        Write-Host "  в папке программы есть ссылки (junction/symlink) в местах, куда пишет обновление ($($linkList.Count)):" -ForegroundColor Red
+        Write-Host "  в папке программы есть ссылки (junction/symlink) или файлы-заглушки облачных папок (например, OneDrive: «только в облаке») в местах, куда пишет обновление ($($linkList.Count)):" -ForegroundColor Red
         Show-FileList $linkList -All
         Fail ("Установка не начата, ничего не изменено. Копирование писало бы сквозь ссылки в другие папки. " +
-              "Уберите ссылки (удаляйте саму ссылку, не её содержимое) или замените их обычными папками и запустите снова.")
+              "Уберите ссылки (удаляйте саму ссылку, не её содержимое) или замените их обычными папками; файлы-заглушки облачной папки (OneDrive) сделайте доступными на этом компьютере или держите папку программы вне облачной папки; затем запустите снова.")
     }
     $pruneStale = $false; $pruneExtra = $false
     if ($stale) {
@@ -834,7 +885,7 @@ if ($Source -ne $Target) {
                 $pruneStale = $true
             }
         } elseif (-not $stale.manifest) {
-            Write-Host "  прежнего build-info.json нет (или он не читается): какие файлы ставила прежняя сборка, неизвестно — ничего не удаляю" -ForegroundColor DarkGray
+            Write-Host "  прежнего build-info.json нет (или он не читается): какие файлы ставила прежняя сборка, неизвестно — устаревшие файлы автоматически не удаляются (лишние в tools/tests/examples удаляет только -ExtraFiles Delete или ответ «да»)" -ForegroundColor DarkGray
         }
         if ($changedList.Count) {
             Write-Host "  файлы прежней сборки, которых нет в новой версии, но вы их изменили — оставлены ($($changedList.Count)):" -ForegroundColor Yellow
@@ -852,7 +903,7 @@ if ($Source -ne $Target) {
                 Write-Host "  возможно, это ваши файлы; если это старые тесты, они попадут в самопроверку (self_check)" -ForegroundColor Yellow
             }
             if ($extraMode -eq "Ask") {
-                $ans = Read-Host "  Удалить эти файлы? y — удалить, Enter или n — оставить (y/N)"
+                $ans = Read-Host "  Удалить эти файлы? y или да — удалить, Enter или n — оставить (y/N)"
                 $extraMode = Get-ExtraFilesAnswer $ans
             }
             if ($extraMode -eq "Delete") { $pruneExtra = $true; Write-Host "  будут удалены (-ExtraFiles Delete или ответ y)" -ForegroundColor Yellow }
@@ -860,6 +911,7 @@ if ($Source -ne $Target) {
             else { Write-Host "  файлы оставлены; чтобы удалить: -ExtraFiles Delete" -ForegroundColor DarkGray }
         }
     }
+    Sync-NameCase $Source $Target -Only $rootFiles
     foreach ($f in $rootFiles) {
         Copy-Checked (Join-Path $Source $f) (Join-Path $Target $f) -Literal
     }
@@ -878,7 +930,8 @@ if ($Source -ne $Target) {
         if (-not (Test-Path $sd)) { continue }
         $dd = Join-Path $Target $sub
         New-Item -ItemType Directory -Path $dd -Force | Out-Null
-        Copy-Checked (Join-Path $sd "*") $dd -Recurse
+        Sync-NameCase $sd $dd
+        Copy-Tree $sd $dd
         # вложенные дубли прошлых версий установщика и кэш байткода — не данные пользователя
         $dup = Join-Path $dd $sub
         if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
@@ -888,20 +941,32 @@ if ($Source -ne $Target) {
     # Удаление по показанному списку: buildinfo.py получает его на входе, пересчитывает кандидатов и удаляет
     # только пересечение (имя, появившееся после копирования, не удаляется), проверяет каждое имя, удаляет
     # только обычные файлы внутри папки программы и не заходит в ссылки (junction/symlink).
-    # После любой ошибки копирования ничего не удаляется.
+    # После любой ошибки копирования ничего не удаляется. Список передаётся файлом без BOM: через конвейер
+    # Windows PowerShell 5.1 в консоли с кодовой страницей 65001 дописывает BOM в начало ввода программы.
+    $shownFile = Join-Path ([IO.Path]::GetTempPath()) ("rus-transcriber-shown-" + [guid]::NewGuid().ToString("N") + ".json")
+    if ($pruneStale -or $pruneExtra) { WriteUtf8NoBom $shownFile ($staleText -join "`n") }
     foreach ($kind in @(@{ run = $pruneStale; arg = "stale"; what = "устаревших файлов прежней сборки" },
                         @{ run = $pruneExtra; arg = "unknown"; what = "лишних файлов в tools/tests/examples" })) {
         if (-not $kind.run) { continue }
         if ($script:CopyFailed) {
             Write-Host "  удаление $($kind.what) не выполнено: копирование прошло с ошибками (см. выше)" -ForegroundColor Yellow
+            $script:InstallProblems += "удаление $($kind.what) не выполнено из-за ошибок копирования"
             continue
         }
-        $pruneText = @(($staleText -join "`n") | & $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --prune $kind.arg --shown-stdin)
+        $pruneText = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --prune $kind.arg --shown-file $shownFile)
         $pruned = $null
         if ($LASTEXITCODE -eq 0 -and $pruneText.Count) { try { $pruned = ($pruneText -join "`n") | ConvertFrom-Json } catch { $pruned = $null } }
-        if (-not $pruned) { Write-Host "  не удалось удалить список $($kind.what): ничего не удалено" -ForegroundColor Yellow; continue }
+        if (-not $pruned) {
+            Write-Host "  не удалось удалить список $($kind.what): ничего не удалено" -ForegroundColor Red
+            $script:InstallProblems += "не удалось удалить список $($kind.what)"
+            continue
+        }
         Write-Host "  удалено $($kind.what): $(@($pruned.removed).Count)" -ForegroundColor Green
-        if (@($pruned.failed).Count) { Write-Host "  не удалось удалить ($(@($pruned.failed).Count)):" -ForegroundColor Yellow; Show-FileList @($pruned.failed) -All }
+        if (@($pruned.failed).Count) {
+            Write-Host "  не удалось удалить ($(@($pruned.failed).Count); файл только для чтения, занят или стал ссылкой) — остаются в build-info.json, при следующем обновлении их предложат удалить снова:" -ForegroundColor Yellow
+            Show-FileList @($pruned.failed) -All
+            $script:InstallProblems += "не удалось удалить $(@($pruned.failed).Count) $($kind.what)"
+        }
         if (@($pruned.skipped).Count) {
             Write-Host "  после копирования появились кандидаты, которых человеку не показывали — оставлены ($(@($pruned.skipped).Count)):" -ForegroundColor Yellow
             Show-FileList @($pruned.skipped) -All
@@ -911,6 +976,7 @@ if ($Source -ne $Target) {
             Show-FileList @($pruned.gone) -All
         }
     }
+    if (Test-Path -LiteralPath $shownFile) { Remove-Item -LiteralPath $shownFile -Force -ErrorAction SilentlyContinue }
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
 # Generate provenance from the checked source, not from a nonexistent .git in the installation.
@@ -1127,6 +1193,11 @@ if (-not $SkipClaudeConfig) {
 
 if ($AcceptanceCopyOnly) {
     Write-Host "Копирование runtime-файлов для приёмки завершено; зависимости и настройки не менялись."
+    if ($script:InstallProblems.Count) {
+        Write-Host "Но не всё удалось (код выхода 2):" -ForegroundColor Yellow
+        $script:InstallProblems | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        exit 2
+    }
     exit 0
 }
 
@@ -1191,4 +1262,8 @@ if ($storeOk -eq $false) {
 if (-not $selfCheckOk) {
     Write-Host "Установка завершена, но самопроверка нашла проблемы (см. шаг 11). Код выхода 2." -ForegroundColor Yellow
 }
-if (($storeOk -eq $false) -or -not $selfCheckOk) { exit 2 }
+if ($script:InstallProblems.Count) {
+    Write-Host "Установка завершена, но не всё удалось (код выхода 2):" -ForegroundColor Yellow
+    $script:InstallProblems | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+}
+if (($storeOk -eq $false) -or -not $selfCheckOk -or $script:InstallProblems.Count) { exit 2 }

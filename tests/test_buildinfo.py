@@ -278,6 +278,9 @@ class BuildTests(unittest.TestCase):
         self.git("worktree", "remove", str(linked))
 
 
+BOM = bytes([0xEF, 0xBB, 0xBF])  # what Windows PowerShell with code page 65001 puts before piped input
+
+
 class StaleFilesTests(unittest.TestCase):
     """Update removes only what the previous build-info.json proves was ours and unchanged."""
 
@@ -332,7 +335,7 @@ class StaleFilesTests(unittest.TestCase):
         stdout = io.StringIO()
         with patch.object(sys, "argv", ["buildinfo.py", "--source", str(self.source),
                                         "--target", str(self.target), *args]), \
-                patch.object(sys, "stdin", io.StringIO(stdin)), \
+                patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")))), \
                 redirect_stdout(stdout), redirect_stderr(io.StringIO()):
             try:
                 buildinfo.main()
@@ -567,6 +570,36 @@ class StaleFilesTests(unittest.TestCase):
         links = self.report()["links"]
         self.assertEqual(links, ["examples", "tools/jn"])
         self.assertEqual((outside / "x.py").read_text(encoding="utf-8"), "# outside\n")
+
+    def test_shown_list_with_a_bom_is_read_from_stdin_and_from_a_file(self):
+        # Windows PowerShell with code page 65001 puts a BOM at the start of piped input
+        shown = json.dumps(self.report()).encode("ascii")
+        code, out = self.cli("--prune", "stale", "--shown-stdin", stdin=BOM + shown)
+        self.assertEqual((code, len(json.loads(out)["removed"])), (0, 4))
+        self.assertFalse((self.target / "old_mod.py").exists())
+
+    def test_shown_list_file_without_stdin(self):
+        listing = Path(self.tmp.name) / "shown.json"
+        listing.write_bytes(BOM + json.dumps(self.report()).encode("ascii"))
+        code, out = self.cli("--prune", "stale", "--shown-file", str(listing))
+        self.assertEqual((code, len(json.loads(out)["removed"])), (0, 4))
+        listing.write_bytes(b"not json")
+        self.assertEqual(self.cli("--prune", "stale", "--shown-file", str(listing))[0], 1)
+
+    def test_stale_file_that_stays_keeps_its_origin_in_the_new_manifest(self):
+        self.prune_now("stale")
+        # old_mod.py could not be removed (read-only, -KeepStaleFiles, failed copy): put it back
+        (self.target / "old_mod.py").write_text("# old\n", encoding="utf-8")
+        (self.target / "tools/gone.py").write_text("# the user changed it\n", encoding="utf-8")
+        data = buildinfo.write_manifest(self.source, self.target)
+        self.assertIn("old_mod.py", data["files"])
+        self.assertNotIn("tools/gone.py", data["files"])  # changed: the user's now
+        self.assertEqual(buildinfo.identity(self.target)["manifest_status"], "modified")  # gone.py is extra
+        (self.target / "tools/gone.py").unlink()
+        self.assertEqual(buildinfo.identity(self.target)["manifest_status"], "matched")
+        self.assertEqual(self.report()["stale"], ["old_mod.py"])  # offered for removal again
+        self.prune_now("stale")
+        self.assertNotIn("old_mod.py", buildinfo.write_manifest(self.source, self.target)["files"])
 
 
 if __name__ == "__main__":

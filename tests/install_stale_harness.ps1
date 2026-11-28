@@ -5,7 +5,12 @@
 param([string]$Script)
 $ErrorActionPreference = "Continue"
 $results = @()
-function Check($name, $cond) { $script:results += [pscustomobject]@{ test = $name; ok = [bool]$cond } }
+$global:LastRun = $null; $global:Diags = @()
+function Check($name, $cond) {
+    $script:results += [pscustomobject]@{ test = $name; ok = [bool]$cond }
+    # при провале — хвост вывода последнего запуска установщика (для разбора в журнале CI)
+    if (-not $cond -and $global:LastRun) { $global:Diags += "---- $name (код $($global:LastRun.code)) ----`n" + $global:LastRun.text.Substring([Math]::Max(0, $global:LastRun.text.Length - 1800)) }
+}
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     "python не найден: сценарии пропущены"
@@ -32,6 +37,8 @@ function Put([string]$root, [string]$rel, [string]$text) {
 }
 function At([string]$rel) { Join-Path $prog $rel }
 function Has([string]$rel) { Test-Path -LiteralPath (At $rel) }
+# точное имя (с учётом регистра): Test-Path регистр не различает
+function Exact([string]$rel) { $leaf = Split-Path $rel -Leaf; (Test-Path -LiteralPath (At $rel)) -and ((@(Get-ChildItem -LiteralPath (Split-Path (At $rel) -Parent) -Force -Name)) -ccontains $leaf) }
 $docs = @("model-download-certificate.md", "2026-11-17-p3-workflow-handoff.md",
           "2026-11-17-p4-opencode-openai-handoff.md", "2026-11-17-p5-screen-handoff.md")
 function New-Source([string]$name, [string[]]$files) {
@@ -51,6 +58,7 @@ function Install([string]$srcDir, [hashtable]$more = @{}) {
     $o = "" | & (Join-Path $srcDir "install.ps1") @a *>&1 | Out-String
     $code = $LASTEXITCODE
     Pop-Location
+    $global:LastRun = @{ code = $code; text = $o }
     return @{ code = $code; text = $o; flat = ($o -replace '\s+', '') }
 }
 function Manifest-Files { (Get-Content (At "build-info.json") -Raw -Encoding UTF8 | ConvertFrom-Json).files.PSObject.Properties.Name }
@@ -179,7 +187,77 @@ Check "K keep stale: nothing of the previous build is deleted" ((Has "stale_root
 Check "K keep stale: files are listed as kept" ($r.flat -match "stale_root\.py" -and $r.flat -match "tools/stale_tool\.py" -and $r.flat -match "оставлены\(-KeepStaleFiles\)")
 Check "K keep stale: no deletion announced" ($r.flat -notmatch "будутудалены")
 
+# ---------- K2: оставленные -KeepStaleFiles остаются в build-info.json и предлагаются снова ----------
+Check "K2 kept stale files stay in the manifest" (((Manifest-Files) -contains "stale_root.py") -and ((Manifest-Files) -contains "tools/stale_tool.py"))
+$r = Install $v11
+Check "K2 next update without the parameter: kept files are offered and removed (tests/ is not in the source: left alone)" ($r.code -eq 0 -and -not (Has "stale_root.py") -and -not (Has "tools/stale_tool.py") -and (Has "tests/test_stale.py"))
+Check "K2 removed files leave the manifest" (-not ((Manifest-Files) -contains "stale_root.py"))
+
+# ---------- L: консоль с кодовой страницей 65001 (в Windows PowerShell 5.1 конвейер в программу начинается с BOM) ----------
+# $OutputEncoding с преамбулой даёт тот же BOM в начале ввода внешней программы, что и chcp 65001
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$v12 = New-Source "v12" @("cards.html", "tools/check.py", "l_stale.py", "tools/l_stale_tool.py")
+$r = Install $v12
+Check "L setup: install" ($r.code -eq 0 -and (Has "l_stale.py"))
+$v13 = New-Source "v13" @("cards.html", "tools/check.py")
+$savedEncoding = $OutputEncoding
+$OutputEncoding = New-Object System.Text.UTF8Encoding $true
+try { $r = Install $v13 @{ ExtraFiles = "Delete" } } finally { $OutputEncoding = $savedEncoding }
+Check "L BOM in piped input: stale files are still removed" ($r.code -eq 0 -and -not (Has "l_stale.py") -and -not (Has "tools/l_stale_tool.py"))
+Check "L BOM in piped input: no error shown" ($r.flat -notmatch "неудалосьудалить" -and $r.flat -notmatch "couldnotbelisted")
+$bomFile = Join-Path $base "bom-shown.json"
+[IO.File]::WriteAllBytes($bomFile, [byte[]](0xEF, 0xBB, 0xBF) + [Text.Encoding]::ASCII.GetBytes('{"stale":[]}'))
+$o = & python -B (Join-Path $v13 "buildinfo.py") --source $v13 --target $prog --prune stale --shown-file $bomFile
+Check "L shown list with a BOM is read" ($LASTEXITCODE -eq 0 -and (($o -join "") -match '"removed": \[\]'))
+
+# ---------- M: переименование только регистра, точные имена ----------
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$m1 = New-Source "m1" @("cards.html", "tools/Foo.py", "tests/Case_Test.py")
+Put $m1 "Mod.py" "# synthetic mod"
+$r = Install $m1
+Check "M setup: install" ($r.code -eq 0 -and (Exact "Mod.py") -and (Exact "tools/Foo.py"))
+$m2 = New-Source "m2" @("cards.html")
+Put $m2 "mod.py" "# synthetic mod"
+Put $m2 "tools/foo.py" "# synthetic tools/Foo.py"
+Put $m2 "tests/Case_Test.py" "# synthetic tests/Case_Test.py"
+$r = Install $m2
+Check "M case-only rename: exit 0" ($r.code -eq 0)
+Check "M root file has the new exact name" ((Exact "mod.py") -and -not (Exact "Mod.py"))
+Check "M tools file has the new exact name" ((Exact "tools/foo.py") -and -not (Exact "tools/Foo.py"))
+Check "M manifest holds the new names" (((Manifest-Files) -ccontains "mod.py") -and ((Manifest-Files) -ccontains "tools/foo.py"))
+$o = & python -B (Join-Path $m2 "buildinfo.py") --source $prog
+Check "M build is not shown as changed" (($o -join "") -match '"manifest_status": "matched"')
+
+# ---------- N: ошибка копирования части папки, устаревший файл только для чтения ----------
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$n1 = New-Source "n1" @("cards.html", "tools/check.py", "gone_late.py", "tools/sub/old_in_sub.py")
+$r = Install $n1
+Check "N setup: install" ($r.code -eq 0 -and (Has "gone_late.py") -and (Has "tools/sub/old_in_sub.py"))
+$n2 = New-Source "n2" @("cards.html", "tools/check.py", "tools/sub/new_in_sub.py", "tools/zz.py")
+$denied = At "tools/sub"
+& icacls $denied /deny "*S-1-1-0:(OI)(CI)(WD,AD)" /Q | Out-Null
+try { $r = Install $n2 } finally { & icacls $denied /remove:d "*S-1-1-0" /Q | Out-Null }
+Check "N copy error: exit code 2" ($r.code -eq 2)
+Check "N copy error: the rest of the folder is still copied" (Has "tools/zz.py")
+Check "N copy error: nothing is deleted" ((Has "gone_late.py") -and (Has "tools/sub/old_in_sub.py") -and $r.flat -match "копированиепрошлосошибками")
+Check "N copy error: stale files stay in the manifest" (((Manifest-Files) -contains "gone_late.py") -and ((Manifest-Files) -contains "tools/sub/old_in_sub.py"))
+$r = Install $n2
+Check "N next run: stale files offered again and removed" ($r.code -eq 0 -and -not (Has "gone_late.py") -and (Has "tools/sub/new_in_sub.py"))
+
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$q1 = New-Source "q1" @("cards.html", "tools/check.py", "ro_stale.py")
+$r = Install $q1
+Set-ItemProperty -LiteralPath (At "ro_stale.py") -Name IsReadOnly -Value $true
+$q2 = New-Source "q2" @("cards.html", "tools/check.py")
+$r = Install $q2
+Check "N2 read-only stale file: exit code 2, file kept" ($r.code -eq 2 -and (Has "ro_stale.py") -and $r.flat -match "неудалосьудалить")
+Check "N2 read-only stale file stays in the manifest" ((Manifest-Files) -contains "ro_stale.py")
+Set-ItemProperty -LiteralPath (At "ro_stale.py") -Name IsReadOnly -Value $false
+$r = Install $q2
+Check "N2 next run: removed, exit 0" ($r.code -eq 0 -and -not (Has "ro_stale.py"))
+
 $results | Format-Table -AutoSize | Out-String -Width 200
+$global:Diags | Select-Object -First 4
 if ($global:Diag) { $global:Diag }
 if (Test-Path -LiteralPath (At "tools/jn")) { try { [IO.Directory]::Delete((At "tools/jn")) } catch { } }
 Remove-Item Env:\RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX -ErrorAction SilentlyContinue

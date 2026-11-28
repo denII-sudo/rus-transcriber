@@ -52,7 +52,8 @@ Check "extra: terminal asks" ((Get-ExtraFilesMode "" $false) -eq "Ask")
 Check "extra: explicit mode wins, any case" ((Get-ExtraFilesMode "delete" $true) -eq "Delete" -and (Get-ExtraFilesMode "KEEP" $false) -eq "Keep" -and (Get-ExtraFilesMode "Show" $false) -eq "Show")
 Check "extra: empty answer keeps" ((Get-ExtraFilesAnswer "") -eq "Keep" -and (Get-ExtraFilesAnswer "   ") -eq "Keep" -and (Get-ExtraFilesAnswer $null) -eq "Keep")
 Check "extra: n and other answers keep" ((Get-ExtraFilesAnswer "n") -eq "Keep" -and (Get-ExtraFilesAnswer "н") -eq "Keep" -and (Get-ExtraFilesAnswer "q") -eq "Keep")
-Check "extra: only y or д delete" ((Get-ExtraFilesAnswer "y") -eq "Delete" -and (Get-ExtraFilesAnswer "Y") -eq "Delete" -and (Get-ExtraFilesAnswer "д") -eq "Delete")
+Check "extra: only the whole word y, yes, д, да deletes" ((Get-ExtraFilesAnswer "y") -eq "Delete" -and (Get-ExtraFilesAnswer "Y") -eq "Delete" -and (Get-ExtraFilesAnswer "yes") -eq "Delete" -and (Get-ExtraFilesAnswer "д") -eq "Delete" -and (Get-ExtraFilesAnswer "да") -eq "Delete" -and (Get-ExtraFilesAnswer " Да ") -eq "Delete")
+Check "extra: words that only start with y or д keep" ((Get-ExtraFilesAnswer "yellow") -eq "Keep" -and (Get-ExtraFilesAnswer "yep") -eq "Keep" -and (Get-ExtraFilesAnswer "дальше") -eq "Keep" -and (Get-ExtraFilesAnswer "действуй") -eq "Keep" -and (Get-ExtraFilesAnswer "y n") -eq "Keep")
 
 # сравнение списков пакетов
 $before = @("numpy==2.3.5", "torch==2.15.0+cpu", "gigaam @ https://example.invalid/main.zip#sha256=aa", "old_pkg==1.0")

@@ -30,6 +30,19 @@ class InstallStaleFilesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, tail)
         self.assertIn("FAILED: 0", result.stdout, tail)
 
+    def test_same_scenarios_in_a_console_with_code_page_65001(self):
+        # Windows PowerShell 5.1 в консоли 65001 дописывает BOM в начало ввода внешней программы: прежняя
+        # передача списка через конвейер ломала удаление. Те же сценарии под chcp 65001 (сам сценарий L
+        # гарнитуры кроме того задаёт $OutputEncoding с BOM, поэтому не зависит от консоли тестового запуска).
+        command = ('chcp 65001 >nul & "%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Script "%s"'
+                   % (_shell(), ROOT / "tests" / "install_stale_harness.ps1", ROOT / "install.ps1"))
+        result = subprocess.run('cmd /d /s /c "' + command + '"',  # одна строка: свои кавычки cmd
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=600)
+        tail = (result.stdout + result.stderr)[-4000:]
+        self.assertEqual(result.returncode, 0, tail)
+        self.assertIn("FAILED: 0", result.stdout, tail)
+
 
 if __name__ == "__main__":
     unittest.main()
