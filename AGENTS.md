@@ -229,6 +229,7 @@
   - П7, перенос в SQLite: у владельца выполнен, включён `sqlite`; инструмент переноса удалён (У-1),
     снимки — `docs/history/legacy-migration.md`, `docs/history/2026-11-21-p7-migration-handoff.md`.
     Старые файлы записи только читаются: `legacy_read.py` (`read_legacy_files`, `rt.py legacy-read`).
+    Привязку мест перенесённых записей сверяет `legacy_anchors.py` (`rt.py legacy-anchor-check`).
 - Действующие ограничения: `docs/development-boundaries.md` (ASR, цитаты, хранение, приёмка; читай
   с документом пакета) и `docs/voice-biometrics-policy.md` (биометрия, резервы, качество аудио).
 - Работай в клоне, не в установленной программе: `docs/development-and-installation.md`.

@@ -1320,8 +1320,12 @@ def _apply_answers_files_once(jp, md):
                 sources = _answer_item_sources(store, binding["recording_id"], manifest)
                 guard = _answer_revision_conflicts(initial, manifest, state, source, sqlite=True,
                                                    sources=sources)
+                # S24: у записи из переноса старых файлов ответ на место с неверной привязкой не вносится — оно
+                # уходит человеку. Сверка — по ревизии переноса (она не меняется), поэтому verify_guard ниже
+                # пересверяет только guard.
+                anchors = _legacy_anchor_conflicts(store, binding["recording_id"], initial, manifest, state)
                 with recordings.answer_draft(jp, initial, state, context) as draft:
-                    draft["revision_conflicts"] = guard
+                    draft["revision_conflicts"] = {**anchors, **guard}
                     report = _apply_answers_files_locked(jp, md)
                     candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
                 if candidate == initial:
@@ -1397,6 +1401,26 @@ def _answer_item_sources(store, recording_id, manifest):
     import review_pack
     return review_pack.item_sources(store, recording_id, manifest, snapshot=lambda revision: _answer_source_snapshot(
         store, recording_id, {"source_revision": revision}))
+
+
+def _legacy_anchor_conflicts(store, recording_id, data, manifest, state):
+    """S24: {id карточки: причина} — ответ лёг бы не на те слова места, перенесённого из старых файлов.
+    Ответы на нынешнюю редакцию карточки, ещё не внесённые, в том числе новый ответ поверх внесённого (К-В3: прежний
+    снимается, новый ложится на те же слова, O265-1). Ответ, не меняющий слов («Оставить человеку», пропуск), не
+    проверяется (O265-6) — как решение агента status human."""
+    import legacy_anchors
+    import review_pack
+    applied = review_pack._applied_map(state)
+    answers = state.get("answers") or {}
+    items = {}
+    for item in manifest.get("items") or []:
+        aid = item.get("id") if isinstance(item, dict) else None
+        answer = answers.get(aid)
+        if (aid is None or not review_pack.answer_is_current(answer, item)
+                or applied.get(aid) == review_pack._sig(answer) or not review_pack.answer_touches_words(answer, item)):
+            continue
+        items[aid] = item
+    return legacy_anchors.card_conflicts(legacy_anchors.migration_mismatches(store, recording_id), data, items)
 
 
 def _answer_revision_conflicts(current, manifest, state, source, *, sqlite, sources=None):
@@ -1792,12 +1816,38 @@ def edit_span_files(jp, md, t1, t2, text, speaker=None, note=None, by=None):
     return rep
 
 
+def _legacy_anchor_refusals(jp, decisions):
+    """S24: решения о словах мест, перенесённых из старых файлов с неверной привязкой, не вносятся.
+    -> (остальные решения, [{"id", "why"}]). «Оставить человеку» (status human) и подтверждение внесённого
+    ответа (confirm_applied) слов не меняют и проходят."""
+    import legacy_anchors
+    import recordings
+    import transcript
+    words = {d.get("id"): d for d in decisions if isinstance(d, dict) and d.get("status") != "human"
+             and not d.get("confirm_applied")}
+    if not words:
+        return decisions, []
+    store, binding = recordings.open_for_document(jp, readonly=True)
+    if store is None:
+        return decisions, []
+    try:
+        mismatches = legacy_anchors.migration_mismatches(store, binding["recording_id"])
+    finally:
+        store.close()
+    refused = legacy_anchors.card_conflicts(mismatches, transcript.load(jp), words)
+    return ([d for d in decisions if not (isinstance(d, dict) and d.get("id") in refused)],
+            [{"id": aid, "why": why} for aid, why in refused.items()])
+
+
 def apply_review_files(jp, md, decisions, by="claude"):
     """Решения по местам разбора (transcript.apply_review); предложения агента по словам или месту человека
     становятся карточками противоречия в открытом пакете (PR 13б): `contradictions`, `cards`."""
     import review_pack
     import transcript
+    decisions, anchored = _legacy_anchor_refusals(jp, decisions)
     _, rep = transcript.apply_review(jp, md, decisions, by=by)
+    if anchored:
+        rep.setdefault("conflicts", []).extend(anchored)
     ids = list(dict.fromkeys(rep.get("contradictions") or []))
     if ids:
         rep["contradictions"] = ids

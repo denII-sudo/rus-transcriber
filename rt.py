@@ -19,6 +19,8 @@
     python rt.py screen [--port 8766]          # локальный экран в браузере (запуск, состояние, резерв)
     python rt.py workflow-list [--limit 20]    # последние запросы workflow
     python rt.py legacy-read ИМЯ.transcript.json [--offset 0 --limit 40]   # старые файлы записи: только чтение
+    python rt.py legacy-anchor-check [--db ФАЙЛ] [--recording ID] [--summary]
+        # записи из переноса старых файлов: места, привязанные не к тем словам; только чтение
     python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
     python rt.py db-init [--check]           # базы нет — создать и выбрать; есть — проверить чтением и выбрать;
         # --check — только сказать, что будет; базу и настройки не меняет
@@ -220,6 +222,12 @@ def build():
     lr = sub.add_parser("legacy-read", help="старые файлы записи рядом с аудио: что в них и на месте ли слова "
                         "карточек (не обещание внесения); только чтение"); lr.add_argument("path")
     lr.add_argument("--offset", type=int, default=0); lr.add_argument("--limit", type=int, default=40)
+    la = sub.add_parser("legacy-anchor-check", help="записи, перенесённые из старых файлов: места, привязанные не к "
+                        "тем словам (S24); только чтение")
+    la.add_argument("--db", help="файл базы (по умолчанию — база папки данных); открывается только для чтения")
+    la.add_argument("--recording", action="append", help="ID записи или его начало (можно несколько); без него — "
+                    "все записи")
+    la.add_argument("--summary", action="store_true", help="только числа, без слов стенограмм")
     sc = sub.add_parser("screen"); sc.add_argument("--port", type=int, default=8766)
     sc.add_argument("--hours", type=float, default=6.0)
     s = sub.add_parser("status"); s.add_argument("job"); s.add_argument("--wait", type=int, default=0)
@@ -316,6 +324,25 @@ def run(a):
             out(legacy_read.read(a.path, a.offset, a.limit))
         except legacy_read.LegacyReadError as ex:
             say(f"Ошибка: {ex}")
+            return 1
+    elif c == "legacy-anchor-check":
+        import legacy_anchors
+        import recordings
+        db = Path(a.db) if a.db else paths.STATE_DB
+        if not db.is_file():
+            say(f"Ошибка: базы нет: {db}")
+            return 1
+        store = recordings.open_store(db, readonly=True)
+        try:
+            report = legacy_anchors.check_store(store, a.recording, texts=not a.summary)
+        finally:
+            store.close()
+        if a.summary:
+            for rec in report["records"]:
+                rec["recording_id"] = rec["recording_id"][:8]
+        out({"database": str(db), **report})
+        if report["not_found"]:
+            say("Ошибка: записи не найдены (или начало ID подходит к нескольким): " + ", ".join(report["not_found"]))
             return 1
     elif c == "workflow-list":
         out(core.workflow_list(a.limit))
