@@ -428,14 +428,22 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
 SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 
 
-def _speaker_display(speaker, names):
+VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
+
+
+def _unconfirmed_voice_names(data):
+    """Имена подписаны программой по голосу и человек их не подтвердил (правило 26: конспект — конечный продукт)."""
+    return data.get("names_source") == "voices" and not data.get("names_confirmed")
+
+
+def _speaker_display(speaker, names, unconfirmed=False):
     """Как назвать говорящего в шапке: текущее имя или честное «имя не указано»."""
     if not speaker:
         return "говорящий в стенограмме не указан"
     name = " ".join(str(names.get(speaker, speaker)).split())
     if not name or re.fullmatch(r"Спикер(\s*\d+)?", name):
         return f"имя не указано (в стенограмме: {name or speaker})"
-    return name
+    return name + (VOICE_UNCONFIRMED if unconfirmed else "")
 
 
 def _labels_header(obj, data, needs_review):
@@ -453,10 +461,11 @@ def _labels_header(obj, data, needs_review):
     names = names if isinstance(names, dict) else {}
     current = {word.get("word_id"): seg.get("speaker")
                for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    unconfirmed = _unconfirmed_voice_names(data)
     lines = []
     for item in labels:
         found = Counter(current[wid] for wid in item.get("word_ids") or [] if wid in current)
-        shown = list(dict.fromkeys(_speaker_display(speaker, names) for speaker, _ in found.most_common()))
+        shown = list(dict.fromkeys(_speaker_display(speaker, names, unconfirmed) for speaker, _ in found.most_common()))
         text = "реплики не найдены в текущей стенограмме" if not shown else shown[0] + (
             f"; часть реплик в текущей стенограмме: {', '.join(shown[1:])}" if shown[1:] else "")
         lines.append(f"- {item.get('label')} — {text}")
@@ -483,6 +492,7 @@ def _author_of(obj, data):
     names = names if isinstance(names, dict) else {}
     current = {word.get("word_id"): seg.get("speaker")
                for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    unconfirmed = _unconfirmed_voice_names(data)
     by_speaker = {}
     for item in obj.get("speaker_labels") or []:
         for wid in item.get("word_ids") or []:
@@ -490,7 +500,7 @@ def _author_of(obj, data):
                 by_speaker.setdefault(current[wid], item.get("label"))
 
     def author(speaker):
-        return by_speaker.get(speaker) or _speaker_display(speaker, names)
+        return by_speaker.get(speaker) or _speaker_display(speaker, names, unconfirmed)
     return author
 
 

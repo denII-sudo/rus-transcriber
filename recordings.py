@@ -880,13 +880,13 @@ _WORKER_FIELDS = frozenset({
     "review", "review_done", "questions", "answers", "conflicts",
     "rejected", "applications", "undo", "interaction_events",
     "interaction_events_evicted", "question_version", "speaker_labels",
-    "timing", "_timing", "group", "no_profile",
+    "speaker_naming", "timing", "_timing", "group", "no_profile",
 })
 _TRANSCRIPT_FIELDS = (
     "file", "duration", "title", "recorded_at", "recorded_timezone",
     "container", "codec", "audio_sha256", "audio_available", "speakers",
     "speaker_names", "names_source", "names_confirmed", "segments",
-    "quality", "edits", "vocab_suggestions",
+    "quality", "edits", "vocab_suggestions", "speaker_naming",
 )
 _REVIEW_FIELDS = (
     "review", "review_done", "questions", "answers", "conflicts", "rejected",
