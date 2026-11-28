@@ -1,4 +1,4 @@
-"""БД-7: публикация резерва без жёстких ссылок, съёмный диск за настройкой человека, фоновый резерв экрана.
+"""БД-7: публикация резерва без жёстких ссылок, резерв на съёмный диск (решение владельца 28.11), фоновый резерв.
 
 Только синтетика во временной папке. Том без жёстких ссылок и съёмный диск подменяются (отказ os.link с кодом
 Windows, тип диска): настоящего FAT/exFAT и флешки в CI нет.
@@ -24,7 +24,6 @@ import core  # noqa: E402
 import core_conflicts  # noqa: E402
 import dbguard  # noqa: E402
 import paths  # noqa: E402
-import settings  # noqa: E402
 import storage  # noqa: E402
 import workflow_page  # noqa: E402
 
@@ -115,19 +114,15 @@ class RemovableTests(Base):
         self.addCleanup(self.drive.stop)
 
     @unittest.skipUnless(WINDOWS, "тип диска проверяется только в Windows")
-    def test_removable_refused_by_default_with_reason(self):
-        with self.assertRaises(ValueError) as caught:
-            core_conflicts.backup_store(self.stick / "copy.sqlite3")
-        self.assertIn("db_backup_allow_removable", str(caught.exception))
-        self.assertEqual(list(self.stick.iterdir()), [])
-        with self.assertRaises(ValueError) as other:          # папка данных на съёмном диске — как прежде
+    def test_data_folder_on_removable_drive_is_still_refused(self):
+        """Съёмный диск разрешён только назначению резерва; база, папка данных, корни — как прежде."""
+        with self.assertRaises(ValueError):
             storage.check_local_path(self.stick / "state.sqlite3")
-        self.assertNotIn("Резерв", str(other.exception))
+        storage.check_local_path(self.stick / "copy.sqlite3", allow_removable=True)
 
-    def test_removable_allowed_by_setting_copies_through_local_folder(self):
+    def test_removable_destination_copies_through_local_folder(self):
         stages = []
-        with mock.patch.object(settings, "load_config", return_value={"db_backup_allow_removable": True}):
-            result = core_conflicts.backup_store(self.stick / "copy.sqlite3", on_stage=stages.append)
+        result = core_conflicts.backup_store(self.stick / "copy.sqlite3", on_stage=stages.append)
         self.assertEqual(result["report"]["integrity"], "ok")
         local = self.base / "check.sqlite3"                    # программа не открывает базы на съёмном носителе
         shutil.copyfile(self.stick / "copy.sqlite3", local)
@@ -139,7 +134,7 @@ class RemovableTests(Base):
     def test_changed_bytes_on_the_drive_leave_nothing(self):
         with mock.patch.object(storage, "_file_sha256", side_effect=["a" * 64, "b" * 64]), \
                 self.assertRaises(storage.StorageError):
-            self.store.backup(self.stick / "copy.sqlite3", allow_removable=True)
+            self.store.backup(self.stick / "copy.sqlite3")
         self.assertEqual(list(self.stick.iterdir()), [])
         self.assertEqual(self.leftovers(self.base), [])
 
@@ -170,10 +165,10 @@ class ScreenTaskTests(unittest.TestCase):
 
     def test_background_failure_is_explained(self):
         tasks = workflow_page.BackupTasks()
-        with mock.patch.object(core, "backup_store", side_effect=ValueError(storage.REMOVABLE_REFUSED)):
+        with mock.patch.object(core, "backup_store", side_effect=ValueError("network paths are not supported")):
             failed = tasks.wait(tasks.start("E:/b.sqlite3")["task_id"])
         self.assertEqual(failed["state"], "failed")
-        self.assertIn("db_backup_allow_removable", failed["error"])
+        self.assertIn("network paths are not supported", failed["error"])
         with self.assertRaises(core.CoreError):
             tasks.status("нет-такого")
         with mock.patch.object(core, "backup_store", side_effect=storage.Busy("database is busy")):

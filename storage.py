@@ -94,16 +94,13 @@ def _drive_type(path):
         return None
     import ctypes
     return ctypes.windll.kernel32.GetDriveTypeW(str(Path(path).resolve().anchor))
-REMOVABLE_REFUSED = ("Резерв на съёмный диск (флешку, карту памяти) сейчас выключен: решение о таких резервах ещё "
-                     "не принято, настройка db_backup_allow_removable выключена. Выберите папку на внутреннем диске.")
 
 
-def check_local_path(path, *, allow_removable=None):
+def check_local_path(path, *, allow_removable=False):
     """Не принимать UNC и диски Windows, не являющиеся локальными fixed-дисками.
 
-    allow_removable — только для назначения резерва (БД-7): True — съёмный диск (тип 2) разрешён настройкой
-    человека, False — отказ с объяснением про резерв. None (все остальные пути: папка данных, база, корни) —
-    как прежде, только несъёмный локальный диск."""
+    allow_removable=True — ещё и съёмный диск (тип 2): только для назначения резерва (БД-7, решение владельца
+    28.11.2026 по вопросу 8). Папка данных, база и корни документов — как прежде, только несъёмный локальный диск."""
     try:
         path = Path(path).absolute()
         resolved = path.resolve()
@@ -114,8 +111,6 @@ def check_local_path(path, *, allow_removable=None):
         if anchor.startswith("\\\\") or not anchor:
             raise ValueError("network paths are not supported")
         kind = _drive_type(resolved)
-        if kind == _DRIVE_REMOVABLE and allow_removable is False:
-            raise ValueError(REMOVABLE_REFUSED)
         if kind not in ((_DRIVE_FIXED, _DRIVE_REMOVABLE) if allow_removable else (_DRIVE_FIXED,)):
             raise ValueError("only local fixed drives are supported")
     return path
@@ -1011,16 +1006,16 @@ class Store:
             raise StorageError("store must have exactly one active installation")
         return dict(rows[0])
 
-    def backup(self, destination, *, allow_damaged_copies=False, allow_removable=False, on_stage=None):
+    def backup(self, destination, *, allow_damaged_copies=False, on_stage=None):
         """SQLite backup в новый файл; восстановленная копия неактивна.
 
-        allow_removable — назначение на съёмном диске разрешено настройкой человека (БД-7). Тогда копия делается и
+        Назначение может быть на съёмном диске (БД-7, решение владельца 28.11.2026 по вопросу 8). Тогда копия делается и
         проверяется рядом с базой (SQLite не открывает файлов на съёмном носителе), потом переносится туда байтами
         с проверкой SHA-256 и публикуется без замены. on_stage(этап) — ход для фонового резерва: copy, verify,
         transfer, publish; сбой в нём резерв не прерывает."""
         if self.db.in_transaction:
             raise Conflict("cannot back up an open transaction")
-        destination = check_local_path(destination, allow_removable=bool(allow_removable))
+        destination = check_local_path(destination, allow_removable=True)
         if destination.exists():
             raise FileExistsError(destination)
         if _drive_type(destination) == _DRIVE_REMOVABLE and self.path is not None:

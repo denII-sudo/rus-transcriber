@@ -1043,16 +1043,12 @@ def _not_written_warning(rows):
 def backup_store(destination, on_stage=None):
     """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии.
 
-    Съёмный диск назначения — только если человек включил db_backup_allow_removable (БД-7, вопрос 8 открыт).
-    on_stage(этап) — ход для фонового резерва экрана."""
+    Назначение может быть на съёмном диске (БД-7). on_stage(этап) — ход для фонового резерва экрана."""
     import recordings
-    import settings
-    allow_removable = settings.load_config().get("db_backup_allow_removable") is True
     store = recordings.open_store()
     try:
         store.current_identity()
-        report = store.backup(destination, allow_damaged_copies=True, allow_removable=allow_removable,
-                              on_stage=on_stage)
+        report = store.backup(destination, allow_damaged_copies=True, on_stage=on_stage)
         warning = _damaged_copies_warning(report.get("damaged_copies"))
         return {"destination": str(destination), "report": report, **({"warning": warning} if warning else {})}
     finally:
