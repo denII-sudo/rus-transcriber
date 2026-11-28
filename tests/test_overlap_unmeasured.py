@@ -189,8 +189,9 @@ class EchoShareTests(unittest.TestCase):
         self.assertFalse(any("overlap" in (w.get("flags") or []) for w in words_))
         self.assertEqual({seg["label"] for seg in data["segments"]}, {S1})       # голос слов прежний
         md = transcript.render_md(dict(data, file="synthetic.wav", duration="00:00:21"))
-        self.assertIn("одновременную речь на 75 % речи — похоже на эхо, гул или долгую одновременную речь", md)
-        self.assertIn("Если говорили одновременно — прослушайте: 00:00:01–00:00:08, 00:00:11–00:00:19.", md)
+        self.assertIn("Внимание: на 75 % речи звучит больше одного голоса сразу (эхо, гул или разговор "
+                      "вперебивку). Там не сверено, чей голос у слова, поэтому цитаты оттуда не считаются "
+                      "проверенными. Прослушайте: 00:00:01–00:00:08, 00:00:11–00:00:19.", md)
 
     def test_share_around_threshold(self):
         """29 % и ровно 30 % речи — ещё не эхо: места наложений ставятся, предупреждения нет; 31 % — мест нет,
@@ -230,7 +231,7 @@ class EchoShareTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(transcript.overlap_skipped_note(bad))
                 md = transcript.render_md(dict(base, quality={"overlap_unmeasured_skipped": bad}))
-                self.assertNotIn("похоже на эхо", md)
+                self.assertNotIn("больше одного голоса", md)
 
     def test_share_just_above_threshold_is_not_written_as_threshold(self):
         """Н28-6: доля 0,30004 (места сняты по правилу «больше 30 %») хранится вверх до 4 знаков и пишется
@@ -247,9 +248,10 @@ class EchoShareTests(unittest.TestCase):
         Н28-1) — прежняя концовка; испорченные отрезки отбрасываются, предупреждение остаётся."""
         spans = [[float(10 * k), float(10 * k + 2)] for k in range(7)]
         note = transcript.overlap_skipped_note({"share": 0.5, "sec": 14.0, "spans": spans})
-        self.assertIn("прослушайте: 00:00:00–00:00:02, 00:00:10–00:00:12, 00:00:20–00:00:22, "
+        self.assertIn("Прослушайте: 00:00:00–00:00:02, 00:00:10–00:00:12, 00:00:20–00:00:22, "
                       "00:00:30–00:00:32, 00:00:40–00:00:42 и ещё 2.", note)
-        self.assertTrue(transcript.overlap_skipped_note({"share": 0.5, "sec": 1.0}).endswith("прослушайте."))
+        self.assertTrue(transcript.overlap_skipped_note({"share": 0.5, "sec": 1.0}).endswith(
+            "цитаты оттуда не считаются проверенными. Прослушайте."))
         for bad in ([[2.0, 1.0]], [[1.0]], "x", [[1.0, float("nan")]], [[True, 2.0]]):
             with self.subTest(bad=bad):
                 info = transcript.overlap_skipped_info({"share": 0.5, "sec": 1.0, "spans": bad})

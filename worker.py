@@ -1030,7 +1030,7 @@ def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, 
             quality["overlap_unmeasured_skipped"] = {
                 "share": min(1.0, math.ceil(share * 10000) / 10000), "sec": round(ov_sec, 1),
                 "spans": [[math.floor(a * 100) / 100, math.ceil(b * 100) / 100] for a, b in hit]}
-            W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо, гул или долгую одновременную речь): "
+            W._log(f"наложения pyannote — {share:.0%} речи (эхо, гул или разговор вперебивку): "
                    f"{skipped} слов без измеренного отрыва голосов в {len(hit)} отрезках не помечены как "
                    "наложение")
     for seg in segments:
