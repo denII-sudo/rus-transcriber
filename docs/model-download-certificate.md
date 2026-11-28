@@ -49,7 +49,7 @@ urllib.error.URLError: ('Истек/не наступил срок действ�
 Быстрая проверка «продлили или нет» без скачивания файла:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import urllib.request as u; r=u.urlopen(u.Request('https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/emo.ckpt', headers={'Range':'bytes=0-0'}), timeout=20); print(r.status)"
+.\.venv\Scripts\python.exe -c "import paths, urllib.request as u; r=u.urlopen(u.Request('https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/emo.ckpt', headers={'Range':'bytes=0-0'}), timeout=20); print(r.status)"
 ```
 
 Пока сертификат просрочен, команда падает с `CERTIFICATE_VERIFY_FAILED`.
@@ -144,8 +144,11 @@ Get-FileHash "$dst\v3_e2e_rnnt.ckpt" -Algorithm MD5
 https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt
 ```
 
-Проект уже использует `truststore` (`paths.py`), поэтому Python после этого
-начнёт доверять цепочке без правки пакетов. Не добавляйте сертификат в файл
+При импорте `paths.py` проект пытается подключить `truststore` и системные
+сертификаты Windows (`truststore.inject_into_ssl()`). Если импорт и подключение
+прошли успешно, Python будет проверять цепочку с этим хранилищем без правки
+пакетов. Если `truststore` отсутствует или подключение завершилось ошибкой,
+этот механизм не включится. Не добавляйте сертификат в файл
 `certifi` через `>>`: при обновлении пакета правка пропадёт, а `pip` использует
 свой отдельный bundle (`.venv\Lib\site-packages\pip\_vendor\certifi\cacert.pem`).
 
