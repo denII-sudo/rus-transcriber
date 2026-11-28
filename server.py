@@ -90,7 +90,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.29.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.29.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -1070,11 +1070,15 @@ async def self_check(tests: bool = True) -> str:
     процессе, с отдельной временной папкой данных — настоящие данные не трогаются), проверка файлов программы на
     личные данные (tools/check_repo.py: только где нарушение, сами слова не показываются) и морфология
     (pymorphy3 для подсказок словаря). Только проверки, ничего не меняет. tests=False — без тестов (быстро).
-    Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части."""
+    Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части.
+    leftovers — остатки после обрывов старше суток (незавершённые копии базы, временные файлы документов): путь,
+    размер, пояснение. Это не ошибка проверки; программа их не удаляет. Покажите человеку список; удалять — только
+    ему самому. Файл с пометкой second_name_of_database — второе имя рабочей базы: не открывать и не копировать."""
     import selfcheck
     r = await asyncio.to_thread(selfcheck.run, VERSION, bool(tests), True, True)
     # объём гипотез моделей в базе этой установки — только числа, ничего не меняется
     r["hypotheses"] = await asyncio.to_thread(core._hypotheses_summary)
+    r["leftovers"] = await asyncio.to_thread(core.leftovers_summary)
     return json.dumps(r, ensure_ascii=False, indent=1)
 
 

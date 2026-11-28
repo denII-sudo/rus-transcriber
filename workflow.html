@@ -142,6 +142,7 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
     <input type="text" id="backup-dest" placeholder="C:\резервы\state-2026-11-17.sqlite3"></label>
   <button id="backup">Создать резерв</button>
   <div id="backup-report"></div>
+  <div id="leftovers"></div>
 </section>
 
 <script>
@@ -976,8 +977,37 @@ $("backup").onclick = async () => {
     warning.forEach(line => report.append(node("p", line, "warn")));
   } catch (ex) { $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
 };
+// Остатки после обрывов (БД-9а): блок появляется, только если они есть. Программа их не удаляет.
+function fmtSize(bytes) {
+  const units = ["Б", "КБ", "МБ", "ГБ"];
+  let v = Number(bytes) || 0, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1).replace(".", ",") : String(v)) + " " + units[i];
+}
+async function loadLeftovers() {
+  const box = $("leftovers");
+  try {
+    const d = await call("api/leftovers");
+    box.textContent = "";
+    if (!d.count) return;
+    box.append(node("h3", "Остатки после обрывов"));
+    box.append(node("p", `Найдено файлов: ${d.count}, вместе ${fmtSize(d.bytes)}. Программа их не использует и ` +
+      "сама не удаляет; удалить их можете вы, когда программа закрыта. В незавершённых копиях базы — " +
+      "содержимое базы со стенограммами.", "muted"));
+    const list = node("ul");
+    d.items.forEach(item => {
+      const li = node("li", null, item.second_name_of_database ? "warn" : "");
+      li.append(node("code", item.path));
+      li.append(document.createTextNode(` — ${fmtSize(item.size)}, изменён ${fmtTime(item.modified)}: ${item.hint}`));
+      list.append(li);
+    });
+    box.append(list);
+    if (d.truncated) box.append(node("p", "Просмотрены не все папки: список может быть неполным.", "muted"));
+  } catch (ex) { box.textContent = ""; box.append(node("p", "Остатки после обрывов не проверены: " + ex.message, "muted")); }
+}
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
 loadConflicts();
+loadLeftovers();
 loadRecordings();
 loadRequests();
 </script>

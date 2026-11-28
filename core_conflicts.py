@@ -1053,10 +1053,39 @@ def backup_store(destination):
         store.close()
 
 
-def inspect_backup(backup_path):
-    """Прочитать резервную копию только для чтения: корни, пользователи, число записей, повреждённые копии."""
+def leftovers_report():
+    """Остатки после обрывов (БД-9а): незавершённые копии базы рядом с ней и в db-backups, временные файлы
+    документов в зарегистрированных корнях — только список, ничего не удаляется и не открывается (leftovers.py).
+    Корни читаются из базы живым чтением; не прочиталась база — проверяются только папки базы и резервов."""
+    import leftovers
+    import paths
+    import recordings
     import storage
-    store = storage.open_store_readonly(str(backup_path))
+    database = Path(paths.STATE_DB)
+    roots, note = [], None
+    if database.is_file():
+        try:
+            store = recordings.open_store(readonly=True)
+            try:
+                roots = [row["path"] for row in store.db.execute("SELECT path FROM allowed_roots ORDER BY path")]
+            finally:
+                store.close()
+        except (storage.StorageError, sqlite3.Error, ValueError) as ex:
+            note = f"корни документов не проверены: база не прочиталась ({explain_error(ex)})"
+    report = leftovers.find(database, roots)
+    if note:
+        report["note"] = note
+    return report
+
+
+def inspect_backup(backup_path):
+    """Прочитать резервную копию только для чтения: корни, пользователи, число записей, повреждённые копии.
+
+    Резерв никто не пишет: он открывается как снимок и следов рядом не оставляет (БД-2). Если вместо резерва
+    указана рабочая база программы, её может писать другой процесс — тогда живое чтение (mode=ro)."""
+    import storage
+    opener = storage.open_store_readonly if _is_working_database(backup_path) else storage.open_snapshot_readonly
+    store = opener(str(backup_path))
     try:
         roots = [dict(row) for row in store.db.execute(
             "SELECT root_id, path, requires_remap FROM allowed_roots ORDER BY path")]
@@ -1071,6 +1100,15 @@ def inspect_backup(backup_path):
                     "SELECT locked FROM restore_guard WHERE id=1").fetchone()[0])}
     finally:
         store.close()
+
+
+def _is_working_database(path):
+    """path — рабочая база программы (тот же файл, что paths.STATE_DB, в том числе под вторым именем)."""
+    import paths
+    try:
+        return Path(paths.STATE_DB).is_file() and os.path.samefile(path, paths.STATE_DB)
+    except OSError:
+        return False
 
 
 _SIDE_SUFFIXES = ("-wal", "-shm", "-journal")     # служебные файлы SQLite рядом с базой: набор с ней одно целое
@@ -1094,6 +1132,17 @@ class _Refused(Exception):
 def _side_files(path):
     """Служебные файлы SQLite, которые сейчас лежат рядом с базой path (в том числе битые ссылки)."""
     return [Path(str(path) + suffix) for suffix in _SIDE_SUFFIXES if os.path.lexists(str(path) + suffix)]
+
+
+def _non_empty(path):
+    """Файл есть и не пуст. Пропавший файл или ошибка чтения размера — «не пуст»: так текст отказа не скроет
+    внесённый журнал."""
+    try:
+        return os.path.getsize(path) > 0
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
 
 
 def _rename(source, target):
@@ -1301,6 +1350,10 @@ def _with_leftovers(text, staged, state):
     if state["settled"]:
         left.append("журнал прежней базы (-wal) внесён в её основной файл и служебные файлы убраны — так делает и "
                     "сама программа при открытии; данные те же")
+    elif state["tidied"]:
+        # БД-2: пустой -wal и -shm оставляет обычное чтение базы; их убрало открытие прежней базы на запись
+        left.append("у прежней базы убраны служебные файлы, которые оставило чтение (пустой журнал -wal и -shm) — "
+                    "так делает и сама программа; данные не менялись")
     if state["shm"]:
         left.append("у прежней базы мог измениться служебный файл -shm (метки SQLite, данные не затронуты)")
     return f"{text}. " + ("Осталось: " + "; ".join(left) + "." if left else "Ничего не изменено.")
@@ -1334,7 +1387,7 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
     except _Refused as ex:
         raise core.CoreError(f"{ex}. Ничего не изменено.") from ex
     staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
-    state = {"roots": [], "shm": False, "settled": False}
+    state = {"roots": [], "shm": False, "settled": False, "tidied": False}
 
     def refused(text):
         return core.CoreError(_with_leftovers(text, staged, state))
@@ -1348,8 +1401,9 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
         store = None
         try:
             try:
-                # повреждённый резерв отвергается, пока в новых корнях ещё ничего не записано
-                storage.validate_copy(staged, allow_damaged_copies=True)
+                # повреждённый резерв отвергается, пока в новых корнях ещё ничего не записано; копию этого вызова
+                # никто, кроме него, не открывал — чтение снимка (БД-2)
+                storage.validate_copy(staged, allow_damaged_copies=True, live=False)
                 store = storage.open_store(staged)
                 installation_id = str(uuid.uuid4())
                 store.rebind_restored_copy(mapping, installation_id, user_id)
@@ -1360,9 +1414,11 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
             try:
                 _check_destination_free(destination, replace)
                 if replacing:
-                    journal = bool(_side_files(destination))
+                    sides = _side_files(destination)
+                    journal = any(_non_empty(side) for side in sides if side.name.endswith(("-wal", "-journal")))
                     unreadable = _settle_previous(destination)
                     state["settled"] = unreadable is None and journal
+                    state["tidied"] = unreadable is None and bool(sides) and not journal
                     holds = _hold_previous(destination, unreadable)
             except _Refused as ex:
                 state["shm"] = state["shm"] or ex.shm
@@ -1376,7 +1432,8 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
                 not_written = [dict(row) for row in store.db.execute(
                     "SELECT recording_id, document_revision, error_code FROM document_outbox "
                     "WHERE state = 'pending' ORDER BY recording_id, document_revision")]
-                validation = storage.validate_copy(staged, allow_damaged_copies=True)
+                # копия ещё открыта на запись (store): живое чтение видит записанное в её -wal (БД-2)
+                validation = storage.validate_copy(staged, allow_damaged_copies=True, live=True)
             except (storage.StorageError, ValueError) as ex:
                 raise refused(f"восстановление не выполнено ({ex}); прежняя база на месте") from ex
         finally:

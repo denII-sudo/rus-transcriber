@@ -157,7 +157,7 @@ class HypothesesDbTests(unittest.TestCase):
         self.put(1, self.rec_a)
         backups = sorted((self.root / "db-backups").glob("state-before-hypotheses-*.sqlite3"))
         self.assertEqual(len(backups), 1)
-        old = storage.open_store_readonly(backups[0])
+        old = storage.open_snapshot_readonly(backups[0])     # резерв никто не пишет: чтение снимка, без следов
         try:
             self.assertFalse(old.has_hypotheses())           # резерв — база как была до таблицы
         finally:

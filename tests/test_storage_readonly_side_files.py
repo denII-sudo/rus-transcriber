@@ -1,10 +1,12 @@
-"""Чтение базы «только на чтение» не должно оставлять рядом служебные файлы -wal/-shm.
+"""Чтение снимка (резерв, своя копия) «только на чтение» не должно оставлять рядом служебные файлы -wal/-shm.
 
 База всегда в режиме WAL. Соединение mode=ro на закрытой базе создаёт -wal/-shm и при
-закрытии не может их убрать; в папке данных или рядом с резервной копией остаются лишние
-файлы (а на каталоге только для чтения открытие вообще может не удаться).
-Это верно только для закрытой базы без служебных файлов; если -wal/-shm уже есть, меняется
-или создаётся -shm (второй класс ниже). Все базы здесь синтетические и лежат во временной папке.
+закрытии не может их убрать; рядом с резервной копией остались бы лишние файлы (а на каталоге
+только для чтения открытие вообще может не удаться). Поэтому снимок (open_snapshot_readonly,
+validate_copy по умолчанию) открывается неизменяемым. Это верно только для закрытой базы без
+служебных файлов; если -wal/-shm уже есть, меняется или создаётся -shm (второй класс ниже).
+Живая база (open_store_readonly) с БД-2 читается обычным mode=ro и может оставить -wal/-shm:
+это проверяет tests/test_storage_live_reader.py. Все базы здесь синтетические и лежат во временной папке.
 """
 import os
 import shutil
@@ -33,8 +35,8 @@ class ReadonlyLeavesNoTraces(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_open_store_readonly_leaves_no_side_files(self):
-        store = storage.open_store_readonly(self.path)
+    def test_open_snapshot_readonly_leaves_no_side_files(self):
+        store = storage.open_snapshot_readonly(self.path)
         try:
             store.db.execute("SELECT count(*) FROM recordings").fetchone()
         finally:
@@ -96,7 +98,7 @@ def file_bytes(directory):
 
 
 class ReadonlyWithServiceFiles(unittest.TestCase):
-    """Что именно меняется рядом с базой, если -wal/-shm уже есть (см. _connect_readonly).
+    """Что именно меняется рядом с базой, если -wal/-shm уже есть (см. _connect_snapshot_readonly).
 
     Читатель WAL всегда отмечается в -shm, поэтому «без следов» верно только для закрытой
     базы. Здесь зафиксировано реальное поведение: основной файл и -wal не меняются, данные

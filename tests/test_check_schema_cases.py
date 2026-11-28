@@ -31,7 +31,7 @@ def change(path, *statements):
 def verdict(path):
     """None — база подходит; иначе класс отказа."""
     try:
-        db = storage._connect_readonly(path)
+        db = storage._connect_snapshot_readonly(path)      # прежнее чтение копии (БД-2: снимок)
     except Exception as exc:                                    # не база: отказ уже при открытии
         return type(exc).__name__
     try:
