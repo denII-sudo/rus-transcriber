@@ -521,8 +521,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.get(self.store, request)["model_task"], legacy)
         payload, md = self.conspect_files(recording)
         # файл версии 1 — прежнего вида: без расшифровки меток и времени
-        self.assertEqual(md, "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
-                             "Итог блока.\n\nИтог блока.\n")
+        self.assertTrue(md.startswith("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
+                                      "Событие: "))
+        self.assertIn("Составлен: моделью OpenAI через OpenCode\n", md)
+        self.assertTrue(md.endswith("\n\nИтог блока.\n\nИтог блока.\n"))
+        self.assertNotIn("Участники", md)
         self.assertNotIn("speaker_labels", payload)
         self.assertEqual(len(self.store.list_conspects(recording)), 1)
         # новое поколение задания для того же запроса (явное «начать заново») — уже текущей версии 3
@@ -620,6 +623,8 @@ class WorkflowTests(unittest.TestCase):
         md, _ = conspect.render(obj, data, update_last=False)
         self.assertEqual(md, (
             "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
+            "Событие: не указано\nДата записи: не установлена\nСоставлен: моделью OpenAI через OpenCode\n"
+            "Стенограмма: версия не указана\nМеста разбора: мест разбора нет\n\n"
             "Участники (условные метки; имена — по текущей стенограмме):\n\n"
             "- Участник 1 — Анна Синтетическая; часть реплик в текущей стенограмме: Борис Синтетический\n"
             "- Участник 2 — имя не указано (в стенограмме: Спикер 7)\n"
@@ -630,9 +635,12 @@ class WorkflowTests(unittest.TestCase):
         # после подтверждения человеком на текущей ревизии строка об отсутствии проверки не пишется
         confirmed, _ = conspect.render({**obj, "analysis_revision": 2}, data, update_last=False)
         self.assertTrue(confirmed.startswith("# Конспект\n\nСоздан моделью.\n\n"))
-        # конспект без привязки меток собирается как раньше — без шапки
+        # конспект без привязки меток: без списка участников и времени, но со сведениями шапки (7.6а)
         plain = {key: value for key, value in obj.items() if key != "speaker_labels"}
-        self.assertEqual(conspect.render(plain, data, update_last=False)[0], "[00:00:01]\nТекст раздела.")
+        plain_md = conspect.render(plain, data, update_last=False)[0]
+        self.assertTrue(plain_md.endswith("\n\n[00:00:01]\nТекст раздела."))
+        self.assertNotIn("Участники", plain_md)
+        self.assertIn("Составлен: моделью OpenAI через OpenCode\n", plain_md)
 
     def test_section_time_spans_is_pure_and_tolerates_missing_words(self):
         transcript = {"segments": [

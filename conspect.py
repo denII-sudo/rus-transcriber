@@ -32,6 +32,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import quotes as Q
@@ -485,6 +486,7 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
 SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 
 
+MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
 VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
 
 
@@ -532,6 +534,49 @@ def _labels_header(obj, data, needs_review):
     if SECTION_TIME.search(obj.get("template") or ""):
         head += "Время в квадратных скобках — начало раздела в записи (часы:минуты:секунды).\n\n"
     return head
+
+
+def _event_and_date(data):
+    """(событие, подпись даты) для шапки (РАР-7, 7.6а; решения В-3, В-4).
+
+    Событие — название записи, иначе имя файла аудио (без пути). Дата — дата записи (`recorded_at`), иначе дата
+    файла аудио (время его изменения), если файл ещё на месте; дату переноса в базу не берём. Неизвестна — честное
+    «не установлена».
+    """
+    file = data.get("file") if isinstance(data.get("file"), str) else ""
+    title = data.get("title") if isinstance(data.get("title"), str) else ""
+    event = " ".join(title.split()) or (Path(file.replace("\\", "/")).name if file else "") or "не указано"
+    recorded = data.get("recorded_at")
+    if isinstance(recorded, str) and recorded.strip():
+        return event, f"Дата записи: {recorded.strip()[:10]}"
+    if file:
+        try:
+            when = datetime.fromtimestamp(Path(file).stat().st_mtime)
+            return event, f"Дата файла аудио: {when:%Y-%m-%d}"
+        except (OSError, ValueError, OverflowError):
+            pass
+    return event, "Дата записи: не установлена"
+
+
+def _info_lines(obj, data, rep, model):
+    """Сведения шапки: событие, дата, кто составил, версия стенограммы, разобрано мест (7.6а). Ставит программа."""
+    import transcript
+    import workflow
+    event, date = _event_and_date(data)
+    places = [item for item in data.get("review") or [] if isinstance(item, dict)]
+    done = sum(1 for item in places if not transcript.place_unresolved(item))
+    unheard = sum(1 for item in places if workflow._closed_unheard(item))
+    now, before = data.get("source_revision"), obj.get("assembly_revision")
+    if before is not None and now is not None and before != now:
+        version = (f"собрана по версии стенограммы {before}, сейчас {now}: изменено цитат "
+                   f"{len(rep['changed_since_last'])}, у говорящих {len(rep['speaker_changed'])}")
+    else:
+        version = f"версия {now}" if now is not None else "версия не указана"
+    review = (f"разобрано {done} из {len(places)}" + (f", не прослушано {unheard}" if unheard else "")
+              if places else "мест разбора нет")
+    return (f"Событие: {event}" + chr(10) + f"{date}" + chr(10) +
+            f"Составлен: {'моделью OpenAI через OpenCode' if model else 'ИИ-агентом'}" + chr(10) +
+            f"Стенограмма: {version}" + chr(10) + f"Места разбора: {review}" + chr(10) + chr(10))
 
 
 def _clock(seconds):
@@ -664,6 +709,16 @@ def render(obj, data, update_last=True):
 
     body_md = SLOT.sub(sub, obj["template"])         # один проход: вставленный текст не раскрывается повторно
     header = _labels_header(obj, data, rep["analysis_needs_review"])
+    # Файл версии 1 (без меток): «# Конспект / Создан моделью…» уже стоит в начале самого текста (workflow.py)
+    lead = MODEL_LEAD.match(body_md) if not header else None
+    info = _info_lines(obj, data, rep, bool(header) or policy or bool(lead) or obj.get("provenance") == "model")
+    if header:                                  # шапка модельного конспекта: «# Конспект», «Создан моделью…»
+        cut = header.index(chr(10) * 2, header.index(chr(10) * 2) + 2) + 2
+        header = header[:cut] + info + header[cut:]
+    elif lead:
+        header, body_md = body_md[:lead.end()] + info, body_md[lead.end():]
+    else:
+        header = info
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
                    + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
