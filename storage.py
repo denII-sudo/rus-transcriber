@@ -85,21 +85,57 @@ def _is_busy(exc):
             or "locked" in str(exc).lower() or "busy" in str(exc).lower())
 
 
-def check_local_path(path):
-    """Не принимать UNC и диски Windows, не являющиеся локальными fixed-дисками."""
+_DRIVE_REMOVABLE, _DRIVE_FIXED = 2, 3
+
+
+def _drive_type(path):
+    """Windows: тип диска пути (GetDriveTypeW: 2 — съёмный, 3 — несъёмный, 4 — сетевой…). Вне Windows — None."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    return ctypes.windll.kernel32.GetDriveTypeW(str(Path(path).resolve().anchor))
+
+
+def check_local_path(path, *, allow_removable=False):
+    """Не принимать UNC и диски Windows, не являющиеся локальными fixed-дисками.
+
+    allow_removable=True — ещё и съёмный диск (тип 2): только для назначения резерва (БД-7, решение владельца
+    28.11.2026 по вопросу 8). Папка данных, база и корни документов — как прежде, только несъёмный локальный диск."""
     try:
         path = Path(path).absolute()
         resolved = path.resolve()
     except (OSError, RuntimeError) as exc:
         raise ValueError("invalid path") from exc
     if os.name == "nt":
-        import ctypes
         anchor = resolved.anchor
         if anchor.startswith("\\\\") or not anchor:
             raise ValueError("network paths are not supported")
-        if ctypes.windll.kernel32.GetDriveTypeW(str(anchor)) != 3:
+        kind = _drive_type(resolved)
+        if kind not in ((_DRIVE_FIXED, _DRIVE_REMOVABLE) if allow_removable else (_DRIVE_FIXED,)):
             raise ValueError("only local fixed drives are supported")
     return path
+
+
+_NO_HARD_LINKS = (1, 50)         # ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED: том без жёстких ссылок (FAT, exFAT)
+
+
+def _publish_new(staged, destination):
+    """Опубликовать проверенный файл под новым именем, не заменяя существующий (БД-7).
+
+    Обычно — жёсткая ссылка (staged остаётся, его удаляет вызывающий). Том без жёстких ссылок (FAT, exFAT, часто
+    у внешних дисков) на Windows — переименование: там os.rename не заменяет существующий файл (FileExistsError).
+    Вне Windows rename заменяет молча, поэтому там такой том — отказ. -> True, если staged переименован (его больше
+    нет), False — опубликована ссылка."""
+    try:
+        os.link(staged, destination)
+        return False
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) not in _NO_HARD_LINKS:
+            raise
+    os.rename(staged, destination)
+    return True
 
 
 _FILE_SHARE_DELETE = 0x4
@@ -658,6 +694,23 @@ def _release_wal_files(path):
         db.close()
 
 
+def _stage(on_stage, name):
+    """Сообщить этап резерва; сбой наблюдателя резерв не прерывает."""
+    if on_stage is not None:
+        try:
+            on_stage(name)
+        except Exception:
+            pass
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _remove_unpublished(staged):
     """Удалить неопубликованный временный файл (резерва или новой базы) и его служебные -wal/-shm/-journal.
 
@@ -953,17 +1006,70 @@ class Store:
             raise StorageError("store must have exactly one active installation")
         return dict(rows[0])
 
-    def backup(self, destination, *, allow_damaged_copies=False):
-        """SQLite backup в новый файл; восстановленная копия неактивна."""
+    def backup(self, destination, *, allow_damaged_copies=False, on_stage=None):
+        """SQLite backup в новый файл; восстановленная копия неактивна.
+
+        Назначение может быть на съёмном диске (БД-7, решение владельца 28.11.2026 по вопросу 8). Тогда копия делается и
+        проверяется рядом с базой (SQLite не открывает файлов на съёмном носителе), потом переносится туда байтами
+        с проверкой SHA-256 и публикуется без замены. on_stage(этап) — ход для фонового резерва: copy, verify,
+        transfer, publish; сбой в нём резерв не прерывает."""
         if self.db.in_transaction:
             raise Conflict("cannot back up an open transaction")
-        destination = check_local_path(destination)
+        destination = check_local_path(destination, allow_removable=True)
         if destination.exists():
             raise FileExistsError(destination)
+        if _drive_type(destination) == _DRIVE_REMOVABLE and self.path is not None:
+            return self._backup_via_local(destination, allow_damaged_copies, on_stage)
         staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
+        report = self._backup_staged(staged, allow_damaged_copies, on_stage)
+        try:
+            _stage(on_stage, "publish")
+            renamed = _publish_new(staged, destination)
+        except BaseException:
+            _remove_unpublished(staged)
+            raise
+        if not renamed:
+            staged.unlink()
+        return report
+
+    def _backup_via_local(self, destination, allow_damaged_copies, on_stage):
+        """Съёмный диск: проверенная копия рядом с базой → байтами на носитель → сверка SHA-256 → публикация."""
+        token = uuid.uuid4().hex
+        staged = self.path.with_name(self.path.name + ".incomplete-" + token)
+        outgoing = destination.with_name(destination.name + ".incomplete-" + token)
+        report = self._backup_staged(staged, allow_damaged_copies, on_stage)
+        try:
+            _stage(on_stage, "transfer")
+            expected = _file_sha256(staged)
+            with staged.open("rb") as source, outgoing.open("xb") as target:
+                while True:
+                    chunk = source.read(1 << 20)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if _file_sha256(outgoing) != expected:
+                raise StorageError("backup copy changed while writing to the removable drive")
+            _stage(on_stage, "publish")
+            if not _publish_new(outgoing, destination):
+                outgoing.unlink()
+        except BaseException:
+            _remove_unpublished(staged)
+            try:
+                outgoing.unlink(missing_ok=True)      # свой незаконченный файл на носителе: SQLite его не открывал
+            except OSError:
+                pass
+            raise
+        staged.unlink()
+        return report
+
+    def _backup_staged(self, staged, allow_damaged_copies, on_stage):
+        """Снимок в новый временный файл staged, пометка «неактивна», validate_copy. Сбой — staged убран."""
         with staged.open("xb"):
             pass
         try:
+            _stage(on_stage, "copy")
             target = _connect(staged, "rw")
             try:
                 self.db.backup(target)
@@ -982,15 +1088,14 @@ class Store:
                 raise
             finally:
                 target.close()
+            _stage(on_stage, "verify")
             report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
             _release_wal_files(staged)
-            os.link(staged, destination)
         except BaseException:
             # Ф204-2 (слово владельца 26.11.2026): до публикации убрать только свой временный файл этого вызова;
             # назначение, база, другие .incomplete-* и резервы не трогаются; не удалось удалить — файл остаётся
             _remove_unpublished(staged)
             raise
-        staged.unlink()
         return report
 
     def rebind_restored_copy(self, root_mapping, installation_id, user_id):

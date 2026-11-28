@@ -1040,13 +1040,15 @@ def _not_written_warning(rows):
                else "ждёт предыдущую ревизию этой записи") for row in rows)]
 
 
-def backup_store(destination):
-    """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии."""
+def backup_store(destination, on_stage=None):
+    """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии.
+
+    Назначение может быть на съёмном диске (БД-7). on_stage(этап) — ход для фонового резерва экрана."""
     import recordings
     store = recordings.open_store()
     try:
         store.current_identity()
-        report = store.backup(destination, allow_damaged_copies=True)
+        report = store.backup(destination, allow_damaged_copies=True, on_stage=on_stage)
         warning = _damaged_copies_warning(report.get("damaged_copies"))
         return {"destination": str(destination), "report": report, **({"warning": warning} if warning else {})}
     finally:

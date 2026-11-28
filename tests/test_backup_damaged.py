@@ -293,7 +293,10 @@ class WarningIsShownTests(BackupCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js нужен для проверки JavaScript")
     def test_page_shows_warning_as_text(self):
         runner = fixtures.PAGE_RUNNER.replace(
-            '"api/history": {revisions: []}};', '"api/history": {revisions: []}, "api/backup": sc.backup};'
+            # БД-7: страница запускает резерв в фоне и берёт отчёт из хода задачи; отчёт тот же, что у api/backup
+            '"api/history": {revisions: []}};', '"api/history": {revisions: []}, '
+            '"api/backup/start": {task_id: "t", state: "running"}, '
+            '"api/backup/status": {task_id: "t", state: "done", result: sc.backup}};'
         ).replace('  if (sc.compare || sc.confirm) {', '''  if (sc.backup) {
     await ids["backup"].click();
     await settle();

@@ -83,11 +83,17 @@ def open_store(path=None, readonly=False):
     """Открыть существующую runtime-БД; не создавать, мигрировать или инициализировать.
 
     readonly=True — соединение только для чтения (storage.open_store_readonly): для тех, кто базу не меняет.
+    Главная база на запись открывается только после quick_check в этом процессе (БД-4(а), dbguard): провал —
+    отказ dbguard.Damaged, чтение по-прежнему работает.
     """
     if path is None:
         import paths
         path = paths.STATE_DB
-    return storage.open_store_readonly(path) if readonly else storage.open_store(path)
+    if readonly:
+        return storage.open_store_readonly(path)
+    import dbguard
+    dbguard.require_writable(path)
+    return storage.open_store(path)
 
 
 def document_backend_hint(document_path):

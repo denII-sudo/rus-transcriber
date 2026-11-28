@@ -1,8 +1,9 @@
-"""Самопроверка программы на этом компьютере: тесты, проверка файлов на личные данные, морфология.
+"""Самопроверка программы на этом компьютере: тесты, проверка файлов на личные данные, морфология, целостность
+базы записей (quick_check, БД-4(а)).
 
 Только проверки, произвольных команд нет. Тесты идут в отдельном процессе с отдельной временной папкой данных
-(настоящие данные не трогаются), проверка файлов только читает. В ответе нет запрещённых слов: только где
-нарушение и какого оно вида.
+(настоящие данные не трогаются), проверка файлов только читает, базу записей — только чтение. В ответе нет
+запрещённых слов: только где нарушение и какого оно вида.
 
     python selfcheck.py            # то же из командной строки
 """
@@ -241,7 +242,16 @@ def run_morph():
     return {"ok": got == MORPH_EXPECT, "pymorphy3": True, "got": got, "expected": MORPH_EXPECT}
 
 
-def run(version=None, tests=True, repo=True, morph=True):
+def run_database():
+    """БД-4(а): quick_check базы записей этой установки — только чтение; база и её файлы не меняются."""
+    try:
+        import dbguard
+        return dbguard.self_check_report()
+    except Exception as ex:
+        return {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:300]}
+
+
+def run(version=None, tests=True, repo=True, morph=True, database=True):
     out = {"version": version, "python": platform.python_version(), "program": HERE.name}
     try:
         import buildinfo
@@ -255,7 +265,9 @@ def run(version=None, tests=True, repo=True, morph=True):
         out["check_repo"] = run_check_repo()
     if morph:
         out["morphology"] = run_morph()
-    parts = [k for k in ("tests", "check_repo", "morphology") if k in out]
+    if database:
+        out["database"] = run_database()
+    parts = [k for k in ("tests", "check_repo", "morphology", "database") if k in out]
     out["ok"] = all(out[k].get("ok") for k in parts)
     bad = [k for k in parts if not out[k].get("ok")]
     out["summary"] = "всё в порядке" if out["ok"] else "не в порядке: " + ", ".join(bad)

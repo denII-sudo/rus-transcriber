@@ -125,9 +125,87 @@ def state_ru(state):
             "interrupted": "прервано"}.get(state, state)
 
 
+def explain_failure(ex):
+    """Текст отказа для человека — те же правила, что у ответов экрана на запросы."""
+    if isinstance(ex, core.CoreError):
+        return str(ex)
+    if isinstance(ex, (storage.StorageError, sqlite3.Error, OSError)):
+        return core.explain_error(ex)
+    if isinstance(ex, (ValueError, KeyError)):
+        return f"не удалось обработать запрос: {ex}"
+    return core.explain_error(ex)
+
+
+class BackupTasks:
+    """Резерв по просьбе человека в фоне (БД-7): поток делает core.backup_store, страница спрашивает ход.
+
+    Одновременно — один резерв: второй запрос, пока идёт первый, получает отказ. Задачи живут, пока работает экран;
+    отчёт — тот же, что у прежнего синхронного api/backup."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks = {}
+        self._running = None
+
+    def start(self, destination):
+        with self._lock:
+            if self._running is not None:
+                raise core.CoreError("Резерв уже делается: дождитесь его окончания.")
+            task_id = secrets.token_hex(8)
+            task = {"task_id": task_id, "state": "running", "stage": None, "started": time.monotonic()}
+            self._tasks[task_id] = task
+            self._running = task_id
+
+        def stage(name):
+            with self._lock:
+                task["stage"] = name
+
+        def work():
+            try:
+                result = core.backup_store(destination, on_stage=stage)
+                outcome = {"state": "done", "result": result}
+            except BaseException as ex:          # поток не должен умереть молча: человек видит причину
+                outcome = {"state": "failed", "error": explain_failure(ex)}
+            with self._lock:
+                task.update(outcome)
+                task["seconds"] = round(time.monotonic() - task["started"], 1)
+                self._running = None
+
+        threading.Thread(target=work, name="backup-" + task_id, daemon=True).start()
+        return self.status(task_id)
+
+    def status(self, task_id):
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise core.CoreError("Такого резерва нет: возможно, экран перезапускали. Создайте резерв заново.")
+            view = {key: value for key, value in task.items() if key != "started"}
+            if task["state"] == "running":
+                view["seconds"] = round(time.monotonic() - task["started"], 1)
+            return view
+
+    def wait(self, task_id, timeout=60):
+        """Для тестов и командной строки: дождаться конца задачи."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            view = self.status(task_id)
+            if view["state"] != "running":
+                return view
+            time.sleep(0.02)
+        raise TimeoutError("backup task did not finish")
+
+
+def health_lines():
+    """Строки полосы о состоянии базы (БД-4): пусто — всё в порядке или база ещё не проверялась."""
+    import dbguard
+    known = dbguard.view()
+    return [known["message"]] if known.get("ok") is False else []
+
+
 def make_server(port):
     """Собрать локальный сервер экрана; возвращает (server, url, last)."""
     last = [time.time()]
+    backups = BackupTasks()
     token = secrets.token_urlsafe(32)
     prefix = f"/{token}/"
 
@@ -212,6 +290,10 @@ def make_server(port):
                                       "text/html; charset=utf-8")
                 if u == "api/pick":
                     return self._send(200, {"path": pick_audio_path()})
+                if u == "api/health":
+                    return self._send(200, {"lines": health_lines()})
+                if u == "api/backup/status":
+                    return self._send(200, backups.status(q.get("task_id", "")))
                 if u == "api/requests":
                     return self._send(200, {"requests": core.workflow_list(30)})
                 if u == "api/status":
@@ -305,6 +387,11 @@ def make_server(port):
                     if not destination or len(destination) > 300:
                         return self._send(400, {"error": "укажите путь к новому файлу резерва"})
                     return self._send(200, core.backup_store(destination))
+                if u == "api/backup/start":          # то же в фоне с ходом (БД-7): страница спрашивает api/backup/status
+                    destination = str(body.get("destination", "")).strip()
+                    if not destination or len(destination) > 300:
+                        return self._send(400, {"error": "укажите путь к новому файлу резерва"})
+                    return self._send(200, backups.start(destination))
                 if u == "api/verify/prepare":
                     return self._send(200, core.workflow_verification_snapshot(
                         str(body.get("request_id", ""))))
@@ -370,6 +457,11 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8766)
     ap.add_argument("--hours", type=float, default=6.0)
     a = ap.parse_args(argv)
+    import dbguard
+    checked = dbguard.ensure_checked()              # БД-4(а): провал увидит полоса экрана и журнал
+    if checked is not None and checked["ok"] is False:
+        print("[экран] база записей не прошла проверку целостности: запись в неё остановлена", file=sys.stderr,
+              flush=True)
     srv, url, last = make_server(a.port)
     print(f"[экран] {url}", file=sys.stderr, flush=True)
 
