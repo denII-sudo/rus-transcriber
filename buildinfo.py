@@ -202,13 +202,174 @@ def list_root(source, target=None):
     return names
 
 
+REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: junctions and other Windows links
+NAME_LIMIT = 260
+
+
+def _linked(path):
+    """Link of any kind, including a junction on a Python without Path.is_junction."""
+    if _link(path):
+        return True
+    try:
+        return bool(path.lstat().st_file_attributes & REPARSE_POINT)
+    except AttributeError:  # not Windows: st_file_attributes does not exist
+        return False
+    except OSError:
+        return False
+
+
+def _program_name(name):
+    """The same rule root_files applies: a top-level program file, never data or a transcript."""
+    return bool(ROOT_NAME.fullmatch(name)) and ".transcript." not in name.lower() and (
+        name.lower().endswith(PROGRAM_SUFFIXES) or name in FIXED_ROOT_FILES)
+
+
+def _inside(target, name):
+    """Path of a delivery name under target, or None if it is not a plain delivery name.
+
+    A manifest is installed data, not trusted input: only a root program file, one file
+    directly under docs/ (.md), or a file under tools/, tests/ or examples/ is accepted, with
+    no absolute path, drive, backslash, '.', '..' or empty part. An existing part of the
+    path (a folder or the file itself) that is a link is refused, so nothing outside the
+    program folder can be reached through it.
+    """
+    if not isinstance(name, str) or not name or len(name) > NAME_LIMIT:
+        return None
+    if "\\" in name or ":" in name or "\0" in name or name.startswith("/"):
+        return None
+    parts = name.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if len(parts) == 1:
+        if not _program_name(name):
+            return None
+    elif parts[0] == "docs":
+        if len(parts) != 2 or not ROOT_NAME.fullmatch(parts[1]) or not parts[1].endswith(".md"):
+            return None
+    elif parts[0] not in SUPPORT_DIRS:
+        return None
+    here = Path(target)
+    for part in parts:
+        here = here / part
+        if _linked(here):
+            return None
+    return here
+
+
+def _regular_file(path):
+    return path.is_file() and not _linked(path)
+
+
+def stale_report(source, target):
+    """What an update could remove from target, without changing anything.
+
+    stale        files listed in the previous build-info.json, absent from the new source
+                 and byte-identical to what was installed: provably ours, deletable;
+    modified     the same, but changed (or not a plain file) since installation: kept;
+    unknown      files under tools/, tests/, examples/ that the source does not ship and
+                 the previous manifest never listed: possibly the user's own;
+    root_unknown program files at the top level of target that the source does not ship
+                 and the previous manifest never listed (shown only, never removed).
+    Without a valid previous manifest nothing is stale: files are only shown.
+    """
+    source, target = Path(source), Path(target)
+    new = delivery_hashes(source)
+    old = _manifest(target)
+    old_files = old["files"] if old else {}
+    report = {"manifest": old is not None, "stale": [], "modified": [], "unknown": [],
+              "root_unknown": []}
+    for name in sorted(set(old_files) - set(new)):
+        top = name.split("/")[0]
+        if top in SUPPORT_DIRS and not (source / top).is_dir():
+            continue  # the source ships no such folder at all: leave the installed one alone
+        path = _inside(target, name)
+        if path is None or not (path.exists() or path.is_symlink()):
+            continue
+        try:
+            same = _regular_file(path) and file_hash(path) == old_files[name]
+        except (OSError, ValueError):
+            same = False
+        report["stale" if same else "modified"].append(name)
+    seen = set(new) | set(old_files)
+    for sub in SUPPORT_DIRS:
+        base = target / sub
+        if not base.is_dir() or _linked(base):
+            continue
+        for root, dirs, files in os.walk(base, followlinks=False):
+            parent = Path(root)
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not _linked(parent / d))
+            for n in sorted(files):
+                if n.endswith((".pyc", ".pyo")):
+                    continue
+                rel = (parent / n).relative_to(target).as_posix()
+                # tools/tools/..., tests/tests/...: copies by an old installer, removed by it
+                if rel in seen or rel.startswith(f"{sub}/{sub}/"):
+                    continue
+                if _inside(target, rel) is not None and _regular_file(parent / n):
+                    report["unknown"].append(rel)
+    report["unknown"].sort()
+    if target.is_dir():
+        wanted = {n for n in new if "/" not in n}
+        report["root_unknown"] = [n for n in root_files(target)
+                                  if n not in wanted and n not in old_files
+                                  and _regular_file(target / n)]
+    return report
+
+
+def prune(source, target, what):
+    """Delete the files stale_report names under `what` ("stale" or "unknown").
+
+    Each name is checked again right before deletion; only plain files are removed,
+    never folders (empty folders left under tools/, tests/, examples/ and docs/ are
+    removed), never anything outside target. Returns (removed, failed).
+    """
+    report = stale_report(source, target)
+    removed, failed = [], []
+    for name in report[what]:
+        path = _inside(target, name)
+        if path is None or not _regular_file(path):
+            failed.append(name)
+            continue
+        try:
+            path.unlink()
+            removed.append(name)
+        except OSError:
+            failed.append(name)
+            continue
+        folder = path.parent
+        while folder != Path(target) and folder.parent != Path(target) and not _linked(folder):
+            try:
+                folder.rmdir()  # only an empty folder goes; a non-empty one raises
+            except OSError:
+                break
+            folder = folder.parent
+    return removed, failed
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", required=True)
     p.add_argument("--target")
     p.add_argument("--list-root", action="store_true",
                    help="print top-level program files of --source, one per line")
+    p.add_argument("--stale-report", action="store_true",
+                   help="print JSON: files an update could remove from --target (changes nothing)")
+    p.add_argument("--prune", choices=("stale", "unknown"),
+                   help="delete the files named in the report under this heading; print JSON")
     a = p.parse_args()
+    if a.stale_report or a.prune:
+        if not a.target:
+            p.exit(2, "Build identity: --target is required.\n")
+        try:
+            if a.prune:
+                removed, failed = prune(a.source, a.target, a.prune)
+                out = {"removed": removed, "failed": failed}
+            else:
+                out = stale_report(a.source, a.target)
+        except (OSError, ValueError):
+            p.exit(1, "Build identity: stale files could not be listed.\n")
+        print(json.dumps(out))  # ASCII only: install.ps1 reads it whatever the console code page
+        return
     if a.list_root:
         try:
             names = list_root(a.source, a.target)

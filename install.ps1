@@ -22,6 +22,14 @@
       -AllowUnreviewedSource ставить из клона с незакоммиченными изменениями или из коммита,
                              которого нет в origin/main и на котором нет тега
       -SkipSelfCheck         не запускать самопроверку в конце
+      -ExtraFiles <режим>    что делать с файлами в tools/tests/examples, которых нет в комплекте и
+                             которых прежняя сборка не ставила (возможно, ваши): Show — показать и
+                             оставить (умолчание без терминала), Delete — удалить, Keep — оставить
+                             без списка. В терминале без параметра установщик спрашивает; пустой
+                             ответ — «оставить». Файлы, которые ставила прежняя сборка (список в
+                             build-info.json), не изменились и пропали из комплекта, удаляются
+                             сами и перечисляются; изменённые вами и файлы корня вне списка не
+                             удаляются никогда — только показываются
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptanceCopyOnly -Target <sandbox>\program
       -DataDir <sandbox>\data -SkipClaudeConfig
@@ -54,7 +62,8 @@ param(
     [switch]$KeepSavedToken,
     [switch]$AllowRunningServer,
     [switch]$AllowUnreviewedSource,
-    [switch]$SkipSelfCheck
+    [switch]$SkipSelfCheck,
+    [string]$ExtraFiles = ""
 )
 $ErrorActionPreference = "Continue"
 # Windows PowerShell 5.1: без этого ConvertTo-Json пишет массивы как {"value":[...],"Count":n}
@@ -85,6 +94,9 @@ if ($AcceptanceCopyOnly) {
     }
 }
 if ($Token -and $KeepSavedToken) { Fail "Укажите что-то одно: -Token или -KeepSavedToken." }
+if ($ExtraFiles -and @("Show", "Delete", "Keep") -notcontains $ExtraFiles) {
+    Fail "-ExtraFiles принимает Show (показать), Delete (удалить) или Keep (оставить); получено: $ExtraFiles"
+}
 # без терминала (ИИ-агент, перенаправленный ввод) вопросы Read-Host не задаются
 $nonInteractive = [Console]::IsInputRedirected
 
@@ -153,6 +165,24 @@ function Get-TokenMode([string]$token, [bool]$keepSaved, [string]$saved, [bool]$
     if ($token) { return "given" }
     if ($keepSaved -or $noTerminal) { if ($saved) { return "saved" } else { return "none" } }
     return "ask"
+}
+# Что делать с файлами в tools/tests/examples, которых нет в комплекте и которых не ставила прежняя
+# сборка: Show (показать и оставить), Delete, Keep (оставить без списка) или Ask (спросить в терминале).
+# Умолчание без терминала — Show: ничего не удаляется, пока человек не скажет иначе.
+function Get-ExtraFilesMode([string]$mode, [bool]$noTerminal) {
+    if ($mode) { return @("Show", "Delete", "Keep") | Where-Object { $_ -ieq $mode } | Select-Object -First 1 }
+    if ($noTerminal) { return "Show" }
+    return "Ask"
+}
+# Ответ на вопрос «Удалить эти файлы?»: удалить только по явному «y» или «д»; пустой ответ — оставить.
+function Get-ExtraFilesAnswer([string]$answer) {
+    if ($answer -match '^\s*(y|д)') { return "Delete" }
+    return "Keep"
+}
+# Печатает имена файлов отступом, не больше 20 строк.
+function Show-FileList([string[]]$names) {
+    foreach ($n in @($names | Select-Object -First 20)) { Write-Host "    $n" -ForegroundColor Yellow }
+    if (@($names).Count -gt 20) { Write-Host "    и ещё $(@($names).Count - 20)" -ForegroundColor Yellow }
 }
 # Разница двух списков pip freeze: какие пакеты добавлены, удалены или сменили версию.
 function Compare-PipFreeze([string[]]$before, [string[]]$after) {
@@ -752,6 +782,51 @@ if ($Source -ne $Target) {
         @($rootFiles | Where-Object { $_ -notmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' }).Count) {
         Fail "Не удалось составить список файлов программы в $Source (ссылка вместо файла или файлов нет). Файлы программы не скопированы."
     }
+    # Что обновление могло бы убрать, — до любых изменений. Список составляет buildinfo.py по прежнему
+    # build-info.json: «устаревшие» — файлы, которые ставила прежняя сборка, их нет в новой и они не
+    # менялись (хэш совпадает); остальные лишние файлы только показываются. Сбой — ничего не удаляется.
+    $stale = $null
+    $staleText = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --stale-report)
+    if ($LASTEXITCODE -eq 0 -and $staleText.Count) {
+        try { $stale = ($staleText -join "`n") | ConvertFrom-Json } catch { $stale = $null }
+    }
+    $pruneStale = $false; $pruneExtra = $false
+    if (-not $stale) {
+        Write-Host "  не удалось составить список устаревших файлов: ничего не удаляю" -ForegroundColor Yellow
+    } else {
+        $goneList = @($stale.stale); $changedList = @($stale.modified)
+        $unknownList = @($stale.unknown); $rootList = @($stale.root_unknown)
+        if ($goneList.Count) {
+            Write-Host "  устаревшие файлы прежней сборки ($($goneList.Count)): они были в её build-info.json, в новой версии их нет, после установки не менялись — будут удалены:" -ForegroundColor Yellow
+            Show-FileList $goneList
+            $pruneStale = $true
+        } elseif (-not $stale.manifest) {
+            Write-Host "  прежнего build-info.json нет (или он не читается): какие файлы ставила прежняя сборка, неизвестно — ничего не удаляю" -ForegroundColor DarkGray
+        }
+        if ($changedList.Count) {
+            Write-Host "  файлы прежней сборки, которых нет в новой версии, но вы их изменили — оставлены ($($changedList.Count)):" -ForegroundColor Yellow
+            Show-FileList $changedList
+        }
+        if ($rootList.Count) {
+            Write-Host "  в корне папки программы есть файлы, которых нет в новой версии и которых прежняя сборка не ставила — оставлены, установщик их не удаляет ($($rootList.Count)):" -ForegroundColor Yellow
+            Show-FileList $rootList
+        }
+        if ($unknownList.Count) {
+            $extraMode = Get-ExtraFilesMode $ExtraFiles $nonInteractive
+            if ($extraMode -ne "Keep") {
+                Write-Host "  в папках tools/tests/examples есть файлы, которых нет в комплекте программы и которых прежняя сборка не ставила ($($unknownList.Count)):" -ForegroundColor Yellow
+                Show-FileList $unknownList
+                Write-Host "  возможно, это ваши файлы; если это старые тесты, они попадут в самопроверку (self_check)" -ForegroundColor Yellow
+            }
+            if ($extraMode -eq "Ask") {
+                $ans = Read-Host "  Удалить эти файлы? y — удалить, Enter или n — оставить (y/N)"
+                $extraMode = Get-ExtraFilesAnswer $ans
+            }
+            if ($extraMode -eq "Delete") { $pruneExtra = $true; Write-Host "  будут удалены (-ExtraFiles Delete или ответ y)" -ForegroundColor Yellow }
+            elseif ($extraMode -eq "Keep") { Write-Host "  файлов в tools/tests/examples, которых нет в комплекте, оставлено: $($unknownList.Count) (-ExtraFiles Keep или ответ n)" -ForegroundColor DarkGray }
+            else { Write-Host "  файлы оставлены; чтобы удалить: -ExtraFiles Delete" -ForegroundColor DarkGray }
+        }
+    }
     foreach ($f in $rootFiles) {
         Copy-Item -LiteralPath (Join-Path $Source $f) -Destination (Join-Path $Target $f) -Force
     }
@@ -762,47 +837,32 @@ if ($Source -ne $Target) {
     Copy-Item (Join-Path $Source "docs\2026-11-17-p4-opencode-openai-handoff.md") (Join-Path $docsTarget "2026-11-17-p4-opencode-openai-handoff.md") -Force
     Copy-Item (Join-Path $Source "docs\2026-11-17-p5-screen-handoff.md") (Join-Path $docsTarget "2026-11-17-p5-screen-handoff.md") -Force
     # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
-    # examples — вымышленный пример группы. Это копии комплекта программы, а личные данные
-    # лежат в папке данных, поэтому при обновлении папки заменяются целиком: иначе старые
-    # тесты и инструменты остаются рядом с новыми и self_check проверяет устаревший набор.
+    # examples — вымышленный пример группы. Это копии комплекта программы: файлы комплекта
+    # перезаписываются поверх. Папки целиком установщик не удаляет: лишнее убирается только
+    # по списку (см. выше) и только файлами, без перехода по ссылкам.
     foreach ($sub in @("tools", "tests", "examples")) {
         $sd = Join-Path $Source $sub
         if (-not (Test-Path $sd)) { continue }
         $dd = Join-Path $Target $sub
-        $srcFiles = @(Get-ChildItem $sd -Recurse -File | ForEach-Object { $_.FullName.Substring($sd.Length + 1) })
-        # файлы, которых нет в комплекте, могли добавить вы сами: без согласия их не удаляем
-        $extra = @()
-        if (Test-Path $dd) {
-            $extra = @(Get-ChildItem $dd -Recurse -File -ErrorAction SilentlyContinue |
-                ForEach-Object { $_.FullName.Substring($dd.Length + 1) } |
-                Where-Object { $srcFiles -notcontains $_ -and $_ -notlike "$sub\*" -and
-                               ($_ -split '\\') -notcontains "__pycache__" -and $_ -notlike "*.pyc" })
-        }
-        $replace = $true
-        if ($extra.Count) {
-            $shown = ($extra | Select-Object -First 5) -join "; "
-            if ($extra.Count -gt 5) { $shown += "; и ещё " + ($extra.Count - 5) }
-            Write-Host "  в папке $sub есть файлы, которых нет в комплекте программы ($($extra.Count)):" -ForegroundColor Yellow
-            Write-Host "    $shown" -ForegroundColor Yellow
-            Write-Host "  при обновлении папка $sub заменяется целиком, чтобы self_check проверял актуальный набор" -ForegroundColor Yellow
-            $ans = Read-Host "  Удалить эти файлы? Enter или y — удалить, n — оставить (Y/n)"
-            $replace = -not ($ans -match '^(n|н)')
-            if (-not $replace) {
-                Write-Host "  файлы оставлены: файлы программы будут перезаписаны, устаревшие останутся, self_check может показывать старые проверки" -ForegroundColor Yellow
-            }
-        }
-        if ($replace) {
-            if (Test-Path $dd) { Remove-Item $dd -Recurse -Force }
-            Copy-Item $sd $dd -Recurse -Force
-        } else {
-            New-Item -ItemType Directory -Path $dd -Force | Out-Null
-            Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
-        }
+        New-Item -ItemType Directory -Path $dd -Force | Out-Null
+        Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
         # вложенные дубли прошлых версий установщика и кэш байткода — не данные пользователя
         $dup = Join-Path $dd $sub
         if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
         Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # Удаление по списку: buildinfo.py ещё раз проверяет каждое имя, удаляет только обычные файлы внутри
+    # папки программы и не заходит в ссылки (junction/symlink).
+    foreach ($kind in @(@{ run = $pruneStale; arg = "stale"; what = "устаревших файлов прежней сборки" },
+                        @{ run = $pruneExtra; arg = "unknown"; what = "лишних файлов в tools/tests/examples" })) {
+        if (-not $kind.run) { continue }
+        $pruneText = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --prune $kind.arg)
+        $pruned = $null
+        if ($LASTEXITCODE -eq 0 -and $pruneText.Count) { try { $pruned = ($pruneText -join "`n") | ConvertFrom-Json } catch { $pruned = $null } }
+        if (-not $pruned) { Write-Host "  не удалось удалить список $($kind.what): ничего не удалено" -ForegroundColor Yellow; continue }
+        Write-Host "  удалено $($kind.what): $(@($pruned.removed).Count)" -ForegroundColor Green
+        if (@($pruned.failed).Count) { Write-Host "  не удалось удалить ($(@($pruned.failed).Count)):" -ForegroundColor Yellow; Show-FileList @($pruned.failed) }
     }
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает
 } else { Write-Host "  запуск из папки программы, копировать нечего" }

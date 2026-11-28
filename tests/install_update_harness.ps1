@@ -23,7 +23,7 @@ $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errs)
 Check "installer parses" (-not $errs)
 $wanted = @("Get-ProgramProcesses", "Split-ProgramProcesses", "Get-ServerVersion", "Get-SourceState",
-            "Get-OnnxPlan", "Get-TokenMode", "Compare-PipFreeze")
+            "Get-OnnxPlan", "Get-TokenMode", "Compare-PipFreeze", "Get-ExtraFilesMode", "Get-ExtraFilesAnswer")
 $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) |
     Where-Object { $wanted -contains $_.Name })
 Check "helpers found" ($defs.Count -eq $wanted.Count)
@@ -45,6 +45,14 @@ Check "token: keep saved" ((Get-TokenMode "" $true "hf_saved" $false) -eq "saved
 Check "token: keep without saved" ((Get-TokenMode "" $true "" $false) -eq "none")
 Check "token: no terminal keeps saved" ((Get-TokenMode "" $false "hf_saved" $true) -eq "saved")
 Check "token: terminal asks" ((Get-TokenMode "" $false "hf_saved" $false) -eq "ask")
+
+# лишние файлы в tools/tests/examples: без терминала не спрашиваем и не удаляем; пустой ответ — «оставить»
+Check "extra: no terminal shows and keeps" ((Get-ExtraFilesMode "" $true) -eq "Show")
+Check "extra: terminal asks" ((Get-ExtraFilesMode "" $false) -eq "Ask")
+Check "extra: explicit mode wins, any case" ((Get-ExtraFilesMode "delete" $true) -eq "Delete" -and (Get-ExtraFilesMode "KEEP" $false) -eq "Keep" -and (Get-ExtraFilesMode "Show" $false) -eq "Show")
+Check "extra: empty answer keeps" ((Get-ExtraFilesAnswer "") -eq "Keep" -and (Get-ExtraFilesAnswer "   ") -eq "Keep" -and (Get-ExtraFilesAnswer $null) -eq "Keep")
+Check "extra: n and other answers keep" ((Get-ExtraFilesAnswer "n") -eq "Keep" -and (Get-ExtraFilesAnswer "н") -eq "Keep" -and (Get-ExtraFilesAnswer "q") -eq "Keep")
+Check "extra: only y or д delete" ((Get-ExtraFilesAnswer "y") -eq "Delete" -and (Get-ExtraFilesAnswer "Y") -eq "Delete" -and (Get-ExtraFilesAnswer "д") -eq "Delete")
 
 # сравнение списков пакетов
 $before = @("numpy==2.3.5", "torch==2.15.0+cpu", "gigaam @ https://example.invalid/main.zip#sha256=aa", "old_pkg==1.0")
