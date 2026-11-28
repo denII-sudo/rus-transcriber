@@ -297,7 +297,7 @@ def make_server(port):
                     policy = product_policy.resolve({
                         key: body[key] for key in (
                             "require_conspect", "allow_cloud_model", "participation",
-                            "goal", "question_budget") if key in body
+                            "goal", "question_budget", "speaker_hints") if key in body
                     })
                     return self._send(200, core.start_workflow(audio, policy))
                 if u == "api/backup":

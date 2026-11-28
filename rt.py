@@ -49,6 +49,7 @@ from pathlib import Path
 import core
 import confirm
 import paths
+import product_policy
 
 
 def out(obj):
@@ -191,6 +192,12 @@ def build():
     wf.add_argument("--named-speakers", action="store_true")
     wf.add_argument("--human-verified", action="store_true")
     wf.add_argument("--participation", choices=["simple", "advanced", "developer"], default="simple")
+    wf.add_argument("--speakers", type=int, default=0, help="сколько голосов на записи (с --approx — примерно)")
+    wf.add_argument("--approx", action="store_true", help="число голосов примерное: от N-1 до N+1")
+    wf.add_argument("--participants", default="", help="«Анна=Аня/Анне, Борис»: имена и формы обращения")
+    wf.add_argument("--group", default="", help="группа голосовых профилей")
+    wf.add_argument("--stray-voices", action="store_true", help="возможны случайные голоса (запас +3)")
+    wf.add_argument("--no-enroll", action="store_true", help="голоса только сопоставлять, профиль не пополнять")
     wf.add_argument("--goal", default=""); wf.add_argument("--question-budget", type=int, default=0)
     ws = sub.add_parser("workflow-status"); ws.add_argument("request")
     wt = sub.add_parser("workflow-task"); wt.add_argument("request")
@@ -282,7 +289,10 @@ def run(a):
                                          "require_named_speakers": a.named_speakers,
                                          "require_human_verification": a.human_verified,
                                          "participation": a.participation, "goal": a.goal,
-                                         "question_budget": a.question_budget}))
+                                         "question_budget": a.question_budget,
+                                         "speaker_hints": product_policy.hints_from_text(
+                                             a.speakers, a.approx, a.participants, a.group, a.stray_voices,
+                                             not a.no_enroll)}))
     elif c == "workflow-status":
         out(core.workflow_status(a.request))
     elif c == "workflow-task":
