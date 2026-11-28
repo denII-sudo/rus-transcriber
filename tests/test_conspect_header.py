@@ -159,6 +159,23 @@ class ReviewFindingsTests(unittest.TestCase):
         self.assertIn("у говорящих не определено", md)
         self.assertNotIn("у говорящих 0", md)
 
+    def test_t260_10_human_line_after_the_header_survives(self):
+        mine = "Моя строка сразу под шапкой.\n\nОсновной текст."
+        md, _ = conspect.render(agent_obj(template=mine), data(title="А"))
+        head, _, rest = md.partition("\n\n")
+        self.assertEqual(rest, mine)
+        # человек дописал строку к шапке без пустой строки
+        edited = head + "\nДопиской человека\n\nДальше."
+        template = conspect.link(edited, data(title="А"))[0]["template"]
+        self.assertEqual(template, "Допиской человека\n\nДальше.")
+        self.assertEqual(conspect._strip_info(md), mine)
+
+    def test_t260_10_mark_at_the_start_of_human_text_removes_nothing(self):
+        mine = conspect.INFO_MARK + "\nПервый абзац человека.\n\nВторой абзац."
+        self.assertEqual(conspect._strip_info(mine), mine)
+        template = conspect.link(mine, data(title="А"))[0]["template"]
+        self.assertEqual(template, mine)
+
 
 if __name__ == "__main__":
     unittest.main()

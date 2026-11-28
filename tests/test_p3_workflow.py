@@ -521,6 +521,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.get(self.store, request)["model_task"], legacy)
         payload, md = self.conspect_files(recording)
         # файл версии 1 — прежнего вида: без расшифровки меток и времени
+        import conspect
         self.assertTrue(md.startswith("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
                                       + conspect.INFO_MARK + "\nСобытие: "))
         self.assertIn("Составлен: моделью OpenAI через OpenCode\n", md)

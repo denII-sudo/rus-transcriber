@@ -490,15 +490,30 @@ SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
 # Сведения шапки (7.6а), поставленные программой: при повторном вводе готового Markdown не дублируются (T260-5)
 INFO_MARK = "<!-- rus-transcriber: сведения шапки, ставит программа -->"
-INFO_BLOCK = re.compile(re.escape(INFO_MARK) + r"\n(?:[^\n]+\n){1,8}\n")   # только с невидимой отметкой программы
+INFO_LINE = re.compile(r"(?:Событие: |Дата записи: |Дата файла аудио: |Стенограмма: |Места разбора: |Источник не подтверждён: "
+                       r"|Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)$)")
 
 
 def _strip_info(text):
-    """Убрать сведения шапки, поставленные программой (в начале текста или сразу после «Создан моделью…»)."""
+    """Убрать сведения шапки, поставленные программой (в начале текста или сразу после «Создан моделью…»).
+
+    Снимается отметка программы и следующие за ней строки её собственного формата (INFO_LINE) и одна пустая строка
+    после них; на первой чужой строке разбор останавливается, и она остаётся (T260-7, T260-10). Отметка без строк
+    программы (человек начал текст с такой же строки) ничего не снимает.
+    """
     lead = MODEL_LEAD.match(text)
     start = lead.end() if lead else 0
-    found = INFO_BLOCK.match(text, start)
-    return text[:start] + text[found.end():] if found else text
+    if not text.startswith(INFO_MARK + "\n", start):
+        return text
+    rows = text[start + len(INFO_MARK) + 1:].split("\n")
+    taken = 0
+    while taken < len(rows) and INFO_LINE.match(rows[taken]):
+        taken += 1
+    if not taken:
+        return text
+    if taken < len(rows) and rows[taken] == "" and taken + 1 <= len(rows):
+        taken += 1                                  # пустая строка-разделитель, которую ставит программа
+    return text[:start] + "\n".join(rows[taken:])
 
 
 VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
