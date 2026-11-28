@@ -130,7 +130,107 @@ def preview_answer(json_path, markdown, aid, text):
     conflicts = [c for c in P.preflight_answers(json_path, markdown, decisions, free) if aid in c["cards"]]
     if conflicts:
         return {"cards": [], "preflight_conflicts": conflicts}
-    return P.apply_free(json_path, markdown, {aid: free[aid]}, dry_run=True)
+    result = P.apply_free(json_path, markdown, {aid: free[aid]}, dry_run=True)
+    one = (result.get("cards") or [{}])[0]
+    if one.get("was_now") and " → " in one["was_now"]:     # Н-9, п. 5: три слова до и после места
+        import transcript as T
+        data = T.load(json_path)
+        place = next((r for r in data.get("review") or [] if r.get("id") == aid), None)
+        if place is not None:
+            result["context"] = _context(data, place, one["was_now"].split(" → ", 1)[1])
+    return result
+
+
+PLAN_WAITING = ("saved", "pending_new", "revert_pending", "skipped")
+CONTEXT_WORDS = 3
+
+
+def _context(data, item, center):
+    """«в тексте будет»: по CONTEXT_WORDS слов нынешней стенограммы до и после места, между ними — center."""
+    import transcript as T
+    times = T._place_time(item)
+    if times is None:
+        return None
+    t1, t2 = times
+    words = sorted((w for seg in data.get("segments") or [] for w in seg.get("words") or []
+                    if isinstance(w.get("s"), (int, float))), key=lambda w: w["s"])
+    own = set(item.get("word_ids") or []) if not T.is_gap_place(item) else set()
+    before = [w["w"] for w in words if w["s"] < t1 - 0.005 and w.get("word_id") not in own][-CONTEXT_WORDS:]
+    after = [w["w"] for w in words if w["s"] >= t2 - 0.005 and w["s"] > t1 and w.get("word_id") not in own][:CONTEXT_WORDS]
+    return {"before": " ".join(before), "center": center, "after": " ".join(after)}
+
+
+def apply_plan(json_path, markdown):
+    """Н-9, PR В (эскиз 7, слово владельца 28.11): список перед «Применить» — что изменится, что останется как
+    было, что не впишется. Без записи; те же проверки, что у «Применить» и предпросмотра (answer_guard,
+    preflight_answers, apply_free с dry_run). -> {"rows": [{id, group, …}]}; group: change | keep | refresh |
+    blocked. refresh — слова места изменились: после «Применить» по месту будет новая редакция карточки
+    (core.refresh_unapplicable_cards, только хранение в базе); blocked — нужно действие человека (ответ за словами места, ответы двух
+    карточек на одни слова: не впишется ни один)."""
+    import transcript as T
+    man = P.manifest(json_path) or {}
+    items = {it.get("id"): it for it in man.get("items") or []}
+    store = P.answers_state(json_path, {"answers": {}})
+    states = P.answer_states_of(store, man)
+    applied = P._applied_map(store)
+    # пропуск, уже прошедший «Применить», в списке не нужен: его отметка применения та же
+    waiting = [it["id"] for it in man.get("items") or []
+               if (states.get(it["id"]) or {}).get("state") in PLAN_WAITING and it["id"] in store.get("answers", {})
+               and not ((states.get(it["id"]) or {}).get("state") == "skipped"
+                        and applied.get(it["id"]) == P._sig(store["answers"][it["id"]]))]
+    if not waiting:
+        return {"rows": []}
+    data = T.load(json_path)
+    places = {r.get("id"): r for r in data.get("review") or []}
+    import recordings
+    in_store = recordings.read_review_pack_state(json_path) is not None     # файловый режим: дособирает агент
+    free = P.free_answers(json_path)
+    decisions, _ = P.decisions(json_path)
+    partners = {}
+    for conflict in P.preflight_answers(json_path, markdown, decisions, free):
+        for aid in conflict["cards"]:
+            partners.setdefault(aid, set()).update(c for c in conflict["cards"] if c != aid)
+    rows = []
+    for aid in waiting:
+        answer = store["answers"][aid]
+        place = places.get(aid) or items[aid]
+        row = {"id": aid}
+        if answer.get("kind") == "skip":
+            rows.append({**row, "group": "keep", "kind": "skip"})
+            continue
+        guard = P.answer_guard(json_path, markdown, aid, answer) if answer.get("kind") != "revert" else None
+        if guard:
+            renew = False
+            if guard != P.FREE_OUTSIDE and aid in places and in_store:   # будет ли новая редакция (append_cards)
+                q = {k: items[aid].get(k) for k in ("question", "options", "recommended", "answer_mode", "note")
+                     if items[aid].get(k) is not None}
+                new, _ = P._card(T, data, places[aid], {**q, "id": aid})
+                renew = new is not None and not P._same_question(items[aid], new)
+            rows.append({**row, "group": "refresh" if renew else "blocked", "why": guard})
+            continue
+        if aid in partners:
+            rows.append({**row, "group": "blocked", "partners": sorted(partners[aid])})
+            continue
+        if aid in free:
+            dry = P.apply_free(json_path, markdown, {aid: free[aid]}, dry_run=True)
+            human = [h["why"] for h in dry.get("left_to_human") or [] if h.get("id") == aid]
+            if human or dry.get("not_found"):        # программа не впишет ответ сама: место останется человеку
+                rows.append({**row, "group": "blocked",
+                             "why": human[0] if human else "слова этой карточки не найдены в нынешнем тексте"})
+                continue
+            one = (dry.get("cards") or [{}])[0]
+            was_now = one.get("was_now") or ""
+            center = was_now.split(" → ", 1)[1] if " → " in was_now else free[aid].get("text", "")
+            rows.append({**row, "group": "change", "was_now": was_now, "warnings": one.get("warnings") or [],
+                         "context": _context(data, place, center)})
+            continue
+        decision = next((d for d in decisions if d.get("id") == aid), None)
+        if decision is None:                      # ответ не меняет стенограмму (отрицание, «оставить как есть»)
+            rows.append({**row, "group": "keep", "kind": "kept"})
+            continue
+        center = decision.get("text") or " ".join(w.get("w", "") for w in P._place_words(data, place))
+        rows.append({**row, "group": "change", "context": _context(data, place, center)})
+    return {"rows": rows}
 
 
 def legacy_clip(json_path, rel):
@@ -320,7 +420,7 @@ def main():
             u = self._path(post=True)
             if u is None:
                 return
-            if u not in ("api/answer", "api/voice", "api/apply", "api/preview", "api/event"):
+            if u not in ("api/answer", "api/voice", "api/apply", "api/preview", "api/plan", "api/event"):
                 return self._refuse(404, {"error": "не найдено"})
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             types = {"audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/wav": "wav"}
@@ -351,6 +451,14 @@ def main():
                     with lock:
                         result = preview_answer(a.json_path, a.markdown, obj["id"], obj["text"])
                     return self._send(200, result)
+                if u == "api/plan":                 # Н-9, PR В: список перед «Применить», без записи
+                    obj = json.loads(body.decode("utf-8"))
+                    if not isinstance(obj, dict) or obj.get("version") != (P.manifest(a.json_path) or {}).get("version"):
+                        return self._send(400, {"error": "версия пакета изменилась"})
+                    if not a.markdown:
+                        return self._send(400, {"error": "путь к Markdown не указан; запустите страницу через review-page"})
+                    with lock:
+                        return self._send(200, apply_plan(a.json_path, a.markdown))
                 if u == "api/apply":
                     obj = json.loads(body.decode("utf-8"))
                     if not isinstance(obj, dict) or obj.get("version") != (P.manifest(a.json_path) or {}).get("version"):
@@ -360,6 +468,8 @@ def main():
                     import core
                     with lock:
                         rep = core.apply_answers_files(a.json_path, a.markdown)
+                        # Н-9, PR В: слова места изменились — по месту сразу новая редакция карточки
+                        rep = core.refresh_unapplicable_cards(a.json_path, rep)
                     return self._send(200, rep)
                 if u == "api/answer":
                     ans = json.loads(body.decode("utf-8"))

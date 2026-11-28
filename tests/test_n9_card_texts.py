@@ -38,7 +38,7 @@ class NeighborDupWarningTests(six.Case):
                 (card,) = [c for c in rep["free_text"]["cards"] if c["id"] == "r1"]
                 (warn,) = card["warnings"]
                 self.assertIn("последнее слово ответа «вот»", warn)
-                self.assertIn("Анна, 2,00 с", warn)
+                self.assertIn("Анна, 2,00 с, карточка r2", warn)     # П1: соседнее слово — и его карточка
                 self.assertIn("будет вписано второй раз", warn)
                 (done,) = card["warnings_done"]                          # отчёт «Применить» — итог, не прогноз
                 self.assertIn("вписано второй раз", done)
@@ -156,6 +156,91 @@ class ContradictionReasonTests(cc.Base):
     def test_human_own_span_is_named_in_message(self):
         self.assertEqual(transcript._decided_by({"card": "span@12.30"}), " (своей правкой отрезка с 12,30 с)")
         self.assertEqual(transcript._decided_by({}), "")
+
+
+class RefreshAfterApplyTests(unittest.TestCase):
+    """PR В, слово владельца 28.11: ответ не вписался, потому что слова места изменились, — после «Применить»
+    у того же места (номер тот же) новая редакция карточки с нынешними словами, без дособирания агентом."""
+
+    def test_changed_place_gets_new_edition_with_same_id(self):
+        import test_answer_outcomes as ao
+        case = ao.AnswerOutcomeCase()
+        with ao.answer_files("sqlite") as (jp, md, version):
+            before = {it["id"]: it for it in review_pack.manifest(jp)["items"]}["r1"]
+            transcript.edit_span(jp, md, 0.2, 0.5, "ручной текст", by="claude")
+            case.save(jp, version, option=0)
+            rep = core.refresh_unapplicable_cards(jp, core.apply_answers_files(jp, md))   # как api/apply
+            self.assertEqual({r["id"]: r["outcome"] for r in rep["outcomes"]}["r1"], "apply_conflict")
+            self.assertEqual(rep.get("refreshed_cards"), ["r1"], rep)
+            after = {it["id"]: it for it in review_pack.manifest(jp)["items"]}["r1"]
+            self.assertGreater(review_pack.card_rev(after), review_pack.card_rev(before))
+            self.assertNotIn("r1", review_pack.answers_state(jp)["answers"])   # ответ на прежнюю редакцию снят
+
+    def test_place_decided_by_human_edit_is_not_reasked(self):
+        """Слова места поправил сам человек: вопрос тот же, карточка не меняется, ответ остаётся у него."""
+        import test_answer_outcomes as ao
+        case = ao.AnswerOutcomeCase()
+        with ao.answer_files("sqlite") as (jp, md, version):
+            transcript.edit_span(jp, md, 0.2, 0.5, "ручной", by="human")
+            case.save(jp, version, option=0)
+            rep = core.refresh_unapplicable_cards(jp, core.apply_answers_files(jp, md))
+            self.assertEqual(rep.get("refreshed_cards"), [])
+            self.assertIn("r1", review_pack.answers_state(jp)["answers"])
+
+    def test_files_mode_unchanged(self):
+        import test_answer_outcomes as ao
+        case = ao.AnswerOutcomeCase()
+        with ao.answer_files("legacy_files") as (jp, md, version):
+            transcript.edit_span(jp, md, 0.2, 0.5, "ручной текст", by="claude")
+            case.save(jp, version, option=0)
+            rep = core.refresh_unapplicable_cards(jp, core.apply_answers_files(jp, md))
+            self.assertNotIn("refreshed_cards", rep)
+
+
+class ApplyPlanTests(unittest.TestCase):
+    """PR В, эскиз 7: список перед «Применить» (review_page.apply_plan) — группы, «в тексте будет», без записи."""
+
+    def plan(self, jp, md):
+        import review_page
+        before = transcript.load(jp)
+        rows = {r["id"]: r for r in review_page.apply_plan(jp, md)["rows"]}
+        self.assertEqual(transcript.load(jp), before)              # без записи
+        return rows
+
+    def test_groups_and_context(self):
+        import test_answer_outcomes as ao
+        case = ao.AnswerOutcomeCase()
+        for backend in ao.BACKENDS:
+            with self.subTest(backend=backend), ao.answer_files(backend) as (jp, md, version):
+                case.save(jp, version, option=1)
+                case.save(jp, version, aid="r2", kind="skip", text="пропущено")
+                rows = self.plan(jp, md)
+                self.assertEqual(rows["r1"]["group"], "change")
+                self.assertEqual(rows["r1"]["context"], {"before": "", "center": "третье", "after": "слово"})
+                self.assertEqual((rows["r2"]["group"], rows["r2"]["kind"]), ("keep", "skip"))
+
+    def test_free_answer_preview_and_changed_place(self):
+        import test_answer_outcomes as ao
+        case = ao.AnswerOutcomeCase()
+        with ao.answer_files("sqlite") as (jp, md, version):
+            case.save(jp, version, aid="r2", text="Глеб: иное")     # не сопоставляется — место останется человеку
+            row = self.plan(jp, md)["r2"]
+            self.assertEqual(row["group"], "blocked")
+            self.assertIn("не удалось сопоставить", row["why"])
+            transcript.edit_span(jp, md, 0.2, 0.5, "ручной текст", by="claude")
+            case.save(jp, version, option=0)
+            self.assertEqual(self.plan(jp, md)["r1"]["group"], "refresh")
+
+    def test_card_preview_shows_three_words_around(self):
+        import review_page
+        with files("sqlite", two_speakers()) as (jp, md, version):
+            r = review_page.preview_answer(jp, md, "r1", "Борис: ну")
+            self.assertEqual(r["context"]["before"], "начало")
+            self.assertEqual(r["context"]["after"], "вот дальше та")
+
+    def test_page_has_plan_list(self):
+        for needle in ('"api/plan"', "Останется как было", "Изменить ответ", "plan-list"):
+            self.assertTrue(needle in CARDS, needle)
 
 
 if __name__ == "__main__":
