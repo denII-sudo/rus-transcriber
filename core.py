@@ -1169,7 +1169,9 @@ def _save_selected_conspect_locked(snapshot, text, selections):
             "analysis_needs_review": render_report["analysis_needs_review"],
             "assembly_revision": render_report["assembly_revision"],
             "analysis_revision": render_report["analysis_revision"],
-            "external_publication": render_report["external_publication"]}
+            "external_publication": render_report["external_publication"],
+            **({"overlap_unchecked": render_report["overlap_unchecked"]}
+               if "overlap_unchecked" in render_report else {})}
 
 
 def confirm_conspect_analysis(snapshot):
@@ -1875,6 +1877,15 @@ def _hypotheses_summary():
     return hypstore.summary(settings.load_config())
 
 
+def leftovers_summary():
+    """Остатки после обрывов для самопроверки (БД-9а, только список). Сбой поиска самопроверку не роняет, а
+    называется в ответе."""
+    try:
+        return leftovers_report()
+    except Exception as ex:          # самопроверка показывает и сбой этой части, как у морфологии
+        return {"error": f"{type(ex).__name__}: {ex}"[:300]}
+
+
 def settings_info():
     import recordings
     import storage
@@ -2110,6 +2121,7 @@ from core_conflicts import (  # noqa: E402,F401
     explain_error,
     find_recording_results,
     inspect_backup,
+    leftovers_report,
     list_all_conflicts,
     list_conspect_conflicts,
     list_document_conflicts,

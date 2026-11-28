@@ -690,7 +690,7 @@ def pairwise_unit(canon, W):
 def open_readonly(path):
     """База результатов песочницы только на чтение; без служебных файлов — неизменяемой.
 
-    Копию базы записей анализ открывает штатно (storage.open_store_readonly, load_human);
+    Копию базы записей анализ открывает штатно (storage.open_snapshot_readonly, load_human);
     здесь — база результатов lab.sqlite3: у неё своя схема, штатная проверка схемы не подходит.
     Правило то же, что у storage: при -wal/-shm/-journal рядом — обычное mode=ro."""
     path = Path(path)
@@ -810,7 +810,7 @@ def load_human(db_path, units, W):
     # копия базы записей — штатным чтением программы: проверка схемы и правило «без -wal/-shm —
     # неизменяемая». Копию делает Store.backup, служебных файлов рядом с ней нет.
     import lab_sandbox
-    store = lab_sandbox._import_repo_module("storage").open_store_readonly(db_path)
+    store = lab_sandbox._import_repo_module("storage").open_snapshot_readonly(db_path)
     db = store.db
     try:
         out = {}

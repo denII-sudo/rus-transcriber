@@ -76,7 +76,11 @@ class InstallationStoreTests(unittest.TestCase):
         report = recordings.prepare_installation_store()
         self.assertEqual((report["case"], report["ok"]), ("ready", True))
         self.assert_untouched(before, report)
-        self.assertEqual(sorted(p.name for p in self.data.iterdir() if p.name.startswith("state")), ["state.sqlite3"])
+        # ни новой базы, ни .incomplete-*; живое чтение (БД-2) может оставить пустой -wal и -shm
+        names = {p.name for p in self.data.iterdir() if p.name.startswith("state")}
+        self.assertTrue({"state.sqlite3"} <= names <= {"state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"}, names)
+        wal = self.data / "state.sqlite3-wal"
+        self.assertTrue(not wal.exists() or wal.stat().st_size == 0)
 
     def test_existing_store_not_selected_gets_selected_without_changing_it(self):
         for config in (None, {"recording_backend": "legacy_files"}, {"recording_backend": "other"},

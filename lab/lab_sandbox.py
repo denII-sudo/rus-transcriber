@@ -3,7 +3,7 @@
 Что делает prepare (подробно — lab/README.md, раздел «Что копируется»):
   * база записей state.sqlite3 копируется штатной резервной копией программы
     (storage.Store.backup). Если рядом с базой нет -wal и -shm, она открывается штатно
-    storage.open_store_readonly (неизменяемой, без служебных файлов); иначе база и -wal
+    storage.open_snapshot_readonly (неизменяемой, без служебных файлов); иначе база и -wal
     читаются побайтно во временную папку песочницы и копия делается оттуда (copy_database:
     штатное чтение при служебных файлах меняет -shm). Копия неактивна: программа по ней не
     пишет файлы рядом с аудио, пока её явно не перепривязать;
@@ -388,7 +388,7 @@ def _file_state(path):
 def copy_database(src_db, dest, staging):
     """Неактивная резервная копия базы записей в песочницу. -> (отчёт проверки копии, способ).
 
-    «readonly» — штатно: storage.open_store_readonly + Store.backup. Применяется, только когда
+    «readonly» — штатно: storage.open_snapshot_readonly + Store.backup. Применяется, только когда
     рядом с базой нет ни -wal, ни -shm (программа базу не держит): тогда SQLite открывает её как
     неизменяемую и рядом ничего не создаёт. Если за время копирования база или служебные файлы
     изменились (программа начала писать), копия выбрасывается и делается побайтно.
@@ -399,7 +399,7 @@ def copy_database(src_db, dest, staging):
     storage = _import_repo_module("storage")
     if not _side_files(src_db):
         before = _file_state(src_db)
-        store = storage.open_store_readonly(src_db)
+        store = storage.open_snapshot_readonly(src_db)
         try:
             report = store.backup(dest)
         finally:
@@ -513,7 +513,7 @@ def add_database_hypotheses(db_copy, dest_dir, manifest_path, manifest):
     for f in manifest["files"]:
         f.setdefault("origin", "files")
     taken = {f["relative"] for f in manifest["files"] if f["result"] == HYP_COPIED}
-    store = storage.open_store_readonly(db_copy)
+    store = storage.open_snapshot_readonly(db_copy)
     try:
         rows = store.hypotheses_rows()
     finally:
@@ -579,7 +579,7 @@ def prepare(sandbox, source_data, program_dir, voice_profiles, env=None, log=pri
     if not only_audio:
         (s / "source").mkdir(parents=True, exist_ok=True)
         report, copy_method = copy_database(src_db, s / "source" / "state.sqlite3", s / "source" / "staging")
-        store = storage.open_store_readonly(s / "source" / "state.sqlite3")
+        store = storage.open_snapshot_readonly(s / "source" / "state.sqlite3")
         try:
             recordings = read_recordings(store.db)
         finally:

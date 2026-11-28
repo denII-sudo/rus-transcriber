@@ -447,6 +447,7 @@ def run(a):
     elif c == "self-check":
         import selfcheck
         r = selfcheck.run(None, not a.no_tests)
+        r["leftovers"] = core.leftovers_summary()     # остатки после обрывов: только список (БД-9а)
         out(r)
         return 0 if r["ok"] else 1
     elif c == "export":

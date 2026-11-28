@@ -265,6 +265,9 @@ def make_server(port):
                     return self._send(200, core.read_recording_revision(
                         q.get("recording_id", ""), q.get("kind", "transcript"),
                         int(q.get("revision", "0"))))
+                if u == "api/leftovers":
+                    # остатки после обрывов (БД-9а): только список, ничего не удаляется и не открывается
+                    return self._send(200, core.leftovers_report())
                 if u == "api/conflicts/all":
                     return self._send(200, core.list_all_conflicts())
                 if u == "api/conflicts":
