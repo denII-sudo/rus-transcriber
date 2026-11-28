@@ -1169,7 +1169,9 @@ def _save_selected_conspect_locked(snapshot, text, selections):
             "analysis_needs_review": render_report["analysis_needs_review"],
             "assembly_revision": render_report["assembly_revision"],
             "analysis_revision": render_report["analysis_revision"],
-            "external_publication": render_report["external_publication"]}
+            "external_publication": render_report["external_publication"],
+            **({"overlap_unchecked": render_report["overlap_unchecked"]}
+               if "overlap_unchecked" in render_report else {})}
 
 
 def confirm_conspect_analysis(snapshot):

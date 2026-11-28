@@ -226,15 +226,30 @@ def read_recording_revision(recording_id, kind, revision):
         store.close()
 
 
-def _conspect_screen_sections(payload):
-    """Разделы конспекта для экрана. Прежнее поле `sections` отдаётся как есть; если его нет,
-    берутся тексты из `evidence` (так исполнитель свёртки сохраняет разделы), без номеров слов."""
+def _conspect_screen_sections(payload, data_of=None):
+    """Разделы конспекта для экрана. Прежнее поле `sections` отдаётся как есть.
+
+    Свёртка исполнителя (есть `evidence`, `template` и `quotes`) показывается так, как её печатает файл:
+    conspect.render_body при текущей стенограмме — кавычки только у проверенных цитат, остальные с пометкой
+    «по распознаванию, не проверено» и метками участников. Сырой ответ модели в `evidence` не показывается
+    (О255-М1). data_of() — текущая стенограмма с разбором (читается один раз на запись). Если собрать не вышло,
+    вместо текста — сообщение, а не сырой ответ. Без data_of и у остальных конспектов берутся тексты из `evidence`.
+    """
     sections = payload.get("sections")
     if isinstance(sections, list):
         return sections
     evidence = payload.get("evidence")
     if not isinstance(evidence, list):
         return []
+    if data_of is not None and isinstance(payload.get("template"), str) and isinstance(payload.get("quotes"), dict):
+        import conspect
+        import storage
+        try:
+            body = conspect.render_body(payload, data_of())
+        except (KeyError, ValueError, TypeError, IndexError, storage.StorageError):
+            return [{"text": "Не удалось собрать текст свёртки для показа. Сырой ответ модели не показан: в нём "
+                             "цитаты стоят в кавычках без проверки. Откройте файл свёртки."}]
+        return [{"text": part} for part in body.split("\n\n") if part.strip()]
     return [{"text": item["text"]} for item in evidence
             if isinstance(item, dict) and isinstance(item.get("text"), str)]
 
@@ -306,6 +321,12 @@ def recording_conspects(recording_id):
     try:
         store.current_identity()
         result = []
+        loaded = []
+
+        def data_of():       # стенограмма с разбором, как её читает пересборка файла; один раз на запись
+            if not loaded:
+                loaded.append(recordings.load_recording(store, recording_id))
+            return loaded[0]
         for item in store.list_conspects(recording_id):
             root = store.db.execute("SELECT path FROM allowed_roots WHERE root_id=?",
                                     (item["root_id"],)).fetchone()
@@ -320,7 +341,7 @@ def recording_conspects(recording_id):
             result.append({"conspect_id": item["conspect_id"], "name": item["name"],
                            "current_revision": item["current_revision"],
                            "source_revision": item["source_revision"],
-                           "sections": _conspect_screen_sections(item["payload"]),
+                           "sections": _conspect_screen_sections(item["payload"], data_of),
                            "quote_repair": (None if quote_repair_view(item["payload"]) is None else
                                             {**quote_repair_view(item["payload"]),
                                              **quote_repair_state(store, item["name"])}),

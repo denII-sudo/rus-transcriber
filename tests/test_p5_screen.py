@@ -172,8 +172,9 @@ class P5ServiceTests(unittest.TestCase):
         self.save_plain_conspect(ident, "no-sections", {"name": "no-sections"})
 
         by_name = {item["name"]: item for item in core.recording_conspects(ident)}
+        # разделы собраны так же, как в файле свёртки (О255-М1): со временем начала раздела; без цитат текст тот же
         self.assertEqual(by_name["workflow-" + request]["sections"],
-                         [{"text": "Первый раздел."}, {"text": "Второй раздел."}])
+                         [{"text": "[00:00:00]\nПервый раздел."}, {"text": "[00:00:01]\nВторой раздел."}])
         self.assertEqual(by_name["old-sections"]["sections"], [{"text": "Старый раздел."}])
         self.assertEqual(by_name["no-sections"]["sections"], [])
 

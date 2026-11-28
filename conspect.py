@@ -22,6 +22,7 @@
   * место не найдено (слова удалены) — выводится авторская версия с пометкой, место в отчёте.
 Связь односторонняя: правки в документе Claude Docs в стенограмму не возвращаются.
 """
+import copy
 import json
 import re
 import base64
@@ -664,12 +665,13 @@ def _author_of(obj, data):
     return author
 
 
-def render(obj, data, update_last=True):
+def render(obj, data, update_last=True, _body=None):
     """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания.
 
     Свёртка с quote_policy 1 («цитаты по одной», РАР-7, 7.5): автора пишет программа, цитата в «» только
     если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
     с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
+    _body — список-приёмник: туда кладётся текст без шапки (для render_body).
     """
     hdr = {"speaker_changes": 0, "speaker_unknown": False}
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
@@ -787,6 +789,8 @@ def render(obj, data, update_last=True):
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
                    + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
+    if _body is not None:
+        _body.append(body_md)
     md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
@@ -794,6 +798,16 @@ def render(obj, data, update_last=True):
             obj["assembly_review_revision"] = data["review_revision"]
     rep["assembly_revision"] = obj.get("assembly_revision")
     return md, rep
+
+
+def render_body(obj, data):
+    """Текст свёртки без шапки — так, как его печатает render в файл, но ничего не пишет и obj не меняет.
+
+    Для локального экрана: те же кавычки, пометки «по распознаванию, не проверено» и метки участников, что в файле.
+    """
+    sink = []
+    render(copy.deepcopy(obj), data, update_last=False, _body=sink)
+    return sink[0]
 
 
 def confirm_analysis(obj, data):
@@ -837,7 +851,9 @@ def _save_linked_locked(json_path, name, conspect_md):
     return {"conspect_json": str(cj), "conspect_md": str(cm), **rep,
             "analysis_needs_review": rrep["analysis_needs_review"],
             "assembly_revision": rrep["assembly_revision"], "analysis_revision": rrep["analysis_revision"],
-            "external_publication": rrep["external_publication"], "check": check}
+            "external_publication": rrep["external_publication"],
+            **({"overlap_unchecked": rrep["overlap_unchecked"]} if "overlap_unchecked" in rrep else {}),
+            "check": check}
 
 
 def rerender(json_path, name=None):
