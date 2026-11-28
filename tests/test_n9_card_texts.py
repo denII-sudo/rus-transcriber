@@ -63,6 +63,29 @@ class NeighborDupWarningTests(six.Case):
         self.assertIn("(c.warnings_done || c.warnings || []).forEach(w => action.push(", CARDS)
 
 
+class GluedWordsTests(six.Case):
+    """PR Б, слово владельца «Да, делить»: знак препинания без пробела между словами — граница слов."""
+
+    def test_split(self):
+        F = six.freeform if hasattr(six, "freeform") else __import__("freeform")
+        cases = {"Вот.Ну": ["Вот.", "Ну"], "Вот.ну": ["Вот.", "ну"], "Ну,да": ["Ну,", "да"],
+                 "Да!Нет?Ну": ["Да!", "Нет?", "Ну"], "3.5": ["3.5"], "т.е. так": ["т.е.", "так"],
+                 "и т.д.": ["и", "т.д."], "ну-ка": ["ну-ка"], "Вот... Ну": ["Вот", "Ну"]}
+        for text, words in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual([w for _, ws in F.split_replies(text, ["Анна"]) for w in ws], words)
+
+    def test_glued_neighbor_word_is_not_doubled(self):
+        """Н-9: «Анна: новое.вот» на пропуск перед «вот» того же говорящего — «вот» второй раз не вписан."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), files(backend) as (jp, md, version):
+                self.save(jp, version, text="Анна: новое.вот")
+                core.apply_answers_files(jp, md)
+                texts = self.texts(jp)
+                self.assertEqual(texts.count("вот"), 1, texts)
+                self.assertIn("новое.", texts)
+
+
 class GapCardTextTests(unittest.TestCase):
     def test_gap_card_has_example_and_neighbor_rule(self):
         self.assertIn("«Анна: Вот. Ну»", CARDS)
