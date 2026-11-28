@@ -224,7 +224,17 @@ def _clean(s):
 
 
 def _id_text(data, ids):
-    """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
+    """-> (текст, говорящий) слов ссылки ids; (None, None) — место не найдено или неоднозначно (см. _id_words)."""
+    text, speaker, _ = _id_words(data, ids)
+    return text, speaker
+
+
+def _id_words(data, ids):
+    """-> (текст, говорящий, [ID слов, которые фактически напечатаны]) или (None, None, None).
+    Набор ID — тот, по которому проверяются блокировки цитаты (А255-1): сохранённый ID слова, разбитого
+    ответом на части, раскрывается на все части, и проверять надо каждую напечатанную.
+
+    Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
     ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
     (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
     оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
@@ -238,7 +248,7 @@ def _id_text(data, ids):
                 if word.get("part_of"):
                     parts.setdefault(word["part_of"], []).append(word["word_id"])
     if any(wid in merged for wid in ids or []):
-        return None, None
+        return None, None, None
     if ids and parts:
         rank = {wid: i for i, wid in enumerate(w.get("word_id") for seg in data.get("segments") or []
                                                for w in seg.get("words") or [])}
@@ -254,17 +264,17 @@ def _id_text(data, ids):
             if wid:
                 by_id.setdefault(wid, []).append((word["w"], seg["speaker"]))
     if not ids or len(set(ids)) != len(ids) or any(len(by_id.get(wid, [])) != 1 for wid in ids):
-        return None, None
+        return None, None, None
     found = [by_id[wid][0] for wid in ids]
     if len({speaker for _, speaker in found}) != 1:
-        return None, None
+        return None, None, None
     positions = [next(i for i, (wid, _) in enumerate(order) if wid == target) for target in ids]
     if positions != sorted(positions):
-        return None, None
+        return None, None, None
     speaker = found[0][1]
     if any(wid not in ids and spk == speaker for wid, spk in order[positions[0]:positions[-1] + 1]):
-        return None, None
-    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1]
+        return None, None, None
+    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1], list(ids)
 
 
 def _legacy_span(data, t1, t2):
@@ -545,8 +555,12 @@ def render(obj, data, update_last=True):
         q = obj["quotes"].get(key)
         if not q:
             return m.group(0)
-        texts = [(None, None) if source_conflict else _id_text(data, p["word_ids"]) if "word_ids" in p
-                 else _legacy_span(data, p["t1"], p["t2"]) for p in q["parts"]]
+        # Один раз раскрыть ссылку: текст и ID слов, которые фактически печатаются (А255-1). Все блокировки
+        # цитаты проверяются по этим ID — сохранённый ID разбитого слова покрывает и его части.
+        resolved = [(None, None, None) if source_conflict else _id_words(data, p["word_ids"]) if "word_ids" in p
+                    else (*_legacy_span(data, p["t1"], p["t2"]), []) for p in q["parts"]]
+        texts = [(t, s) for t, s, _ in resolved]
+        ids = [wid for _, _, part_ids in resolved for wid in part_ids or []]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
             if policy:
@@ -571,8 +585,7 @@ def render(obj, data, update_last=True):
         if update_last:
             q["last"], q["last_speaker"] = cur, cur_spk
         if policy:
-            return one_by_one(key, q, body, cur_spk)
-        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
+            return one_by_one(key, q, body, cur_spk, ids)
         if ids and workflow.overlap_blockers(data, ids):
             # слова цитаты в отрезке наложения без места (Н28-1, Р255-1): не «дословно и сверено»
             rep.setdefault("overlap_unchecked", []).append(key)
@@ -581,13 +594,13 @@ def render(obj, data, update_last=True):
             return (f"{spk}: " if spk else "") + f"{body} (по распознаванию, не проверено{when})"
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
-    def one_by_one(key, q, body, speaker):
-        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают."""
+    def one_by_one(key, q, body, speaker, ids):
+        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают.
+        ids — слова, которые фактически напечатаны (раскрытая ссылка, А255-1)."""
         author = author_of(speaker)
         written = q.get("written_label")
         if written and written != author:
             rep["author_corrected"].append({"id": key, "written": written, "now": author})
-        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
         blockers = workflow.quote_blockers(data, ids)
         if not blockers:
             stats["quoted"] += 1

@@ -412,5 +412,190 @@ class AgentConspectTests(unittest.TestCase):
                          {"share": 0.35, "sec": 7.0, "spans": spans[:10], "spans_more": 2})
 
 
+def split_data(spans=((5.4, 7.0),), review=()):
+    """Реплика «Спикер 1»: «начало» 1,0 с, «оригинал» 4,8–6,0 с (w1), «конец» 8,0 с. Отрезки spans — пропущенные
+    наложения записи (доля выше порога). Правило попадания: начало слова + 0,1 с внутри [начало, конец)."""
+    field = {"share": 0.35, "sec": 7.0, **({"spans": [list(x) for x in spans]} if spans is not None else {})}
+    ws = [{"word_id": "w0", "w": "начало", "s": 1.0, "e": 1.5, "c": 1.0},
+          {"word_id": "w1", "w": "оригинал", "s": 4.8, "e": 6.0, "c": 1.0},
+          {"word_id": "w3", "w": "конец", "s": 8.0, "e": 8.5, "c": 1.0}]
+    return {"recording_id": "rec", "source_revision": 1, "speaker_names": {}, "review": list(review),
+            "file": "s.wav", "duration": "00:00:10", "speakers": [S1],
+            "quality": {"overlap_unmeasured_skipped": field},
+            "segments": [{"segment_id": "g1", "speaker": S1, "start": 0.0, "end": 9.0,
+                          "text": "начало оригинал конец", "words": ws}]}
+
+
+def split_word(data, wid, text, item="span@1"):
+    """Штатное разбиение слова wid на слова text (как ответ или правка отрезка: _diff_words + _relink_places)."""
+    seg = data["segments"][0]
+    k = next(i for i, w in enumerate(seg["words"]) if w["word_id"] == wid)
+    old = [seg["words"][k]]
+    origin = []
+    new, conflicts, _ = transcript._diff_words(old, text, item, origin=origin)
+    assert not conflicts
+    transcript._relink_places(data, old, origin)
+    seg["words"][k:k + 1] = new
+    seg["text"] = " ".join(w["w"] for w in seg["words"])
+    return [w["word_id"] for w in new]
+
+
+def policy_copy(obj):
+    return dict(obj, quote_policy=1)
+
+
+class SplitWordQuoteTests(unittest.TestCase):
+    """А255-1 (аудит OpenCode №255): сохранённая ссылка на слово, разбитое на части, печатает все части —
+    блокировки (непроверенные отрезки, открытые места, правки человека) проверяются по всем напечатанным словам,
+    в обеих разновидностях конспекта; строка «в кавычках / без проверки» совпадает с напечатанным."""
+
+    TEXT = "Итог: Спикер 1: «оригинал»."
+
+    def render_both(self, obj, data):
+        md, rep = conspect.render(obj, data, update_last=False)
+        pmd, prep = conspect.render(policy_copy(obj), data, update_last=False)
+        return md, rep, pmd
+
+    def assert_header_matches(self, pmd):
+        """Строка «Цитат: N в кавычках, M без проверки» — по тому, что напечатано в теле."""
+        head, body = pmd.split("Итог:", 1)
+        quoted = body.count("«")
+        marked = body.count("(по распознаванию") + body.count("(место в стенограмме не найдено)")
+        self.assertIn(f"Цитат: {quoted} в кавычках, {marked} без проверки", head)
+
+    def assert_blocked(self, md, rep, pmd, text):
+        self.assertNotIn(f"«{text}»", md)
+        self.assertIn(f"Спикер 1: {text} (по распознаванию, не проверено, 00:00:04)", md)
+        self.assertEqual(len(rep["overlap_unchecked"]), 1)
+        self.assertNotIn(f"«{text}»", pmd)
+        self.assertIn(f"{text} (по распознаванию, не проверено, 00:00:04)", pmd)
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 0 в кавычках, 1 без проверки", pmd)
+
+    def assert_quoted(self, md, rep, pmd, text):
+        self.assertIn(f"Спикер 1: «{text}»", md)
+        self.assertNotIn("overlap_unchecked", rep)
+        self.assertIn(f"«{text}»", pmd)
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 1 в кавычках, 0 без проверки", pmd)
+
+    def test_split_after_link_checks_every_printed_part(self):
+        """Ссылка на w1 сохранена до разбиения; «альфа» 4,8 с — вне отрезка 5,4–7,0, «бета» 5,4 с — внутри."""
+        data = split_data()
+        obj, rep = conspect.link(self.TEXT, data)
+        self.assertEqual(obj["quotes"]["1"]["parts"][0]["word_ids"], ["w1"])
+        self.assert_quoted(*self.render_both(obj, data), "оригинал")       # до разбиения слово вне отрезка
+        split_word(data, "w1", "альфа бета")
+        self.assertEqual(conspect._id_text(data, ["w1"])[0], "альфа бета")
+        self.assertEqual(workflow.overlap_blockers(data, ["w1"]), [])      # первая часть одна — чиста
+        self.assert_blocked(*self.render_both(obj, data), "альфа бета")
+
+    def test_parts_on_both_sides_of_span_boundary(self):
+        """Граница отрезка между частями: задета любая часть — без кавычек; ни одна — в кавычках."""
+        for spans, blocked in (([5.4, 7.0], True), ([4.5, 5.3], True), ([7.0, 7.5], False), ([5.6, 7.0], False)):
+            with self.subTest(spans=spans):
+                data = split_data(spans=(spans,))
+                obj, _ = conspect.link(self.TEXT, data)
+                split_word(data, "w1", "альфа бета")
+                result = self.render_both(obj, data)
+                (self.assert_blocked if blocked else self.assert_quoted)(*result, "альфа бета")
+
+    def test_split_before_link(self):
+        """Слово разбито до связывания: ссылка сразу на обе части; check_quotes даёт сомнение по второй."""
+        data = split_data()
+        split_word(data, "w1", "альфа бета")
+        obj, rep = conspect.link("Итог: Спикер 1: «альфа бета».", data)
+        self.assertEqual(rep["linked"], 1)
+        self.assertEqual(len(obj["quotes"]["1"]["parts"][0]["word_ids"]), 2)
+        self.assert_blocked(*self.render_both(obj, data), "альфа бета")
+        check = quotes.check("Спикер 1: «альфа бета»", data)
+        self.assertEqual(check["summary"]["in_doubt"], 1)
+        self.assertEqual(next(r for r in check["problems"] if r.get("doubt"))["doubt"], ["overlap_skipped:0"])
+
+    def test_repeated_edit_of_a_part(self):
+        """Повторная правка: «бета» разбита ещё раз — части помнят корень w1; в отрезке только «гамма»."""
+        data = split_data(spans=((5.75, 7.0),))
+        obj, _ = conspect.link(self.TEXT, data)
+        _, beta = split_word(data, "w1", "альфа бета")
+        self.assert_quoted(*self.render_both(obj, data), "альфа бета")
+        split_word(data, beta, "бета гамма", item="span@2")
+        self.assertEqual(conspect._id_text(data, ["w1"])[0], "альфа бета гамма")
+        self.assert_blocked(*self.render_both(obj, data), "альфа бета гамма")
+
+    def test_human_touch_counts_per_printed_part(self):
+        """Правка человека снимает отрезок только со своего слова: тронута первая часть — цитата всё равно
+        без кавычек; тронута часть в отрезке — в кавычках."""
+        for touched, blocked in ((0, True), (1, False)):
+            with self.subTest(touched=touched):
+                data = split_data()
+                obj, _ = conspect.link(self.TEXT, data)
+                ids = split_word(data, "w1", "альфа бета")
+                word = next(w for w in data["segments"][0]["words"] if w["word_id"] == ids[touched])
+                word["by"] = "human"
+                result = self.render_both(obj, data)
+                (self.assert_blocked if blocked else self.assert_quoted)(*result, "альфа бета")
+
+    def test_open_place_on_a_later_part_blocks_policy_quote(self):
+        """Открытое место на второй части (не на сохранённом ID) задевает цитату свёртки «цитаты по одной»."""
+        data = split_data(spans=None)
+        obj, _ = conspect.link(self.TEXT, data)
+        ids = split_word(data, "w1", "альфа бета")
+        data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.4, "t1": 5.4, "t2": 6.0,
+                           "speaker": S1, "word_ids": [ids[1]]}]
+        self.assertEqual(workflow.quote_blockers(data, ["w1"]), [])
+        pmd, _ = conspect.render(policy_copy(obj), data, update_last=False)
+        self.assertIn("альфа бета (по распознаванию, не проверено, 00:00:04)", pmd)
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 0 в кавычках, 1 без проверки", pmd)
+
+    def test_old_links(self):
+        """Старые ссылки: запись до Н28-1 (без отрезков) — как раньше, в кавычках; ссылка, которую раскрыть
+        однозначно нельзя (часть слова ушла в слово другого корня), в «цитатах по одной» — без кавычек."""
+        data = split_data(spans=None)
+        obj, _ = conspect.link(self.TEXT, data)
+        split_word(data, "w1", "альфа бета")
+        md, rep, pmd = self.render_both(obj, data)
+        self.assertIn("Спикер 1: «альфа бета»", md)
+        self.assertIn("Цитат: 1 в кавычках, 0 без проверки", pmd)
+        data = split_data()
+        obj, _ = conspect.link(self.TEXT, data)
+        split_word(data, "w1", "альфа бета")
+        data["segments"][0]["words"][2]["merged_from"] = ["w1"]
+        self.assertEqual(conspect._id_text(data, ["w1"]), (None, None))
+        pmd, prep = conspect.render(policy_copy(obj), data, update_last=False)
+        self.assertNotIn("«", pmd.split("Итог:", 1)[1])
+        self.assertEqual(len(prep["missing"]), 1)
+        self.assert_header_matches(pmd)
+
+    def test_end_to_end_words_link_edit_render(self):
+        """Сквозной путь на файлах: стенограмма → conspect.save_linked (ссылка) → transcript.edit_span
+        (агент разбивает слово) → conspect.rerender (сборка) — обе разновидности конспекта и check_quotes."""
+        with tempfile.TemporaryDirectory(dir=_TMP) as folder:
+            jp = Path(folder) / "s.transcript.json"
+            md_path = Path(folder) / "s.md"
+            data = split_data()
+            transcript.save(data, jp, md_path)
+            saved = conspect.save_linked(jp, "Агент", self.TEXT)
+            self.assertEqual(saved["linked"], 1)
+            self.assertIn("Спикер 1: «оригинал»", Path(saved["conspect_md"]).read_text(encoding="utf-8"))
+            policy_obj = json.loads(Path(saved["conspect_json"]).read_text(encoding="utf-8"))
+            policy_obj.update(name="Свёртка", quote_policy=1)
+            pj, pm = conspect.path_for(jp, "Свёртка")
+            pj.write_text(json.dumps(policy_obj, ensure_ascii=False), encoding="utf-8")
+            transcript.edit_span(jp, md_path, 4.7, 5.0, "альфа бета", by="claude")
+            now = transcript.load(jp)
+            self.assertEqual([w["w"] for w in now["segments"][0]["words"]], ["начало", "альфа", "бета", "конец"])
+            out = conspect.rerender(jp)
+            agent_md = Path(out["Агент"]["conspect_md"]).read_text(encoding="utf-8")
+            policy_md = Path(out["Свёртка"]["conspect_md"]).read_text(encoding="utf-8")
+            self.assertNotIn("«альфа бета»", agent_md)
+            self.assertIn("Спикер 1: альфа бета (по распознаванию, не проверено, 00:00:04)", agent_md)
+            self.assertNotIn("«альфа бета»", policy_md)
+            self.assert_header_matches(policy_md)
+            self.assertIn("Цитат: 0 в кавычках, 1 без проверки", policy_md)
+            self.assertEqual(out["Агент"]["check"]["verbatim"], 0)
+            self.assertEqual(quotes.check("Спикер 1: «альфа бета»", now)["summary"]["in_doubt"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
