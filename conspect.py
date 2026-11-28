@@ -490,30 +490,43 @@ SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
 # Сведения шапки (7.6а), поставленные программой: при повторном вводе готового Markdown не дублируются (T260-5)
 INFO_MARK = "<!-- rus-transcriber: сведения шапки, ставит программа -->"
-INFO_LINE = re.compile(r"(?:Событие: |Дата записи: |Дата файла аудио: |Стенограмма: |Места разбора: |Источник не подтверждён: "
-                       r"|Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)$)")
+_DATE = r"\d{4}-\d{2}-\d{2}"
+_CHANGE = r"(?:\d+|не определено)"
+# Строки шапки ровно в том виде, в каком их пишет _info_lines (T260-12): снимается только полное совпадение
+INFO_CORE = re.compile(
+    r"Событие: [^\n]+\n"
+    rf"(?:Дата записи: (?:{_DATE}|не установлена)|Дата файла аудио: {_DATE})\n"
+    r"Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)\n"
+    r"Стенограмма: (?:версия \S+|версия не указана|собрана по версии стенограммы \S+, сейчас \S+: изменено цитат \d+, "
+    rf"у говорящих {_CHANGE})\n"
+    r"Места разбора: (?:разобрано \d+ из \d+(?:, не прослушано \d+)?|мест разбора нет|"
+    r"неизвестно \(данные разбора не переданы\))\n"
+    r"(?:Источник не подтверждён: у конспекта нет признака записи; сведения взяты из записи, к которой он привязан\.\n)?")
+INFO_FOREIGN = re.compile(
+    r"Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны\.\n"
+    r"Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)\n")
 
 
 def _strip_info(text):
     """Убрать сведения шапки, поставленные программой (в начале текста или сразу после «Создан моделью…»).
 
-    Снимается отметка программы и следующие за ней строки её собственного формата (INFO_LINE) и одна пустая строка
-    после них; на первой чужой строке разбор останавливается, и она остаётся (T260-7, T260-10). Отметка без строк
-    программы (человек начал текст с такой же строки) ничего не снимает.
+    Снимается отметка программы и следующие за ней строки ровно в том формате, который программа пишет сейчас
+    (INFO_CORE или INFO_FOREIGN, значения проверяются целиком), и одна пустая строка после них. Всё, что не совпало
+    (чужая строка, строка с тем же началом, но другим значением, отметка без шапки), остаётся нетронутым
+    (T260-7, T260-10, T260-12).
     """
     lead = MODEL_LEAD.match(text)
     start = lead.end() if lead else 0
     if not text.startswith(INFO_MARK + "\n", start):
         return text
-    rows = text[start + len(INFO_MARK) + 1:].split("\n")
-    taken = 0
-    while taken < len(rows) and INFO_LINE.match(rows[taken]):
-        taken += 1
-    if not taken:
+    body = start + len(INFO_MARK) + 1
+    found = INFO_CORE.match(text, body) or INFO_FOREIGN.match(text, body)
+    if not found:
         return text
-    if taken < len(rows) and rows[taken] == "" and taken + 1 <= len(rows):
-        taken += 1                                  # пустая строка-разделитель, которую ставит программа
-    return text[:start] + "\n".join(rows[taken:])
+    end = found.end()
+    if text.startswith("\n", end):
+        end += 1                                    # пустая строка-разделитель, которую ставит программа
+    return text[:start] + text[end:]
 
 
 VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
@@ -576,7 +589,7 @@ def _event_and_date(data):
     title = data.get("title") if isinstance(data.get("title"), str) else ""
     event = " ".join(title.split()) or (Path(file.replace("\\", "/")).name if file else "") or "не указано"
     recorded = data.get("recorded_at")
-    if isinstance(recorded, str) and recorded.strip():
+    if isinstance(recorded, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", recorded.strip()[:10]):
         return event, f"Дата записи: {recorded.strip()[:10]}"
     if file:
         try:

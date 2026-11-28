@@ -176,6 +176,41 @@ class ReviewFindingsTests(unittest.TestCase):
         template = conspect.link(mine, data(title="А"))[0]["template"]
         self.assertEqual(template, mine)
 
+    def test_t260_12_prefix_with_foreign_value_is_kept(self):
+        mark = conspect.INFO_MARK + "\n"
+        for line in ("Событие: Мой план", "Дата записи: вчера вечером", "Дата файла аудио: около полудня",
+                     "Составлен: мной", "Стенограмма: версия моя", "Места разбора: все хорошо",
+                     "Источник не подтверждён: пока не проверял"):
+            text = mark + line + "\n\nДальше."
+            with self.subTest(line=line, kind="после отметки"):
+                self.assertEqual(conspect._strip_info(text), text)
+                self.assertEqual(conspect.link(text, data(title="А"))[0]["template"], text)
+            real, _ = conspect.render(agent_obj(template="Текст."), data(title="А", recorded_at="2026-11-20"))
+            head = real.rsplit("\n\nТекст.", 1)[0]
+            with self.subTest(line=line, kind="после шапки без пустой строки"):
+                kept = conspect._strip_info(head + "\n" + line + "\n\nТекст.")
+                self.assertEqual(kept, line + "\n\nТекст.")
+
+    def test_t260_12_real_headers_are_stripped_without_duplicates(self):
+        foreign = agent_obj(recording_id="OTHER")
+        legacy = agent_obj()
+        del legacy["recording_id"]
+        for name, obj in (("агент", agent_obj()), ("модель", model_obj()), ("чужой источник", foreign),
+                          ("без записи", legacy)):
+            with self.subTest(name):
+                md, _ = conspect.render(obj, data(title="А", recorded_at="2026-11-20"))
+                self.assertEqual(md.count(conspect.INFO_MARK), 1)
+                relinked = conspect.link(md, data(title="А"))[0]["template"]
+                self.assertNotIn(conspect.INFO_MARK, relinked)
+                self.assertNotIn("Составлен:", relinked)
+                again, _ = conspect.render(dict(obj, template=md), data(title="А", recorded_at="2026-11-20"))
+                self.assertEqual(again.count(conspect.INFO_MARK), 1)
+                self.assertEqual(again.count("Составлен:"), 1)
+
+    def test_recorded_at_that_is_not_a_date_falls_back_to_the_file(self):
+        md, _ = conspect.render(agent_obj(), data(recorded_at="вчера вечером"))
+        self.assertIn("Дата записи: не установлена", md)
+
 
 if __name__ == "__main__":
     unittest.main()
