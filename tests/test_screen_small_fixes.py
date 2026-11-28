@@ -58,7 +58,7 @@ class ScreenSmallFixes(unittest.TestCase):
             lowered = os.path.normcase(str(real))      # так хранит корень база
             store = _Store(lowered, "Заметка.md")
             with mock.patch("recordings.open_store", return_value=store), \
-                    mock.patch.object(core_screen, "_conspect_screen_sections", return_value=[]), \
+                    mock.patch.object(core_screen, "_conspect_screen_text", return_value=("", [])), \
                     mock.patch.object(core_screen, "quote_repair_view", return_value=None):
                 result = core_screen.recording_conspects("rec")
             self.assertEqual(result[0]["files"]["md"], str(real / "Заметка.md"))

@@ -394,18 +394,27 @@ def validate_pair(transcript, review):
     _validate_embedded_provenance(review)
 
 
-def _connect_readonly(path):
-    """Соединение только для чтения; следов не оставляет только у закрытой базы.
+def _connect_live_readonly(path):
+    """Соединение только для чтения живой базы (БД-2, S-1): всегда обычное mode=ro.
 
-    База всегда в режиме WAL. Обычное mode=ro на закрытой базе создаёт -wal/-shm и не может
-    убрать их при закрытии. Если рядом нет ни -wal, ни -shm, все записи уже в основном файле
-    и никто его не использует: открываем с immutable=1, и файлы не появляются. Если они есть,
-    свежие данные могут лежать в -wal, а immutable=1 его игнорирует, поэтому открываем
-    обычным mode=ro. Это не бесследно (читатель WAL всегда отмечается в -shm):
-      - есть -wal и -shm (пишут в базу или остались после сбоя): меняется содержимое -shm;
-      - есть только -wal: создаётся новый -shm.
-    Основной файл и -wal не меняются, данные записей не затрагиваются.
-    """
+    Живую базу в любой момент может начать писать другой процесс (сервер, экран, обработка). Режим immutable=1
+    обещает SQLite, что файл не меняется, поэтому такой читатель после чужой записи видит прежнее состояние, а
+    соседний запрос может получить «database disk image is malformed» (опыты А и Б, 28.11.2026). mode=ro видит
+    всё подтверждённое. Цена: читатель WAL отмечается в -shm, а на закрытой базе создаёт -wal (0 байт) и -shm и
+    не может убрать их при закрытии; их убирает следующее закрытие соединения на запись. Пока читатель открыт,
+    закрывшийся писатель не переносит журнал в основной файл: непустой -wal остаётся до следующего закрытия
+    соединения на запись. Основной файл и -wal читатель не меняет. Для чтения нужно право создать -shm в папке
+    базы (у папки данных программы оно есть)."""
+    return _connect(check_local_path(path).resolve(), "ro")
+
+
+def _connect_snapshot_readonly(path):
+    """Соединение только для чтения файла, который никто не пишет: подготовленная этим вызовом копия
+    (`.incomplete-*`) или опубликованный резерв. Живую базу так не открывать (см. _connect_live_readonly).
+
+    Если рядом нет ни -wal, ни -shm, все записи уже в основном файле: открываем с immutable=1, и рядом ничего не
+    появляется. Если они есть, данные могут лежать в -wal, а immutable=1 его игнорирует, поэтому обычное mode=ro
+    (меняется или создаётся только -shm; основной файл и -wal не меняются)."""
     resolved = check_local_path(path).resolve()
     busy = any(Path(str(resolved) + suffix).exists() for suffix in ("-wal", "-shm"))
     return _connect(resolved, "ro" if busy else "ro&immutable=1")
@@ -632,7 +641,7 @@ def initialize(path, *, initial_display_name=None):
     try:
         created = _initialize_at(staged, initial_display_name)
         created.close()
-        validate_copy(staged)
+        validate_copy(staged, live=False)       # своя неопубликованная копия: чтение снимка (БД-2)
         _release_wal_files(staged)
         os.link(staged, path)
     except BaseException:
@@ -645,7 +654,7 @@ def initialize(path, *, initial_display_name=None):
 def _release_wal_files(path):
     """Убрать служебные -wal/-shm временного имени до публикации файла.
 
-    validate_copy обычно не оставляет служебных файлов (см. _connect_readonly), но страхуемся:
+    validate_copy копии обычно не оставляет служебных файлов (см. _connect_snapshot_readonly), но страхуемся:
     если они уже были, соединение только для чтения не может их удалить, и они остались бы
     рядом под временным именем. Последнее закрываемое соединение для записи само переносит
     журнал в файл и удаляет их; журнал SQLite открывает только при первом обращении к базе,
@@ -751,9 +760,25 @@ def open_store(path):
         raise
 
 
-def open_store_readonly(path):
-    """Открыть существующую совместимую БД только для чтения."""
-    db = _connect_readonly(path)
+def open_store_readonly(path, *, snapshot=False):
+    """Открыть совместимую БД только для чтения (query_only).
+
+    По умолчанию — живая база (mode=ro): видит всё подтверждённое, в том числе записанное другим процессом после
+    открытия; может оставить рядом -wal/-shm (см. _connect_live_readonly). snapshot=True — файл, который никто не
+    пишет (резерв, своя неопубликованная копия): без служебных файлов рядом — неизменяемым, следов не оставляет
+    (см. _connect_snapshot_readonly); обычно через open_snapshot_readonly."""
+    return _readonly_store(_connect_snapshot_readonly(path) if snapshot else _connect_live_readonly(path))
+
+
+def open_snapshot_readonly(path):
+    """Открыть только для чтения файл базы, который никто не пишет (резерв, своя неопубликованная копия): без
+    служебных файлов рядом — неизменяемым, следов не оставляет. Для живой базы — open_store_readonly.
+    Вызывает open_store_readonly(snapshot=True): у чтения базы одна точка входа (ею пользуются и проверки
+    лаборатории, которые следят за штатным чтением источника)."""
+    return open_store_readonly(path, snapshot=True)
+
+
+def _readonly_store(db):
     try:
         _check_schema(db)
         db.execute("PRAGMA query_only=ON")
@@ -777,13 +802,15 @@ def damaged_conflict_copies(db):
     return found
 
 
-def validate_copy(path, *, allow_damaged_copies=False):
+def validate_copy(path, *, allow_damaged_copies=False, live=False):
     """Проверка копии без записи и запуска восстановленных очередей.
 
     allow_damaged_copies — только для резерва и восстановления (решение владельца 23.11.2026): повреждённая
     копия правки не отказ, а список damaged_copies в отчёте. Любое другое нарушение — отказ, как прежде.
+    live — режим чтения (БД-2): False — файл никто не пишет (своя подготовленная копия, резерв), чтение без
+    следов; True — файл может писать открытое соединение (живая база или копия, открытая на запись), mode=ro.
     """
-    db = _connect_readonly(path)
+    db = _connect_live_readonly(path) if live else _connect_snapshot_readonly(path)
     try:
         _check_schema(db)
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":

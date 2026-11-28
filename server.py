@@ -90,7 +90,25 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.25.18"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.29.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+
+
+def _data_dir_notice():
+    """БД-8а: папка данных или резервов в облаке или на сетевом диске — строка в instructions и одна строка в журнал
+    (stderr) на запуск, без пути. Сервер запускается в любом случае; сбой проверки — без предупреждения."""
+    try:
+        import cloudpaths
+        found = cloudpaths.data_dir_warnings(paths.DATA_DIR)
+    except Exception:
+        return ""
+    if not found:
+        return ""
+    print("[rus-transcriber] " + " ".join(found), file=sys.stderr, flush=True)
+    return ("\n\nВНИМАНИЕ (проверка папки данных при запуске): " + " ".join(found)
+            + " Сообщите это человеку; сами папку данных не переносите.")
+
+
+INSTRUCTIONS += _data_dir_notice()
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -403,7 +421,9 @@ def _backup_for_agent(destination):
     if copies:
         result["report"]["damaged_copies"] = {"count": len(copies),
                                               "conflict_ids": [item["conflict_id"] for item in copies]}
-        result["warning"] = result["warning"][:1]
+        # строки об облаке (без путей) и первая строка о повреждённых копиях; остальные строки — с путями
+        cloud = core.backup_destination_warning(destination)
+        result["warning"] = result["warning"][:len(cloud) + 1]
     return result
 
 
@@ -418,7 +438,8 @@ async def backup_state(destination: str) -> str:
                  "В копии вся база, в том числе сохранённые гипотезы моделей (полный текст записей), "
                  "если включалась настройка save_hypotheses.",
                  "Существующие файлы не изменяются и не удаляются.",
-                 "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением."],
+                 "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением.",
+                 *core.backup_destination_warning(destination)],
         lambda: _backup_for_agent(destination), require_human=True)
 
 
@@ -747,7 +768,10 @@ def conspect_link(job_id: str, conspect_text: str, name: str = "конспект
     conspect_text — конспект в markdown (как он пойдёт в документ). name — название (несколько конспектов
     к одной записи различаются названием). Создаёт в папке результатов <имя>.<name>.conspect.json и .md.
     Возвращает, сколько цитат связано, какие не найдены, и проверку цитат собранного конспекта.
-    Составные, приблизительные и неоднозначные цитаты остаются несвязанными."""
+    Составные, приблизительные и неоднозначные цитаты остаются несвязанными (unlinked, варианты — candidates):
+    в файле они стоят в «» как написаны и проверенными не считаются (check_quotes покажет их в problems, но поля in_doubt у них может не быть). Как читать ответ: check считается по уже
+    собранному файлу, а цитата из слов под наложением печатается там без кавычек, поэтому check.in_doubt = 0 не
+    значит, что кавычки не сняты; снятые названы в overlap_unchecked (номера связанных цитат; ключа нет, если не снимали)."""
     import conspect
     s = _status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
@@ -806,6 +830,10 @@ async def conspect_link_selected(job_id: str, conspect_text: str, selections: di
 
     selections: {номер цитаты: {recording_id, source_revision, word_ids}} из conspect_candidates.
     Существующий конспект не перезаписывается; отказ без новой просьбы не повторять.
+    В ответе: unlinked/candidates — цитаты без выбранного места: в файле они остаются в «» и проверенными не
+    считаются; overlap_unchecked — связанные цитаты, у которых кавычки сняты из-за наложения (ключа нет, если не снимали).
+    Ключа check в ответе нет: собранный файл проверяйте через check_quotes, помня, что в нём сомнение (in_doubt) бывает
+    не у всех непроверенных цитат (несвязанная цитата в «» может пройти как ambiguous, «близко» или «не найдено»).
     """
     try:
         snapshot, report = core.prepare_selected_conspect(job_id, name, conspect_text, selections)
@@ -1063,11 +1091,15 @@ async def self_check(tests: bool = True) -> str:
     процессе, с отдельной временной папкой данных — настоящие данные не трогаются), проверка файлов программы на
     личные данные (tools/check_repo.py: только где нарушение, сами слова не показываются) и морфология
     (pymorphy3 для подсказок словаря). Только проверки, ничего не меняет. tests=False — без тестов (быстро).
-    Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части."""
+    Тесты идут несколько минут, предел — 12 мин. Итог: ok, summary и подробности по каждой части.
+    leftovers — остатки после обрывов старше суток (незавершённые копии базы, временные файлы документов): путь,
+    размер, пояснение. Это не ошибка проверки; программа их не удаляет. Покажите человеку список; удалять — только
+    ему самому. Файл с пометкой second_name_of_database — второе имя рабочей базы: не открывать и не копировать."""
     import selfcheck
     r = await asyncio.to_thread(selfcheck.run, VERSION, bool(tests), True, True)
     # объём гипотез моделей в базе этой установки — только числа, ничего не меняется
     r["hypotheses"] = await asyncio.to_thread(core._hypotheses_summary)
+    r["leftovers"] = await asyncio.to_thread(core.leftovers_summary)
     return json.dumps(r, ensure_ascii=False, indent=1)
 
 

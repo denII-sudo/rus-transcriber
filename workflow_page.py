@@ -12,6 +12,7 @@
 Реальные и старые данные не подключаются до П5 и отдельно согласованной миграции.
 """
 import argparse
+import html as html_lib
 import json
 import mimetypes
 import secrets
@@ -128,6 +129,18 @@ def state_ru(state, request=None):
             "interrupted": "прервано"}.get(state, state)
 
 
+def data_dir_banner():
+    """БД-8а: полоса вверху экрана, если папка данных или резервов в облаке или на сетевом диске; иначе пусто.
+    Только читает признаки папки; сбой проверки — без полосы."""
+    try:
+        import cloudpaths
+        found = cloudpaths.data_dir_warnings(paths.DATA_DIR)
+    except Exception:
+        return ""
+    return "".join(f'<p class="warn" role="alert" data-banner="data-dir"><b>{html_lib.escape(line)}</b></p>\n'
+                   for line in found)
+
+
 def make_server(port):
     """Собрать локальный сервер экрана; возвращает (server, url, last)."""
     last = [time.time()]
@@ -211,6 +224,7 @@ def make_server(port):
             try:
                 if u in ("", "index.html"):
                     html = (HERE / "workflow.html").read_text(encoding="utf-8")
+                    html = html.replace("</style>\n", "</style>\n" + data_dir_banner(), 1)
                     return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"),
                                       "text/html; charset=utf-8")
                 if u == "api/pick":
@@ -255,6 +269,9 @@ def make_server(port):
                     return self._send(200, core.read_recording_revision(
                         q.get("recording_id", ""), q.get("kind", "transcript"),
                         int(q.get("revision", "0"))))
+                if u == "api/leftovers":
+                    # остатки после обрывов (БД-9а): только список, ничего не удаляется и не открывается
+                    return self._send(200, core.leftovers_report())
                 if u == "api/conflicts/all":
                     return self._send(200, core.list_all_conflicts())
                 if u == "api/conflicts":
