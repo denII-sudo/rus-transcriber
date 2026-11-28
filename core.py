@@ -319,11 +319,22 @@ def cancel_job(job_id):
 
 def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path="", tag="", voices=True,
                         names="", whisper="", whisper_max_repeat=-1, group="", *,
-                        workflow_job_id=None, workflow_context=None, workflow_request_id=None):
+                        workflow_job_id=None, workflow_context=None, workflow_request_id=None,
+                        min_speakers=0, max_speakers=0, stray_voices=False, enroll=True, screen_hints=False):
     src = Path(audio_path).expanduser()
     if not src.exists():
         raise CoreError(f"Файл не найден: {src}")
     args = (["--speakers", str(num_speakers)] if num_speakers else []) + ([] if emotions else ["--no-emotions"])
+    if min_speakers:
+        args += ["--min-speakers", str(int(min_speakers))]
+    if max_speakers:
+        args += ["--max-speakers", str(int(max_speakers))]
+    if stray_voices:
+        args.append("--stray-voices")
+    if not enroll:
+        args.append("--no-enroll")
+    if screen_hints:
+        args.append("--screen-hints")
     if vocab_path:
         args += ["--vocab", vocab_path]
     if group:
@@ -384,6 +395,17 @@ def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_simila
     return {"job_id": launch("bench.py", args, src, "benchmark")}
 
 
+def _hint_launch_args(hints):
+    """Аргументы запуска из подсказок формы «кто на записи»; без подсказок — прежний запуск."""
+    if not hints:
+        return {}
+    import product_policy
+    num, low, high = product_policy.diarization_bounds(hints)
+    return {"num_speakers": num, "min_speakers": low, "max_speakers": high,
+            "names": ", ".join(p["name"] for p in hints["participants"]), "group": hints["group"],
+            "stray_voices": hints["stray_voices"], "enroll": hints["enroll_profile"], "screen_hints": True}
+
+
 def start_workflow(audio_path, policy=None):
     """Создать сохранённый запрос и один раз запустить SQLite-worker без обучения голосов."""
     import recordings
@@ -396,8 +418,10 @@ def start_workflow(audio_path, policy=None):
         job_id = workflow.claim_start(store, request_id)
         request = workflow.get(store, request_id)
         try:
-            start_transcription(request["source"], voices=False, workflow_job_id=job_id,
-                                workflow_context=request["context"], workflow_request_id=request_id)
+            hints = request["policy"].get("speaker_hints")
+            extra = _hint_launch_args(hints)
+            start_transcription(request["source"], voices=bool(hints), workflow_job_id=job_id,
+                                workflow_context=request["context"], workflow_request_id=request_id, **extra)
         except Exception:
             workflow.mark_launch_interrupted(store, request_id)
             return {"request_id": request_id, "job_id": job_id, "state": "interrupted",
