@@ -339,6 +339,26 @@ class DiarHook:
         return out
 
 
+def diarization_bounds(a, allowed, names):
+    """(max, min) числа голосов для pyannote. Точное --speakers главнее всего; явные --min/--max-speakers
+    (форма на экране: «примерно N» → N-1…N+1) главнее выводимых из имён; запас на посторонних: +1, при
+    --stray-voices +3. Без новых флагов — прежние границы."""
+    if a.speakers:
+        return 0, 0
+    reserve = 3 if getattr(a, "stray_voices", False) else 1
+    max_spk = len(allowed) + reserve if allowed else 0
+    min_spk = len(names) if names else 0
+    explicit_max = getattr(a, "max_speakers", 0) or 0
+    explicit_min = getattr(a, "min_speakers", 0) or 0
+    if explicit_max:
+        max_spk = explicit_max
+    if explicit_min:
+        min_spk = explicit_min
+    if max_spk and min_spk > max_spk:
+        min_spk = max_spk
+    return max_spk, min_spk
+
+
 def diarize(audio, num_speakers, token, cfg, status, max_speakers=0, min_speakers=0):
     import torch
     from pyannote.audio import Pipeline
@@ -1401,6 +1421,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             "_timing": timing}
     if names:
         data.update(speaker_names=names, names_source="voices", names_confirmed=False)
+        if getattr(a, "screen_hints", False):
+            # экранный путь (форма до расшифровки): источник каждого имени — голос; подтверждает только человек
+            data["speaker_naming"] = {l: {"name": names[l], "source": "voice", "confirmed": False}
+                                      for l in labels if l in names}
     if hyp:
         data["_hyp"] = hyp      # служебное, как _timing: main забирает и пишет файл после сохранения результата
     return data
@@ -1421,7 +1445,7 @@ class _ProfileBackupFailed(Exception):
     """Резерв профиля перед автозаписью не сохранён; профиль не записывается."""
 
 
-def prepare_group_voice_profile(group, src, embedder, names, quality):
+def prepare_group_voice_profile(group, src, embedder, names, quality, enroll=True):
     """Подготовить профиль и безопасно выполнить разрешённое автоматическое пополнение."""
     import voices
     ppath = voices.profile_path(group)
@@ -1430,7 +1454,10 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
         selection_report = {}
         quality_report = {}
         learned = []
-        if profile_ok:
+        if profile_ok and not enroll:
+            # галочка «пополнять профиль группы» снята на экране: только сопоставление, профиль не пишется
+            quality["voice_auto_learn"] = {"enabled": False, "reason": "enroll_off"}
+        elif profile_ok:
             try:
                 sqlite_mode = settings.recording_backend() == "sqlite"
             except (ValueError, OSError):
@@ -1627,6 +1654,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
     ap.add_argument("--speakers", type=int, default=0, help="число участников, если известно")
+    ap.add_argument("--min-speakers", type=int, default=0, help="не меньше стольки голосов (если число примерно известно)")
+    ap.add_argument("--max-speakers", type=int, default=0, help="не больше стольки голосов")
+    ap.add_argument("--stray-voices", action="store_true", help="возможны случайные голоса: запас +3 вместо +1")
+    ap.add_argument("--screen-hints", action="store_true", help="запуск с формы экрана: писать speaker_naming")
+    ap.add_argument("--no-enroll", action="store_true", help="голоса только сопоставлять: профиль группы не пополнять")
     ap.add_argument("--no-emotions", action="store_true")
     ap.add_argument("--status", default="", help="файл статуса (для MCP-сервера)")
     ap.add_argument("--vocab", default="", help="путь к словарю группы (rus-transcriber.vocab.json)")
@@ -1711,8 +1743,7 @@ def main():
 
         st.set(stage="разделение по спикерам", progress=5, duration=hms(duration))
         # участники известны: не меньше их числа и запас на один посторонний голос; точное число — только --speakers
-        max_spk = len(allowed) + 1 if allowed and not a.speakers else 0
-        min_spk = len(names) if names and not a.speakers else 0
+        max_spk, min_spk = diarization_bounds(a, allowed, names)
         raw, diar_info, pipe, full_ann = diarize(audio, a.speakers, token, cfg, st, max_speakers=max_spk,
                                                  min_speakers=min_spk)
         order = {}
@@ -1753,7 +1784,8 @@ def main():
                                              "и не пополняются (имена — rename_speakers)")
                 else:
                     group = vgroup or "default"
-                    ppath, prof, learned = prepare_group_voice_profile(group, src, emb, all_names, quality)
+                    ppath, prof, learned = prepare_group_voice_profile(
+                        group, src, emb, all_names, quality, enroll=not getattr(a, "no_enroll", False))
                 quality["learned_from"] = learned     # уже записанное на диск: фиксируем, даже если ниже будет сбой
                 st.set(stage="голоса: проверка реплик", progress=33)
                 work = [dict(t) for t in turns]       # рабочие копии: turns меняются только при применении
