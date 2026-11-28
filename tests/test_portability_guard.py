@@ -39,7 +39,7 @@ ALLOWED = {
     "review_pack.py": "creationflags (с условием os.name)",
     "runinfo.py": "winreg, kernel32, PowerShell для сведений о железе",
     "selfcheck.py": "taskkill, creationflags (с условием os.name)",
-    "storage.py": "GetDriveTypeW: проверка локального диска",
+    "storage.py": "GetDriveTypeW: проверка локального диска; CreateFileW: удержание FileHold при восстановлении",
     "voice_io.py": "winmm, creationflags (только Windows)",
     "workflow_page.py": "creationflags без условия (на POSIX ошибка)",
     # тексты с путём .venv\Scripts
@@ -54,6 +54,7 @@ ALLOWED = {
     "tests/test_download_hint.py": "путь .venv\\Scripts в ожидаемом тексте",
     "tests/test_install_uninstall.py": "поиск PowerShell для install.ps1",
     "tests/test_install_update.py": "поиск PowerShell для install.ps1",
+    "tests/test_install_stale.py": "поиск PowerShell для install.ps1",
     "tests/test_text_hygiene.py": "сообщение о файлах PowerShell без BOM",
     "tests/test_p6_acceptance.py": "поиск powershell.exe",
 }
