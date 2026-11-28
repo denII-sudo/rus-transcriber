@@ -958,6 +958,12 @@ def answer_guard(json_path, md, aid, answer):
         current = recordings.load_recording(store, rid)
         why = answer_revision_conflicts(current, man, state, source_snapshot(store, rid, man.get("source_revision")),
                                         sqlite=True, sources=item_sources(store, rid, man)).get(aid)
+        if not why and aid not in _applied_map(state):
+            import legacy_anchors        # S24: место из переноса с неверной привязкой — как в «Применить»
+            why = legacy_anchors.card_conflicts(legacy_anchors.migration_mismatches(store, rid), current,
+                                                {aid: item}).get(aid)
+            if why:
+                return why
     finally:
         store.close()
     if why:
