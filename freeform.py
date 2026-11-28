@@ -492,6 +492,20 @@ def _pause_answer(item, rep, flat, words, inside):
             eds.append({"op": "insert", "s": s, "e": round(s + step * 0.9, 3), "text": x, "speaker": spk,
                         "card": item["id"], "in_place": True})
         rep["applied"] = [f"«{x}» — уже в стенограмме рядом с паузой, не вставлено" for _, x in known]
+        # Н-9 (слово владельца 28.11: «вписать с предупреждением»): слово ответа на краю совпало с соседним
+        # словом другого говорящего — вписываем, но человек видит, что слово окажется в стенограмме дважды.
+        warn = []
+        for edge, w in (("первое", before[-1] if before and k == 0 else None),
+                        ("последнее", after[0] if after and m == 0 else None)):
+            tok = middle[0] if edge == "первое" else middle[-1]
+            if w is None or not norm(tok[1]) or norm(tok[1]) != norm(w["w"]) or tok[0] == w["_spk"]:
+                continue
+            if abs(cents(w["s"]) - cents(t_a if edge == "первое" else t_b)) > limit:
+                continue
+            warn.append(PAUSE_NEIGHBOR_DUP.format(edge=edge, word=tok[1], speaker=w["_spk"] or "без подписи",
+                                                  sec=f"{float(w['s']):.2f}".replace(".", ",")))
+        if warn:
+            rep["warnings"] = warn
         rep["inserted"] = [f"{spk}: {' '.join(x for s2, x in grp)}"
                            for spk, grp in itertools.groupby(middle, key=lambda t: t[0])]
         return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
@@ -504,6 +518,10 @@ def _pause_answer(item, rep, flat, words, inside):
     rep["human"] = (f"в паузе уже есть слова («{here}»), ответ с ними не совпадает; исправьте их правкой "
                     "отрезка или ответом на карточку этих слов")
     return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+
+
+PAUSE_NEIGHBOR_DUP = ("{edge} слово ответа «{word}» совпадает с соседним словом стенограммы ({speaker}, {sec} с): "
+                      "оно будет вписано второй раз; если это то же слово — уберите его из ответа")
 
 
 # Подсказки на короткий ответ (В8): место остаётся открытым, стенограмма не меняется.
