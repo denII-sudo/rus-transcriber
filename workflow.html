@@ -53,6 +53,24 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
     части прилагается изложение предыдущих, составленное моделью. Подписи говорящих именами, аудио, время слов, путь к файлу,
     голосовые профили и журналы не отправляются. Без отметки всё остаётся на этом компьютере.</p>
   <label>Цель (необязательно):<input type="text" id="goal" placeholder="например: протокол встречи"></label>
+  <fieldset id="who">
+    <legend>Кто на записи (необязательно)</legend>
+    <p class="muted">Подсказки помогают разделить голоса и найти знакомых по профилям группы. Это только
+      подсказки: имена программа предлагает, подтверждает их человек. Подсказки остаются на этом компьютере
+      и в облако не отправляются.</p>
+    <div class="bar">
+      <label>Сколько голосов:
+        <select id="who-mode"><option value="unknown">не знаю</option><option value="exact">точно</option>
+          <option value="approx">примерно</option></select></label>
+      <label><input type="number" id="who-count" value="2" min="1" max="30" style="width:60px"></label>
+      <label><input type="checkbox" id="who-stray"> возможны случайные голоса</label>
+    </div>
+    <label>Группа (необязательно):<input type="text" id="who-group" maxlength="80"></label>
+    <div id="who-people"></div>
+    <div class="bar"><button id="who-add" type="button">Добавить участника</button></div>
+    <label><input type="checkbox" id="who-enroll" checked> пополнять профиль группы голосами из этой записи</label>
+    <p class="muted">Если снять отметку, голоса только сопоставляются с профилями, профиль не меняется.</p>
+  </fieldset>
   <button id="start">Запустить обработку</button>
 </section>
 
@@ -906,10 +924,31 @@ $("pick").onclick = async () => {
     if (d.path) { $("audio").value = d.path; say(""); }
   } catch (ex) { say(ex.message, true); }
 };
+function addPerson() {
+  const row = document.createElement("div");
+  row.className = "bar who-row";
+  row.innerHTML = '<label>имя в стенограмме: <input type="text" class="who-name" maxlength="80"></label>' +
+    '<label>как могут обращаться (через запятую): <input type="text" class="who-forms"></label>';
+  $("who-people").appendChild(row);
+}
+$("who-add").onclick = addPerson;
+function speakerHints() {
+  const people = [];
+  document.querySelectorAll(".who-row").forEach(row => {
+    const name = row.querySelector(".who-name").value.trim();
+    if (!name) return;
+    const forms = row.querySelector(".who-forms").value.split(",").map(x => x.trim()).filter(Boolean);
+    people.push({name, forms});
+  });
+  const mode = $("who-mode").value;
+  return {count_mode: mode, count: mode === "unknown" ? 0 : Number($("who-count").value), participants: people,
+    stray_voices: $("who-stray").checked, group: $("who-group").value.trim(), enroll_profile: $("who-enroll").checked};
+}
 $("start").onclick = async () => {
   try {
     const d = await post("api/start", {audio: $("audio").value, require_conspect: $("conspect").checked,
-      allow_cloud_model: $("conspect").checked, goal: $("goal").value, question_budget: Number($("budget").value)});
+      allow_cloud_model: $("conspect").checked, goal: $("goal").value, question_budget: Number($("budget").value),
+      speaker_hints: speakerHints()});
     say(`Запрос сохранён: ${d.request_id}. Обработка идёт в фоне; обновляйте состояние.`);
     openRequest(d.request_id); loadRequests();
   } catch (ex) { say(ex.message, true); }

@@ -59,6 +59,21 @@ class PolicyHintsTests(unittest.TestCase):
             self.assertNotIn("speaker_hints", (ROOT / name).read_text(encoding="utf-8"), name)
 
 
+class TextHintsTests(unittest.TestCase):
+    def test_nothing_given_means_old_behaviour(self):
+        self.assertIsNone(product_policy.hints_from_text())
+        self.assertIsNone(product_policy.hints_from_text(enroll_profile=False))
+
+    def test_text_forms(self):
+        got = product_policy.hints_from_text(4, True, "Анна=Аня/Анне, Борис; Вера", "demo", True, False)
+        self.assertEqual((got["count_mode"], got["count"], got["stray_voices"], got["enroll_profile"]),
+                         ("approx", 4, True, False))
+        self.assertEqual(got["participants"], [{"name": "Анна", "forms": ["Аня", "Анне"]},
+                                               {"name": "Борис", "forms": []}, {"name": "Вера", "forms": []}])
+        self.assertEqual(product_policy.hints_from_text(2)["count_mode"], "exact")
+        self.assertEqual(product_policy.hints_from_text(participants="Анна")["count_mode"], "unknown")
+
+
 class LaunchArgsTests(unittest.TestCase):
     def test_no_hints_is_old_launch(self):
         self.assertEqual(core._hint_launch_args(None), {})

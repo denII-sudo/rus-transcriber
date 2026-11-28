@@ -617,6 +617,27 @@ class P5ScreenHTTPTests(unittest.TestCase):
         status, fail = self.post("api/start", {"audio": ""})
         self.assertEqual(status, 400)
 
+    def test_start_passes_speaker_hints_and_form_is_optional(self):
+        status, html = self.get("")
+        for needle in ('id="who-mode"', 'id="who-add"', 'id="who-enroll" checked', "как могут обращаться"):
+            self.assertIn(needle, html)
+        audio = str(self.base / "a.wav")
+        base = {"audio": audio, "require_conspect": False, "allow_cloud_model": False}
+        with mock.patch.object(core, "start_workflow", return_value={"request_id": "r", "job_id": "j"}) as start:
+            self.assertEqual(self.post("api/start", base)[0], 200)
+            self.assertIsNone(start.call_args.args[1]["speaker_hints"])      # старый вызов: как раньше
+            hints = {"count_mode": "approx", "count": 4, "stray_voices": True, "group": "demo",
+                     "participants": [{"name": "Анна", "forms": []}, {"name": "Борис", "forms": ["Боря"]}],
+                     "enroll_profile": False}
+            self.assertEqual(self.post("api/start", {**base, "speaker_hints": hints})[0], 200)
+            got = start.call_args.args[1]["speaker_hints"]
+            self.assertEqual((got["count_mode"], got["count"], got["enroll_profile"]), ("approx", 4, False))
+            self.assertEqual([p["name"] for p in got["participants"]], ["Анна", "Борис"])
+            start.reset_mock()
+            status, error = self.post("api/start", {**base, "speaker_hints": {"count_mode": "exact", "count": 99}})
+            self.assertEqual(status, 400)
+            start.assert_not_called()
+
     def test_unknown_route_and_bad_body(self):
         self.assertEqual(self.get("api/none")[0], 404)
         status, error = self.post("api/backup", {})

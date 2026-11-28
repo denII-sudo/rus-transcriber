@@ -148,18 +148,26 @@ def make_conspect(job_id: str, focus: str = "") -> str:
 def start_workflow(audio_path: str, require_conspect: bool = False,
                    allow_cloud_model: bool = False,
                    require_named_speakers: bool = False, require_human_verification: bool = False,
-                   participation: str = "simple", goal: str = "", question_budget: int = 0) -> str:
+                   participation: str = "simple", goal: str = "", question_budget: int = 0,
+                   speakers_count: int = 0, speakers_approx: bool = False, participants: str = "",
+                   group: str = "", stray_voices: bool = False, enroll_profile: bool = True) -> str:
     """Начать процесс на новой SQLite-схеме. allow_cloud_model=true — только при явном согласии человека
     на отправку текста стенограммы (без аудио, путей и биометрии) в OpenAI для конспекта; по умолчанию false.
     Запись длиннее 10 000 слов отправляется частями; к каждой части прилагается изложение предыдущих,
-    составленное моделью."""
+    составленное моделью. Необязательно (форма «кто на записи»): speakers_count — сколько голосов (с
+    speakers_approx — примерно, от N-1 до N+1), participants — «Анна=Аня/Анне, Борис» (имя и формы обращения),
+    group, stray_voices — возможны случайные голоса, enroll_profile=false — голоса только сопоставлять.
+    Если что-то из этого задано, голоса ищутся среди названных; без этих параметров — как раньше."""
     try:
+        import product_policy
         result = core.start_workflow(audio_path, {
             "require_conspect": require_conspect,
             "allow_cloud_model": allow_cloud_model,
             "require_named_speakers": require_named_speakers,
             "require_human_verification": require_human_verification,
             "participation": participation, "goal": goal, "question_budget": question_budget,
+            "speaker_hints": product_policy.hints_from_text(
+                speakers_count, speakers_approx, participants, group, stray_voices, enroll_profile),
         })
         return json.dumps(result, ensure_ascii=False)
     except (core.CoreError, storage.StorageError, ValueError, OSError) as ex:

@@ -62,6 +62,23 @@ def normalize_speaker_hints(hints):
             "stray_voices": stray, "group": group.strip(), "enroll_profile": enroll}
 
 
+def hints_from_text(count=0, approx=False, participants="", group="", stray_voices=False, enroll_profile=True):
+    """Подсказки из простых параметров (командная строка, MCP). Ничего не задано — None (прежний запуск).
+    participants: «Анна=Аня/Анне, Борис» — имя в стенограмме, после «=» через «/» формы обращения."""
+    if not (count or participants.strip() or group.strip() or stray_voices):
+        return None
+    people = []
+    for chunk in participants.replace(";", ",").split(","):
+        if not chunk.strip():
+            continue
+        name, _, forms = chunk.partition("=")
+        people.append({"name": name.strip(), "forms": [f.strip() for f in forms.split("/") if f.strip()]})
+    mode = ("approx" if approx else "exact") if count else "unknown"
+    return normalize_speaker_hints({"count_mode": mode, "count": count, "participants": people,
+                                    "stray_voices": stray_voices, "group": group,
+                                    "enroll_profile": enroll_profile})
+
+
 def diarization_bounds(hints):
     """(num_speakers, min_speakers, max_speakers) из подсказок: точно N; примерно N → N-1…N+1; запас голосов +1/+3."""
     if not hints or hints["count_mode"] == "unknown":
