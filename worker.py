@@ -703,7 +703,10 @@ def _load_whisper(backend, device, quant, third, cfg, make_asr):
 
 
 def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cfg, st, make_asr, prog):
-    """Повтор ошибочных фрагментов на onnx-cpu; сведения о попытках дописываются к фрагменту."""
+    """Повтор ошибочных фрагментов на onnx-cpu; сведения о попытках дописываются к фрагменту.
+    Фрагмент заменяется целиком (текст, состояние, попытки) только после того, как его результат
+    разобран без ошибок; при сбое ошибка дописывается лишь ещё не заменённым фрагментам."""
+    replaced = set()
     try:
         st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
         cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",
@@ -717,15 +720,19 @@ def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cf
             raise ValueError("неверное количество результатов CPU")
         for pos, i in enumerate(failed_indices):
             rec, replacement = whisper_diag[i], cpu_diag[pos]
-            for attempt in replacement["attempts"]:
-                attempt["backend"] = "onnx-cpu:CPU"
-                attempt["batch"] = [failed_indices[j] for j in attempt["batch"]]
-            rec["attempts"].extend(replacement["attempts"])
-            rec["state"] = replacement["state"]
-            texts[i] = cpu_texts[pos]
+            attempts = [{**attempt, "backend": "onnx-cpu:CPU",
+                         "batch": [failed_indices[j] for j in attempt["batch"]]}
+                        for attempt in replacement["attempts"]]
+            state, text = replacement["state"], cpu_texts[pos]
+            rec["attempts"].extend(attempts)
+            rec["state"] = state
+            texts[i] = text
+            replaced.add(i)
         del cpu
     except Exception as ex:
         for i in failed_indices:
+            if i in replaced:
+                continue
             whisper_diag[i]["attempts"].append(
                 {"result": "error", "backend": "onnx-cpu:CPU",
                  "error_type": type(ex).__name__, "fallback": True})
