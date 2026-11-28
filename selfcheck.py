@@ -1,4 +1,5 @@
-"""Самопроверка программы на этом компьютере: тесты, проверка файлов на личные данные, морфология.
+"""Самопроверка программы на этом компьютере: тесты, проверка файлов на личные данные, морфология,
+версия SQLite и место папки данных (облако, сетевой диск — предупреждение, не отказ).
 
 Только проверки, произвольных команд нет. Тесты идут в отдельном процессе с отдельной временной папкой данных
 (настоящие данные не трогаются), проверка файлов только читает. В ответе нет запрещённых слов: только где
@@ -241,7 +242,58 @@ def run_morph():
     return {"ok": got == MORPH_EXPECT, "pymorphy3": True, "got": got, "expected": MORPH_EXPECT}
 
 
-def run(version=None, tests=True, repo=True, morph=True):
+# Ошибка WAL-reset SQLite (https://sqlite.org/wal.html, раздел 11): есть в 3.7.0–3.51.2, исправлена в 3.51.3;
+# исправление перенесено в 3.50.7 и 3.44.6 (и более поздние выпуски этих веток). БД-3а: показать, не отказывать.
+WAL_RESET_FIX = (3, 51, 3)
+WAL_RESET_BACKPORTS = {(3, 50): 7, (3, 44): 6}
+
+
+def wal_reset_fixed(version):
+    """True — в этой версии SQLite ошибка WAL-reset исправлена, False — нет, None — версию разобрать не удалось."""
+    try:
+        parts = [int(x) for x in str(version).split(".")[:3]]
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+    v = tuple(parts + [0] * (3 - len(parts)))
+    if v >= WAL_RESET_FIX:
+        return True
+    backport = WAL_RESET_BACKPORTS.get(v[:2])
+    return backport is not None and v[2] >= backport
+
+
+def run_storage():
+    """Версия SQLite (БД-3а) и место папки данных (БД-8а): облако, сеть или локальный диск. Только читает.
+
+    Папка данных проверяется, только если модуль paths уже загружен (сервер, rt.py): сам selfcheck его не
+    импортирует, чтобы не создавать каталоги в папке данных по умолчанию, когда настоящая папка задана иначе
+    (установщик запускает selfcheck без RUS_TRANSCRIBER_DATA). Предупреждения не меняют ok."""
+    import sqlite3
+    version = sqlite3.sqlite_version
+    fixed = wal_reset_fixed(version)
+    out = {"sqlite": version, "wal_reset_fixed": fixed, "warnings": [], "labels": []}
+    if fixed is False:
+        out["warnings"].append(
+            f"SQLite {version} без исправления ошибки WAL-reset (исправлена в 3.51.3, а также в 3.50.7 и 3.44.6): "
+            "при одновременной записи в базу нескольких процессов программы база может, очень редко, повредиться. "
+            "Это не авария: держите резервы базы; переход на исправленную SQLite готовится отдельно.")
+        out["labels"].append("SQLite без исправления WAL-reset")
+    paths_mod = sys.modules.get("paths")
+    if paths_mod is None or not hasattr(paths_mod, "DATA_DIR"):
+        out["data_dir"] = {"kind": "not_checked", "note": "папка данных не проверялась: самопроверка запущена "
+                                                          "вне сервера и rt.py"}
+        return out
+    import cloudpaths
+    out["data_dir"] = cloudpaths.classify(paths_mod.DATA_DIR)
+    found = cloudpaths.data_dir_warnings(paths_mod.DATA_DIR)
+    out["warnings"].extend(found)
+    if found:
+        out["labels"].append("папка данных или резервов в облаке или на сетевом диске")
+    return out
+
+
+def run(version=None, tests=True, repo=True, morph=True, storage=True):
     out = {"version": version, "python": platform.python_version(), "program": HERE.name}
     try:
         import buildinfo
@@ -259,6 +311,14 @@ def run(version=None, tests=True, repo=True, morph=True):
     out["ok"] = all(out[k].get("ok") for k in parts)
     bad = [k for k in parts if not out[k].get("ok")]
     out["summary"] = "всё в порядке" if out["ok"] else "не в порядке: " + ", ".join(bad)
+    if storage:
+        try:
+            out["storage"] = run_storage()
+        except Exception as ex:      # предупреждения не должны ломать самопроверку
+            out["storage"] = {"error": f"{type(ex).__name__}: {ex}"[:300], "warnings": [], "labels": []}
+        labels = out["storage"].pop("labels", [])
+        if labels:
+            out["summary"] += "; предупреждения: " + "; ".join(labels) + " (подробно — storage.warnings)"
     return out
 
 

@@ -1894,6 +1894,13 @@ def settings_info():
               "recording_backend": settings.recording_backend(), "groups": paths.list_groups(),
               # объём гипотез моделей (те же числа, что у очистки без отбора): записи с гипотезами, прогоны, байты
               "hypotheses": _hypotheses_summary()}
+    try:    # БД-8а: папка данных или резервов в облаке или на сетевом диске — предупреждение, не отказ
+        import cloudpaths
+        found = cloudpaths.data_dir_warnings(paths.DATA_DIR)
+    except Exception:
+        found = []
+    if found:
+        result["data_dir_warnings"] = found
     if paths.STATE_DB.is_file():
         try:
             store = recordings.open_store()
@@ -2107,6 +2114,7 @@ from core_conflicts import (  # noqa: E402,F401
     _view,
     _waits_for,
     _write_and_report,
+    backup_destination_warning,
     backup_store,
     confirm_review_answers,
     conflict_copy,
