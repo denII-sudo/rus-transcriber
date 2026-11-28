@@ -267,33 +267,37 @@ def _id_words(data, ids, family=None):
     оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
     находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний.
 
-    family — снимок семей слов ссылки при связывании (_family_snapshot, ключ part["family"]). По нему ссылка на
-    корень не покрывает соседние части, что были рядом уже при связывании и не выбраны (О255-2), а ссылка на
-    часть (не корень), у семьи которой с тех пор появились новые слова, не находится: у частей, на которые потом
-    разбили саму эту часть, корень общий с её соседями, и по записи не определить, чьи они (А255-1, О255-1) —
-    неоднозначно, кавычек нет. Без снимка (старые ссылки) то же для части, сразу за которой идёт слово её семьи."""
-    families, roots, order = _word_families(data)
+    Одно консервативное правило неоднозначности (О255-1…О255-4): у частей, на которые разбито слово, корень общий,
+    и по записи не определить, из какой части получилось новое слово семьи. Поэтому кавычек нет («место не
+    найдено»), если слова ссылки — не вся семья, а семья с момента связывания изменилась:
+    * ссылка со снимком family (_family_snapshot, ключ part["family"]) и невыбранными словами в нём (соседние части,
+      что были рядом при связывании): семья сейчас должна совпасть со снимком — новое слово или пропавшее из снимка
+      делают ссылку неоднозначной (О255-1, О255-3); тогда печатаются ровно выбранные слова;
+    * ссылка без снимка (связана до разбиения слова, либо старая) на корень покрывает всю его семью, как на main
+      (Ф234-11б); на часть (не корень) — только если у корня нет других слов семьи, с любой стороны (О255-4);
+    * ссылка со снимком, в котором нет невыбранных слов (выбрана вся семья), покрывает всю семью, в том числе
+      новые части: они получились из выбранных слов."""
+    families, roots, _ = _word_families(data)
     merged = {x for seg in data.get("segments") or [] for word in seg.get("words") or []
               for x in word.get("merged_from") or []}
     if any(wid in merged for wid in ids or []):
         return None, None, None
     if ids and any(root != wid for wid, root in roots.items()):
-        wanted, seen = set(ids), set(family or [])
+        wanted, snap = set(ids), set(family or [])
         out = []
-        for wid in ids:
-            root = roots.get(wid, wid)
-            if root == wid:         # корень (в том числе удалённый): все слова его семьи, кроме отброшенных снимком
-                out += [m for m in families.get(wid, []) if m in wanted or m not in seen] or [wid]
-                continue
-            if root not in wanted:
-                after = order[order.index(wid) + 1] if order.index(wid) + 1 < len(order) else None
-                if family is not None:
-                    unclear = any(m not in seen for m in families.get(root, []))
+        if family is not None and snap - wanted:
+            if {m for wid in ids for m in families.get(roots.get(wid, wid), [])} != snap:
+                return None, None, None
+            out = list(ids)
+        else:
+            for wid in ids:
+                root = roots.get(wid, wid)
+                if family is not None or root == wid:       # снимок без чужих слов: вся семья; корень без снимка — тоже
+                    out += families.get(root, []) or [wid]
+                elif any(m not in wanted for m in families.get(root, [])):
+                    return None, None, None                  # часть без снимка: у корня есть другие слова семьи
                 else:
-                    unclear = after is not None and after not in wanted and roots.get(after) == root
-                if unclear:
-                    return None, None, None
-            out.append(wid)
+                    out.append(wid)
         ids = list(dict.fromkeys(out))
     by_id = {}
     placed = []

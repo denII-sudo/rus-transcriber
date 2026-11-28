@@ -440,6 +440,20 @@ def split_word(data, wid, text, item="span@1"):
     return [w["word_id"] for w in new]
 
 
+def edit_region(data, wids, text, item="span@2"):
+    """Штатная правка нескольких подряд идущих слов wids одним текстом (_diff_words + _relink_places)."""
+    seg = data["segments"][0]
+    idx = [i for i, w in enumerate(seg["words"]) if w["word_id"] in wids]
+    old = [seg["words"][i] for i in idx]
+    origin = []
+    new, conflicts, _ = transcript._diff_words(old, text, item, origin=origin)
+    assert not conflicts
+    transcript._relink_places(data, old, origin)
+    seg["words"][idx[0]:idx[-1] + 1] = new
+    seg["text"] = " ".join(w["w"] for w in seg["words"])
+    return [w["word_id"] for w in new]
+
+
 def policy_copy(obj):
     return dict(obj, quote_policy=1)
 
@@ -668,23 +682,59 @@ class SplitWordQuoteTests(unittest.TestCase):
                 self.assertEqual("(по распознаванию, не проверено" in body, blocked)
                 self.assert_header_matches(pmd)
 
-    def test_o255_2_link_to_first_part_follows_its_own_later_split(self):
-        """Ссылка на «альфа» (после разбиения), потом саму «альфу» заменяют двумя словами «эта дельта»: новая часть
-        «дельта» — часть «альфы», в цитате и в проверке; соседняя «бета» по-прежнему вне цитаты."""
+    def test_o255_2_link_to_first_part_then_it_is_replaced(self):
+        """Ссылка на «альфа» (после разбиения; «бета» — невыбранная соседка), потом саму «альфу» заменяют двумя
+        словами «эта дельта»: семья изменилась, а чья «дельта» — «альфы» или «беты» — по общему корню не определить
+        (правило О255-1…О255-4): место не найдено, кавычек нет."""
         data, obj, ids = self.link_after_split("альфа", spans=None)
         split_word(data, "w1", "эта дельта", item="span@1")
-        delta = next(w["word_id"] for w in data["segments"][0]["words"] if w["w"] == "дельта")
-        self.assertEqual(conspect._id_words(data, ["w1"], obj["quotes"]["1"]["parts"][0]["family"])[2], ["w1", delta])
-        for place, blocked in (({"word_ids": [ids[1]]}, False), ({"word_ids": [delta]}, True)):
-            with self.subTest(place=place):
-                data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.0, "t1": 5.0, "t2": 6.0,
-                                   "speaker": S1, **place}]
-                pmd, rep = conspect.render(policy_copy(obj), data, update_last=False)
-                body = pmd.split("Итог:", 1)[1]
-                self.assertEqual("(по распознаванию, не проверено" in body, blocked)
-                self.assertIn("эта дельта", body)                                    # текст изменился — выводится новый
-                self.assertNotIn("бета", body)
-                self.assert_header_matches(pmd)
+        self.assertEqual(conspect._id_words(data, ["w1"], obj["quotes"]["1"]["parts"][0]["family"]), (None, None, None))
+        self.assert_not_found(*self.render_both(obj, data), "альфа")
+
+    def test_o255_3_word_inserted_between_the_parts(self):
+        """О255-3: ссылка на «альфа» слова «альфа бета»; перед «бета» вставили «гамма» (тот же корень w1). Прежде
+        печаталось в кавычках «альфа гамма»; теперь — место не найдено: у ссылки снимок с невыбранной «бета», семья
+        изменилась, и чья «гамма» — не определить."""
+        data, obj, ids = self.link_after_split("альфа", spans=((5.0, 5.3),))
+        edit_region(data, ids, "альфа гамма бета", item="span@2")
+        self.assertEqual([w["w"] for w in data["segments"][0]["words"]], ["начало", "альфа", "гамма", "бета", "конец"])
+        self.assertEqual(next(w for w in data["segments"][0]["words"] if w["w"] == "гамма")["part_of"], "w1")
+        self.assert_not_found(*self.render_both(obj, data), "альфа")
+
+    def test_o255_4_word_inserted_before_the_linked_part(self):
+        """О255-4: ссылка на «бета» (часть), перед ней вставили «гамма» (корень w1) — слова после «беты» нет. Прежде
+        без снимка проверялось только слово после части, и в кавычки уходила «бета»; теперь — у корня есть другие
+        слова семьи с любой стороны, кавычек нет, и со снимком, и без него."""
+        for with_snapshot in (True, False):
+            with self.subTest(with_snapshot=with_snapshot):
+                data, obj, ids = self.link_after_split("бета", spans=((5.0, 5.3),))
+                if not with_snapshot:
+                    del obj["quotes"]["1"]["parts"][0]["family"]
+                edit_region(data, ids, "альфа гамма бета", item="span@2")
+                self.assertEqual([w["w"] for w in data["segments"][0]["words"]],
+                                 ["начало", "альфа", "гамма", "бета", "конец"])
+                self.assert_not_found(*self.render_both(obj, data), "бета")
+
+    def test_family_rule_keeps_clean_cases_quoted(self):
+        """Контроль правила: неразбитое слово, неизменная семья (со снимком, ссылка на корень или на часть), вся
+        семья выбрана — в кавычках; ссылка на корень без снимка, связанная до разбиения, покрывает семью."""
+        data = split_data(spans=None)
+        obj, _ = conspect.link(self.TEXT, data)
+        self.assert_quoted_at(self.render_both(obj, data), "оригинал")               # неразбитое слово
+        for quote in ("альфа", "бета"):                                              # семья со снимком не менялась
+            data, obj, ids = self.link_after_split(quote, spans=None)
+            self.assert_quoted_at(self.render_both(obj, data), quote)
+        data, obj, ids = self.link_after_split("альфа бета", spans=None)             # выбрана вся семья
+        self.assert_quoted_at(self.render_both(obj, data), "альфа бета")
+        edit_region(data, ids, "альфа гамма бета", item="span@2")                    # новая часть — из выбранных слов
+        pmd, rep = conspect.render(policy_copy(obj), data, update_last=False)
+        self.assertIn("«альфа гамма бета»", pmd)
+        data = split_data(spans=None)                                                # связана до разбиения (без снимка)
+        obj, _ = conspect.link(self.TEXT, data)
+        split_word(data, "w1", "альфа бета")
+        self.assertNotIn("family", obj["quotes"]["1"]["parts"][0])
+        self.assertIn("«альфа бета»", conspect.render(policy_copy(obj), data, update_last=False)[0])
+
 
     def test_s255_2_place_on_a_root_id_missing_from_the_transcript(self):
         """С255-2 (проверка Sonnet, S9): место разбора ссылается на корневой ID w1, слова с этим ID в стенограмме
@@ -714,11 +764,11 @@ class SplitWordQuoteTests(unittest.TestCase):
         self.assertEqual([b["id"] for b in workflow.quote_blockers(data, ["w1", "w3"], overlap_ids=["w1"])], ["r9"])
 
     def test_old_link_to_a_part_without_family_snapshot(self):
-        """Ссылка без снимка семьи (связана до этой правки): часть без новых слов рядом — как раньше, в кавычках;
-        сразу за частью идёт слово её семьи (новая часть или сосед) — неоднозначно, без кавычек."""
+        """Ссылка на часть (не корень) без снимка семьи (связана до этой правки): у корня есть другие слова семьи
+        (хоть соседняя «альфа») — кавычек нет и до, и после правок; ссылка на корень без снимка покрывает семью."""
         data, obj, ids = self.link_after_split("бета", spans=None)
         del obj["quotes"]["1"]["parts"][0]["family"]
-        self.assert_quoted_at(self.render_both(obj, data), "бета")
+        self.assert_not_found(*self.render_both(obj, data), "бета")
         split_word(data, ids[1], "бета гамма", item="span@2")
         self.assert_not_found(*self.render_both(obj, data), "бета")
 
