@@ -94,26 +94,6 @@ def process_start_time(pid):
         return None
 
 
-def file_held_elsewhere(path):
-    """Windows: файл сейчас открыт другой программой (или этим процессом). Файл не меняется: проба — открытие
-    только на чтение без совместного доступа, сразу закрывается. Иная ошибка открытия — не «занят»: её покажет
-    следующий шаг вызывающего. Вне Windows — False (так не проверить). Берёт восстановление базы (БД-1)."""
-    if os.name != "nt":
-        return False
-    import ctypes
-    from ctypes import wintypes
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-    k.CreateFileW.restype = wintypes.HANDLE
-    k.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-                              wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
-    k.CloseHandle.argtypes = (wintypes.HANDLE,)
-    handle = k.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, без общего доступа
-    if handle is None or handle == wintypes.HANDLE(-1).value:
-        return ctypes.get_last_error() in (32, 33)      # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
-    k.CloseHandle(handle)
-    return False
-
-
 def _pid_record(job_id):
     """(pid, метка запуска или None) из PID-файла задачи; None, если файла нет."""
     if not _valid_job_id(job_id):

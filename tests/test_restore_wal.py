@@ -12,6 +12,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -223,7 +224,167 @@ class RestoreOverWalTests(RestoreCase):
                 self.check_restored(result)
 
 
+@unittest.skipUnless(WINDOWS, "замена базы при восстановлении — только Windows")
+class RefusalAfterCopyTests(RestoreCase):
+    """Р258-2, Р258-5: отказы после подготовки копии называют, что осталось; возврат набора при сбое."""
+
+    def files(self):
+        return {suffix: digest(str(self.db) + suffix) for suffix in ("", "-wal")}
+
+    def assert_names_staged(self, message):
+        staged = [name for name in self.names() if ".incomplete-" in name]
+        self.assertEqual(len(staged), 1)
+        self.assertIn(staged[0], message)
+        self.assertIn("Осталось:", message)
+        self.assertNotIn("Ничего не изменено", message)
+
+    def test_writer_after_probe_is_refused_before_documents(self):
+        release = self.writer(3, "hold")
+        files = self.files()
+        with mock.patch.object(storage, "file_held_elsewhere", return_value=False):
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        message = str(caught.exception)
+        self.assertIn("другая программа", message)
+        self.assert_names_staged(message)
+        self.assertIn("-shm", message)
+        self.assertNotIn("документы", message)
+        self.assertEqual(list((self.base / "r2").iterdir()), [])
+        self.assertEqual(self.files(), files)
+        self.assertFalse([name for name in self.names() if ".before-restore-" in name])
+        release()
+        self.assertEqual(self.counted(self.db), (4, "ok"))
+
+    def test_writer_after_step_2_is_refused_by_the_hold(self):
+        release = self.writer(3, "hold")
+        files = self.files()
+        with mock.patch.object(storage, "file_held_elsewhere", return_value=False), \
+                mock.patch.object(core_conflicts, "_settle_previous", return_value=None):
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        message = str(caught.exception)
+        self.assertIn("только что открыла другая программа", message)
+        self.assert_names_staged(message)
+        self.assertEqual(list((self.base / "r2").iterdir()), [])
+        self.assertEqual(self.files(), files)
+        release()
+        self.assertEqual(self.counted(self.db), (4, "ok"))
+
+    def test_previous_base_is_held_while_documents_are_written(self):
+        """Окно между проверкой и переименованием закрыто: пока пишутся документы, прежнюю базу не открыть."""
+        import documents
+        tried = []
+        original = documents.materialize_pending
+
+        def materialize(*args, **kwargs):
+            try:
+                con = sqlite3.connect(self.db, timeout=0)
+                try:
+                    con.execute("SELECT count(*) FROM local_users").fetchone()
+                    tried.append("opened")
+                finally:
+                    con.close()
+            except sqlite3.Error as exc:
+                tried.append(type(exc).__name__)
+            return original(*args, **kwargs)
+        with mock.patch.object(documents, "materialize_pending", side_effect=materialize):
+            result = self.restore()
+        self.assertEqual(tried, ["OperationalError"])
+        self.check_previous(result, 1)
+        self.check_restored(result)
+
+    def test_failed_side_file_rename_returns_the_set(self):
+        self.db.unlink()
+        self.db.write_bytes(b"not a database")
+        Path(str(self.db) + "-wal").write_bytes(b"stray journal")
+        original = os.rename
+
+        def rename(source, target):
+            if str(source).endswith("-wal") and ".before-restore-" in str(target):
+                raise PermissionError("synthetic")
+            original(source, target)
+        with mock.patch.object(core_conflicts, "_rename", side_effect=rename):
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        self.assertIn("прежняя база на месте", str(caught.exception))
+        self.assert_names_staged(str(caught.exception))
+        self.assertEqual(self.db.read_bytes(), b"not a database")
+        self.assertEqual(Path(str(self.db) + "-wal").read_bytes(), b"stray journal")
+        self.assertFalse([name for name in self.names() if ".before-restore-" in name])
+
+    def test_failed_publish_and_failed_return_name_both_files(self):
+        original = os.rename
+
+        def rename(source, target):
+            if Path(target) == self.db:
+                raise PermissionError("synthetic")
+            original(source, target)
+        with mock.patch.object(core_conflicts, "_publish", side_effect=OSError("synthetic")), \
+                mock.patch.object(core_conflicts, "_rename", side_effect=rename):
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        message = str(caught.exception)
+        saved = [name for name in self.names() if ".before-restore-" in name]
+        self.assertEqual(len(saved), 1)
+        self.assertIn(saved[0], message)
+        self.assertIn("должен называться", message)
+        self.assert_names_staged(message)
+        self.assertFalse(self.db.exists())
+        self.assertEqual(self.counted(self.base / saved[0]), (1, "ok"))      # ничего не удалено
+
+    def test_second_name_left_after_publish_is_a_strong_warning(self):
+        original = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if ".incomplete-" in path.name:
+                raise PermissionError("synthetic")
+            return original(path, *args, **kwargs)
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+            result = self.restore()
+        staged = [self.base / name for name in self.names() if ".incomplete-" in name]
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(os.path.samefile(staged[0], self.db))
+        text = " ".join(result["warning"])
+        self.assertIn("не открывайте его ничем, пока работает программа", text)
+        self.assertIn("Удалите его после закрытия программы", text)
+
+    def test_read_only_previous_base_gets_the_right_reason(self):
+        self.writer(3, "kill")
+        os.chmod(self.db, stat.S_IREAD)
+        self.addCleanup(os.chmod, self.db, stat.S_IREAD | stat.S_IWRITE)
+        files = {suffix: digest(str(self.db) + suffix) for suffix in ("", "-wal", "-shm")}
+        names = self.names()
+        with self.assertRaises(core.CoreError) as caught:
+            self.restore()
+        self.assertIn("защищён от записи", str(caught.exception))
+        self.assertIn("Ничего не изменено", str(caught.exception))
+        self.assertEqual({suffix: digest(str(self.db) + suffix) for suffix in ("", "-wal", "-shm")}, files)
+        self.assertEqual(self.names(), names)
+
+    def test_damaged_backup_is_refused_before_any_document(self):
+        import documents
+        with mock.patch.object(storage, "validate_copy", side_effect=storage.StorageError("integrity check failed")), \
+                mock.patch.object(documents, "materialize_pending") as materialize:
+            with self.assertRaises(core.CoreError) as caught:
+                self.restore()
+        materialize.assert_not_called()
+        self.assert_names_staged(str(caught.exception))
+        self.assertNotIn("документы", str(caught.exception))
+        self.assertFalse([name for name in self.names() if ".before-restore-" in name])
+
+
 class RestoreRefusalTests(RestoreCase):
+    def test_backup_with_its_own_journal_is_refused_untouched(self):
+        """Р258-6: чей журнал рядом с резервом, не узнать — отказ до любых изменений."""
+        Path(str(self.backup) + "-wal").write_bytes(b"journal of unknown origin")
+        names = self.names()
+        before = digest(self.db)
+        with self.assertRaises(core.CoreError) as caught:
+            self.restore()
+        self.assertIn("журнал", str(caught.exception))
+        self.assertIn("Ничего не изменено", str(caught.exception))
+        self.assertEqual((self.names(), digest(self.db)), (names, before))
+
     def test_orphan_wal_without_database_is_refused_untouched(self):
         self.db.rename(self.base / "elsewhere.sqlite3")
         Path(str(self.db) + "-wal").write_bytes(b"orphan")

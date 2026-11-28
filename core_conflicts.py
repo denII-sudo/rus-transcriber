@@ -1075,9 +1075,20 @@ def inspect_backup(backup_path):
 
 _SIDE_SUFFIXES = ("-wal", "-shm", "-journal")     # служебные файлы SQLite рядом с базой: набор с ней одно целое
 _SQLITE_HEADER = b"SQLite format 3\x00"
-_REPLACE_SUPPORTED = os.name == "nt"               # замена открытой базы проверяется переименованием: только Windows
+# Замена базы опирается на Windows: открытый файл не переименовывается, удержание `storage.FileHold`. Вне Windows
+# (переход на Linux — будущая цель владельца, срок не определён) замена существующей базы пока — отказ.
+_REPLACE_SUPPORTED = os.name == "nt"
 _BUSY_HINT = ("закройте программу (сервер в приложении ИИ-агента, экран rt.py screen, идущую обработку) "
               "и повторите")
+
+
+class _Refused(Exception):
+    """Отказ восстановления; restore_from_backup допишет, что после него осталось. shm — отказ случился после того,
+    как SQLite открывал прежнюю базу, и её -shm мог измениться."""
+
+    def __init__(self, text, *, shm=False):
+        super().__init__(text)
+        self.shm = shm
 
 
 def _side_files(path):
@@ -1085,35 +1096,52 @@ def _side_files(path):
     return [Path(str(path) + suffix) for suffix in _SIDE_SUFFIXES if os.path.lexists(str(path) + suffix)]
 
 
-def _held_elsewhere(path):
-    """Файл набора сейчас открыт другой программой (проба в core.file_held_elsewhere, файл не меняется)."""
-    return core.file_held_elsewhere(path)
+def _rename(source, target):
+    """Переименование файла набора; в Windows не заменяет существующий файл. Отдельной функцией — для тестов сбоя."""
+    os.rename(source, target)
+
+
+def _check_backup(backup):
+    """Р258-6: непустой журнал рядом с резервом — отказ до любых изменений. Резервы программы делаются без служебных
+    файлов, а чей это журнал, не узнать: чужой наложился бы на восстановленную базу (как в S-2), без своего пропали
+    бы последние изменения резерва."""
+    for side in _side_files(backup):
+        if side.name.endswith(("-wal", "-journal")) and os.path.getsize(side) > 0:
+            raise _Refused(f"рядом с резервом лежит журнал SQLite «{side}». Резервы программы делаются без него, и "
+                           "программа не может узнать, от этого ли он резерва: чужой журнал испортил бы "
+                           "восстановленную базу. Переложите файл резерва в отдельную папку без журнала (журнал тогда "
+                           "не учтётся) или, если журнал точно его, откройте резерв на запись любой программой SQLite "
+                           "и закройте её (журнал войдёт в файл), затем повторите")
 
 
 def _check_destination_free(destination, replace):
     """До любых изменений: можно ли занять место базы. Ничего не пишет и не создаёт."""
+    import storage
     present = os.path.lexists(destination)
     orphans = _side_files(destination)
     if not present and orphans:
         # без основного файла чужой -wal наложился бы на опубликованную базу (S-2): не трогаем, отказ
-        raise core.CoreError("рядом с местом восстановления лежат служебные файлы базы без самой базы: "
-                             + ", ".join(str(item) for item in orphans) + ". Рядом с новой базой их оставить "
-                             "нельзя. Ничего не изменено; укажите другой путь или перенесите эти файлы вручную.")
-    if not present or not replace:
+        raise _Refused("рядом с местом восстановления лежат служебные файлы базы без самой базы: "
+                       + ", ".join(str(item) for item in orphans) + ". Рядом с новой базой их оставить нельзя; "
+                       "укажите другой путь или перенесите эти файлы вручную")
+    if not present:
         return
+    if not replace:
+        raise _Refused(f"файл {destination} уже существует; укажите другой путь")
     if not _REPLACE_SUPPORTED:
-        # на POSIX переименование открытой базы проходит молча: занятость так не проверить (до отдельного решения)
-        raise core.CoreError("замена существующей базы при восстановлении поддерживается только в Windows; "
-                             "ничего не изменено. Укажите новый путь.")
-    if any(_held_elsewhere(item) for item in (destination, *orphans)):
-        raise core.CoreError("прежнюю базу сейчас использует другая программа: " + _BUSY_HINT
-                             + ". Ничего не изменено.")
+        raise _Refused("замена существующей базы при восстановлении пока поддерживается только в Windows "
+                       "(Linux — будущая цель); укажите новый путь")
+    if not os.access(destination, os.W_OK):
+        raise _Refused("файл прежней базы защищён от записи (атрибут «только чтение» или права доступа): снимите "
+                       "защиту и повторите")
+    if any(storage.file_held_elsewhere(item) for item in (destination, *orphans)):
+        raise _Refused("прежнюю базу сейчас использует другая программа: " + _BUSY_HINT)
 
 
 def _copy_backup(backup, staged):
-    """Шаг 1: копия резерва через SQLite backup API из соединения только на чтение. Резерв со своим -wal рядом
-    копируется вместе с подтверждённым в -wal; резерв без служебных файлов открывается неизменяемым и следов
-    не оставляет. Путь резерва на тип диска не проверяется (как и прежним копированием файла)."""
+    """Шаг 1: копия резерва через SQLite backup API из соединения только на чтение. Резерв без служебных файлов
+    открывается неизменяемым и следов не оставляет; при пустом -wal или одном -shm рядом — обычным mode=ro (меняется
+    только -shm резерва). Путь резерва на тип диска не проверяется (как и прежним копированием файла)."""
     import storage
     uri = backup.resolve().as_uri() + ("?mode=ro" if _side_files(backup) else "?mode=ro&immutable=1")
     with staged.open("xb"):
@@ -1131,23 +1159,23 @@ def _copy_backup(backup, staged):
 
 def _settle_previous(destination):
     """Шаг 2: прежнюю базу не копировать, а открыть на запись и закрыть: SQLite сам вносит подтверждённое из -wal
-    в основной файл и убирает служебные файлы. -> None, если база открылась, иначе причина (база не читается: её
-    набор файлов откладывается как есть). Остались служебные файлы у читаемой базы — её держит другая программа:
-    отказ, ничего не переименовано."""
+    в основной файл и убирает служебные файлы. -> None, если база открылась, иначе причина (не база SQLite: такой
+    файл не открывается, его набор откладывается как есть). Остались служебные файлы у читаемой базы — её держит
+    другая программа: отказ, ничего не переименовано."""
     import storage
-    busy = "прежняя база занята другой программой: " + _BUSY_HINT + ". Ничего не изменено."
     try:
         with open(destination, "rb") as file:
             header = file.read(len(_SQLITE_HEADER))
     except OSError as ex:
-        raise core.CoreError(f"прежнюю базу не удалось прочитать ({ex}). Ничего не изменено.") from ex
+        raise _Refused(f"прежнюю базу не удалось прочитать ({ex})") from ex
     if header != _SQLITE_HEADER:
         # пустой или чужой файл SQLite не открываем: при открытии он удалил бы лежащий рядом -wal
         return "прежний файл базы пуст или не является базой SQLite"
+    busy = "прежняя база занята другой программой: " + _BUSY_HINT
     try:
         db = storage._connect(destination, "rw")
     except storage.Busy as ex:
-        raise core.CoreError(busy) from ex
+        raise _Refused(busy, shm=True) from ex
     except (storage.StorageError, ValueError) as ex:
         return f"прежняя база не открывается ({ex})"
     unreadable = None
@@ -1155,38 +1183,62 @@ def _settle_previous(destination):
         db.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.DatabaseError as ex:
         if storage._is_busy(ex):
-            raise core.CoreError(busy) from ex
+            raise _Refused(busy, shm=True) from ex
         unreadable = f"прежняя база не читается ({ex})"
     finally:
         db.close()
     if unreadable is None and _side_files(destination):
-        raise core.CoreError("прежнюю базу держит другая программа (её служебные файлы не закрылись): "
-                             + _BUSY_HINT + ". Ничего не изменено.")
+        raise _Refused("прежнюю базу держит другая программа (её служебные файлы не закрылись): " + _BUSY_HINT,
+                       shm=True)
     return unreadable
 
 
+def _hold_previous(destination, unreadable):
+    """Удержать прежнюю базу (и служебные файлы нечитаемого набора) от шага 2 до публикации: пока удержание
+    действует, никто не откроет базу, а переименовать её можно. Закрывает окно между проверкой занятости и
+    переименованием. -> список удержаний."""
+    import storage
+    holds = []
+    try:
+        for item in (destination, *_side_files(destination)):
+            holds.append(storage.FileHold(item))
+        if unreadable is None and _side_files(destination):
+            raise storage.Busy("side files appeared")
+    except storage.Busy as ex:
+        _release(holds)
+        raise _Refused("прежнюю базу только что открыла другая программа: " + _BUSY_HINT, shm=True) from ex
+    except OSError as ex:
+        _release(holds)
+        raise _Refused(f"не удалось удержать прежнюю базу на время восстановления ({ex})", shm=True) from ex
+    return holds
+
+
+def _release(holds):
+    for hold in holds:
+        hold.close()
+
+
 def _move_aside(destination):
-    """Шаг 3: переименовать прежнюю базу целиком в before-restore-*: сначала основной файл (в Windows открытый
-    файл не переименовывается — это и проверка «никто не держит»), затем её служебные файлы с тем же именем, чтобы
-    SQLite нашёл их у отложенной базы. Набор не разлучается и не удаляется. -> (новое имя, [(было, стало)])."""
+    """Шаг 3: переименовать прежнюю базу целиком в before-restore-*: сначала основной файл (открытый другой программой
+    файл в Windows не переименовывается), затем её служебные файлы с тем же именем, чтобы SQLite нашёл их у
+    отложенной базы. Набор не разлучается и не удаляется. -> (новое имя, [(было, стало)])."""
     name = destination.name + ".before-restore-" + time.strftime("%Y%m%d-%H%M%S")
     if any(os.path.lexists(destination.with_name(name + suffix)) for suffix in ("", *_SIDE_SUFFIXES)):
         name += "-" + uuid.uuid4().hex[:8]
     saved = destination.with_name(name)
     moved = []
     try:
-        os.rename(destination, saved)        # в Windows не заменяет существующий файл
+        _rename(destination, saved)
         moved.append((destination, saved))
         for side in _side_files(destination):
             target = Path(str(saved) + side.name[len(destination.name):])
-            os.rename(side, target)
+            _rename(side, target)
             moved.append((side, target))
     except OSError as ex:
         left = _move_back(moved)
         if left:
-            raise core.CoreError(_not_returned(left)) from ex
-        raise core.CoreError("не удалось отложить прежнюю базу (возможно, её держит другая программа): "
-                             + _BUSY_HINT + f". Прежняя база на месте ({ex}).") from ex
+            raise _Refused(_not_returned(left)) from ex
+        raise _Refused(f"не удалось отложить прежнюю базу ({ex}); прежняя база на месте") from ex
     return saved, moved
 
 
@@ -1196,7 +1248,7 @@ def _move_back(moved):
     left = []
     for original, renamed in reversed(moved):
         try:
-            os.rename(renamed, original)
+            _rename(renamed, original)
         except OSError:
             left.append((original, renamed))
     return left
@@ -1205,7 +1257,7 @@ def _move_back(moved):
 def _not_returned(left):
     return ("восстановление не выполнено, и прежнюю базу не удалось вернуть на место. Ничего не удалено: "
             + "; ".join(f"«{renamed}» должен называться «{original}»" for original, renamed in left)
-            + ". Закройте программу и переименуйте эти файлы обратно вручную.")
+            + ". Закройте программу и переименуйте эти файлы обратно вручную")
 
 
 def _publish(staged, destination):
@@ -1213,11 +1265,29 @@ def _publish(staged, destination):
     os.link(staged, destination)
 
 
+def _with_leftovers(text, staged, state):
+    """Текст отказа и что после него осталось и где (Р258-2). «Ничего не изменено» — только если это так."""
+    left = []
+    if os.path.lexists(staged):
+        left.append(f"подготовленная копия резерва «{staged}» — она не подключена к программе, её можно удалить")
+    if state["roots"]:
+        left.append("документы записей могли быть уже записаны в новые папки: " + ", ".join(state["roots"]))
+    if state["settled"]:
+        left.append("журнал прежней базы (-wal) внесён в её основной файл и служебные файлы убраны — так делает и "
+                    "сама программа при открытии; данные те же")
+    if state["shm"]:
+        left.append("у прежней базы мог измениться служебный файл -shm (метки SQLite, данные не затронуты)")
+    return f"{text}. " + ("Осталось: " + "; ".join(left) + "." if left else "Ничего не изменено.")
+
+
 def restore_from_backup(backup_path, destination, root_mapping, user_id, *, replace=True):
     """Мастер восстановления: копия резерва получает новые корни и установку, документы
     формируются в новых корнях из сохранённых bytes. Живая база подменяется только
     при replace=True и только в Windows: её набор файлов (база, -wal, -shm) переименовывается рядом
-    в before-restore-*, ничего не удаляется; из резерва ничего не удаляется (БД-1, S-2)."""
+    в before-restore-*, ничего не удаляется; из резерва ничего не удаляется (БД-1, S-2).
+
+    Порядок: всё, что может дать отказ, — до записи документов в новые корни: проверка резерва и места, копия,
+    validate_copy, переназначение в копии, шаг 2 и удержание прежней базы; затем документы, шаги 3–5."""
     import documents
     import storage
     backup = Path(backup_path).expanduser()
@@ -1232,64 +1302,98 @@ def restore_from_backup(backup_path, destination, root_mapping, user_id, *, repl
     for root_id, path in mapping.items():
         if not Path(path).is_dir():
             raise core.CoreError(f"путь документного корня не существует: {path}")
-    _check_destination_free(destination, replace)
-    staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
     try:
-        _copy_backup(backup, staged)
-    except (OSError, sqlite3.Error, storage.StorageError, ValueError) as ex:
-        raise core.CoreError(f"не удалось скопировать резерв в {staged}: {ex}") from ex
-    try:
-        store = storage.open_store(staged)
-        try:
-            installation_id = str(uuid.uuid4())
-            store.rebind_restored_copy(mapping, installation_id, user_id)
-            materialized = []
-            for root_id, path in mapping.items():
-                materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
-            # PR 5б-2: занятый или защищённый от записи файл больше не обрывает восстановление — называем, что осталось
-            not_written = [dict(row) for row in store.db.execute(
-                "SELECT recording_id, document_revision, error_code FROM document_outbox "
-                "WHERE state = 'pending' ORDER BY recording_id, document_revision")]
-            validation = storage.validate_copy(staged, allow_damaged_copies=True)
-        finally:
-            store.close()
-        storage._release_wal_files(staged)
-    except (storage.StorageError, ValueError) as ex:
-        raise core.CoreError(f"восстановление не выполнено; подготовленный файл остался: {staged} "
-                        f"({ex})") from ex
-    if _side_files(staged):
-        # опубликуется только основной файл: подтверждённое в -wal подготовленной копии пропало бы
-        raise core.CoreError("восстановление не выполнено: у подготовленной копии не закрылись служебные файлы; "
-                             f"подготовленный файл остался: {staged}")
-    previous_saved_as = None
-    warning = []
-    moved = []
-    if os.path.lexists(destination):
-        if not replace:
-            raise core.CoreError(f"файл {destination} уже существует; укажите другой путь")
+        _check_backup(backup)
         _check_destination_free(destination, replace)
-        unreadable = _settle_previous(destination)
-        saved, moved = _move_aside(destination)
-        previous_saved_as = str(saved)
-        if unreadable:
-            warning.append(f"{unreadable}; она отложена как есть вместе со служебными файлами: "
-                           + ", ".join(str(renamed) for _, renamed in moved))
+    except _Refused as ex:
+        raise core.CoreError(f"{ex}. Ничего не изменено.") from ex
+    staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
+    state = {"roots": [], "shm": False, "settled": False}
+
+    def refused(text):
+        return core.CoreError(_with_leftovers(text, staged, state))
+
+    holds = []
     try:
-        occupied = ([destination] if os.path.lexists(destination) else []) + _side_files(destination)
-        if occupied:
-            raise FileExistsError("на месте базы появились файлы: " + ", ".join(str(item) for item in occupied))
-        _publish(staged, destination)
-    except OSError as ex:
-        left = _move_back(moved)
-        if left:
-            raise core.CoreError(_not_returned(left) + f" Подготовленный файл остался: {staged}") from ex
-        raise core.CoreError(f"не удалось опубликовать восстановленную базу ({ex}); прежняя база на месте, "
-                             f"подготовленный файл остался: {staged}") from ex
+        try:
+            _copy_backup(backup, staged)
+        except (OSError, sqlite3.Error, storage.StorageError, ValueError) as ex:
+            raise refused(f"не удалось скопировать резерв ({ex})") from ex
+        store = None
+        try:
+            try:
+                # повреждённый резерв отвергается, пока в новых корнях ещё ничего не записано
+                storage.validate_copy(staged, allow_damaged_copies=True)
+                store = storage.open_store(staged)
+                installation_id = str(uuid.uuid4())
+                store.rebind_restored_copy(mapping, installation_id, user_id)
+            except (storage.StorageError, ValueError) as ex:
+                raise refused(f"восстановление не выполнено ({ex})") from ex
+            unreadable = None
+            replacing = os.path.lexists(destination)
+            try:
+                _check_destination_free(destination, replace)
+                if replacing:
+                    journal = bool(_side_files(destination))
+                    unreadable = _settle_previous(destination)
+                    state["settled"] = unreadable is None and journal
+                    holds = _hold_previous(destination, unreadable)
+            except _Refused as ex:
+                state["shm"] = state["shm"] or ex.shm
+                raise refused(str(ex)) from ex
+            state["roots"] = list(mapping.values())        # отсюда документы могут оказаться в новых корнях
+            try:
+                materialized = []
+                for root_id, path in mapping.items():
+                    materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
+                # PR 5б-2: занятый или защищённый от записи файл не обрывает восстановление — называем, что осталось
+                not_written = [dict(row) for row in store.db.execute(
+                    "SELECT recording_id, document_revision, error_code FROM document_outbox "
+                    "WHERE state = 'pending' ORDER BY recording_id, document_revision")]
+                validation = storage.validate_copy(staged, allow_damaged_copies=True)
+            except (storage.StorageError, ValueError) as ex:
+                raise refused(f"восстановление не выполнено ({ex}); прежняя база на месте") from ex
+        finally:
+            if store is not None:
+                store.close()
+        try:
+            storage._release_wal_files(staged)
+        except storage.StorageError as ex:
+            raise refused(f"восстановление не выполнено ({ex}); прежняя база на месте") from ex
+        if _side_files(staged):
+            # опубликуется только основной файл: подтверждённое в -wal подготовленной копии пропало бы
+            raise refused("восстановление не выполнено: у подготовленной копии не закрылись служебные файлы; "
+                          "прежняя база на месте")
+        previous_saved_as = None
+        warning = []
+        moved = []
+        if replacing:
+            try:
+                saved, moved = _move_aside(destination)
+            except _Refused as ex:
+                raise refused(str(ex)) from ex
+            previous_saved_as = str(saved)
+            if unreadable:
+                warning.append(f"{unreadable}; она отложена как есть вместе со служебными файлами: "
+                               + ", ".join(str(renamed) for _, renamed in moved))
+        try:
+            occupied = ([destination] if os.path.lexists(destination) else []) + _side_files(destination)
+            if occupied:
+                raise FileExistsError("на месте базы появились файлы: " + ", ".join(str(item) for item in occupied))
+            _publish(staged, destination)
+        except OSError as ex:
+            left = _move_back(moved)
+            if left:
+                raise refused(_not_returned(left)) from ex
+            raise refused(f"не удалось опубликовать восстановленную базу ({ex}); прежняя база на месте") from ex
+    finally:
+        _release(holds)
     try:
         staged.unlink()       # второе имя того же файла: данные остаются под именем базы
     except OSError:
-        warning.append(f"временное имя восстановленной базы не убралось: {staged} — это то же содержимое, "
-                       "что и у базы; не открывайте его, удалите после закрытия программы")
+        warning.append(f"временное имя «{staged}» не убралось. Это не копия, а второе имя той же восстановленной "
+                       "базы: не открывайте его ничем, пока работает программа, — иначе база испортится. Удалите "
+                       "его после закрытия программы")
     warning = _not_written_warning(not_written) + _damaged_copies_warning(validation.get("damaged_copies")) + warning
     return {"destination": str(destination), "installation_id": installation_id,
             "previous_saved_as": previous_saved_as, "validation": validation,
