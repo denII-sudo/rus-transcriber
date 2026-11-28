@@ -70,5 +70,66 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(md.count("Цитат:"), 1)
 
 
+WORDS = "мы решили купить новый стол сегодня".split()
+
+
+def spoken(speaker, revision=3):
+    return {"recording_id": "r1", "source_revision": revision,
+            "segments": [{"speaker": speaker, "words": [{"word_id": f"w{i}", "w": w, "s": float(i), "e": i + .9}
+                                                        for i, w in enumerate(WORDS)]}],
+            "review": [{"id": "a", "status": "resolved"}]}
+
+
+class ReviewFindingsTests(unittest.TestCase):
+    def linked(self, labels):
+        obj, _ = conspect.link("Анна: «мы решили купить новый стол»", spoken("Анна"), labels=labels)
+        obj.update(recording_id="r1", analysis_revision=3, assembly_revision=3)
+        return obj
+
+    def test_t260_3_speaker_change_counted_with_labels(self):
+        for labels in (False, True):
+            md, _ = conspect.render(self.linked(labels), spoken("Борис", 4))
+            self.assertIn("изменено цитат 0, у говорящих 1", md, labels)
+
+    def test_t260_3_unknown_speaker_is_not_zero(self):
+        obj = self.linked(False)
+        for quote in obj["quotes"].values():
+            quote["base_speaker"] = quote["last_speaker"] = None
+        md, _ = conspect.render(obj, spoken("Борис", 4))
+        self.assertIn("у говорящих не определено", md)
+
+    def test_t260_4_foreign_recording_shows_nothing_from_its_data(self):
+        obj = agent_obj(recording_id="OTHER")
+        md, _ = conspect.render(obj, data(title="Чужая запись", recorded_at="2026-11-20"))
+        self.assertIn("Источник не подтверждён", md)
+        self.assertNotIn("Чужая запись", md)
+        self.assertNotIn("2026-11-20", md)
+        self.assertNotIn("разобрано", md)
+
+    def test_t260_4_conspect_without_recording_id_is_marked(self):
+        obj = agent_obj()
+        del obj["recording_id"]
+        md, _ = conspect.render(obj, data(title="Планёрка"))
+        self.assertIn("Событие: Планёрка", md)
+        self.assertIn("Источник не подтверждён: у конспекта нет признака записи", md)
+
+    def test_t260_1_missing_review_is_unknown_not_zero(self):
+        without = data()
+        del without["review"]
+        md, _ = conspect.render(agent_obj(), without)
+        self.assertIn("Места разбора: неизвестно", md)
+        self.assertNotIn("мест разбора нет", md)
+
+    def test_t260_5_own_header_is_not_duplicated(self):
+        for obj in (agent_obj(), model_obj()):
+            md, _ = conspect.render(obj, data(title="А"))
+            again = dict(obj, template=md)
+            md2, _ = conspect.render(again, data(title="А"))
+            self.assertEqual(md2.count("Событие:"), 1, md2)
+            relinked, _ = conspect.link(md, data(title="А"))
+            self.assertNotIn("Событие:", relinked["template"])
+            self.assertEqual(conspect.render(dict(relinked, recording_id="r1"), data(title="А"))[0].count("Составлен:"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

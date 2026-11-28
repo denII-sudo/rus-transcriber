@@ -764,11 +764,10 @@ def refresh_conspects(store, recording_id, document_path):
     report = {}
     for saved in store.list_conspects(recording_id):
         payload = saved["payload"]
-        # Свёртка «цитаты по одной» (quote_policy 1) показывает цитаты по текущему разбору: она устаревает и
-        # когда изменилась только ревизия разбора (место закрыто, слова те же). Остальные — по стенограмме.
+        # Шапка («разобрано N из M», 7.6а) и цитаты свёртки «по одной» (quote_policy 1) зависят от разбора: любой
+        # конспект устаревает и когда изменилась только ревизия разбора (место закрыто, слова те же).
         stale = (payload.get("assembly_revision") != source_revision
-                 or (payload.get("quote_policy") == 1
-                     and payload.get("assembly_review_revision") != review_revision))
+                 or payload.get("assembly_review_revision") != review_revision)
         if stale:
             report.update(conspect.rerender(document_path, saved["name"]))
     return report

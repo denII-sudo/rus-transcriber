@@ -386,15 +386,17 @@ class RefreshConspectsTests(unittest.TestCase):
             recordings.refresh_conspects(store, "rec", Path("doc.json"))
         return [call.args[1] for call in rerender.call_args_list]
 
-    def test_old_conspect_is_not_rebuilt_by_a_review_only_change(self):
+    def test_old_conspect_is_rebuilt_once_by_a_review_only_change(self):
+        # 7.6а: в шапке «разобрано N из M» — любой конспект устаревает и при смене только ревизии разбора (T260-2)
         old = {"assembly_revision": 5, "assembly_review_revision": 1}              # нет quote_policy
-        self.assertEqual(self.run_refresh({"old": old}), [])
-        self.assertEqual(self.run_refresh({"old": {"assembly_revision": 5}}), [])
+        self.assertEqual(self.run_refresh({"old": old}), ["old"])
+        self.assertEqual(self.run_refresh({"old": {"assembly_revision": 5}}), ["old"])   # поле ещё не записано
+        self.assertEqual(self.run_refresh({"old": {"assembly_revision": 5, "assembly_review_revision": 2}}), [])
 
     def test_policy_conspect_is_rebuilt_once_by_a_review_only_change(self):
         stale = {"assembly_revision": 5, "assembly_review_revision": 1, "quote_policy": 1}
         fresh = {"assembly_revision": 5, "assembly_review_revision": 2, "quote_policy": 1}
-        self.assertEqual(self.run_refresh({"new": stale, "old": {"assembly_revision": 5}}), ["new"])
+        self.assertEqual(self.run_refresh({"new": stale, "old": {"assembly_revision": 5}}), ["new", "old"])
         self.assertEqual(self.run_refresh({"new": fresh}), [])                      # повтор — уже свежая
         self.assertEqual(self.run_refresh({"new": {"assembly_revision": 5, "quote_policy": 1}}), ["new"])
 

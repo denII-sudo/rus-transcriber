@@ -360,6 +360,7 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
     в цитате остаётся written_label, автора пишет сборка.
     """
     unlinked_mode = unlinked                # ниже имя unlinked занимает список несвязанных цитат
+    conspect_md = _strip_info(conspect_md)  # свою шапку (7.6а) программа ставит сама — повторно не принимается
     toks = _tokens(data)
     seq = [t[0] for t in toks]
     first = {}
@@ -487,6 +488,20 @@ SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 
 
 MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
+# Сведения шапки (7.6а), поставленные программой: при повторном вводе готового Markdown не дублируются (T260-5)
+INFO_BLOCK = re.compile(r"(?:Событие: [^\n]*\nДата[^\n]*\n|Источник не подтверждён[^\n]*\n)"
+                        r"Составлен: [^\n]*\n(?:Стенограмма: [^\n]*\n)?(?:Места разбора: [^\n]*\n)?"
+                        r"(?:Источник не подтверждён[^\n]*\n)?\n")
+
+
+def _strip_info(text):
+    """Убрать сведения шапки, поставленные программой (в начале текста или сразу после «Создан моделью…»)."""
+    lead = MODEL_LEAD.match(text)
+    start = lead.end() if lead else 0
+    found = INFO_BLOCK.match(text, start)
+    return text[:start] + text[found.end():] if found else text
+
+
 VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
 
 
@@ -558,25 +573,41 @@ def _event_and_date(data):
     return event, "Дата записи: не установлена"
 
 
-def _info_lines(obj, data, rep, model):
-    """Сведения шапки: событие, дата, кто составил, версия стенограммы, разобрано мест (7.6а). Ставит программа."""
+def _info_lines(obj, data, rep, model, hdr):
+    """Сведения шапки: событие, дата, кто составил, версия стенограммы, разобрано мест (7.6а). Ставит программа.
+
+    hdr — счётчики сборки: speaker_changes (у скольких цитат сменился говорящий с прошлой сборки) и
+    speaker_unknown (у какой-то цитаты прежний или текущий говорящий неизвестен — число не определить).
+    Конспект чужой записи: сведения из её данных не показываются (T260-4); без признака записи — показываются
+    с оговоркой.
+    """
     import transcript
     import workflow
+    who = f"Составлен: {'моделью OpenAI через OpenCode' if model else 'ИИ-агентом'}" + chr(10)
+    if rep.get("source_conflict"):
+        return ("Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны."
+                + chr(10) + who + chr(10))
     event, date = _event_and_date(data)
-    places = [item for item in data.get("review") or [] if isinstance(item, dict)]
-    done = sum(1 for item in places if not transcript.place_unresolved(item))
-    unheard = sum(1 for item in places if workflow._closed_unheard(item))
+    if isinstance(data.get("review"), list):
+        places = [item for item in data["review"] if isinstance(item, dict)]
+        done = sum(1 for item in places if not transcript.place_unresolved(item))
+        unheard = sum(1 for item in places if workflow._closed_unheard(item))
+        review = (f"разобрано {done} из {len(places)}" + (f", не прослушано {unheard}" if unheard else "")
+                  if places else "мест разбора нет")
+    else:
+        review = "неизвестно (данные разбора не переданы)"
     now, before = data.get("source_revision"), obj.get("assembly_revision")
     if before is not None and now is not None and before != now:
+        speakers = "не определено" if hdr["speaker_unknown"] else str(hdr["speaker_changes"])
         version = (f"собрана по версии стенограммы {before}, сейчас {now}: изменено цитат "
-                   f"{len(rep['changed_since_last'])}, у говорящих {len(rep['speaker_changed'])}")
+                   f"{len(rep['changed_since_last'])}, у говорящих {speakers}")
     else:
         version = f"версия {now}" if now is not None else "версия не указана"
-    review = (f"разобрано {done} из {len(places)}" + (f", не прослушано {unheard}" if unheard else "")
-              if places else "мест разбора нет")
-    return (f"Событие: {event}" + chr(10) + f"{date}" + chr(10) +
-            f"Составлен: {'моделью OpenAI через OpenCode' if model else 'ИИ-агентом'}" + chr(10) +
-            f"Стенограмма: {version}" + chr(10) + f"Места разбора: {review}" + chr(10) + chr(10))
+    note = ""
+    if rep.get("legacy_unverified"):
+        note = "Источник не подтверждён: у конспекта нет признака записи; сведения взяты из записи, к которой он привязан." + chr(10)
+    return (f"Событие: {event}" + chr(10) + f"{date}" + chr(10) + who +
+            f"Стенограмма: {version}" + chr(10) + f"Места разбора: {review}" + chr(10) + note + chr(10))
 
 
 def _clock(seconds):
@@ -613,6 +644,7 @@ def render(obj, data, update_last=True):
     если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
     с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
     """
+    hdr = {"speaker_changes": 0, "speaker_unknown": False}
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
     rep["rendered_source_revision"] = data.get("source_revision")
     rep["analysis_revision"] = obj.get("analysis_revision")
@@ -668,6 +700,11 @@ def render(obj, data, update_last=True):
         if _clean(cur) != _clean(q.get("last", q["base"])):
             rep["changed_since_last"].append({"id": key, "was": q.get("last"), "now": cur})
         body = cur if changed else q["author"]
+        last_spk = q.get("last_speaker", q.get("base_speaker"))
+        if last_spk is None or cur_spk is None:                  # для шапки: сменился ли говорящий, определить нельзя
+            hdr["speaker_unknown"] = True
+        elif cur_spk != last_spk:                                # считаем и при метках (speaker=None), T260-3
+            hdr["speaker_changes"] += 1
         spk = q.get("speaker")
         if spk and cur_spk != q.get("base_speaker"):          # говорящий сменился в стенограмме
             if cur_spk != q.get("last_speaker"):
@@ -707,11 +744,11 @@ def render(obj, data, update_last=True):
         when = f", {_clock(min(found))}" if found else ""
         return f"{author}: {body} (по распознаванию, {'не прослушано' if unheard else 'не проверено'}{when})"
 
-    body_md = SLOT.sub(sub, obj["template"])         # один проход: вставленный текст не раскрывается повторно
+    body_md = SLOT.sub(sub, _strip_info(obj["template"]))         # один проход: вставленный текст не раскрывается повторно
     header = _labels_header(obj, data, rep["analysis_needs_review"])
     # Файл версии 1 (без меток): «# Конспект / Создан моделью…» уже стоит в начале самого текста (workflow.py)
     lead = MODEL_LEAD.match(body_md) if not header else None
-    info = _info_lines(obj, data, rep, bool(header) or policy or bool(lead) or obj.get("provenance") == "model")
+    info = _info_lines(obj, data, rep, bool(header) or policy or bool(lead) or obj.get("provenance") == "model", hdr)
     if header:                                  # шапка модельного конспекта: «# Конспект», «Создан моделью…»
         cut = header.index(chr(10) * 2, header.index(chr(10) * 2) + 2) + 2
         header = header[:cut] + info + header[cut:]
@@ -725,6 +762,8 @@ def render(obj, data, update_last=True):
     md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
+        if data.get("review_revision") is not None:
+            obj["assembly_review_revision"] = data["review_revision"]
     rep["assembly_revision"] = obj.get("assembly_revision")
     return md, rep
 
@@ -805,8 +844,7 @@ def _rerender_locked(json_path, name=None):
                     continue
                 md, rep = render(obj, data)
                 obj["source_revision"] = data.get("source_revision")
-                if obj.get("quote_policy") == 1:
-                    obj["assembly_review_revision"] = review_revision
+                obj["assembly_review_revision"] = review_revision
                 paths = recordings.document_binding(store, binding["recording_id"])["root"]
                 cj, cm = paths / saved["json_relative"], paths / saved["md_relative"]
                 write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
