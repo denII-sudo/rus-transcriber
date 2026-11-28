@@ -223,12 +223,49 @@ def _clean(s):
     return " ".join(Q._n(x) for x in Q.WORD.findall(s))
 
 
-def _id_text(data, ids):
+def _shape(data, ids):
+    """Строение слов цитаты при связывании (Н28-3…Н28-5): для корня каждого слова цитаты (`part_of` или само слово) —
+    все ID его частей. Ссылка с этой отметкой сделана на конкретные слова: её текст — ровно эти ID."""
+    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
+    cited = [w for w in words if w["word_id"] in set(ids or [])]
+    roots = {w.get("part_of") or w["word_id"] for w in cited}
+    return {"roots": {root: sorted(w["word_id"] for w in words if (w.get("part_of") or w["word_id"]) == root)
+                      for root in sorted(roots)},
+            "span": [min(w["s"] for w in cited), max(w["e"] for w in cited)] if cited else None}
+
+
+def _exact_holds(data, ids, exact):
+    """Точная ссылка остаётся точной, пока ни одно слово цитаты не разбили после связывания: новая часть корня
+    цитаты, лежащая во времени слов цитаты, — это разбиение её слова, и укороченный текст выдать нельзя (Н-7).
+    Новая часть вне этого времени — разбиение соседнего слова того же корня: цитату не меняет (Н28-5); на самой
+    границе (вставка нулевой длины) не различить — как у старой ссылки. Слово цитаты,
+    вышедшее за время цитаты при связывании, вобрало соседнее слово: тоже не точная. Время — на момент связывания."""
+    if not isinstance(exact, dict) or not exact.get("span"):
+        return False
+    known = {wid for parts in (exact.get("roots") or {}).values() for wid in parts}
+    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
+    cited = [w for w in words if w["word_id"] in set(ids or [])]
+    if not cited:
+        return True                                       # слов нет — «не найдено» решит общий разбор
+    roots = set(exact.get("roots") or {})
+    lo, hi = exact["span"]
+    eps = 0.005
+    if any(w["s"] < lo - eps or w["e"] > hi + eps for w in cited):
+        return False
+    return not any((w.get("part_of") or w["word_id"]) in roots and w["word_id"] not in known
+                   and w["s"] <= hi + eps and w["e"] >= lo - eps for w in words)
+
+
+def _id_text(data, ids, exact=None):
     """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
     ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
     (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
     оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
-    находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний."""
+    находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний.
+    exact — строение слов при связывании (`_shape`): ссылка сделана на конкретные слова, и пока строение их корней
+    не выросло, корень не разворачивается и `merged_from` не мешает (Н28-3…Н28-5); иначе — как у старой ссылки."""
+    if exact is not None and _exact_holds(data, ids, exact):
+        return _plain_text(data, ids)
     parts, present, merged = {}, set(), set()
     for seg in data.get("segments") or []:
         for word in seg.get("words") or []:
@@ -245,6 +282,11 @@ def _id_text(data, ids):
         ids = list(dict.fromkeys(x for wid in ids for x in sorted(
             ([wid] if wid in present or wid not in parts else []) + parts.get(wid, []),
             key=lambda x: rank.get(x, -1))))
+    return _plain_text(data, ids)
+
+
+def _plain_text(data, ids):
+    """Текст и говорящий ровно этих ID в порядке ссылки (общая часть `_id_text`)."""
     by_id = {}
     order = []
     for seg in data.get("segments") or []:
@@ -393,15 +435,15 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
                 ok = False
                 break
             t1, t2 = _part_times(toks[i:i + L])
-            parts.append({"t1": t1, "t2": t2, "word_ids": ids})
+            parts.append({"t1": t1, "t2": t2, "word_ids": ids, "exact": _shape(data, ids)})
         if not ok or not parts:
             mark_unlinked(m, q, why)
             continue
         n += 1
         key = str(n)
         t1, t2 = parts[0]["t1"], parts[-1]["t2"]
-        base, base_spk = _id_text(data, parts[0]["word_ids"])
-        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"])[0] for p in parts)))
+        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0]["exact"])
+        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p["exact"])[0] for p in parts)))
         quotes[key] = {"parts": parts, "author": q, "speaker": None if labels else spk, "base": joined,
                        "base_speaker": base_spk, "last": joined, "last_speaker": base_spk}
         # «Имя: «…»» — имя тоже часть ссылки, чтобы обновлялось вместе с говорящим
@@ -535,7 +577,7 @@ def render(obj, data, update_last=True):
         q = obj["quotes"].get(key)
         if not q:
             return m.group(0)
-        texts = [(None, None) if source_conflict else _id_text(data, p["word_ids"]) if "word_ids" in p
+        texts = [(None, None) if source_conflict else _id_text(data, p["word_ids"], p.get("exact")) if "word_ids" in p
                  else _legacy_span(data, p["t1"], p["t2"]) for p in q["parts"]]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
