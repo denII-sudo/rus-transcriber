@@ -24,9 +24,12 @@ KIND_RU = {FOREIGN: "чужие слова", PARTIAL: "не все слова м
 
 # Что видит человек под карточкой после «Применить» (уточнение к исходу «не применён»). Простыми словами, без
 # внутренних имён; {text} — слова, которые звучат в это время по записи в том виде, в каком её перенесли.
-ANCHOR_MISMATCH = ("это место перенесено из старых файлов с ошибкой: карточка указывает не на те слова, что звучат "
-                   "в это время (здесь звучит «{text}»). Ответ не внесён, стенограмма не изменилась — скажите Claude, "
-                   "какие слова здесь верны")
+ANCHOR_MISMATCH = ("это место перенесено из старых файлов с ошибкой: карточка указывает не на те слова, что стоят в "
+                   "стенограмме в это время (по стенограмме здесь «{text}»). Этот ответ не внесён и слов не изменил. "
+                   "Сначала нужно исправить привязку места — скажите Claude; после этого карточка обновится, и "
+                   "ответить на неё нужно будет заново")
+# Отметка места после ремонта привязки (ставит ремонт): дальше место сверяется как обычное.
+REPAIRED = "anchor_repaired"
 
 
 def _by_id(data):
@@ -96,18 +99,26 @@ def card_conflicts(mismatches, data, cards):
 
     mismatches — migration_mismatches; data — нынешняя стенограмма с разбором; cards — {id: карточка или решение}.
     Ответ ложится на `word_ids` карточки, а без них — на `word_ids` места сейчас (transcript.apply_review). Отказ —
-    если эти слова не совпадают со словами по времени. Нет ID ни там, ни там — место ищется по времени, отказа нет."""
+    если эти слова не совпадают со словами по времени ни в ревизии переноса, ни в нынешних данных. Нет ID ни там, ни
+    там — место ищется по времени, отказа нет. Место с отметкой ремонта (REPAIRED) не проверяется: после ремонта его
+    слова правят как обычно, и `_relink_places` переносит привязку на слова правок (O265-3)."""
     if not mismatches:
         return {}
     places = {r.get("id"): r for r in data.get("review") or [] if isinstance(r, dict)}
     out = {}
     for aid, card in cards.items():
         found = mismatches.get(aid)
-        if found is None:
+        place = places.get(aid) or {}
+        if found is None or place.get(REPAIRED):
             continue
         card = card or {}
-        ids = card.get("word_ids") if "word_ids" in card else (places.get(aid) or {}).get("word_ids")
+        ids = card.get("word_ids") if "word_ids" in card else place.get("word_ids")
         if not ids or set(ids) == set(found["by_time"]):
+            continue
+        loc = T._find_span(data, {k: v for k, v in place.items() if k != "word_ids"}) if place else None
+        now = [] if loc is None else \
+            [w.get("word_id") for w in (data["segments"][loc[0]].get("words") or [])[loc[1]:loc[2]]]
+        if now and set(ids) == set(now):
             continue
         out[aid] = ANCHOR_MISMATCH.format(text=found["by_time_text"] or "—")
     return out
@@ -151,9 +162,20 @@ def record_report(store, recording_id, *, texts=True):
 
 
 def check_store(store, recording_ids=None, *, texts=True):
-    """Сводка по базе (или по названным записям). Только чтение: ничего не пишет."""
+    """Сводка по базе (или по названным записям: полный ID или его начало). Только чтение: ничего не пишет.
+    Записи, которых нет (или начало подходит к нескольким), — в not_found: опечатка не выглядит как «расхождений нет»."""
+    known = [r[0] for r in store.db.execute("SELECT recording_id FROM recordings ORDER BY recording_id")]
+    not_found = []
     if recording_ids is None:
-        recording_ids = [r[0] for r in store.db.execute("SELECT recording_id FROM recordings ORDER BY recording_id")]
+        recording_ids = known
+    else:
+        wanted, recording_ids = recording_ids, []
+        for key in wanted:
+            hits = [rid for rid in known if rid == key] or [rid for rid in known if rid.startswith(key)]
+            if len(hits) == 1:
+                recording_ids.append(hits[0])
+            else:
+                not_found.append(key)
     migrated, records = 0, []
     for rid in recording_ids:
         report = record_report(store, rid, texts=texts)
@@ -171,4 +193,4 @@ def check_store(store, recording_ids=None, *, texts=True):
             "closed": sum(1 for row in places if row["closed"]),
             "closed_with_human_marks": sum(1 for row in places if row["closed"] and row["human_marked"]),
             "human_marked_wrong_words": sum(row["human_marked_wrong"] for row in places),
-            "records": records, "writes": False}
+            "records": records, "not_found": not_found, "writes": False}

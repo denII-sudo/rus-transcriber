@@ -246,6 +246,80 @@ class ApplyGuard(Case):
             self.assertEqual(self.place(jp, "r1")["status"], "human")
 
 
+class ReviewFixes(Case):
+    """Находки приёмки №265: O265-1 (= T265-1), O265-6 (= S265-4, T265-4), O265-7 (= S265-3, T265-5),
+    O265-8 (= S265-5), выход для места после ремонта (O265-3)."""
+
+    def words(self, jp):
+        return [w["w"] for s in transcript.load(jp)["segments"] for w in s["words"]]
+
+    def test_new_answer_over_applied_one_is_refused(self):
+        """O265-1: «Другое» внесено на чужие слова до защиты; «как есть» поверх (К-В3) прежде снимало его и снова
+        ставило отметку человека на чужие слова."""
+        with record() as (jp, md, version, _db, _rid):
+            self.answer(jp, version, "r1", option=1)
+            with mock.patch.object(LA, "card_conflicts", return_value={}):
+                core.apply_answers_files(jp, md)
+            after = transcript.load(jp)["segments"]
+            self.assertIn("другое", self.words(jp))
+            self.assertIn("перенесено из старых файлов",
+                          review_pack.answer_guard(jp, md, "r1", {"kind": "option", "option": 0, "version": version}))
+            self.answer(jp, version, "r1", option=0)
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(next(r for r in rep["outcomes"] if r["id"] == "r1")["outcome"], "apply_conflict")
+            self.assertEqual(transcript.load(jp)["segments"], after)
+
+    def test_leave_to_human_from_card_passes(self):
+        with record() as (jp, md, version, _db, _rid):
+            Case._ts += 1
+            review_pack.add_answers(jp, [{"id": "r1", "version": version, "kind": "human",
+                                          "ts": f"2026-11-28T10:00:{Case._ts:02d}"}], "local", trusted_actor="human")
+            self.assertIsNone(review_pack.answer_guard(jp, md, "r1", {"kind": "human", "version": version}))
+            rep = core.apply_answers_files(jp, md)
+            self.assertNotEqual(next(r for r in rep["outcomes"] if r["id"] == "r1")["outcome"], "apply_conflict")
+            self.assertEqual(self.place(jp, "r1")["status"], "human")
+
+    def test_text_names_transcript_not_audio_and_next_step(self):
+        with record() as (jp, md, version, _db, _rid):
+            self.answer(jp, version, "r1")
+            detail = next(r for r in core.apply_answers_files(jp, md)["outcomes"] if r["id"] == "r1")["detail"]
+        self.assertIn("по стенограмме здесь «подписали договор»", detail)
+        self.assertIn("Этот ответ не внесён", detail)
+        self.assertIn("ответить на неё нужно будет заново", detail)
+        self.assertNotIn("звучит", detail)
+
+    def test_repaired_place_is_not_held(self):
+        with record() as (jp, md, version, _db, _rid):
+            data = transcript.load(jp)
+            next(r for r in data["review"] if r["id"] == "r1")[LA.REPAIRED] = True
+            transcript.save(data, jp, md)
+            self.answer(jp, version, "r1")
+            rep = core.apply_answers_files(jp, md)
+            self.assertEqual(next(r for r in rep["outcomes"] if r["id"] == "r1")["outcome"], "applied")
+
+    def test_words_by_time_now_pass(self):
+        """Решение агента со словами, которые стоят в это время сейчас (после правки слов места), не отказывается."""
+        with record() as (jp, md, _version, _db, _rid):
+            transcript.edit_span(jp, md, 0.45, 1.65, "подписали", by="claude", resolve=False)   # «договор» удалено
+            data = transcript.load(jp)
+            loc = transcript._find_span(data, {k: v for k, v in self.place(jp, "r1").items() if k != "word_ids"})
+            now = [w["word_id"] for w in data["segments"][loc[0]]["words"][loc[1]:loc[2]]]
+            rep = core.apply_review_files(jp, md, [{"id": "r1", "word_ids": now}], by="claude")
+            self.assertFalse(rep.get("conflicts"))
+            self.assertIn("r1", rep["successful_ids"])
+
+    def test_recording_by_prefix_and_unknown(self):
+        import rt
+        with record() as (_jp, _md, _version, db, rid):
+            out = report(db, rid[:8])
+            self.assertEqual((out["places"], out["not_found"]), (2, []))
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf), mock.patch("sys.stderr", io.StringIO()) as err:
+                code = rt.main(["legacy-anchor-check", "--db", str(db), "--summary", "--recording", "ffffffff"])
+        self.assertEqual(code, 1)
+        self.assertIn("не найдены", err.getvalue())
+
+
 class NoFalseRefusalAfterRelink(Case):
     def test_place_relinked_by_edit_is_checked_only_by_migration_revision(self):
         """Правка «хорошо» → «хорошо очень»: `_relink_places` переносит word_ids места на оба слова, «очень» начинается

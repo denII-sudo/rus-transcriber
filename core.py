@@ -1403,13 +1403,21 @@ def _answer_item_sources(store, recording_id, manifest):
 
 def _legacy_anchor_conflicts(store, recording_id, data, manifest, state):
     """S24: {id карточки: причина} — ответ лёг бы не на те слова места, перенесённого из старых файлов.
-    Как answer_revision_conflicts: только ответы на нынешнюю редакцию карточки, ещё не внесённые."""
+    Ответы на нынешнюю редакцию карточки, ещё не внесённые, в том числе новый ответ поверх внесённого (К-В3: прежний
+    снимается, новый ложится на те же слова, O265-1). Ответ, не меняющий слов («Оставить человеку», пропуск), не
+    проверяется (O265-6) — как решение агента status human."""
     import legacy_anchors
     import review_pack
     applied = review_pack._applied_map(state)
     answers = state.get("answers") or {}
-    items = {item.get("id"): item for item in manifest.get("items") or [] if isinstance(item, dict)
-             and item.get("id") not in applied and review_pack.answer_is_current(answers.get(item.get("id")), item)}
+    items = {}
+    for item in manifest.get("items") or []:
+        aid = item.get("id") if isinstance(item, dict) else None
+        answer = answers.get(aid)
+        if (aid is None or not review_pack.answer_is_current(answer, item)
+                or applied.get(aid) == review_pack._sig(answer) or not review_pack.answer_touches_words(answer, item)):
+            continue
+        items[aid] = item
     return legacy_anchors.card_conflicts(legacy_anchors.migration_mismatches(store, recording_id), data, items)
 
 

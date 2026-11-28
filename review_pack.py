@@ -958,7 +958,8 @@ def answer_guard(json_path, md, aid, answer):
         current = recordings.load_recording(store, rid)
         why = answer_revision_conflicts(current, man, state, source_snapshot(store, rid, man.get("source_revision")),
                                         sqlite=True, sources=item_sources(store, rid, man)).get(aid)
-        if not why and aid not in _applied_map(state):
+        if not why and _applied_map(state).get(aid) != _sig(state["answers"][aid]) and \
+                answer_touches_words(answer, item):
             import legacy_anchors        # S24: место из переноса с неверной привязкой — как в «Применить»
             why = legacy_anchors.card_conflicts(legacy_anchors.migration_mismatches(store, rid), current,
                                                 {aid: item}).get(aid)
@@ -1699,6 +1700,21 @@ def _desc(a, it):
 
 def _sig(a):
     return [a.get("kind"), a.get("option"), (a.get("text") or "").strip() if a.get("kind") == "free" else None]
+
+
+def answer_touches_words(answer, item):
+    """Ложится ли ответ на слова места. Нет: «Оставить человеку», пропуск, «повторить», отмена внесённого и вариант,
+    решение которого — только status human (S24: такие ответы защита привязки не держит, O265-6)."""
+    kind = (answer or {}).get("kind")
+    if kind in ("human", "skip", "repeat", "revert"):
+        return False
+    if kind in ("option", "recommended"):
+        options = (item or {}).get("options") or []
+        n = answer.get("option") if kind == "option" else (item or {}).get("recommended")
+        decision = (options[n].get("decision") or {}) if isinstance(n, int) and 0 <= n < len(options) else {}
+        if decision.get("status") == "human" and not ({"text", "speaker", "word_ids"} & set(decision)):
+            return False
+    return True
 
 
 def over_applied(answer, applied_sig):

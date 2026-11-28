@@ -225,7 +225,8 @@ def build():
     la = sub.add_parser("legacy-anchor-check", help="записи, перенесённые из старых файлов: места, привязанные не к "
                         "тем словам (S24); только чтение")
     la.add_argument("--db", help="файл базы (по умолчанию — база папки данных); открывается только для чтения")
-    la.add_argument("--recording", action="append", help="ID записи (можно несколько); без него — все записи")
+    la.add_argument("--recording", action="append", help="ID записи или его начало (можно несколько); без него — "
+                    "все записи")
     la.add_argument("--summary", action="store_true", help="только числа, без слов стенограмм")
     sc = sub.add_parser("screen"); sc.add_argument("--port", type=int, default=8766)
     sc.add_argument("--hours", type=float, default=6.0)
@@ -340,6 +341,9 @@ def run(a):
             for rec in report["records"]:
                 rec["recording_id"] = rec["recording_id"][:8]
         out({"database": str(db), **report})
+        if report["not_found"]:
+            say("Ошибка: записи не найдены (или начало ID подходит к нескольким): " + ", ".join(report["not_found"]))
+            return 1
     elif c == "workflow-list":
         out(core.workflow_list(a.limit))
     elif c == "screen":
