@@ -61,6 +61,20 @@ audio{width:100%;height:36px}
 .btn:hover:not(:disabled){border-color:var(--fg)}
 /* КН-12: неактивная кнопка видно неактивна и не подсвечивается при наведении */
 .btn:disabled{opacity:.5;cursor:not-allowed}
+/* Н-9, PR В (эскиз 7): список перед «Применить» — строка ответа: время и номер места, плашка-результат (нажатие —
+   к карточке), причины места, «Изменить ответ»; ниже «в тексте будет» и предупреждения */
+.plan{display:grid;gap:4px}
+.plan h2{font:600 .95rem var(--f-body);margin:0 0 4px}
+.plan .grp{margin:8px 0 2px;font:600 .74rem var(--f-mono);text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.plan .row{display:grid;grid-template-columns:78px 1fr auto;gap:4px 12px;align-items:center;padding:6px 0;border-top:1px solid var(--line)}
+.plan .tc{font:500 .8rem var(--f-mono);color:var(--muted)}
+.plan .tc .pid{display:block;font-size:.72rem;opacity:.8}
+.plan .res{font:inherit;text-align:left;padding:4px 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--fg);cursor:pointer}
+.plan .res:hover{border-color:var(--accent);box-shadow:0 1px 4px color-mix(in srgb,var(--accent) 25%,transparent)}
+.plan .why{font-size:.76rem;color:var(--muted);margin-left:8px}
+.plan .ctx,.plan .warn{display:block;grid-column:2/4;font-size:.84rem;color:var(--muted)}
+.plan .ctx mark{display:inline;background:var(--mark);color:var(--mark-ink);padding:0 2px;border-radius:3px}
+.plan .warn{color:var(--warn)}
 .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
 .btn.primary:hover:not(:disabled){border-color:var(--fg)}
 .btn[aria-pressed="true"]{background:var(--fg);color:var(--bg)}
@@ -102,6 +116,7 @@ audio{width:100%;height:36px}
       </div>
     </div>
     <div class="note" id="mode-note" hidden></div>
+    <div class="note plan" id="plan-list" hidden aria-live="polite"></div>
     <button class="btn" id="apply" type="button" hidden>Применить сохранённые ответы</button>
     <div class="note" id="apply-report" hidden aria-live="polite"></div>
   </header>
@@ -387,6 +402,9 @@ audio{width:100%;height:36px}
   const OPEN_TYPE_IT = "Кнопок прослушивания здесь нет: нажмите «Изменить ответ» и впишите, что услышали.";
   // КН-14: предпросмотр говорит то же, что «Применить»: сначала проверка программы (guard), затем изменение без записи.
   // Хвост «может измениться» — только если есть другие сохранённые ответы: они применятся вместе с этим.
+  const GAP_PLACEHOLDER = "Что сказано в паузе: «Имя: слова», например «Анна: Вот. Ну»";
+  const GAP_HINT = "Только слова из паузы: слова соседних карточек сюда не пишите — их исправляют на своих карточках. " +
+    "Между фразами ставьте пробел («Вот. Ну»).";
   function previewText(it, r) {
     if (r.guard) return "Этот ответ не внесётся: " + r.guard;
     if ((r.preflight_conflicts || []).length) return "Этот ответ не внесётся: он затрагивает те же слова, что и сохранённый ответ другой карточки.";
@@ -397,6 +415,10 @@ audio{width:100%;height:36px}
     return "Предпросмотр (без записи): " + (one && (wasNow || (one.applied || []).join("; ")) || "автоматических изменений нет") +
       ((r.left_to_human || []).length ? "; программа не внесёт это сама: место останется вам" : "") +
       ((r.not_found || []).length ? "; программа не нашла в нынешнем тексте слова этой карточки" : "") + "." +
+      // Н-9: слово ответа совпало с соседним словом другого говорящего — впишется, но человек решает, нужно ли
+      // Н-9, п. 5: «в тексте будет» — три слова до и после места
+      (r.context ? ` В тексте будет: …${r.context.before ? r.context.before + " " : ""}«${r.context.center}»${r.context.after ? " " + r.context.after : ""}….` : "") +
+      (one && (one.warnings || []).length ? " Внимание: " + one.warnings.join("; ") + "." : "") +
       (others ? " Результат может измениться: вместе с ним применятся другие сохранённые ответы." : "");
   }
   // Строки отчёта «Применить» (4.4): что внесено сейчас, что без изменений, где нужно действие человека — по номеру
@@ -417,10 +439,14 @@ audio{width:100%;height:36px}
     // «было → стало» без видимой разницы (was_now показывает не всю замену) — сама замена
     const shown = (c) => c.was_now && !/^(.*) → \1$/.test(c.was_now) ? c.was_now : (c.applied || []).join("; ");
     if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (shown(c)) lines.push(`${cardName(c.id)}: ${shown(c)}`); });
+    if (rep.free_text) (rep.free_text.cards || []).forEach(c => (c.warnings_done || c.warnings || []).forEach(w => action.push(`${cardName(c.id)}: внимание — ${w}`)));
     if (quiet.length) lines.push(`Без изменений: ${quiet.length} — применены раньше или пропущены (карточки ${quiet.map(num).join(", ")})`);
     // apply_conflict: уточнение программы (версия стенограммы, слова вне места) полнее общей причины — без повтора
     rows.filter(o => !DONE.includes(o.outcome) && !QUIET.includes(o.outcome)).forEach(o =>
-      action.push(`${cardName(o.id, o.card)}: ` + (o.outcome === "apply_conflict" && o.detail ? `не применён: ${o.detail}` :
+      action.push(`${cardName(o.id, o.card)}: ` +
+        // Н-9, PR В: по месту уже новая редакция карточки (core._refresh_unapplicable_cards) — шаг один: ответить
+        ((rep.refreshed_cards || []).includes(o.id) ? "слова места изменились, ответ не внесён — по этому месту новая карточка, ответьте на неё" :
+        o.outcome === "apply_conflict" && o.detail ? `не применён: ${o.detail}` :
         // К-В3: отказ замены — без общей причины «отмена не выполнена»: человек менял ответ, а не отменял
         o.outcome === "undo_conflict" && o.detail && answers[o.id] && kindOf(answers[o.id]) !== "revert" ? o.detail :
         o.why + (o.detail ? ` — ${o.detail}` : ""))));
@@ -459,7 +485,7 @@ audio{width:100%;height:36px}
       async answer(a) {
         const r = await fetch("api/answer", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(a)});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
-        answers = await this.load(); return j;
+        return reloadAfter(this, j);
       },
       async event(e) {
         const r = await fetch("api/event", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(e)});
@@ -476,7 +502,11 @@ audio{width:100%;height:36px}
       async apply() {
         const r = await fetch("api/apply", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({version: man.version})});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
-        answers = await this.load(); return j;
+        return reloadAfter(this, j);
+      },
+      async plan() {
+        const r = await fetch("api/plan", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({version: man.version})});
+        const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j;
       },
       async preview(it, text) {
         const r = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: it.id, rev: revOf(it), text, version: man.version})});
@@ -485,6 +515,12 @@ audio{width:100%;height:36px}
       subscribe() {}
     };
   }
+  // Н-А1: запись прошла, а перечитать список не удалось — это не отказ: результат с пометкой reloadFailed
+  async function reloadAfter(api, j) {
+    try { answers = await api.load(); } catch (e) { return {...j, reloadFailed: true}; }
+    return j;
+  }
+  const RELOAD_FAILED = "Сохранено, но список ответов не обновился — обновите страницу";
   async function cloudApi() {
     const db = await claude.use("db");
     const assets = await claude.use("assets");
@@ -495,8 +531,9 @@ audio{width:100%;height:36px}
       async load() { const s = await col.get(); live = pick(s.docs.map(d => d.data())); return merge(); },
       async answer(a) {
         const doc = {...a, source: "cloud", ts: new Date().toISOString().slice(0, 19)};
-        live[a.id] = doc; answers = merge(); render();
-        await col.doc(`${man.version}--${a.id}`).set(doc); return {};
+        // Н-А2: «сохранён в облаке» — только после записи; при отказе на карточке остаётся прежнее
+        await col.doc(`${man.version}--${a.id}`).set(doc);
+        live[a.id] = doc; answers = merge(); return {};
       },
       async voice(it, file) {
         const t = (file.type || "").toLowerCase();
@@ -510,11 +547,12 @@ audio{width:100%;height:36px}
         col.onSnapshot(s => {
           if (!s.metadata.fromCache) clearTimeout(timer);
           live = pick(s.docs.map(d => d.data())); answers = merge(); render();
-        }, () => clearTimeout(timer));
+        }, () => { clearTimeout(timer); note(SUBSCRIBE_FAILED, "warn"); });
       }
     };
   }
 
+  const SUBSCRIBE_FAILED = "Связь с базой потеряна — ответы могли не прийти. Обновите страницу.";
   function note(text, kind) { const n = $("mode-note"); n.textContent = text; n.dataset.kind = kind || ""; n.hidden = !text; }
 
   function optionPreview(decision) {
@@ -614,14 +652,19 @@ audio{width:100%;height:36px}
       const rejected = r.rejected && r.rejected.length;
       render();
       // К-17: свой текст остаётся в поле; вариант или кнопку нужно выбрать заново
-      if (rejected && r.rejected[0].why === STALE) flash(it.id, a.text ? STALE_TEXT : STALE_CHOICE_TEXT);
+      if (r.reloadFailed) flash(it.id, RELOAD_FAILED);
+      else if (rejected && r.rejected[0].why === STALE) flash(it.id, a.text ? STALE_TEXT : STALE_CHOICE_TEXT);
       else if (rejected) flash(it.id, "Не принято: " + r.rejected[0].why);
       else if (skip && typed) flash(it.id, SKIP_NOTE_TEXT);
       else if (acc && acc.note) flash(it.id, "Не записано: " + acc.note);
       else if (a.kind === "keep") flash(it.id, "Применённый ответ остаётся: подготовленная отмена или новый ответ сняты");
       else if (a.kind === "revert") flash(it.id, "Отмена подготовлена: нажмите «Применить сохранённые ответы»");
       else flash(it.id, acc && acc.answer ? "Сохранено (ещё не применено): " + acc.answer : "Ответ записан");
-    } catch (e) { stateEl.textContent = "Не сохранилось: " + e.message; }
+    } catch (e) {
+      // Н-А2: карточку могли перерисовать — сообщение в её нынешний элемент состояния, а не в снятый с экрана
+      const why = "Не сохранилось: " + e.message;
+      if (stateEl.isConnected) stateEl.textContent = why; else flash(it.id, why);
+    }
   }
   const STALE_TEXT = "Не принято: вопрос обновлён — карточка показана заново, ваш текст остался в поле";
   const STALE_CHOICE_TEXT = "Не принято: вопрос обновлён — карточка показана заново, выберите ответ ещё раз";
@@ -826,6 +869,10 @@ audio{width:100%;height:36px}
     mk("Оставить человеку", () => send(it, {kind: "human"}, state), a && a.kind === "human").title =
       "Место останется вам; это ничего не подтверждает: слова и говорящий не отмечаются как проверенные";
     if (editing.has(it.id)) mk("Не менять", () => { editing.delete(it.id); render(); });
+    // Н-9, PR В: сохранённый, ещё не применённый ответ — та же кнопка, что в списке перед «Применить»: поле с прежним
+    // ответом; другой вариант можно и просто выбрать выше
+    else if (a && stateOf(it, a) === "saved" && kindOf(a) !== "skip") mk("Изменить ответ", () => goToCard(it.id, true)).title =
+      "Поправьте ответ в поле ниже или выберите другой вариант: до «Применить» стенограмма не меняется";
     if (revertInEdit(it, a)) {        // К-В3: отмена ответа — внутри «Изменить ответ»
       const rv = revertButton(it, a);
       mk(rv.label, () => send(it, {kind: rv.kind}, state)).title = rv.title;
@@ -861,12 +908,15 @@ audio{width:100%;height:36px}
     c.append(row);
 
     const free = document.createElement("form"); free.className = "free";
-    const inp = document.createElement("input"); inp.id = `free-${it.id}`; inp.placeholder = it.answer_mode === "speaker"
-      ? "Кто говорит: имя (как в записи) или «Имя: точные слова»; пояснения — не сюда"
+    // Н-9: на карточке пропуска — пример с пробелом между фразами и запрет на слова соседних карточек
+    const gap = (it.reasons || []).includes("missed");
+    const inp = document.createElement("input"); inp.id = `free-${it.id}`; inp.placeholder = gap ? GAP_PLACEHOLDER
+      : it.answer_mode === "speaker" ? "Кто говорит: имя (как в записи) или «Имя: точные слова»; пояснения — не сюда"
       : "Свой ответ: имя, «не Анна, а Вера» или «Имя: точные слова»";
     const ok = document.createElement("button"); ok.className = "btn"; ok.type = "submit"; ok.textContent = "Записать";
     if (a && kindOf(a) === "free" && editing.has(it.id)) inp.value = a.text || "";   // «Изменить ответ» — с прежним текстом
     free.append(inp, ok);
+    if (gap) { const h = document.createElement("div"); h.className = "sub gap-hint"; h.textContent = GAP_HINT; free.append(h); }
     if (LOCAL && api.preview) {
       const preview = document.createElement("button"); preview.type = "button"; preview.className = "btn"; preview.textContent = "Предпросмотр";
       preview.onclick = async () => { if (!inp.value.trim()) return; state.textContent = "Проверяю без записи…";
@@ -908,6 +958,83 @@ audio{width:100%;height:36px}
       }
     });
     if (active && $(active)) $(active).focus();
+    schedulePlan();
+  }
+
+  // Н-9, PR В (эскиз 7, слово владельца 28.11): что сделает «Применить» — по сохранённым ответам, без записи.
+  let planSig = null, planTimer = null;
+  function schedulePlan() {
+    if (!LOCAL || !api || !api.plan) return;
+    const sig = JSON.stringify(man.version) + JSON.stringify(man.pack_rev || 0) +
+      JSON.stringify(Object.entries(answers).map(([id, a]) => [id, a && a.ts, stateOf({id}, a)]));
+    if (sig === planSig) return;
+    planSig = sig; clearTimeout(planTimer); planTimer = setTimeout(showPlan, 300);
+  }
+  const placeReasons = (it) => (it.reasons || []).map(k => REASONS[k]).filter(Boolean).join(", ");
+  function goToCard(id, edit) {
+    if (edit) editing.add(id);
+    if (!showAll) { showAll = true; $("f-all").setAttribute("aria-pressed", "true"); $("f-open").setAttribute("aria-pressed", "false"); }
+    render();
+    const el = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+    if (!el) return;
+    el.scrollIntoView({behavior: "smooth", block: "center"});
+    if (edit) { const f = el.querySelector(".free input"); if (f) f.focus({preventScroll: true}); }
+  }
+  // плашка: «Говорящий: было → станет»; пропуск места — «пауза → …»; «останется как было» — только место
+  function planResult(it, a, row) {
+    const who = it.speaker ? it.speaker + ": " : "", was = (it.text || "").trim();
+    if (row.group === "keep") return who + (was ? `«${was}»` : "пауза");
+    if (row.was_now) { const [b, n] = row.was_now.split(" → "); return (b.trim() ? who + b.trim() : "пауза") + " → " + (n || "").trim(); }
+    const opt = a && a.option != null ? ((it.options || [])[a.option] || {}) : null;
+    const now = opt ? ((opt.decision || {}).text || opt.label || optionPreview(opt.decision)) : (a && a.text) || "ответ";
+    return (was ? who + was : "пауза") + " → " + now;
+  }
+  const PLAN_KEEP = {skip: "вы пропустили — карточка вернётся в «без ответа»", kept: "вы оставили прежнее"};
+  function planRow(row) {
+    const it = man.items.find(x => x.id === row.id); if (!it) return null;
+    const a = answers[row.id], el = document.createElement("div"); el.className = "row";
+    const tc = document.createElement("span"); tc.className = "tc"; tc.textContent = it.t || "";
+    const pid = document.createElement("span"); pid.className = "pid"; pid.textContent = it.id; tc.append(pid);
+    const what = document.createElement("span");
+    const res = document.createElement("button"); res.type = "button"; res.className = "res";
+    res.title = "Перейти к карточке"; res.textContent = planResult(it, a, row); res.onclick = () => goToCard(it.id, false);
+    const why = document.createElement("span"); why.className = "why";
+    why.textContent = row.group === "keep" ? PLAN_KEEP[row.kind] || "" : placeReasons(it);
+    what.append(res, why);
+    const acts = document.createElement("span");
+    if (row.group !== "refresh" && row.kind !== "skip") {
+      const eb = document.createElement("button"); eb.type = "button"; eb.className = "btn"; eb.textContent = "Изменить ответ";
+      eb.onclick = () => goToCard(it.id, true); acts.append(eb);
+    }
+    el.append(tc, what, acts);
+    const line = (cls, text) => { const x = document.createElement("span"); x.className = cls; x.textContent = text; el.append(x); return x; };
+    if (row.context) {
+      const c = line("ctx", "в тексте будет: …" + (row.context.before ? row.context.before + " " : ""));
+      const m = document.createElement("mark"); m.textContent = row.context.center || "∅"; c.append(m, (row.context.after ? " " + row.context.after : "") + "…");
+    }
+    (row.warnings || []).forEach(w => line("warn", "⚠ " + w));
+    if (row.group === "refresh") line("warn", `Слова места изменились (${row.why}). После «Применить» по этому месту появится новая карточка с тем же номером — ответьте на неё заново.`);
+    if (row.partners) line("warn", `Ответы ${[row.id, ...row.partners].join(" и ")} правят одни и те же слова — не впишется ни один. Измените один из ответов.`);
+    else if (row.group === "blocked" && row.why) line("warn", `Не впишется: ${row.why}.`);
+    return el;
+  }
+  async function showPlan() {
+    const box = $("plan-list");
+    let plan;
+    try { plan = await api.plan(); } catch (e) { box.hidden = true; return; }
+    const rows = plan.rows || [];
+    if (!rows.length) { box.hidden = true; box.replaceChildren(); return; }
+    const by = (g) => rows.filter(r => g.includes(r.group));
+    const groups = [["Изменится", by(["change"])], ["Останется как было", by(["keep"])], ["Не впишется", by(["refresh", "blocked"])]];
+    const h = document.createElement("h2");
+    h.textContent = groups.filter(([, rs]) => rs.length).map(([t, rs]) => `${t.toLowerCase()}: ${rs.length}`).join(" · ");
+    const out = [h];
+    for (const [title, rs] of groups) {
+      if (!rs.length) continue;
+      out.push(Object.assign(document.createElement("div"), {className: "grp", textContent: title}));
+      rs.forEach(r => { const el = planRow(r); if (el) out.push(el); });
+    }
+    box.replaceChildren(...out); box.hidden = false;
   }
 
   function header() {
@@ -930,7 +1057,8 @@ audio{width:100%;height:36px}
     const box = $("apply-report"); box.hidden = false; box.textContent = "Применяю…"; $("apply").disabled = true;
     try { const rep = await api.apply(); const lines = reportLines(rep, man.items);
       box.style.whiteSpace = "pre-line";
-      box.textContent = lines.length ? lines.join("\n") : "Применять нечего: новых ответов нет. Карточки, где нужно ваше действие, — в списке «без ответа»."; showAll = true; render(); }
+      box.textContent = (lines.length ? lines.join("\n") : "Применять нечего: новых ответов нет. Карточки, где нужно ваше действие, — в списке «без ответа».") +
+        (rep.reloadFailed ? "\nПрименено, но список ответов не обновился — обновите страницу." : ""); showAll = true; render(); }
     catch (e) { box.textContent = "Не удалось применить: " + e.message; }
     finally { $("apply").disabled = false; }
   };

@@ -298,9 +298,20 @@ def classify(text, names):
     return {"kind": "unmatched"}      # все названные имена отрицаются — выбрать говорящего должен человек
 
 
+# Н-9 (слово владельца 28.11: «Да, делить»): знак препинания между словами без пробела — конец слова.
+# «Вот.Ну» → «Вот.» «Ну», «Ну,да» → «Ну,» «да». Слева нужны две буквы: «т.е.», «т.д.», «3.5» не делятся.
+GLUED = re.compile(r"(?<=[^\W\d_]{2})([.,!?;:]+)(?=[^\W\d_])")
+
+
+def unglue(text):
+    """Пробел после знака препинания, приклеенного к следующему слову (см. GLUED)."""
+    return GLUED.sub(lambda m: m.group(1) + " ", text or "")
+
+
 def split_replies(text, names):
-    """-> [(говорящий | None, [слова])]. Метка — «Имя:» или имя в начале фразы перед словом с заглавной."""
-    toks = (text or "").replace("…", "... ").split()
+    """-> [(говорящий | None, [слова])]. Метка — «Имя:» или имя в начале фразы перед словом с заглавной.
+    Слова, склеенные знаком препинания без пробела, делятся (unglue)."""
+    toks = unglue(text).replace("…", "... ").split()
     out, cur, spk = [], [], None
     i = 0
     while i < len(toks):
@@ -492,6 +503,23 @@ def _pause_answer(item, rep, flat, words, inside):
             eds.append({"op": "insert", "s": s, "e": round(s + step * 0.9, 3), "text": x, "speaker": spk,
                         "card": item["id"], "in_place": True})
         rep["applied"] = [f"«{x}» — уже в стенограмме рядом с паузой, не вставлено" for _, x in known]
+        # Н-9 (слово владельца 28.11: «вписать с предупреждением»): слово ответа на краю совпало с соседним
+        # словом другого говорящего — вписываем, но человек видит, что слово окажется в стенограмме дважды.
+        warn = []
+        for edge, w in (("первое", before[-1] if before and k == 0 else None),
+                        ("последнее", after[0] if after and m == 0 else None)):
+            tok = middle[0] if edge == "первое" else middle[-1]
+            if w is None or not norm(tok[1]) or norm(tok[1]) != norm(w["w"]) or tok[0] == w["_spk"]:
+                continue
+            if abs(cents(w["s"]) - cents(t_a if edge == "первое" else t_b)) > limit:
+                continue
+            fields = dict(edge=edge, word=tok[1], speaker=w["_spk"] or "без подписи",
+                          sec=f"{float(w['s']):.2f}".replace(".", ","),
+                          card=f", карточка {w['_card']}" if w.get("_card") and w["_card"] != item["id"] else "")
+            warn.append((PAUSE_NEIGHBOR_DUP.format(**fields), PAUSE_NEIGHBOR_DUP_DONE.format(**fields)))
+        if warn:
+            rep["warnings"] = [x for x, _ in warn]            # предпросмотр: что произойдёт
+            rep["warnings_done"] = [x for _, x in warn]       # отчёт «Применить»: что произошло
         rep["inserted"] = [f"{spk}: {' '.join(x for s2, x in grp)}"
                            for spk, grp in itertools.groupby(middle, key=lambda t: t[0])]
         return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
@@ -504,6 +532,13 @@ def _pause_answer(item, rep, flat, words, inside):
     rep["human"] = (f"в паузе уже есть слова («{here}»), ответ с ними не совпадает; исправьте их правкой "
                     "отрезка или ответом на карточку этих слов")
     return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
+
+
+PAUSE_NEIGHBOR_DUP_DONE = ("{edge} слово ответа «{word}» совпадало с соседним словом стенограммы ({speaker}, "
+                           "{sec} с{card}) и вписано второй раз; если это то же слово — уберите лишнее: скажите Claude "
+                           "«исправь место этой карточки»")
+PAUSE_NEIGHBOR_DUP = ("{edge} слово ответа «{word}» совпадает с соседним словом стенограммы ({speaker}, {sec} с{card}): "
+                      "оно будет вписано второй раз; если это то же слово — уберите его из ответа")
 
 
 # Подсказки на короткий ответ (В8): место остаётся открытым, стенограмма не меняется.
@@ -844,10 +879,13 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
 def plan(manifest, answers, data, vocab_words=()):
     """manifest — пакет; answers — {id: ответ} со свободным текстом (kind free/text) или «только имя».
     data — стенограмма. -> (правки слов, отчёт по карточкам, закрытые места {id: через}, конфликты)."""
+    # Н-9, П1: у слова — открытое место, в которое оно входит (предупреждение о дубле называет его карточку)
+    card_of = {wid: r["id"] for r in data.get("review") or [] if T.place_open(r)
+               for wid in r.get("word_ids") or []}
     words = []
     for seg in data["segments"]:
         for w in seg.get("words") or []:
-            words.append({**w, "_spk": seg["speaker"]})
+            words.append({**w, "_spk": seg["speaker"], "_card": card_of.get(w.get("word_id"))})
     words.sort(key=lambda w: w["s"])
     names = [n for n in (data.get("speakers") or []) if n] or sorted({w["_spk"] for w in words})
     corpus = frozenset(norm(w["w"]) for w in words) | frozenset(

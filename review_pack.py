@@ -380,7 +380,8 @@ def _contradiction_options(T, data, it):
     opts = [{"label": f"Оставить подтверждённое: «{confirmed.get('text', '')}» ({_who(T, confirmed)})",
              "decision": {"contradiction": "keep"}}]
     for p in proposals[-(2 if raw_needed else 3):]:
-        opts.append({"label": f"Принять новое: «{p['text']}» ({_who(T, p)})",
+        opts.append({"label": f"Принять новое: «{p['text']}» ({_who(T, p)}" +
+                          (f"; причина: {p['note']}" if p.get("note") else "") + ")",
                      "decision": {"text": p["text"], "contradiction": "accept", "proposal": p["key"],
                                   **({"speaker": p["speaker"]} if p.get("speaker") else {})}})
     if raw_needed:
@@ -2013,7 +2014,9 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
             "cards": [{"id": r["id"], "answer": r["answer"], "kind": r["kind"],
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
-                       "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"]} for r in reports],
+                       "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"],
+                       **({"warnings": r["warnings"], "warnings_done": r.get("warnings_done") or r["warnings"]}
+                          if r.get("warnings") else {})} for r in reports],
             "closed_via": closed, "conflicts": conflicts, "left_to_human": human, "hints": sorted(hint_ids),
             "successful_ids": [r["id"] for r in reports if (r["id"] in rep["cards"] or r["id"] in confirmed)
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids

@@ -1341,11 +1341,11 @@ def _edit_span_locked(json_path, md_path, t1, t2, text, speaker=None, note=None,
         _ensure_ids(data)
         rid, new = propose_contradiction(data, [w for w, _ in pairs], {
             "text": (text or "").strip(), "speaker": speaker, "by": by, "via": "edit_span",
-            "speaker_now": pairs[0][1]}, confirmed)
+            "speaker_now": pairs[0][1], **({"note": note.strip()} if (note or "").strip() else {})}, confirmed)
         if new:
             save(data, json_path, md_path)
         return data, {"written": False, "contradiction": rid, "new": new,
-                      "text": CONTRADICTION_NOT_WRITTEN.format(rid=rid)}
+                      "text": CONTRADICTION_NOT_WRITTEN.format(rid=rid, by_card=_decided_by(confirmed))}
     e = {"op": "place_text", "t1": t1, "t2": t2, "text": (text or "").strip(), "card": card}
     if speaker:
         e["speaker"] = speaker
@@ -1540,9 +1540,23 @@ def overwrite_refusal(word, data, writer, card):
 
 
 CONTRADICTION = "contradiction"
-CONTRADICTION_NOT_WRITTEN = ("не записано: противоречие, карточка {rid} — слова не изменены; "
-                             "выберите вариант на карточке этого места")
+CONTRADICTION_NOT_WRITTEN = ("не записано: противоречие, карточка {rid} — слова не изменены: эти слова решил человек"
+                             "{by_card}")
+# что дальше — по тому, встала ли карточка в открытый пакет (core.edit_span_files)
+CONTRADICTION_NEXT = {
+    "sent": "; ваше предложение отправлено ему карточкой {rid}. Ждите его выбора на этой карточке и не повторяйте правку",
+    "pending": "; предложение записано на место {rid}, но открытого пакета карточек нет: человек увидит его, когда "
+               "соберёте карточки (build_review_pack). Правку не повторяйте",
+    "not_replaced": "; карточку {rid} поставить не удалось: повторите ту же правку — она поставит карточку"}
 CONTRADICTION_VIA_RU = {"edit_span": "правкой отрезка", "apply_review": "решением агента", "card": "карточкой"}
+
+
+def _decided_by(confirmed):
+    """Чем человек решил слова — для сообщения агенту: « (карточка rN)», « (правка отрезка с N,NN с)» или пусто."""
+    card = str((confirmed or {}).get("card") or "")
+    if card.startswith("span@"):
+        return f" (своей правкой отрезка с {card[5:].replace('.', ',')} с)"
+    return f" (карточка {card})" if card else ""
 
 
 def contradiction_pending(item):
@@ -1597,7 +1611,8 @@ def propose_contradiction(data, words, proposal, confirmed=None):
         places.append(item)
         places.sort(key=lambda i: i.get("t", 0))
     record = item.setdefault(CONTRADICTION, {"words": ids, "proposals": [], "history": []})
-    key = hashlib.sha1(json.dumps([sorted(ids), proposal.get("text"), proposal.get("speaker"), proposal.get("by")],
+    key = hashlib.sha1(json.dumps([sorted(ids), proposal.get("text"), proposal.get("speaker"), proposal.get("by")]
+                                  + ([proposal["note"]] if proposal.get("note") else []),
                                   ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
     if any(p.get("key") == key for p in record["proposals"]):
         return item["id"], False
@@ -1606,6 +1621,7 @@ def propose_contradiction(data, words, proposal, confirmed=None):
         record["confirmed"] = {"text": current, "by": "human", "at": now, **(confirmed or {})}
     record["proposals"].append({"text": proposal.get("text", ""), "by": proposal.get("by"),
                                 "via": proposal.get("via"), "at": now, "key": key,
+                                **({"note": proposal["note"]} if proposal.get("note") else {}),
                                 **({"speaker": proposal["speaker"]} if proposal.get("speaker") else {})})
     if CONTRADICTION not in (item.get("reasons") or []):
         item["reasons"] = list(item.get("reasons") or []) + [CONTRADICTION]

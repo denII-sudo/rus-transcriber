@@ -1286,6 +1286,43 @@ def _replace_open_cards(jp, report):
     return report
 
 
+REFRESH_OUTCOMES = ("apply_conflict", "not_found", "source_conflict")
+
+
+def refresh_unapplicable_cards(jp, report):
+    """Н-9, PR В (слово владельца 28.11: «появится новая по тому же месту», «Номер тот же»): ответ не вписался,
+    потому что слова места изменились или место не нашлось (`review_pack.APPEND_REFRESH`), — карточка того же
+    места сразу получает новую редакцию с нынешними словами, как при дособирании пакета (В-6), без агента.
+    Ответы, не вписанные из-за ответа другой карточки на те же слова (blocked_preflight), не трогаются: слова
+    места не менялись, решает человек; not_applied и listen_mismatch — тоже (слова те же, ответ человека остаётся).
+    Вопрос по нынешним словам тот же (место решил сам человек своей правкой) — карточка и ответ не меняются.
+    Зовёт страница после «Применить» (review_page, api/apply): агент, применяя ответы, дособирает карточки сам.
+    Только хранение в базе; сбой — в отчёте, применённое не отменяется. -> report."""
+    import review_pack
+    outcomes = report.get("outcomes") or []
+    ids = [row["id"] for row in outcomes if row.get("outcome") in REFRESH_OUTCOMES]
+    if not ids:
+        return report
+    try:
+        items = {it.get("id"): it for it in (review_pack.manifest(jp) or {}).get("items") or []}
+        cards = [{**{k: items[aid].get(k) for k in ("question", "options", "recommended", "answer_mode", "note")
+                     if items[aid].get(k) is not None}, "id": aid} for aid in ids if aid in items]
+        rep = review_pack.append_cards(jp, cards, actor="system")
+    except RuntimeError as ex:
+        if str(ex) == review_pack.APPEND_FILES_REFUSAL:
+            return report                                 # файловый режим: как прежде, дособирает агент
+        report["cards_not_replaced"] = (report.get("cards_not_replaced") or []) + \
+            [{"id": aid, "why": str(ex)} for aid in ids]
+        return report
+    except _card_errors() as ex:
+        report["cards_not_replaced"] = (report.get("cards_not_replaced") or []) + \
+            [{"id": aid, "why": str(ex)} for aid in ids]
+        return report
+    if rep:
+        report["refreshed_cards"] = [row["id"] for row in rep.get("replaced") or []]
+    return report
+
+
 def _apply_answers_files_once(jp, md):
     import conspect
     import recordings
@@ -1787,6 +1824,8 @@ def edit_span_files(jp, md, t1, t2, text, speaker=None, note=None, by=None):
         except _card_errors() as ex:
             rep["card"] = "not_replaced"
             rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)}]
+        state = rep["card"] if rep["card"] in ("pending", "not_replaced") else "sent"
+        rep["text"] = rep.get("text", "") + transcript.CONTRADICTION_NEXT[state].format(rid=rid)
     return rep
 
 
