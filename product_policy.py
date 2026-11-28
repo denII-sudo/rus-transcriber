@@ -10,12 +10,90 @@ DEFAULTS = {
     "participation": "simple",
     "goal": "",
 }
+# Подсказки «кто на записи» из формы до расшифровки. Только для разбора на говорящих; в задание модели и в
+# облако не попадают (model_tasks берёт из политики лишь goal). Ключ хранится только когда подсказки есть:
+# запросы без них совместимы с кодом до этого PR в обе стороны.
+OPTIONAL_KEYS = frozenset(("speaker_hints",))
+
+HINT_KEYS = frozenset(("count_mode", "count", "participants", "stray_voices", "group", "enroll_profile"))
+_COUNT_MODES = ("unknown", "exact", "approx")
+
+
+def normalize_speaker_hints(hints):
+    """Проверить подсказки формы; None — подсказок нет (прежнее поведение)."""
+    if hints is None:
+        return None
+    if not isinstance(hints, dict) or set(hints) - HINT_KEYS:
+        raise ValueError("speaker_hints: неизвестные поля")
+    mode = hints.get("count_mode", "unknown")
+    if mode not in _COUNT_MODES:
+        raise ValueError("speaker_hints.count_mode: unknown, exact или approx")
+    count = hints.get("count", 0)
+    if mode == "unknown":
+        count = 0
+    elif isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 30:
+        raise ValueError("speaker_hints.count: целое число от 1 до 30")
+    participants = hints.get("participants", [])
+    if not isinstance(participants, list) or len(participants) > 30:
+        raise ValueError("speaker_hints.participants: список не длиннее 30")
+    clean, seen = [], set()
+    for item in participants:
+        if not isinstance(item, dict) or set(item) - {"name", "forms"}:
+            raise ValueError("speaker_hints.participants: ожидаются name и forms")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80 or "," in name or ";" in name:
+            raise ValueError("speaker_hints.participants: имя — текст до 80 знаков без запятых")
+        name = name.strip()
+        if name.casefold() in seen:
+            raise ValueError("speaker_hints.participants: имя повторяется")
+        seen.add(name.casefold())
+        forms = item.get("forms", [])
+        if not isinstance(forms, list) or len(forms) > 10 or any(
+                not isinstance(f, str) or not f.strip() or len(f.strip()) > 80 for f in forms):
+            raise ValueError("speaker_hints.participants: формы обращения — до 10 строк до 80 знаков")
+        clean.append({"name": name, "forms": [f.strip() for f in forms]})
+    stray = hints.get("stray_voices", False)
+    enroll = hints.get("enroll_profile", True)
+    if not isinstance(stray, bool) or not isinstance(enroll, bool):
+        raise ValueError("speaker_hints: stray_voices и enroll_profile — логические значения")
+    group = hints.get("group", "")
+    if not isinstance(group, str) or len(group) > 80:
+        raise ValueError("speaker_hints.group: текст до 80 знаков")
+    return {"count_mode": mode, "count": count, "participants": clean,
+            "stray_voices": stray, "group": group.strip(), "enroll_profile": enroll}
+
+
+def hints_from_text(count=0, approx=False, participants="", group="", stray_voices=False, enroll_profile=True):
+    """Подсказки из простых параметров (командная строка, MCP). Ничего не задано — None (прежний запуск).
+    participants: «Анна=Аня/Анне, Борис» — имя в стенограмме, после «=» через «/» формы обращения."""
+    if not (count or participants.strip() or group.strip() or stray_voices or not enroll_profile):
+        return None
+    people = []
+    for chunk in participants.replace(";", ",").split(","):
+        if not chunk.strip():
+            continue
+        name, _, forms = chunk.partition("=")
+        people.append({"name": name.strip(), "forms": [f.strip() for f in forms.split("/") if f.strip()]})
+    mode = ("approx" if approx else "exact") if count else "unknown"
+    return normalize_speaker_hints({"count_mode": mode, "count": count, "participants": people,
+                                    "stray_voices": stray_voices, "group": group,
+                                    "enroll_profile": enroll_profile})
+
+
+def diarization_bounds(hints):
+    """(num_speakers, min_speakers, max_speakers) из подсказок: точно N; примерно N → N-1…N+1; запас голосов +1/+3."""
+    if not hints or hints["count_mode"] == "unknown":
+        return 0, 0, 0
+    n = hints["count"]
+    if hints["count_mode"] == "exact":
+        return n, 0, 0
+    return 0, max(1, n - 1), n + 1
 
 
 def resolve(overrides=None):
     """Проверить и сохранить явную политику без угадывания её по роли человека."""
     overrides = {} if overrides is None else overrides
-    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS):
+    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS) - OPTIONAL_KEYS:
         raise ValueError("неизвестные требования к результату")
     result = {**DEFAULTS, **overrides}
     for key in ("require_conspect", "allow_cloud_model", "require_named_speakers", "require_human_verification"):
@@ -28,6 +106,9 @@ def resolve(overrides=None):
         raise ValueError("неизвестный режим участия")
     if not isinstance(result["goal"], str) or len(result["goal"]) > 2000:
         raise ValueError("цель должна быть текстом длиной не более 2000 символов")
+    hints = normalize_speaker_hints(result.pop("speaker_hints", None))
+    if hints is not None:
+        result["speaker_hints"] = hints
     return result
 
 

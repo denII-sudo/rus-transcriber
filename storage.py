@@ -16,7 +16,7 @@ SCHEMA_VERSION = 4
 TRANSCRIPT_FIELDS = frozenset(("file", "duration", "speakers", "speaker_names",
                                "names_source", "names_confirmed", "segments",
                                "quality", "edits", "vocab_suggestions", "title", "recorded_at", "recorded_timezone",
-                               "container", "codec", "audio_sha256", "audio_available"))
+                               "container", "codec", "audio_sha256", "audio_available", "speaker_naming"))
 REVIEW_FIELDS = frozenset(("review", "review_done", "questions", "answers",
                            "conflicts", "rejected", "applications", "undo",
                            "interaction_events", "interaction_events_evicted", "question_version"))
@@ -102,6 +102,65 @@ def check_local_path(path):
     return path
 
 
+_FILE_SHARE_DELETE = 0x4
+_HELD_ERRORS = (32, 33)          # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+class FileHold:
+    """Windows: файл открыт этим процессом только на чтение, а другим разрешено лишь переименование (БД-1).
+
+    Пока удержание действует, никто (в том числе SQLite в этом процессе) не откроет файл ни на чтение, ни на запись,
+    а переименовать его можно: так базу держат от проверки занятости до публикации восстановленной. Содержимое файла
+    не меняется. Вне Windows так проверить и удержать файл нельзя: отказ OSError."""
+
+    def __init__(self, path):
+        if os.name != "nt":
+            raise OSError("exclusive file hold is supported only on Windows")
+        import ctypes
+        from ctypes import wintypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateFileW.restype = wintypes.HANDLE
+        self._kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                               wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        self._kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        # GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+        handle = self._kernel32.CreateFileW(str(path), 0x80000000, _FILE_SHARE_DELETE, None, 3, 0x80, None)
+        if handle is None or handle == wintypes.HANDLE(-1).value:
+            error = ctypes.get_last_error()
+            if error in _HELD_ERRORS:
+                raise Busy("file is open in another program")
+            raise ctypes.WinError(error)
+        self._handle = handle
+
+    def close(self):
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def file_held_elsewhere(path):
+    """Windows: открыт ли файл сейчас другой программой (или этим процессом). Файл не меняется: удержание `FileHold`
+    берётся и сразу снимается. Иная ошибка открытия — не «занят»: её покажет следующий шаг вызывающего. Вне Windows —
+    отказ OSError (так не проверить)."""
+    try:
+        FileHold(path).close()
+    except Busy:
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        if os.name != "nt":
+            raise
+        return False
+    return False
+
+
 def _uuid(value):
     if not isinstance(value, str):
         raise ValueError("expected UUID string")
@@ -170,11 +229,39 @@ def _context(ctx):
         _uuid(ctx["origin_installation_id"])
 
 
+NAMING_SOURCES = frozenset(("form", "voice", "transcript", "model", "agent", "human"))
+
+
+def validate_speaker_naming(naming):
+    """Поле `speaker_naming`: исходная метка -> {name, source, confirmed, revision[, unknown]}."""
+    if not isinstance(naming, dict):
+        raise ValueError("speaker_naming must be an object")
+    for label, item in naming.items():
+        if not isinstance(label, str) or not label or not isinstance(item, dict):
+            raise ValueError("invalid speaker_naming entry")
+        if not set(item) <= {"name", "source", "confirmed", "revision", "unknown"}:
+            raise ValueError("unknown speaker_naming fields")
+        if not isinstance(item.get("name"), str) or not item["name"]:
+            raise ValueError("speaker_naming name must be text")
+        if item.get("source") not in NAMING_SOURCES:
+            raise ValueError("invalid speaker_naming source")
+        if not isinstance(item.get("confirmed"), bool):
+            raise ValueError("speaker_naming confirmed must be boolean")
+        if "unknown" in item and not isinstance(item["unknown"], bool):
+            raise ValueError("speaker_naming unknown must be boolean")
+        rev = item.get("revision")
+        if rev is not None and (isinstance(rev, bool) or not isinstance(rev, int) or rev < 0):
+            raise ValueError("invalid speaker_naming revision")
+    return naming
+
+
 def _snapshot(value, fields):
     if not isinstance(value, dict) or not set(value) <= fields:
         raise ValueError("unknown snapshot fields")
     _json(value)
     if fields is TRANSCRIPT_FIELDS:
+        if "speaker_naming" in value:
+            validate_speaker_naming(value["speaker_naming"])
         segments = value.get("segments", [])
         if not isinstance(segments, list):
             raise ValueError("segments must be a list")

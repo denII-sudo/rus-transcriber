@@ -14,6 +14,7 @@ worker берёт его из базы сам, как программа в мо
 """
 import argparse
 import json
+import math
 import re
 import os
 import shutil
@@ -337,6 +338,26 @@ class DiarHook:
             out[name] = round(self.last_seen[name] - prev, 1)
             prev = self.last_seen[name]
         return out
+
+
+def diarization_bounds(a, allowed, names):
+    """(max, min) числа голосов для pyannote. Точное --speakers главнее всего; явные --min/--max-speakers
+    (форма на экране: «примерно N» → N-1…N+1) главнее выводимых из имён; запас на посторонних: +1, при
+    --stray-voices +3. Без новых флагов — прежние границы."""
+    if a.speakers:
+        return 0, 0
+    reserve = 3 if getattr(a, "stray_voices", False) else 1
+    max_spk = len(allowed) + reserve if allowed else 0
+    min_spk = len(names) if names else 0
+    explicit_max = getattr(a, "max_speakers", 0) or 0
+    explicit_min = getattr(a, "min_speakers", 0) or 0
+    if explicit_max:
+        max_spk = explicit_max
+    if explicit_min:
+        min_spk = explicit_min
+    if max_spk and min_spk > max_spk:
+        min_spk = max_spk
+    return max_spk, min_spk
 
 
 def diarize(audio, num_speakers, token, cfg, status, max_speakers=0, min_speakers=0):
@@ -682,7 +703,10 @@ def _load_whisper(backend, device, quant, third, cfg, make_asr):
 
 
 def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cfg, st, make_asr, prog):
-    """Повтор ошибочных фрагментов на onnx-cpu; сведения о попытках дописываются к фрагменту."""
+    """Повтор ошибочных фрагментов на onnx-cpu; сведения о попытках дописываются к фрагменту.
+    Фрагмент заменяется целиком (текст, состояние, попытки) только после того, как его результат
+    разобран без ошибок; при сбое ошибка дописывается лишь ещё не заменённым фрагментам."""
+    replaced = set()
     try:
         st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
         cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",
@@ -696,15 +720,19 @@ def _retry_whisper_on_cpu(failed_indices, texts, whisper_diag, pieces, third, cf
             raise ValueError("неверное количество результатов CPU")
         for pos, i in enumerate(failed_indices):
             rec, replacement = whisper_diag[i], cpu_diag[pos]
-            for attempt in replacement["attempts"]:
-                attempt["backend"] = "onnx-cpu:CPU"
-                attempt["batch"] = [failed_indices[j] for j in attempt["batch"]]
-            rec["attempts"].extend(replacement["attempts"])
-            rec["state"] = replacement["state"]
-            texts[i] = cpu_texts[pos]
+            attempts = [{**attempt, "backend": "onnx-cpu:CPU",
+                         "batch": [failed_indices[j] for j in attempt["batch"]]}
+                        for attempt in replacement["attempts"]]
+            state, text = replacement["state"], cpu_texts[pos]
+            rec["attempts"].extend(attempts)
+            rec["state"] = state
+            texts[i] = text
+            replaced.add(i)
         del cpu
     except Exception as ex:
         for i in failed_indices:
+            if i in replaced:
+                continue
             whisper_diag[i]["attempts"].append(
                 {"result": "error", "backend": "onnx-cpu:CPU",
                  "error_type": type(ex).__name__, "fallback": True})
@@ -996,6 +1024,12 @@ def _asr_problem_items(evidence, segments, note):
     return items
 
 
+def _overlap_status(quality, limit=10):
+    """Поле overlap_unmeasured_skipped для сводки статуса задачи: доля, секунды, первые limit отрезков и число
+    остальных (spans_more) — длинная запись с эхом не раздувает статус."""
+    return transcript.overlap_skipped_summary(quality.get("overlap_unmeasured_skipped"), limit)
+
+
 def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality, speech_sec=None):
     """Метки сомнения и места для разбора -> (места, порог сомнения голоса, наложения голосов).
     speech_sec — секунды речи записи (сумма отрезков разметки pyannote без пауз): знаменатель доли речи под
@@ -1006,12 +1040,19 @@ def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, 
     trust = share <= W.OVERLAP_UNMEASURED_MAX_SHARE
     thr = W.doubt_flags(words, overlaps, unmeasured_overlap=trust)
     if not trust:
+        hit = [(a, b) for a, b in overlaps
+               if any(w.get("margin_unmeasured") and a <= w["s"] + 0.1 < b for w in words)]
         skipped = sum(1 for w in words if w.get("margin_unmeasured")
-                      and any(a <= w["s"] + 0.1 < b for a, b in overlaps))
+                      and any(a <= w["s"] + 0.1 < b for a, b in hit))
         if skipped:
-            quality["overlap_unmeasured_skipped"] = {"share": round(share, 4), "sec": round(ov_sec, 1)}
-            W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо или гул): {skipped} слов без "
-                 "измеренного отрыва голосов не помечены как наложение")
+            # доля — вверх до 4 знаков (Н28-6: 0,30004 не превращается в «30 %»), не больше 1; отрезки — наружу
+            # до сотых: по ним workflow.quote_blockers снимает кавычки у цитат свёртки (Н28-1)
+            quality["overlap_unmeasured_skipped"] = {
+                "share": min(1.0, math.ceil(share * 10000) / 10000), "sec": round(ov_sec, 1),
+                "spans": [[math.floor(a * 100) / 100, math.ceil(b * 100) / 100] for a, b in hit]}
+            W._log(f"наложения pyannote — {share:.0%} речи (эхо, гул или разговор вперебивку): "
+                   f"{skipped} слов без измеренного отрыва голосов в {len(hit)} отрезках не помечены как "
+                   "наложение")
     for seg in segments:
         for wd in seg["words"]:
             src_w = wd.pop("_flags_src")
@@ -1401,6 +1442,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             "_timing": timing}
     if names:
         data.update(speaker_names=names, names_source="voices", names_confirmed=False)
+        if getattr(a, "screen_hints", False):
+            # экранный путь (форма до расшифровки): источник каждого имени — голос; подтверждает только человек
+            data["speaker_naming"] = {l: {"name": names[l], "source": "voice", "confirmed": False}
+                                      for l in labels if l in names}
     if hyp:
         data["_hyp"] = hyp      # служебное, как _timing: main забирает и пишет файл после сохранения результата
     return data
@@ -1421,7 +1466,7 @@ class _ProfileBackupFailed(Exception):
     """Резерв профиля перед автозаписью не сохранён; профиль не записывается."""
 
 
-def prepare_group_voice_profile(group, src, embedder, names, quality):
+def prepare_group_voice_profile(group, src, embedder, names, quality, enroll=True):
     """Подготовить профиль и безопасно выполнить разрешённое автоматическое пополнение."""
     import voices
     ppath = voices.profile_path(group)
@@ -1430,7 +1475,10 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
         selection_report = {}
         quality_report = {}
         learned = []
-        if profile_ok:
+        if profile_ok and not enroll:
+            # галочка «пополнять профиль группы» снята на экране: только сопоставление, профиль не пишется
+            quality["voice_auto_learn"] = {"enabled": False, "reason": "enroll_off"}
+        elif profile_ok:
             try:
                 sqlite_mode = settings.recording_backend() == "sqlite"
             except (ValueError, OSError):
@@ -1627,6 +1675,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
     ap.add_argument("--speakers", type=int, default=0, help="число участников, если известно")
+    ap.add_argument("--min-speakers", type=int, default=0, help="не меньше стольки голосов (если число примерно известно)")
+    ap.add_argument("--max-speakers", type=int, default=0, help="не больше стольки голосов")
+    ap.add_argument("--stray-voices", action="store_true", help="возможны случайные голоса: запас +3 вместо +1")
+    ap.add_argument("--screen-hints", action="store_true", help="запуск с формы экрана: писать speaker_naming")
+    ap.add_argument("--no-enroll", action="store_true", help="голоса только сопоставлять: профиль группы не пополнять")
     ap.add_argument("--no-emotions", action="store_true")
     ap.add_argument("--status", default="", help="файл статуса (для MCP-сервера)")
     ap.add_argument("--vocab", default="", help="путь к словарю группы (rus-transcriber.vocab.json)")
@@ -1711,8 +1764,7 @@ def main():
 
         st.set(stage="разделение по спикерам", progress=5, duration=hms(duration))
         # участники известны: не меньше их числа и запас на один посторонний голос; точное число — только --speakers
-        max_spk = len(allowed) + 1 if allowed and not a.speakers else 0
-        min_spk = len(names) if names and not a.speakers else 0
+        max_spk, min_spk = diarization_bounds(a, allowed, names)
         raw, diar_info, pipe, full_ann = diarize(audio, a.speakers, token, cfg, st, max_speakers=max_spk,
                                                  min_speakers=min_spk)
         order = {}
@@ -1753,7 +1805,8 @@ def main():
                                              "и не пополняются (имена — rename_speakers)")
                 else:
                     group = vgroup or "default"
-                    ppath, prof, learned = prepare_group_voice_profile(group, src, emb, all_names, quality)
+                    ppath, prof, learned = prepare_group_voice_profile(
+                        group, src, emb, all_names, quality, enroll=not getattr(a, "no_enroll", False))
                 quality["learned_from"] = learned     # уже записанное на диск: фиксируем, даже если ниже будет сбой
                 st.set(stage="голоса: проверка реплик", progress=33)
                 work = [dict(t) for t in turns]       # рабочие копии: turns меняются только при применении
@@ -1848,6 +1901,7 @@ def main():
                                             "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                             "vote3_skipped": quality.get("vote3_skipped"),
                                             "vote3_partial": quality.get("vote3_partial"),
+                                            "overlap_unmeasured_skipped": _overlap_status(quality),
                                            "emotions_error": quality.get("emotions_error"),
                                            "interaction_error": quality.get("interaction_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),

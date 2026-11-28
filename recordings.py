@@ -764,11 +764,10 @@ def refresh_conspects(store, recording_id, document_path):
     report = {}
     for saved in store.list_conspects(recording_id):
         payload = saved["payload"]
-        # Свёртка «цитаты по одной» (quote_policy 1) показывает цитаты по текущему разбору: она устаревает и
-        # когда изменилась только ревизия разбора (место закрыто, слова те же). Остальные — по стенограмме.
+        # Шапка («разобрано N из M», 7.6а) и цитаты свёртки «по одной» (quote_policy 1) зависят от разбора: любой
+        # конспект устаревает и когда изменилась только ревизия разбора (место закрыто, слова те же).
         stale = (payload.get("assembly_revision") != source_revision
-                 or (payload.get("quote_policy") == 1
-                     and payload.get("assembly_review_revision") != review_revision))
+                 or payload.get("assembly_review_revision") != review_revision)
         if stale:
             report.update(conspect.rerender(document_path, saved["name"]))
     return report
@@ -880,13 +879,13 @@ _WORKER_FIELDS = frozenset({
     "review", "review_done", "questions", "answers", "conflicts",
     "rejected", "applications", "undo", "interaction_events",
     "interaction_events_evicted", "question_version", "speaker_labels",
-    "timing", "_timing", "group", "no_profile",
+    "speaker_naming", "timing", "_timing", "group", "no_profile",
 })
 _TRANSCRIPT_FIELDS = (
     "file", "duration", "title", "recorded_at", "recorded_timezone",
     "container", "codec", "audio_sha256", "audio_available", "speakers",
     "speaker_names", "names_source", "names_confirmed", "segments",
-    "quality", "edits", "vocab_suggestions",
+    "quality", "edits", "vocab_suggestions", "speaker_naming",
 )
 _REVIEW_FIELDS = (
     "review", "review_done", "questions", "answers", "conflicts", "rejected",

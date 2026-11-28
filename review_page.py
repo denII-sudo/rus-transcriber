@@ -369,38 +369,34 @@ def main():
             return u.path[len(prefix):]
 
         def do_GET(self):
-            # И2: ошибка чтения — ответ 500 с понятным текстом, а не обрыв соединения
             try:
-                return self._get()
+                u = self._path()
+                if u is None:
+                    return
+                last[0] = time.time()
+                if u in ("", "index.html"):
+                    html = (HERE / "cards.html").read_text(encoding="utf-8")
+                    return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"), "text/html; charset=utf-8")
+                if u == "api/answers":
+                    return self._send(200, answers_payload(a.json_path))
+                if u == "manifest.json":
+                    manifest = P.manifest(a.json_path)
+                    if manifest is None:
+                        return self._send(404, {"error": "пакет разбора не найден"})
+                    return self._send(200, manifest)
+                f = (pd / u).resolve()
+                if pd.resolve() in f.parents and f.is_file() and (f.parent == pd.resolve() or
+                        (pd / "clips").resolve() in f.parents) \
+                        and f.name != "answers.json":
+                    return self._send_file(f)
+                # клип старой карточки перенесённого пакета — из прежней папки пакета, только чтение (Р-3)
+                f = legacy_clip(a.json_path, u)
+                if f is not None:
+                    return self._send_file(f)
+                self._send(404, {"error": "не найдено"})
             except Exception as ex:
                 print(f"[page] ошибка запроса: {type(ex).__name__}", file=sys.stderr, flush=True)
                 return self._send(500, {"error": safe_error(ex)})
-
-        def _get(self):
-            u = self._path()
-            if u is None:
-                return
-            last[0] = time.time()
-            if u in ("", "index.html"):
-                html = (HERE / "cards.html").read_text(encoding="utf-8")
-                return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"), "text/html; charset=utf-8")
-            if u == "api/answers":
-                return self._send(200, answers_payload(a.json_path))
-            if u == "manifest.json":
-                manifest = P.manifest(a.json_path)
-                if manifest is None:
-                    return self._send(404, {"error": "пакет разбора не найден"})
-                return self._send(200, manifest)
-            f = (pd / u).resolve()
-            if pd.resolve() in f.parents and f.is_file() and (f.parent == pd.resolve() or
-                    (pd / "clips").resolve() in f.parents) \
-                    and f.name != "answers.json":
-                return self._send_file(f)
-            # клип старой карточки перенесённого пакета — из прежней папки пакета, только чтение (Р-3)
-            f = legacy_clip(a.json_path, u)
-            if f is not None:
-                return self._send_file(f)
-            self._send(404, {"error": "не найдено"})
 
         def _send_file(self, f):
             """Файл пакета; с Range — его часть (206): без этого Chromium не перематывает клип."""

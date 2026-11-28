@@ -4,7 +4,9 @@
 {
   "name": "конспект", "job_json": "...transcript.json",
   "template": "markdown с {{q:1}} на местах цитат",
-  "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6}], "author": "текст как в конспекте",
+  "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6, "word_ids": [...],
+                              "family": [...]}],   — «family» — только если слова уже разбиты ответами (_family_snapshot)
+                   "author": "текст как в конспекте",
                    "speaker": "Вера" | null,               — имя перед цитатой («Вера: «…»»)
                    "base": "текст стенограммы при связывании", "base_speaker": "...",
                    "last": "текст при последней сборке", "last_speaker": "..."}},
@@ -30,6 +32,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import quotes as Q
@@ -223,90 +226,100 @@ def _clean(s):
     return " ".join(Q._n(x) for x in Q.WORD.findall(s))
 
 
-def _shape(data, ids):
-    """Строение слов цитаты при связывании (Н28-3…Н28-5): для корня каждого слова цитаты (`part_of` или само слово) —
-    все ID его частей. Ссылка с этой отметкой сделана на конкретные слова: её текст — ровно эти ID."""
-    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
-    cited = [w for w in words if w["word_id"] in set(ids or [])]
-    roots = {w.get("part_of") or w["word_id"] for w in cited}
-    return {"roots": {root: sorted(w["word_id"] for w in words if (w.get("part_of") or w["word_id"]) == root)
-                      for root in sorted(roots)},
-            "span": [min(w["s"] for w in cited), max(w["e"] for w in cited)] if cited else None}
+def _id_text(data, ids, family=None):
+    """-> (текст, говорящий) слов ссылки ids; (None, None) — место не найдено или неоднозначно (см. _id_words)."""
+    text, speaker, _ = _id_words(data, ids, family)
+    return text, speaker
 
 
-def _exact_holds(data, ids, exact):
-    """Точная ссылка остаётся точной, пока ни одно слово цитаты не разбили после связывания: новая часть корня
-    цитаты, лежащая во времени слов цитаты, — это разбиение её слова, и укороченный текст выдать нельзя (Н-7).
-    Новая часть вне этого времени — разбиение соседнего слова того же корня: цитату не меняет (Н28-5); на самой
-    границе (вставка нулевой длины) не различить — как у старой ссылки. Слово цитаты,
-    вышедшее за время цитаты при связывании, вобрало соседнее слово: тоже не точная. Время — на момент связывания."""
-    if not isinstance(exact, dict) or not exact.get("span"):
-        return False
-    known = {wid for parts in (exact.get("roots") or {}).values() for wid in parts}
-    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
-    cited = [w for w in words if w["word_id"] in set(ids or [])]
-    if not cited:
-        return True                                       # слов нет — «не найдено» решит общий разбор
-    roots = set(exact.get("roots") or {})
-    lo, hi = exact["span"]
-    eps = 0.005
-    if any(w["s"] < lo - eps or w["e"] > hi + eps for w in cited):
-        return False
-    return not any((w.get("part_of") or w["word_id"]) in roots and w["word_id"] not in known
-                   and w["s"] <= hi + eps and w["e"] >= lo - eps for w in words)
+def _word_families(data):
+    """-> (семьи, корни, порядок): семья — ID слов с общим корнем по порядку стенограммы {корень: [ID]}; корни —
+    {ID слова: его корень}; порядок — ID слов всей стенограммы подряд. Корень слова — ID слова распознавания, из
+    которого оно получилось (`part_of`), или своё ID."""
+    families, roots, order = {}, {}, []
+    for seg in data.get("segments") or []:
+        for word in seg.get("words") or []:
+            wid = word.get("word_id")
+            order.append(wid)
+            if wid:
+                roots[wid] = word.get("part_of") or wid
+                families.setdefault(roots[wid], []).append(wid)
+    return families, roots, order
 
 
-def _id_text(data, ids, exact=None):
-    """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
+def _family_snapshot(data, ids):
+    """Слова семей, к которым относятся слова ссылки ids, на момент связывания — [ID по порядку стенограммы] или
+    None, если слова ещё не разбиты ответами (семья каждого слова — оно само). Сборка по снимку отличает слова,
+    с которыми ссылка была связана (выбранные ids), от соседних частей, что были рядом уже тогда (их ссылка не
+    печатает), и от частей, появившихся позже (А255-1, О255-2)."""
+    families, roots, _ = _word_families(data)
+    seen = list(dict.fromkeys(m for wid in ids for m in families.get(roots.get(wid, wid), [wid])))
+    return None if set(seen) == set(ids) and all(roots.get(wid, wid) == wid for wid in ids) else seen
+
+
+def _id_words(data, ids, family=None):
+    """-> (текст, говорящий, [ID слов, которые фактически напечатаны]) или (None, None, None).
+    Набор ID — тот, по которому проверяются блокировки цитаты (А255-1): сохранённый ID слова, разбитого
+    ответом на части, раскрывается на все части, и проверять надо каждую напечатанную.
+
+    Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
     ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
     (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
     оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
     находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний.
-    exact — строение слов при связывании (`_shape`): ссылка сделана на конкретные слова, и пока строение их корней
-    не выросло, корень не разворачивается и `merged_from` не мешает (Н28-3…Н28-5); иначе — как у старой ссылки."""
-    if exact is not None and _exact_holds(data, ids, exact):
-        return _plain_text(data, ids)
-    parts, present, merged = {}, set(), set()
-    for seg in data.get("segments") or []:
-        for word in seg.get("words") or []:
-            merged.update(word.get("merged_from") or [])
-            if word.get("word_id"):
-                present.add(word["word_id"])
-                if word.get("part_of"):
-                    parts.setdefault(word["part_of"], []).append(word["word_id"])
+
+    Одно консервативное правило неоднозначности (О255-1…О255-4): у частей, на которые разбито слово, корень общий,
+    и по записи не определить, из какой части получилось новое слово семьи. Поэтому кавычек нет («место не
+    найдено»), если слова ссылки — не вся семья, а семья с момента связывания изменилась:
+    * ссылка со снимком family (_family_snapshot, ключ part["family"]) и невыбранными словами в нём (соседние части,
+      что были рядом при связывании): семья сейчас должна совпасть со снимком — новое слово или пропавшее из снимка
+      делают ссылку неоднозначной (О255-1, О255-3); тогда печатаются ровно выбранные слова;
+    * ссылка без снимка (связана до разбиения слова, либо старая) на корень покрывает всю его семью, как на main
+      (Ф234-11б); на часть (не корень) — только если у корня нет других слов семьи, с любой стороны (О255-4);
+    * ссылка со снимком, в котором нет невыбранных слов (выбрана вся семья), покрывает всю семью, в том числе
+      новые части: они получились из выбранных слов."""
+    families, roots, _ = _word_families(data)
+    merged = {x for seg in data.get("segments") or [] for word in seg.get("words") or []
+              for x in word.get("merged_from") or []}
     if any(wid in merged for wid in ids or []):
-        return None, None
-    if ids and parts:
-        rank = {wid: i for i, wid in enumerate(w.get("word_id") for seg in data.get("segments") or []
-                                               for w in seg.get("words") or [])}
-        ids = list(dict.fromkeys(x for wid in ids for x in sorted(
-            ([wid] if wid in present or wid not in parts else []) + parts.get(wid, []),
-            key=lambda x: rank.get(x, -1))))
-    return _plain_text(data, ids)
-
-
-def _plain_text(data, ids):
-    """Текст и говорящий ровно этих ID в порядке ссылки (общая часть `_id_text`)."""
+        return None, None, None
+    if ids and any(root != wid for wid, root in roots.items()):
+        wanted, snap = set(ids), set(family or [])
+        out = []
+        if family is not None and snap - wanted:
+            if {m for wid in ids for m in families.get(roots.get(wid, wid), [])} != snap:
+                return None, None, None
+            out = list(ids)
+        else:
+            for wid in ids:
+                root = roots.get(wid, wid)
+                if family is not None or root == wid:       # снимок без чужих слов: вся семья; корень без снимка — тоже
+                    out += families.get(root, []) or [wid]
+                elif any(m not in wanted for m in families.get(root, [])):
+                    return None, None, None                  # часть без снимка: у корня есть другие слова семьи
+                else:
+                    out.append(wid)
+        ids = list(dict.fromkeys(out))
     by_id = {}
-    order = []
+    placed = []
     for seg in data.get("segments") or []:
         for word in seg.get("words") or []:
             wid = word.get("word_id")
-            order.append((wid, seg["speaker"]))
+            placed.append((wid, seg["speaker"]))
             if wid:
                 by_id.setdefault(wid, []).append((word["w"], seg["speaker"]))
     if not ids or len(set(ids)) != len(ids) or any(len(by_id.get(wid, [])) != 1 for wid in ids):
-        return None, None
+        return None, None, None
     found = [by_id[wid][0] for wid in ids]
     if len({speaker for _, speaker in found}) != 1:
-        return None, None
-    positions = [next(i for i, (wid, _) in enumerate(order) if wid == target) for target in ids]
+        return None, None, None
+    positions = [next(i for i, (wid, _) in enumerate(placed) if wid == target) for target in ids]
     if positions != sorted(positions):
-        return None, None
+        return None, None, None
     speaker = found[0][1]
-    if any(wid not in ids and spk == speaker for wid, spk in order[positions[0]:positions[-1] + 1]):
-        return None, None
-    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1]
+    if any(wid not in ids and spk == speaker for wid, spk in placed[positions[0]:positions[-1] + 1]):
+        return None, None, None
+    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1], list(ids)
 
 
 def _legacy_span(data, t1, t2):
@@ -347,6 +360,7 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
     в цитате остаётся written_label, автора пишет сборка.
     """
     unlinked_mode = unlinked                # ниже имя unlinked занимает список несвязанных цитат
+    conspect_md = _strip_info(conspect_md)  # свою шапку (7.6а) программа ставит сама — повторно не принимается
     toks = _tokens(data)
     seq = [t[0] for t in toks]
     first = {}
@@ -435,15 +449,18 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
                 ok = False
                 break
             t1, t2 = _part_times(toks[i:i + L])
-            parts.append({"t1": t1, "t2": t2, "word_ids": ids, "exact": _shape(data, ids)})
+            parts.append({"t1": t1, "t2": t2, "word_ids": ids})
+            family = _family_snapshot(data, ids)
+            if family:                  # слова уже разбиты ответами: запомнить семьи (А255-1, О255-1/2)
+                parts[-1]["family"] = family
         if not ok or not parts:
             mark_unlinked(m, q, why)
             continue
         n += 1
         key = str(n)
         t1, t2 = parts[0]["t1"], parts[-1]["t2"]
-        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0]["exact"])
-        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p["exact"])[0] for p in parts)))
+        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0].get("family"))
+        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p.get("family"))[0] for p in parts)))
         quotes[key] = {"parts": parts, "author": q, "speaker": None if labels else spk, "base": joined,
                        "base_speaker": base_spk, "last": joined, "last_speaker": base_spk}
         # «Имя: «…»» — имя тоже часть ссылки, чтобы обновлялось вместе с говорящим
@@ -470,14 +487,64 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
 SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 
 
-def _speaker_display(speaker, names):
+MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
+# Сведения шапки (7.6а), поставленные программой: при повторном вводе готового Markdown не дублируются (T260-5)
+INFO_MARK = "<!-- rus-transcriber: сведения шапки, ставит программа -->"
+_DATE = r"\d{4}-\d{2}-\d{2}"
+_CHANGE = r"(?:\d+|не определено)"
+# Строки шапки ровно в том виде, в каком их пишет _info_lines (T260-12): снимается только полное совпадение
+INFO_CORE = re.compile(
+    r"Событие: [^\n]+\n"
+    rf"(?:Дата записи: (?:{_DATE}|не установлена)|Дата файла аудио: {_DATE})\n"
+    r"Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)\n"
+    r"Стенограмма: (?:версия \S+|версия не указана|собрана по версии стенограммы \S+, сейчас \S+: изменено цитат \d+, "
+    rf"у говорящих {_CHANGE})\n"
+    r"Места разбора: (?:разобрано \d+ из \d+(?:, не прослушано \d+)?|мест разбора нет|"
+    r"неизвестно \(данные разбора не переданы\))\n"
+    r"(?:Источник не подтверждён: у конспекта нет признака записи; сведения взяты из записи, к которой он привязан\.\n)?")
+INFO_FOREIGN = re.compile(
+    r"Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны\.\n"
+    r"Составлен: (?:моделью OpenAI через OpenCode|ИИ-агентом)\n")
+
+
+def _strip_info(text):
+    """Убрать сведения шапки, поставленные программой (в начале текста или сразу после «Создан моделью…»).
+
+    Снимается отметка программы и следующие за ней строки ровно в том формате, который программа пишет сейчас
+    (INFO_CORE или INFO_FOREIGN, значения проверяются целиком), и одна пустая строка после них. Всё, что не совпало
+    (чужая строка, строка с тем же началом, но другим значением, отметка без шапки), остаётся нетронутым
+    (T260-7, T260-10, T260-12).
+    """
+    lead = MODEL_LEAD.match(text)
+    start = lead.end() if lead else 0
+    if not text.startswith(INFO_MARK + "\n", start):
+        return text
+    body = start + len(INFO_MARK) + 1
+    found = INFO_CORE.match(text, body) or INFO_FOREIGN.match(text, body)
+    if not found:
+        return text
+    end = found.end()
+    if text.startswith("\n", end):
+        end += 1                                    # пустая строка-разделитель, которую ставит программа
+    return text[:start] + text[end:]
+
+
+VOICE_UNCONFIRMED = " (по голосу, не подтверждено)"
+
+
+def _unconfirmed_voice_names(data):
+    """Имена подписаны программой по голосу и человек их не подтвердил (правило 26: конспект — конечный продукт)."""
+    return data.get("names_source") == "voices" and not data.get("names_confirmed")
+
+
+def _speaker_display(speaker, names, unconfirmed=False):
     """Как назвать говорящего в шапке: текущее имя или честное «имя не указано»."""
     if not speaker:
         return "говорящий в стенограмме не указан"
     name = " ".join(str(names.get(speaker, speaker)).split())
     if not name or re.fullmatch(r"Спикер(\s*\d+)?", name):
         return f"имя не указано (в стенограмме: {name or speaker})"
-    return name
+    return name + (VOICE_UNCONFIRMED if unconfirmed else "")
 
 
 def _labels_header(obj, data, needs_review):
@@ -495,10 +562,11 @@ def _labels_header(obj, data, needs_review):
     names = names if isinstance(names, dict) else {}
     current = {word.get("word_id"): seg.get("speaker")
                for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    unconfirmed = _unconfirmed_voice_names(data)
     lines = []
     for item in labels:
         found = Counter(current[wid] for wid in item.get("word_ids") or [] if wid in current)
-        shown = list(dict.fromkeys(_speaker_display(speaker, names) for speaker, _ in found.most_common()))
+        shown = list(dict.fromkeys(_speaker_display(speaker, names, unconfirmed) for speaker, _ in found.most_common()))
         text = "реплики не найдены в текущей стенограмме" if not shown else shown[0] + (
             f"; часть реплик в текущей стенограмме: {', '.join(shown[1:])}" if shown[1:] else "")
         lines.append(f"- {item.get('label')} — {text}")
@@ -508,6 +576,65 @@ def _labels_header(obj, data, needs_review):
     if SECTION_TIME.search(obj.get("template") or ""):
         head += "Время в квадратных скобках — начало раздела в записи (часы:минуты:секунды).\n\n"
     return head
+
+
+def _event_and_date(data):
+    """(событие, подпись даты) для шапки (РАР-7, 7.6а; решения В-3, В-4).
+
+    Событие — название записи, иначе имя файла аудио (без пути). Дата — дата записи (`recorded_at`), иначе дата
+    файла аудио (время его изменения), если файл ещё на месте; дату переноса в базу не берём. Неизвестна — честное
+    «не установлена».
+    """
+    file = data.get("file") if isinstance(data.get("file"), str) else ""
+    title = data.get("title") if isinstance(data.get("title"), str) else ""
+    event = " ".join(title.split()) or (Path(file.replace("\\", "/")).name if file else "") or "не указано"
+    recorded = data.get("recorded_at")
+    if isinstance(recorded, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", recorded.strip()[:10]):
+        return event, f"Дата записи: {recorded.strip()[:10]}"
+    if file:
+        try:
+            when = datetime.fromtimestamp(Path(file).stat().st_mtime)
+            return event, f"Дата файла аудио: {when:%Y-%m-%d}"
+        except (OSError, ValueError, OverflowError):
+            pass
+    return event, "Дата записи: не установлена"
+
+
+def _info_lines(obj, data, rep, model, hdr):
+    """Сведения шапки: событие, дата, кто составил, версия стенограммы, разобрано мест (7.6а). Ставит программа.
+
+    hdr — счётчики сборки: speaker_changes (у скольких цитат сменился говорящий с прошлой сборки) и
+    speaker_unknown (у какой-то цитаты прежний или текущий говорящий неизвестен — число не определить).
+    Конспект чужой записи: сведения из её данных не показываются (T260-4); без признака записи — показываются
+    с оговоркой.
+    """
+    import transcript
+    import workflow
+    who = f"Составлен: {'моделью OpenAI через OpenCode' if model else 'ИИ-агентом'}" + chr(10)
+    if rep.get("source_conflict"):
+        return (INFO_MARK + chr(10) + "Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны."
+                + chr(10) + who + chr(10))
+    event, date = _event_and_date(data)
+    if isinstance(data.get("review"), list):
+        places = [item for item in data["review"] if isinstance(item, dict)]
+        done = sum(1 for item in places if not transcript.place_unresolved(item))
+        unheard = sum(1 for item in places if workflow._closed_unheard(item))
+        review = (f"разобрано {done} из {len(places)}" + (f", не прослушано {unheard}" if unheard else "")
+                  if places else "мест разбора нет")
+    else:
+        review = "неизвестно (данные разбора не переданы)"
+    now, before = data.get("source_revision"), obj.get("assembly_revision")
+    if before is not None and now is not None and before != now:
+        speakers = "не определено" if hdr["speaker_unknown"] else str(hdr["speaker_changes"])
+        version = (f"собрана по версии стенограммы {before}, сейчас {now}: изменено цитат "
+                   f"{len(rep['changed_since_last'])}, у говорящих {speakers}")
+    else:
+        version = f"версия {now}" if now is not None else "версия не указана"
+    note = ""
+    if rep.get("legacy_unverified"):
+        note = "Источник не подтверждён: у конспекта нет признака записи; сведения взяты из записи, к которой он привязан." + chr(10)
+    return (INFO_MARK + chr(10) + f"Событие: {event}" + chr(10) + f"{date}" + chr(10) + who +
+            f"Стенограмма: {version}" + chr(10) + f"Места разбора: {review}" + chr(10) + note + chr(10))
 
 
 def _clock(seconds):
@@ -525,6 +652,7 @@ def _author_of(obj, data):
     names = names if isinstance(names, dict) else {}
     current = {word.get("word_id"): seg.get("speaker")
                for seg in data.get("segments") or [] for word in seg.get("words") or []}
+    unconfirmed = _unconfirmed_voice_names(data)
     by_speaker = {}
     for item in obj.get("speaker_labels") or []:
         for wid in item.get("word_ids") or []:
@@ -532,7 +660,7 @@ def _author_of(obj, data):
                 by_speaker.setdefault(current[wid], item.get("label"))
 
     def author(speaker):
-        return by_speaker.get(speaker) or _speaker_display(speaker, names)
+        return by_speaker.get(speaker) or _speaker_display(speaker, names, unconfirmed)
     return author
 
 
@@ -543,6 +671,7 @@ def render(obj, data, update_last=True):
     если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
     с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
     """
+    hdr = {"speaker_changes": 0, "speaker_unknown": False}
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
     rep["rendered_source_revision"] = data.get("source_revision")
     rep["analysis_revision"] = obj.get("analysis_revision")
@@ -558,12 +687,12 @@ def render(obj, data, update_last=True):
 
     policy = obj.get("quote_policy") == 1
     stats = {"quoted": 0, "marked": obj.get("unlinked_count", 0) if policy else 0, "unheard": 0}
+    import workflow
+    starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
+              for word in seg.get("words") or [] if _start(word) is not None}
     if policy:
-        import workflow
         rep["author_corrected"] = []
         author_of = _author_of(obj, data)
-        starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
-                  for word in seg.get("words") or [] if _start(word) is not None}
 
     slots = {item.get("id"): item for item in obj.get("unlinked") or [] if isinstance(item, dict)}
 
@@ -577,10 +706,15 @@ def render(obj, data, update_last=True):
         q = obj["quotes"].get(key)
         if not q:
             return m.group(0)
-        texts = [(None, None) if source_conflict else _id_text(data, p["word_ids"], p.get("exact")) if "word_ids" in p
-                 else _legacy_span(data, p["t1"], p["t2"]) for p in q["parts"]]
+        # Один раз раскрыть ссылку: текст и ID слов, которые фактически печатаются (А255-1). Все блокировки
+        # цитаты проверяются по этим ID — сохранённый ID разбитого слова покрывает и его части.
+        resolved = [(None, None, None) if source_conflict else _id_words(data, p["word_ids"], p.get("family")) if "word_ids" in p
+                    else (*_legacy_span(data, p["t1"], p["t2"]), []) for p in q["parts"]]
+        texts = [(t, s) for t, s, _ in resolved]
+        ids = [wid for _, _, part_ids in resolved for wid in part_ids or []]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
+            hdr["speaker_unknown"] = True        # слова не найдены — сменился ли говорящий, определить нельзя
             if policy:
                 stats["marked"] += 1
                 return f"{q['author']} (место в стенограмме не найдено)"
@@ -594,6 +728,11 @@ def render(obj, data, update_last=True):
         if _clean(cur) != _clean(q.get("last", q["base"])):
             rep["changed_since_last"].append({"id": key, "was": q.get("last"), "now": cur})
         body = cur if changed else q["author"]
+        last_spk = q.get("last_speaker", q.get("base_speaker"))
+        if last_spk is None or cur_spk is None:                  # для шапки: сменился ли говорящий, определить нельзя
+            hdr["speaker_unknown"] = True
+        elif cur_spk != last_spk:                                # считаем и при метках (speaker=None), T260-3
+            hdr["speaker_changes"] += 1
         spk = q.get("speaker")
         if spk and cur_spk != q.get("base_speaker"):          # говорящий сменился в стенограмме
             if cur_spk != q.get("last_speaker"):
@@ -603,17 +742,26 @@ def render(obj, data, update_last=True):
         if update_last:
             q["last"], q["last_speaker"] = cur, cur_spk
         if policy:
-            return one_by_one(key, q, body, cur_spk)
+            return one_by_one(key, q, body, cur_spk, ids)
+        if ids and workflow.overlap_blockers(data, ids):
+            # слова цитаты в отрезке наложения без места (Н28-1, Р255-1): не «дословно и сверено»
+            rep.setdefault("overlap_unchecked", []).append(key)
+            found = [starts[wid] for wid in ids if wid in starts]
+            when = f", {_clock(min(found))}" if found else ""
+            return (f"{spk}: " if spk else "") + f"{body} (по распознаванию, не проверено{when})"
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
-    def one_by_one(key, q, body, speaker):
-        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают."""
+    def one_by_one(key, q, body, speaker, ids):
+        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают.
+        ids — слова, которые фактически напечатаны (раскрытая ссылка, А255-1)."""
         author = author_of(speaker)
         written = q.get("written_label")
         if written and written != author:
             rep["author_corrected"].append({"id": key, "written": written, "now": author})
-        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
-        blockers = workflow.quote_blockers(data, ids)
+        # места разбора — по сохранённым и напечатанным ID (место могло сослаться на корневой ID, которого в
+        # стенограмме уже нет, С255-2); отрезки наложений — только по напечатанным словам (О255-2)
+        stored = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
+        blockers = workflow.quote_blockers(data, list(dict.fromkeys(stored + ids)), overlap_ids=ids)
         if not blockers:
             stats["quoted"] += 1
             return f"{author}: «{body}»"
@@ -624,14 +772,26 @@ def render(obj, data, update_last=True):
         when = f", {_clock(min(found))}" if found else ""
         return f"{author}: {body} (по распознаванию, {'не прослушано' if unheard else 'не проверено'}{when})"
 
-    body_md = SLOT.sub(sub, obj["template"])         # один проход: вставленный текст не раскрывается повторно
+    body_md = SLOT.sub(sub, _strip_info(obj["template"]))         # один проход: вставленный текст не раскрывается повторно
     header = _labels_header(obj, data, rep["analysis_needs_review"])
+    # Файл версии 1 (без меток): «# Конспект / Создан моделью…» уже стоит в начале самого текста (workflow.py)
+    lead = MODEL_LEAD.match(body_md) if not header else None
+    info = _info_lines(obj, data, rep, bool(header) or policy or bool(lead) or obj.get("provenance") == "model", hdr)
+    if header:                                  # шапка модельного конспекта: «# Конспект», «Создан моделью…»
+        cut = header.index(chr(10) * 2, header.index(chr(10) * 2) + 2) + 2
+        header = header[:cut] + info + header[cut:]
+    elif lead:
+        header, body_md = body_md[:lead.end()] + info, body_md[lead.end():]
+    else:
+        header = info
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
                    + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
     md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
+        if data.get("review_revision") is not None:
+            obj["assembly_review_revision"] = data["review_revision"]
     rep["assembly_revision"] = obj.get("assembly_revision")
     return md, rep
 
@@ -712,8 +872,7 @@ def _rerender_locked(json_path, name=None):
                     continue
                 md, rep = render(obj, data)
                 obj["source_revision"] = data.get("source_revision")
-                if obj.get("quote_policy") == 1:
-                    obj["assembly_review_revision"] = review_revision
+                obj["assembly_review_revision"] = review_revision
                 paths = recordings.document_binding(store, binding["recording_id"])["root"]
                 cj, cm = paths / saved["json_relative"], paths / saved["md_relative"]
                 write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),

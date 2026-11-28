@@ -167,7 +167,9 @@ with conspect.write_lock(jp):
                     conspect.save_linked(jp, "demo", "Первый текст")
             self.assertTrue(conspect._journal_path(jp).exists())
             result = conspect.save_linked(jp, "demo", "Второй текст")
-            self.assertEqual(Path(result["conspect_md"]).read_text(encoding="utf-8"), "Второй текст")
+            written = Path(result["conspect_md"]).read_text(encoding="utf-8")
+            self.assertTrue(written.endswith("\n\nВторой текст"))
+            self.assertNotIn("Первый текст", written)
             self.assertFalse(conspect._journal_path(jp).exists())
             self.assertEqual(json.loads(cj.read_text(encoding="utf-8"))["assembly_revision"], 1)
 
