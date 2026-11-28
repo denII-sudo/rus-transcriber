@@ -383,6 +383,9 @@ def _database_part(recording_id, unit_id, cutoff, apply, store_path, with_record
         empty = {"runs": 0, "recordings": 0, "bytes": 0}
         return (empty, []) if with_recordings else empty
     before = dt.datetime.fromtimestamp(cutoff, dt.timezone.utc) if cutoff is not None else None
+    if apply:                          # удаление в главной базе — только после её quick_check (БД-4(а))
+        import dbguard
+        dbguard.require_writable(path)
     store = storage.open_store(path) if apply else storage.open_store_readonly(path)
     try:
         if not with_recordings:

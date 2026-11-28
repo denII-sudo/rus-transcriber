@@ -20,6 +20,7 @@ pre{white-space:pre-wrap;background:var(--code-bg);padding:8px;border-radius:6px
 details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
 </style>
 <h1>rus-transcriber: обработка записи</h1>
+<div id="db-health" class="ask" hidden></div>
 <div id="msg" class="muted"></div>
 
 <section id="conflicts">
@@ -958,17 +959,51 @@ $("refresh").onclick = loadRequests;
 $("recordings-refresh").onclick = loadRecordings;
 ["rec-filter", "rec-unresolved", "rec-main", "rec-order"].forEach(id => $(id).oninput = renderRecordings);
 document.querySelectorAll(".hist").forEach(b => b.onclick = () => loadHistory(b.dataset.kind));
+// Резерв идёт в фоне (БД-7): запрос запускает его и сразу отвечает, страница спрашивает ход раз в секунду.
+const BACKUP_STAGES = {copy: "копирование базы", verify: "проверка копии (на большой базе — до нескольких минут)",
+  transfer: "перенос копии на съёмный диск", publish: "сохранение файла резерва"};
+function showBackupDone(d) {
+  const warning = d.warning || [];
+  const report = $("backup-report");
+  report.innerHTML = `<p class="${warning.length ? "warn" : "ok"}">Резерв создан${warning.length
+    ? " с предупреждением" : ""}: ${esc(d.destination)}.
+    Проверка копии: ${esc(d.report.integrity)}, схема ${esc(d.report.schema_version)}.</p>`;
+  warning.forEach(line => report.append(node("p", line, "warn")));
+}
+async function watchBackup(taskId) {
+  try {
+    const t = await call("api/backup/status?task_id=" + encodeURIComponent(taskId));
+    if (t.state === "done") { $("backup").disabled = false; return showBackupDone(t.result); }
+    if (t.state === "failed") {
+      $("backup").disabled = false;
+      $("backup-report").innerHTML = `<p class="bad">${esc(t.error)}</p>`;
+      return;
+    }
+    $("backup-report").innerHTML = `<p class="muted">Резерв делается: ${esc(BACKUP_STAGES[t.stage] || "подготовка")}` +
+      `${t.seconds ? ", " + esc(t.seconds) + " с" : ""}. Страницу можно не закрывать и работать дальше.</p>`;
+    setTimeout(() => watchBackup(taskId), 1000);
+  } catch (ex) {
+    $("backup").disabled = false;
+    $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`;
+  }
+}
 $("backup").onclick = async () => {
   try {
-    const d = await post("api/backup", {destination: $("backup-dest").value});
-    const warning = d.warning || [];
-    const report = $("backup-report");
-    report.innerHTML = `<p class="${warning.length ? "warn" : "ok"}">Резерв создан${warning.length
-      ? " с предупреждением" : ""}: ${esc(d.destination)}.
-      Проверка копии: ${esc(d.report.integrity)}, схема ${esc(d.report.schema_version)}.</p>`;
-    warning.forEach(line => report.append(node("p", line, "warn")));
+    const t = await post("api/backup/start", {destination: $("backup-dest").value});
+    $("backup").disabled = true;
+    setTimeout(() => watchBackup(t.task_id), 0);
   } catch (ex) { $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
 };
+// Состояние базы (БД-4): полоса держится, пока проблема не решена; текст — от программы, без путей.
+async function loadHealth() {
+  try {
+    const h = await call("api/health");
+    const lines = (h.lines || []).filter(Boolean);
+    $("db-health").hidden = !lines.length;
+    $("db-health").replaceChildren(...lines.map(line => node("p", line, "bad")));
+  } catch (ex) { /* нет связи — об этом скажут другие части страницы */ }
+}
+loadHealth();
 $("conflicts-refresh").onclick = () => { conflictNote(""); loadConflicts(); };
 loadConflicts();
 loadRecordings();
