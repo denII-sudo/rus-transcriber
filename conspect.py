@@ -245,6 +245,17 @@ def _shape(data, ids):
             if cited and all(_timed(w) for w in cited) else None}       # слово без времени — как у старой ссылки
 
 
+def _shape_needed(data, ids, exact):
+    """Отметка нужна, только если слова цитаты уже разбиты или склеены ответами: у неразбитого слова нет соседей
+    того же корня, и ссылка без отметки — как раньше (снимок семьи — по тому же правилу)."""
+    if not exact["span"]:
+        return False
+    cited = {wid for wid in ids or []}
+    return any(len(parts) > 1 or root not in cited for root, parts in exact["roots"].items()) or any(
+        w.get("merged_from") for seg in data.get("segments") or [] for w in seg.get("words") or []
+        if w.get("word_id") in cited)
+
+
 def _timed(word):
     return isinstance(word.get("s"), (int, float)) and isinstance(word.get("e"), (int, float))
 
@@ -260,8 +271,8 @@ def _exact_holds(data, ids, exact):
     known = {wid for parts in (exact.get("roots") or {}).values() for wid in parts}
     words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
     cited = [w for w in words if w["word_id"] in set(ids or [])]
-    if not cited:
-        return True                                       # слов нет — «не найдено» решит общий разбор
+    if len({w["word_id"] for w in cited}) != len(set(ids or [])):
+        return False                                      # слова цитаты нет — общие правила (корень покрывает части)
     roots = set(exact.get("roots") or {})
     lo, hi = exact["span"]
     eps = 0.005
@@ -496,7 +507,7 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
             t1, t2 = _part_times(toks[i:i + L])
             parts.append({"t1": t1, "t2": t2, "word_ids": ids})
             exact = _shape(data, ids)
-            if exact["span"]:           # слова со временем: ссылка точная на эти слова (Н28-3…Н28-5)
+            if _shape_needed(data, ids, exact):     # слова разбиты или склеены: ссылка на эти слова (Н28-3…5)
                 parts[-1]["exact"] = exact
             family = _family_snapshot(data, ids)
             if family:                  # слова уже разбиты ответами: запомнить семьи (А255-1, О255-1/2)

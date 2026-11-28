@@ -768,6 +768,7 @@ class SplitWordQuoteTests(unittest.TestCase):
         (хоть соседняя «альфа») — кавычек нет и до, и после правок; ссылка на корень без снимка покрывает семью."""
         data, obj, ids = self.link_after_split("бета", spans=None)
         del obj["quotes"]["1"]["parts"][0]["family"]
+        obj["quotes"]["1"]["parts"][0].pop("exact", None)        # до этой правки не было и отметки Н28 (exact)
         self.assert_not_found(*self.render_both(obj, data), "бета")
         split_word(data, ids[1], "бета гамма", item="span@2")
         self.assert_not_found(*self.render_both(obj, data), "бета")
