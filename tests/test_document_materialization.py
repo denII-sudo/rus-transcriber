@@ -281,7 +281,7 @@ class DocumentTests(unittest.TestCase):
         review = {"review": [], "answers": {}}
         prepared = documents.prepare(self.recording, 1, 1, 1, source, review, self.ctx, self.ctx, "now")
         md = prepared["md"].decode()
-        self.assertIn("одновременную речь на 82 % речи — похоже на эхо или гул", md)
+        self.assertIn("одновременную речь на 82 % речи — похоже на эхо, гул или долгую одновременную речь", md)
         self.assertIn("Если говорили одновременно — прослушайте.", md)
         self.assertEqual(json.loads(prepared["json"])["transcript"]["quality"],
                          {"overlap_unmeasured_skipped": skipped})
@@ -295,7 +295,7 @@ class DocumentTests(unittest.TestCase):
                                         review, self.ctx, self.ctx, "now")
                 self.assertNotIn("overlap_unmeasured_skipped",
                                  json.loads(doc["json"])["transcript"].get("quality") or {})
-                self.assertNotIn("похоже на эхо или гул", doc["md"].decode())
+                self.assertNotIn("похоже на эхо", doc["md"].decode())
 
     def test_order_speaker_names_and_undo_projection(self):
         source = {"speakers": ["s1", "s2"], "speaker_names": {"s1": "Анна", "s2": "Борис"},

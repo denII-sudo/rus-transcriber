@@ -29,6 +29,7 @@ if "paths" not in sys.modules:
 import transcript  # noqa: E402
 import words as W  # noqa: E402
 import worker  # noqa: E402
+import workflow  # noqa: E402
 
 VA = np.array([1.0, 0.0, 0.0])
 VB = np.array([0.0, 1.0, 0.0])
@@ -182,13 +183,14 @@ class EchoShareTests(unittest.TestCase):
     def test_echo_like_overlaps_give_warning_not_places(self):
         data = run_words(RAW_ONE, RAW_ONE + SHADOW, 99.0)
         self.assertEqual([it for it in data["review"] if "overlap" in it.get("reasons", [])], [])
-        self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.75, "sec": 15.0})
+        self.assertEqual(data["quality"]["overlap_unmeasured_skipped"],
+                         {"share": 0.75, "sec": 15.0, "spans": [[1.0, 8.0], [11.0, 19.0]]})
         words_ = [w for seg in data["segments"] for w in seg["words"]]
         self.assertFalse(any("overlap" in (w.get("flags") or []) for w in words_))
         self.assertEqual({seg["label"] for seg in data["segments"]}, {S1})       # голос слов прежний
         md = transcript.render_md(dict(data, file="synthetic.wav", duration="00:00:21"))
-        self.assertIn("одновременную речь на 75 % речи — похоже на эхо или гул", md)
-        self.assertIn("Если говорили одновременно — прослушайте.", md)
+        self.assertIn("одновременную речь на 75 % речи — похоже на эхо, гул или долгую одновременную речь", md)
+        self.assertIn("Если говорили одновременно — прослушайте: 00:00:01–00:00:08, 00:00:11–00:00:19.", md)
 
     def test_share_around_threshold(self):
         """29 % и ровно 30 % речи — ещё не эхо: места наложений ставятся, предупреждения нет; 31 % — мест нет,
@@ -201,7 +203,8 @@ class EchoShareTests(unittest.TestCase):
                 if places:
                     self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
                 else:
-                    self.assertEqual(data["quality"]["overlap_unmeasured_skipped"], {"share": 0.31, "sec": 6.2})
+                    self.assertEqual(data["quality"]["overlap_unmeasured_skipped"],
+                                     {"share": 0.31, "sec": 6.2, "spans": [[2.0, 5.1], [12.0, 15.1]]})
 
     def test_measured_close_voices_still_flagged_with_profiles(self):
         """Профили двух участников с близкими голосами (две опоры, отрыв измерен и мал): при той же доле
@@ -227,7 +230,37 @@ class EchoShareTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(transcript.overlap_skipped_note(bad))
                 md = transcript.render_md(dict(base, quality={"overlap_unmeasured_skipped": bad}))
-                self.assertNotIn("похоже на эхо или гул", md)
+                self.assertNotIn("похоже на эхо", md)
+
+    def test_share_just_above_threshold_is_not_written_as_threshold(self):
+        """Н28-6: доля 0,30004 (места сняты по правилу «больше 30 %») хранится вверх до 4 знаков и пишется
+        «30,1 %», а не «30 %»."""
+        shadow = [(2.0, 5.0004, "SPEAKER_01"), (12.0, 15.0004, "SPEAKER_01")]      # 6,0008 с из 20 с
+        data = run_words(RAW_ONE, RAW_ONE + shadow, 99.0)
+        self.assertEqual([it for it in data["review"] if "overlap" in it.get("reasons", [])], [])
+        info = data["quality"]["overlap_unmeasured_skipped"]
+        self.assertGreater(info["share"], W.OVERLAP_UNMEASURED_MAX_SHARE)
+        self.assertIn("на 30,1 % речи", transcript.overlap_skipped_note(info))
+
+    def test_note_lists_first_spans_and_rest(self):
+        """Н28-2: в предупреждении — первые пять отрезков с таймкодами и «ещё K»; без отрезков (запись до
+        Н28-1) — прежняя концовка; испорченные отрезки отбрасываются, предупреждение остаётся."""
+        spans = [[float(10 * k), float(10 * k + 2)] for k in range(7)]
+        note = transcript.overlap_skipped_note({"share": 0.5, "sec": 14.0, "spans": spans})
+        self.assertIn("прослушайте: 00:00:00–00:00:02, 00:00:10–00:00:12, 00:00:20–00:00:22, "
+                      "00:00:30–00:00:32, 00:00:40–00:00:42 и ещё 2.", note)
+        self.assertTrue(transcript.overlap_skipped_note({"share": 0.5, "sec": 1.0}).endswith("прослушайте."))
+        for bad in ([[2.0, 1.0]], [[1.0]], "x", [[1.0, float("nan")]], [[True, 2.0]]):
+            with self.subTest(bad=bad):
+                info = transcript.overlap_skipped_info({"share": 0.5, "sec": 1.0, "spans": bad})
+                self.assertEqual(info, {"share": 0.5, "sec": 1.0})
+
+    def test_status_summary_caps_spans(self):
+        """Н28-2: сводка quality статуса задачи несёт поле; отрезков — не больше десяти и число остальных."""
+        spans = [[float(k), k + 0.5] for k in range(12)]
+        out = worker._overlap_status({"overlap_unmeasured_skipped": {"share": 0.5, "sec": 6.0, "spans": spans}})
+        self.assertEqual(out, {"share": 0.5, "sec": 6.0, "spans": spans[:10], "spans_more": 2})
+        self.assertIsNone(worker._overlap_status({}))
 
     def test_doubt_flags_switch_touches_only_unmeasured(self):
         """Прямо doubt_flags: unmeasured_overlap=False снимает только пометку неизмеренных слов."""
@@ -240,3 +273,55 @@ class EchoShareTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def quote_data(spans):
+    """Сценарий s249q перепроверки 28.11: одна опора, 20 с речи, «тень» второй метки на отрезках spans."""
+    data = run_words(RAW_ONE, RAW_ONE + [(s, e, "SPEAKER_01") for s, e in spans], 99.0)
+    words_ = [w for seg in data["segments"] for w in seg["words"]]
+    for k, w in enumerate(words_):
+        w.setdefault("word_id", f"x{k}")
+    data["review"] = data.get("review") or []
+    return data, words_
+
+
+class QuoteBlockersTests(unittest.TestCase):
+    """Н28-1: цитата свёртки из слов пропущенного наложения не печатается в кавычках как проверенная."""
+
+    def quote(self, words_):
+        return [w["word_id"] for w in words_ if 6.0 <= w["s"] + 0.1 < 9.0 or 12.0 <= w["s"] + 0.1 < 14.0]
+
+    def test_share_023_keeps_places_and_open_blockers(self):
+        data, words_ = quote_data([(2.0, 4.0), (12.0, 14.6)])
+        self.assertNotIn("overlap_unmeasured_skipped", data["quality"])
+        reasons = {b["reason"] for b in workflow.quote_blockers(data, self.quote(words_))}
+        self.assertEqual(reasons, {"open"})
+
+    def test_share_035_blocks_quote_without_places(self):
+        data, words_ = quote_data([(2.0, 4.0), (6.0, 9.0), (12.0, 14.0)])
+        self.assertEqual([it for it in data["review"] if "overlap" in it.get("reasons", [])], [])
+        self.assertEqual(data["quality"]["overlap_unmeasured_skipped"]["spans"],
+                         [[2.0, 4.0], [6.0, 9.0], [12.0, 14.0]])
+        blockers = workflow.quote_blockers(data, self.quote(words_))
+        self.assertEqual(blockers, [{"id": "overlap_skipped:1", "reason": "overlap_skipped"},
+                                    {"id": "overlap_skipped:2", "reason": "overlap_skipped"}])
+        outside = [w["word_id"] for w in words_ if 15.0 <= w["s"] < 19.0]       # вне отрезков — чисто
+        self.assertEqual(workflow.quote_blockers(data, outside), [])
+
+    def test_human_touched_word_and_old_record(self):
+        data, words_ = quote_data([(2.0, 4.0), (6.0, 9.0), (12.0, 14.0)])
+        ids = [w["word_id"] for w in words_ if 6.0 <= w["s"] + 0.1 < 9.0]
+        for w in words_:
+            if w["word_id"] in ids:
+                w["by"] = "human"                       # человек прослушал и поправил эти слова
+        self.assertEqual(workflow.quote_blockers(data, ids), [])
+        for w in words_:
+            w.pop("by", None)
+        old = dict(data, quality={"overlap_unmeasured_skipped": {"share": 0.35, "sec": 7.0}})
+        self.assertEqual(workflow.quote_blockers(old, ids), [])      # запись до Н28-1: как раньше
+
+    def test_untimed_quote_word_is_unlocated(self):
+        data, words_ = quote_data([(2.0, 4.0), (6.0, 9.0), (12.0, 14.0)])
+        words_[0].pop("s")
+        self.assertEqual(workflow.quote_blockers(data, [words_[0]["word_id"]]),
+                         [{"id": "overlap_skipped", "reason": "unlocated"}])

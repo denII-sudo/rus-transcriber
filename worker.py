@@ -14,6 +14,7 @@ worker берёт его из базы сам, как программа в мо
 """
 import argparse
 import json
+import math
 import re
 import os
 import shutil
@@ -996,6 +997,19 @@ def _asr_problem_items(evidence, segments, note):
     return items
 
 
+def _overlap_status(quality, limit=10):
+    """Поле overlap_unmeasured_skipped для сводки статуса задачи: доля, секунды, первые limit отрезков и число
+    остальных (spans_more) — длинная запись с эхом не раздувает статус."""
+    info = quality.get("overlap_unmeasured_skipped")
+    if not isinstance(info, dict):
+        return None
+    spans = info.get("spans") or []
+    out = {"share": info.get("share"), "sec": info.get("sec"), "spans": spans[:limit]}
+    if len(spans) > limit:
+        out["spans_more"] = len(spans) - limit
+    return out
+
+
 def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality, speech_sec=None):
     """Метки сомнения и места для разбора -> (места, порог сомнения голоса, наложения голосов).
     speech_sec — секунды речи записи (сумма отрезков разметки pyannote без пауз): знаменатель доли речи под
@@ -1006,12 +1020,19 @@ def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, 
     trust = share <= W.OVERLAP_UNMEASURED_MAX_SHARE
     thr = W.doubt_flags(words, overlaps, unmeasured_overlap=trust)
     if not trust:
+        hit = [(a, b) for a, b in overlaps
+               if any(w.get("margin_unmeasured") and a <= w["s"] + 0.1 < b for w in words)]
         skipped = sum(1 for w in words if w.get("margin_unmeasured")
-                      and any(a <= w["s"] + 0.1 < b for a, b in overlaps))
+                      and any(a <= w["s"] + 0.1 < b for a, b in hit))
         if skipped:
-            quality["overlap_unmeasured_skipped"] = {"share": round(share, 4), "sec": round(ov_sec, 1)}
-            W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо или гул): {skipped} слов без "
-                 "измеренного отрыва голосов не помечены как наложение")
+            # доля — вверх до 4 знаков (Н28-6: 0,30004 не превращается в «30 %»), не больше 1; отрезки — наружу
+            # до сотых: по ним workflow.quote_blockers снимает кавычки у цитат свёртки (Н28-1)
+            quality["overlap_unmeasured_skipped"] = {
+                "share": min(1.0, math.ceil(share * 10000) / 10000), "sec": round(ov_sec, 1),
+                "spans": [[math.floor(a * 100) / 100, math.ceil(b * 100) / 100] for a, b in hit]}
+            W._log(f"наложения pyannote — {share:.0%} речи (похоже на эхо, гул или долгую одновременную речь): "
+                   f"{skipped} слов без измеренного отрыва голосов в {len(hit)} отрезках не помечены как "
+                   "наложение")
     for seg in segments:
         for wd in seg["words"]:
             src_w = wd.pop("_flags_src")
@@ -1848,6 +1869,7 @@ def main():
                                             "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
                                             "vote3_skipped": quality.get("vote3_skipped"),
                                             "vote3_partial": quality.get("vote3_partial"),
+                                            "overlap_unmeasured_skipped": _overlap_status(quality),
                                            "emotions_error": quality.get("emotions_error"),
                                            "interaction_error": quality.get("interaction_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),

@@ -381,7 +381,11 @@ def quote_blockers(data, word_ids):
 
     data — стенограмма с ключом review (как у transcript.load): список мест. -> [{"id", "reason"}], reason:
     open — место не решено; unheard — закрыто без прослушивания; unlocated — место или слова цитаты
-    привязать к словам нельзя, и оно задевает все цитаты. Пусто — цитата чистая.
+    привязать к словам нельзя, и оно задевает все цитаты; overlap_skipped — слово цитаты лежит в отрезке
+    наложения, где место overlap не поставлено, потому что наложений в записи больше
+    words.OVERLAP_UNMEASURED_MAX_SHARE (quality.overlap_unmeasured_skipped.spans, Н28-1; id — «overlap_skipped:N»,
+    N — номер отрезка). Слово, которое тронул человек (transcript.human_touched), отрезок не задевает. Пусто —
+    цитата чистая.
 
     Место со ссылками на слова (и не пропуск) — эти слова. Остальные места — слова по transcript.place_words
     (PR 6а) с pause_neighbors=True: у места-паузы (слов внутри нет) это последнее слово до неё и первое после,
@@ -408,6 +412,22 @@ def quote_blockers(data, word_ids):
                 hit = bool(wanted & set(found[0]))
         if hit:
             blockers.append({"id": item.get("id"), "reason": reason})
+    spans = transcript.overlap_skipped_spans(data)
+    if spans:
+        hits = set()
+        for segment in data.get("segments") or []:
+            for word in segment.get("words") or []:
+                if word.get("word_id") not in wanted or transcript.human_touched(word):
+                    continue
+                start = word.get("s")
+                if not _seconds(start):
+                    hits.add(None)                 # время слова неизвестно — отрезок не исключить
+                    continue
+                hits.update(n for n, (a, b) in enumerate(spans) if a <= start + 0.1 < b)
+        if None in hits:
+            blockers.append({"id": "overlap_skipped", "reason": "unlocated"})
+        blockers.extend({"id": f"overlap_skipped:{n}", "reason": "overlap_skipped"}
+                        for n in sorted(x for x in hits if x is not None))
     return blockers
 
 
