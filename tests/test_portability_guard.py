@@ -31,6 +31,8 @@ WORDS = re.compile(r"windll|msvcrt|winreg|creationflags|taskkill|powershell|Scri
 ALLOWED = {
     # рабочий код: окно без консоли, процессы, блокировки — кандидаты на osdeps.py
     "buildinfo.py": "CREATE_NO_WINDOW у запуска git",
+    "cloudpaths.py": "БД-8а: признаки облака и сети (FindFirstFileW, GetDriveTypeW, cldapi, winreg); вне Windows — "
+                     "unknown, ветка Linux — к пилоту",
     "confirm.py": "окно подтверждения MessageBoxW, creationflags",
     "core.py": "kernel32, taskkill, creationflags при запуске задач",
     "documents.py": "msvcrt.locking",

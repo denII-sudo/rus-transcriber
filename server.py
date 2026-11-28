@@ -92,6 +92,24 @@ rus-transcriber: расшифровка речи на этом компьюте�
 
 VERSION = "2026.11.25.18"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
+
+def _data_dir_notice():
+    """БД-8а: папка данных или резервов в облаке или на сетевом диске — строка в instructions и одна строка в журнал
+    (stderr) на запуск, без пути. Сервер запускается в любом случае; сбой проверки — без предупреждения."""
+    try:
+        import cloudpaths
+        found = cloudpaths.data_dir_warnings(paths.DATA_DIR)
+    except Exception:
+        return ""
+    if not found:
+        return ""
+    print("[rus-transcriber] " + " ".join(found), file=sys.stderr, flush=True)
+    return ("\n\nВНИМАНИЕ (проверка папки данных при запуске): " + " ".join(found)
+            + " Сообщите это человеку; сами папку данных не переносите.")
+
+
+INSTRUCTIONS += _data_dir_notice()
+
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
 except TypeError:   # mcp 1.x: параметра version нет
@@ -403,7 +421,9 @@ def _backup_for_agent(destination):
     if copies:
         result["report"]["damaged_copies"] = {"count": len(copies),
                                               "conflict_ids": [item["conflict_id"] for item in copies]}
-        result["warning"] = result["warning"][:1]
+        # строки об облаке (без путей) и первая строка о повреждённых копиях; остальные строки — с путями
+        cloud = core.backup_destination_warning(destination)
+        result["warning"] = result["warning"][:len(cloud) + 1]
     return result
 
 
@@ -418,7 +438,8 @@ async def backup_state(destination: str) -> str:
                  "В копии вся база, в том числе сохранённые гипотезы моделей (полный текст записей), "
                  "если включалась настройка save_hypotheses.",
                  "Существующие файлы не изменяются и не удаляются.",
-                 "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением."],
+                 "Если в базе есть повреждённые копии правок, резерв всё равно будет создан с предупреждением.",
+                 *core.backup_destination_warning(destination)],
         lambda: _backup_for_agent(destination), require_human=True)
 
 

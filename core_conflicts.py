@@ -1040,6 +1040,17 @@ def _not_written_warning(rows):
                else "ждёт предыдущую ревизию этой записи") for row in rows)]
 
 
+def backup_destination_warning(destination):
+    """БД-8а: предупреждение, если файл резерва ляжет в облачную папку или на сетевой диск ([] — нет). Только читает
+    признаки папки, ничего не меняет; сбой проверки — без предупреждения."""
+    try:
+        import cloudpaths
+        found = cloudpaths.warning(destination, "backup")
+    except Exception:
+        return []
+    return [found] if found else []
+
+
 def backup_store(destination):
     """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии."""
     import recordings
@@ -1047,7 +1058,8 @@ def backup_store(destination):
     try:
         store.current_identity()
         report = store.backup(destination, allow_damaged_copies=True)
-        warning = _damaged_copies_warning(report.get("damaged_copies"))
+        # облако — первой строкой: строки о повреждённых копиях после первой содержат пути, агент их не получает
+        warning = backup_destination_warning(destination) + _damaged_copies_warning(report.get("damaged_copies"))
         return {"destination": str(destination), "report": report, **({"warning": warning} if warning else {})}
     finally:
         store.close()
