@@ -4,7 +4,9 @@
 {
   "name": "конспект", "job_json": "...transcript.json",
   "template": "markdown с {{q:1}} на местах цитат",
-  "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6}], "author": "текст как в конспекте",
+  "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6, "word_ids": [...],
+                              "family": [...]}],   — «family» — только если слова уже разбиты ответами (_family_snapshot)
+                   "author": "текст как в конспекте",
                    "speaker": "Вера" | null,               — имя перед цитатой («Вера: «…»»)
                    "base": "текст стенограммы при связывании", "base_speaker": "...",
                    "last": "текст при последней сборке", "last_speaker": "..."}},
@@ -223,48 +225,100 @@ def _clean(s):
     return " ".join(Q._n(x) for x in Q.WORD.findall(s))
 
 
-def _id_text(data, ids):
-    """Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
-    ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
-    (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
-    оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
-    находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний."""
-    parts, present, merged = {}, set(), set()
-    for seg in data.get("segments") or []:
-        for word in seg.get("words") or []:
-            merged.update(word.get("merged_from") or [])
-            if word.get("word_id"):
-                present.add(word["word_id"])
-                if word.get("part_of"):
-                    parts.setdefault(word["part_of"], []).append(word["word_id"])
-    if any(wid in merged for wid in ids or []):
-        return None, None
-    if ids and parts:
-        rank = {wid: i for i, wid in enumerate(w.get("word_id") for seg in data.get("segments") or []
-                                               for w in seg.get("words") or [])}
-        ids = list(dict.fromkeys(x for wid in ids for x in sorted(
-            ([wid] if wid in present or wid not in parts else []) + parts.get(wid, []),
-            key=lambda x: rank.get(x, -1))))
-    by_id = {}
-    order = []
+def _id_text(data, ids, family=None):
+    """-> (текст, говорящий) слов ссылки ids; (None, None) — место не найдено или неоднозначно (см. _id_words)."""
+    text, speaker, _ = _id_words(data, ids, family)
+    return text, speaker
+
+
+def _word_families(data):
+    """-> (семьи, корни, порядок): семья — ID слов с общим корнем по порядку стенограммы {корень: [ID]}; корни —
+    {ID слова: его корень}; порядок — ID слов всей стенограммы подряд. Корень слова — ID слова распознавания, из
+    которого оно получилось (`part_of`), или своё ID."""
+    families, roots, order = {}, {}, []
     for seg in data.get("segments") or []:
         for word in seg.get("words") or []:
             wid = word.get("word_id")
-            order.append((wid, seg["speaker"]))
+            order.append(wid)
+            if wid:
+                roots[wid] = word.get("part_of") or wid
+                families.setdefault(roots[wid], []).append(wid)
+    return families, roots, order
+
+
+def _family_snapshot(data, ids):
+    """Слова семей, к которым относятся слова ссылки ids, на момент связывания — [ID по порядку стенограммы] или
+    None, если слова ещё не разбиты ответами (семья каждого слова — оно само). Сборка по снимку отличает слова,
+    с которыми ссылка была связана (выбранные ids), от соседних частей, что были рядом уже тогда (их ссылка не
+    печатает), и от частей, появившихся позже (А255-1, О255-2)."""
+    families, roots, _ = _word_families(data)
+    seen = list(dict.fromkeys(m for wid in ids for m in families.get(roots.get(wid, wid), [wid])))
+    return None if set(seen) == set(ids) and all(roots.get(wid, wid) == wid for wid in ids) else seen
+
+
+def _id_words(data, ids, family=None):
+    """-> (текст, говорящий, [ID слов, которые фактически напечатаны]) или (None, None, None).
+    Набор ID — тот, по которому проверяются блокировки цитаты (А255-1): сохранённый ID слова, разбитого
+    ответом на части, раскрывается на все части, и проверять надо каждую напечатанную.
+
+    Разрешить точные ID, не прибегая к временным окнам или порядку хранения. ID слова распознавания, которое
+    ответы заменили несколькими словами (Ф234-11б), покрывает и их, в порядке стенограммы: у них `part_of` с этим ID
+    (корнем), в том числе после повторных ответов. Слово с самим этим ID могло быть удалено — ссылка покрывает
+    оставшиеся. Часть слова ушла в слово вместе со словами другого корня (`merged_from`, Н-7) — ссылка на него не
+    находится, как на main, где склеенное слово заменялось целиком: укороченный текст не выдаётся за прежний.
+
+    Одно консервативное правило неоднозначности (О255-1…О255-4): у частей, на которые разбито слово, корень общий,
+    и по записи не определить, из какой части получилось новое слово семьи. Поэтому кавычек нет («место не
+    найдено»), если слова ссылки — не вся семья, а семья с момента связывания изменилась:
+    * ссылка со снимком family (_family_snapshot, ключ part["family"]) и невыбранными словами в нём (соседние части,
+      что были рядом при связывании): семья сейчас должна совпасть со снимком — новое слово или пропавшее из снимка
+      делают ссылку неоднозначной (О255-1, О255-3); тогда печатаются ровно выбранные слова;
+    * ссылка без снимка (связана до разбиения слова, либо старая) на корень покрывает всю его семью, как на main
+      (Ф234-11б); на часть (не корень) — только если у корня нет других слов семьи, с любой стороны (О255-4);
+    * ссылка со снимком, в котором нет невыбранных слов (выбрана вся семья), покрывает всю семью, в том числе
+      новые части: они получились из выбранных слов."""
+    families, roots, _ = _word_families(data)
+    merged = {x for seg in data.get("segments") or [] for word in seg.get("words") or []
+              for x in word.get("merged_from") or []}
+    if any(wid in merged for wid in ids or []):
+        return None, None, None
+    if ids and any(root != wid for wid, root in roots.items()):
+        wanted, snap = set(ids), set(family or [])
+        out = []
+        if family is not None and snap - wanted:
+            if {m for wid in ids for m in families.get(roots.get(wid, wid), [])} != snap:
+                return None, None, None
+            out = list(ids)
+        else:
+            for wid in ids:
+                root = roots.get(wid, wid)
+                if family is not None or root == wid:       # снимок без чужих слов: вся семья; корень без снимка — тоже
+                    out += families.get(root, []) or [wid]
+                elif any(m not in wanted for m in families.get(root, [])):
+                    return None, None, None                  # часть без снимка: у корня есть другие слова семьи
+                else:
+                    out.append(wid)
+        ids = list(dict.fromkeys(out))
+    by_id = {}
+    placed = []
+    for seg in data.get("segments") or []:
+        for word in seg.get("words") or []:
+            wid = word.get("word_id")
+            placed.append((wid, seg["speaker"]))
             if wid:
                 by_id.setdefault(wid, []).append((word["w"], seg["speaker"]))
     if not ids or len(set(ids)) != len(ids) or any(len(by_id.get(wid, [])) != 1 for wid in ids):
-        return None, None
+        return None, None, None
     found = [by_id[wid][0] for wid in ids]
     if len({speaker for _, speaker in found}) != 1:
-        return None, None
-    positions = [next(i for i, (wid, _) in enumerate(order) if wid == target) for target in ids]
+        return None, None, None
+    positions = [next(i for i, (wid, _) in enumerate(placed) if wid == target) for target in ids]
     if positions != sorted(positions):
-        return None, None
+        return None, None, None
     speaker = found[0][1]
-    if any(wid not in ids and spk == speaker for wid, spk in order[positions[0]:positions[-1] + 1]):
-        return None, None
-    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1]
+    if any(wid not in ids and spk == speaker for wid, spk in placed[positions[0]:positions[-1] + 1]):
+        return None, None, None
+    return " ".join(word for word, _ in found).strip(" ,;:—–-"), found[0][1], list(ids)
 
 
 def _legacy_span(data, t1, t2):
@@ -394,14 +448,17 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
                 break
             t1, t2 = _part_times(toks[i:i + L])
             parts.append({"t1": t1, "t2": t2, "word_ids": ids})
+            family = _family_snapshot(data, ids)
+            if family:                  # слова уже разбиты ответами: запомнить семьи (А255-1, О255-1/2)
+                parts[-1]["family"] = family
         if not ok or not parts:
             mark_unlinked(m, q, why)
             continue
         n += 1
         key = str(n)
         t1, t2 = parts[0]["t1"], parts[-1]["t2"]
-        base, base_spk = _id_text(data, parts[0]["word_ids"])
-        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"])[0] for p in parts)))
+        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0].get("family"))
+        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p.get("family"))[0] for p in parts)))
         quotes[key] = {"parts": parts, "author": q, "speaker": None if labels else spk, "base": joined,
                        "base_speaker": base_spk, "last": joined, "last_speaker": base_spk}
         # «Имя: «…»» — имя тоже часть ссылки, чтобы обновлялось вместе с говорящим
@@ -526,12 +583,12 @@ def render(obj, data, update_last=True):
 
     policy = obj.get("quote_policy") == 1
     stats = {"quoted": 0, "marked": obj.get("unlinked_count", 0) if policy else 0, "unheard": 0}
+    import workflow
+    starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
+              for word in seg.get("words") or [] if _start(word) is not None}
     if policy:
-        import workflow
         rep["author_corrected"] = []
         author_of = _author_of(obj, data)
-        starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
-                  for word in seg.get("words") or [] if _start(word) is not None}
 
     slots = {item.get("id"): item for item in obj.get("unlinked") or [] if isinstance(item, dict)}
 
@@ -545,8 +602,12 @@ def render(obj, data, update_last=True):
         q = obj["quotes"].get(key)
         if not q:
             return m.group(0)
-        texts = [(None, None) if source_conflict else _id_text(data, p["word_ids"]) if "word_ids" in p
-                 else _legacy_span(data, p["t1"], p["t2"]) for p in q["parts"]]
+        # Один раз раскрыть ссылку: текст и ID слов, которые фактически печатаются (А255-1). Все блокировки
+        # цитаты проверяются по этим ID — сохранённый ID разбитого слова покрывает и его части.
+        resolved = [(None, None, None) if source_conflict else _id_words(data, p["word_ids"], p.get("family")) if "word_ids" in p
+                    else (*_legacy_span(data, p["t1"], p["t2"]), []) for p in q["parts"]]
+        texts = [(t, s) for t, s, _ in resolved]
+        ids = [wid for _, _, part_ids in resolved for wid in part_ids or []]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
             if policy:
@@ -571,17 +632,26 @@ def render(obj, data, update_last=True):
         if update_last:
             q["last"], q["last_speaker"] = cur, cur_spk
         if policy:
-            return one_by_one(key, q, body, cur_spk)
+            return one_by_one(key, q, body, cur_spk, ids)
+        if ids and workflow.overlap_blockers(data, ids):
+            # слова цитаты в отрезке наложения без места (Н28-1, Р255-1): не «дословно и сверено»
+            rep.setdefault("overlap_unchecked", []).append(key)
+            found = [starts[wid] for wid in ids if wid in starts]
+            when = f", {_clock(min(found))}" if found else ""
+            return (f"{spk}: " if spk else "") + f"{body} (по распознаванию, не проверено{when})"
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
-    def one_by_one(key, q, body, speaker):
-        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают."""
+    def one_by_one(key, q, body, speaker, ids):
+        """Цитата свёртки нового вида: автор от программы; кавычки — если места разбора её не задевают.
+        ids — слова, которые фактически напечатаны (раскрытая ссылка, А255-1)."""
         author = author_of(speaker)
         written = q.get("written_label")
         if written and written != author:
             rep["author_corrected"].append({"id": key, "written": written, "now": author})
-        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
-        blockers = workflow.quote_blockers(data, ids)
+        # места разбора — по сохранённым и напечатанным ID (место могло сослаться на корневой ID, которого в
+        # стенограмме уже нет, С255-2); отрезки наложений — только по напечатанным словам (О255-2)
+        stored = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
+        blockers = workflow.quote_blockers(data, list(dict.fromkeys(stored + ids)), overlap_ids=ids)
         if not blockers:
             stats["quoted"] += 1
             return f"{author}: «{body}»"
