@@ -9,10 +9,11 @@ DEFAULTS = {
     "question_budget": 0,
     "participation": "simple",
     "goal": "",
-    # Подсказки «кто на записи» из формы до расшифровки. Только для разбора на говорящих;
-    # в задание модели и в облако не попадают (model_tasks берёт из политики лишь goal).
-    "speaker_hints": None,
 }
+# Подсказки «кто на записи» из формы до расшифровки. Только для разбора на говорящих; в задание модели и в
+# облако не попадают (model_tasks берёт из политики лишь goal). Ключ хранится только когда подсказки есть:
+# запросы без них совместимы с кодом до этого PR в обе стороны.
+OPTIONAL_KEYS = frozenset(("speaker_hints",))
 
 HINT_KEYS = frozenset(("count_mode", "count", "participants", "stray_voices", "group", "enroll_profile"))
 _COUNT_MODES = ("unknown", "exact", "approx")
@@ -65,7 +66,7 @@ def normalize_speaker_hints(hints):
 def hints_from_text(count=0, approx=False, participants="", group="", stray_voices=False, enroll_profile=True):
     """Подсказки из простых параметров (командная строка, MCP). Ничего не задано — None (прежний запуск).
     participants: «Анна=Аня/Анне, Борис» — имя в стенограмме, после «=» через «/» формы обращения."""
-    if not (count or participants.strip() or group.strip() or stray_voices):
+    if not (count or participants.strip() or group.strip() or stray_voices or not enroll_profile):
         return None
     people = []
     for chunk in participants.replace(";", ",").split(","):
@@ -92,7 +93,7 @@ def diarization_bounds(hints):
 def resolve(overrides=None):
     """Проверить и сохранить явную политику без угадывания её по роли человека."""
     overrides = {} if overrides is None else overrides
-    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS):
+    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS) - OPTIONAL_KEYS:
         raise ValueError("неизвестные требования к результату")
     result = {**DEFAULTS, **overrides}
     for key in ("require_conspect", "allow_cloud_model", "require_named_speakers", "require_human_verification"):
@@ -105,7 +106,9 @@ def resolve(overrides=None):
         raise ValueError("неизвестный режим участия")
     if not isinstance(result["goal"], str) or len(result["goal"]) > 2000:
         raise ValueError("цель должна быть текстом длиной не более 2000 символов")
-    result["speaker_hints"] = normalize_speaker_hints(result["speaker_hints"])
+    hints = normalize_speaker_hints(result.pop("speaker_hints", None))
+    if hints is not None:
+        result["speaker_hints"] = hints
     return result
 
 

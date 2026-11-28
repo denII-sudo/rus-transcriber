@@ -63,7 +63,7 @@ details>summary{cursor:pointer;font-weight:bold;margin:6px 0}
         <select id="who-mode"><option value="unknown">не знаю</option><option value="exact">точно</option>
           <option value="approx">примерно</option></select></label>
       <label><input type="number" id="who-count" value="2" min="1" max="30" style="width:60px"></label>
-      <label><input type="checkbox" id="who-stray"> возможны случайные голоса</label>
+      <label><input type="checkbox" id="who-stray"> возможны случайные голоса (действует, когда число голосов не указано)</label>
     </div>
     <label>Группа (необязательно):<input type="text" id="who-group" maxlength="80"></label>
     <div id="who-people"></div>
@@ -949,7 +949,8 @@ $("start").onclick = async () => {
     const d = await post("api/start", {audio: $("audio").value, require_conspect: $("conspect").checked,
       allow_cloud_model: $("conspect").checked, goal: $("goal").value, question_budget: Number($("budget").value),
       speaker_hints: speakerHints()});
-    say(`Запрос сохранён: ${d.request_id}. Обработка идёт в фоне; обновляйте состояние.`);
+    say(`Запрос сохранён: ${d.request_id}. Обработка идёт в фоне; обновляйте состояние.` +
+      (d.warnings && d.warnings.length ? " Внимание: " + d.warnings.join(" ") : ""));
     openRequest(d.request_id); loadRequests();
   } catch (ex) { say(ex.message, true); }
 };

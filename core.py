@@ -407,11 +407,26 @@ def _hint_launch_args(hints):
 
 
 def start_workflow(audio_path, policy=None):
-    """Создать сохранённый запрос и один раз запустить SQLite-worker без обучения голосов."""
+    """Создать сохранённый запрос и один раз запустить SQLite-worker.
+
+    Без подсказок «кто на записи» (policy["speaker_hints"]) — без голосов, как раньше. С подсказками (экран
+    присылает их всегда) голоса включены, ищутся среди названных имён, а профиль группы пополняется, пока не снята
+    галочка (enroll_profile). Ответ может содержать "warnings": например, группы с таким именем ещё нет."""
     import recordings
     import workflow
     if settings.recording_backend() != "sqlite":
         raise CoreError("Для сохранённого процесса требуется явно выбранный SQLite backend")
+    import product_policy
+    import paths
+    warnings = []
+    hints = product_policy.resolve(policy).get("speaker_hints")
+    if hints and hints["group"]:
+        if paths.safe_group(hints["group"]) != hints["group"]:
+            raise CoreError("Имя группы может содержать только буквы, цифры, «-» и «_» (без пробелов): "
+                            "голоса не включены, ничего не запущено.")
+        if hints["group"] not in paths.list_groups():
+            warnings.append(f"Группы «{hints['group']}» ещё нет: при обработке она будет создана"
+                            + (" и её профиль начнёт пополняться." if hints["enroll_profile"] else "."))
     store = recordings.open_store()
     try:
         request_id = workflow.create(store, audio_path, policy)
@@ -426,7 +441,10 @@ def start_workflow(audio_path, policy=None):
             workflow.mark_launch_interrupted(store, request_id)
             return {"request_id": request_id, "job_id": job_id, "state": "interrupted",
                     "note": "Исход запуска неизвестен; автоматический повтор отключён."}
-        return {"request_id": request_id, "job_id": job_id}
+        out = {"request_id": request_id, "job_id": job_id}
+        if warnings:
+            out["warnings"] = warnings
+        return out
     finally:
         store.close()
 

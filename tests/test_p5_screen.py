@@ -625,7 +625,7 @@ class P5ScreenHTTPTests(unittest.TestCase):
         base = {"audio": audio, "require_conspect": False, "allow_cloud_model": False}
         with mock.patch.object(core, "start_workflow", return_value={"request_id": "r", "job_id": "j"}) as start:
             self.assertEqual(self.post("api/start", base)[0], 200)
-            self.assertIsNone(start.call_args.args[1]["speaker_hints"])      # старый вызов: как раньше
+            self.assertNotIn("speaker_hints", start.call_args.args[1])      # старый вызов: как раньше
             hints = {"count_mode": "approx", "count": 4, "stray_voices": True, "group": "demo",
                      "participants": [{"name": "Анна", "forms": []}, {"name": "Борис", "forms": ["Боря"]}],
                      "enroll_profile": False}

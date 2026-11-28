@@ -25,8 +25,11 @@ def hints(**kw):
 
 class PolicyHintsTests(unittest.TestCase):
     def test_default_has_no_hints_and_old_policies_work(self):
-        self.assertIsNone(product_policy.resolve()["speaker_hints"])
-        self.assertIsNone(product_policy.resolve({"goal": "x"})["speaker_hints"])
+        # без подсказок ключа нет: запросы совместимы с кодом до PR в обе стороны
+        self.assertNotIn("speaker_hints", product_policy.resolve())
+        self.assertNotIn("speaker_hints", product_policy.resolve({"goal": "x"}))
+        self.assertNotIn("speaker_hints", product_policy.resolve({"speaker_hints": None}))
+        self.assertEqual(set(product_policy.resolve()), set(product_policy.DEFAULTS))
 
     def test_valid_hints_are_normalized(self):
         got = product_policy.resolve({"speaker_hints": hints()})["speaker_hints"]
@@ -62,7 +65,9 @@ class PolicyHintsTests(unittest.TestCase):
 class TextHintsTests(unittest.TestCase):
     def test_nothing_given_means_old_behaviour(self):
         self.assertIsNone(product_policy.hints_from_text())
-        self.assertIsNone(product_policy.hints_from_text(enroll_profile=False))
+        # «не пополнять» без прочих подсказок не игнорируется: голоса только сопоставляются
+        got = product_policy.hints_from_text(enroll_profile=False)
+        self.assertEqual((got["count_mode"], got["enroll_profile"]), ("unknown", False))
 
     def test_text_forms(self):
         got = product_policy.hints_from_text(4, True, "Анна=Аня/Анне, Борис; Вера", "demo", True, False)
@@ -72,6 +77,38 @@ class TextHintsTests(unittest.TestCase):
                                                {"name": "Борис", "forms": []}, {"name": "Вера", "forms": []}])
         self.assertEqual(product_policy.hints_from_text(2)["count_mode"], "exact")
         self.assertEqual(product_policy.hints_from_text(participants="Анна")["count_mode"], "unknown")
+
+
+class StartWorkflowTests(unittest.TestCase):
+    def start(self, hints, groups=()):
+        if hints is not None:
+            hints = product_policy.normalize_speaker_hints(hints)
+        policy = {"speaker_hints": hints} if hints is not None else {}
+        with mock.patch.object(core.settings, "recording_backend", return_value="sqlite"),              mock.patch("recordings.open_store"), mock.patch("workflow.create", return_value="r"),              mock.patch("workflow.claim_start", return_value="j"),              mock.patch("workflow.get", return_value={"source": "a.wav", "context": {}, "policy": policy}),              mock.patch.object(paths, "list_groups", return_value=list(groups)),              mock.patch.object(core, "start_transcription") as start:
+            result = core.start_workflow("a.wav", policy)
+        return result, start
+
+    def test_empty_form_sends_hints_with_voices_and_enroll(self):
+        empty = {"count_mode": "unknown", "count": 0, "participants": [], "stray_voices": False,
+                 "group": "", "enroll_profile": True}
+        result, start = self.start(empty)
+        self.assertTrue(start.call_args.kwargs["voices"])
+        self.assertTrue(start.call_args.kwargs["enroll"])
+        self.assertNotIn("warnings", result)
+
+    def test_no_hints_means_no_voices(self):
+        _, start = self.start(None)
+        self.assertFalse(start.call_args.kwargs["voices"])
+
+    def test_group_with_space_is_refused_before_anything_starts(self):
+        with self.assertRaises(core.CoreError):
+            self.start({"group": "моя группа"})
+
+    def test_unknown_group_gives_warning_known_does_not(self):
+        result, _ = self.start({"group": "demo"})
+        self.assertIn("demo", result["warnings"][0])
+        result, _ = self.start({"group": "demo"}, groups=["demo"])
+        self.assertNotIn("warnings", result)
 
 
 class LaunchArgsTests(unittest.TestCase):
