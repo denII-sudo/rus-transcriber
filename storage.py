@@ -985,6 +985,37 @@ def validate_copy(path, *, allow_damaged_copies=False):
         db.close()
 
 
+def finish_snapshot(staged, *, allow_damaged_copies=False):
+    """Довести снимок staged до резерва: пометить неактивным (установки, запуски, корни), validate_copy, убрать
+    служебные файлы. -> отчёт validate_copy. Сбой — staged убран (Ф204-2: только свой временный файл)."""
+    try:
+        target = _connect(staged, "rw")
+        try:
+            target.execute("BEGIN IMMEDIATE")
+            target.execute("UPDATE restore_guard SET locked=1 WHERE id=1")
+            target.execute("UPDATE allowed_roots SET requires_remap=1")
+            target.execute("UPDATE installations SET active=0")
+            target.execute("UPDATE workflow_requests SET state='interrupted', job_id=NULL "
+                           "WHERE state IN ('queued', 'starting', 'running')")
+            target.execute("UPDATE workflow_runs SET state='interrupted' WHERE state IN ('queued', 'running')")
+            target.execute("UPDATE workflow_steps SET state='interrupted' WHERE state IN ('queued', 'running')")
+            target.execute("COMMIT")
+        except BaseException:
+            if target.in_transaction:
+                target.execute("ROLLBACK")
+            raise
+        finally:
+            target.close()
+        report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
+        _release_wal_files(staged)
+    except BaseException:
+        # Ф204-2 (слово владельца 26.11.2026): до публикации убрать только свой временный файл этого вызова;
+        # назначение, база, другие .incomplete-* и резервы не трогаются; не удалось удалить — файл остаётся
+        _remove_unpublished(staged)
+        raise
+    return report
+
+
 class Store:
     def __init__(self, db):
         self.db = db
@@ -1066,37 +1097,30 @@ class Store:
 
     def _backup_staged(self, staged, allow_damaged_copies, on_stage):
         """Снимок в новый временный файл staged, пометка «неактивна», validate_copy. Сбой — staged убран."""
+        _stage(on_stage, "copy")
+        self.snapshot_into(staged)
+        _stage(on_stage, "verify")
+        return finish_snapshot(staged, allow_damaged_copies=allow_damaged_copies)
+
+    def snapshot_into(self, staged):
+        """Только снимок SQLite backup API в новый файл staged (создаётся здесь, существующий — отказ).
+
+        Для авторезерва (БД-4(б)): снимок — сразу при запуске, до первой записи процесса; доводка копии
+        (finish_snapshot) — потом, в фоне. Сбой — staged убран (свой файл этого вызова)."""
+        if self.db.in_transaction:
+            raise Conflict("cannot back up an open transaction")
+        staged = Path(staged)
         with staged.open("xb"):
             pass
         try:
-            _stage(on_stage, "copy")
             target = _connect(staged, "rw")
             try:
                 self.db.backup(target)
-                target.execute("BEGIN IMMEDIATE")
-                target.execute("UPDATE restore_guard SET locked=1 WHERE id=1")
-                target.execute("UPDATE allowed_roots SET requires_remap=1")
-                target.execute("UPDATE installations SET active=0")
-                target.execute("UPDATE workflow_requests SET state='interrupted', job_id=NULL "
-                               "WHERE state IN ('queued', 'starting', 'running')")
-                target.execute("UPDATE workflow_runs SET state='interrupted' WHERE state IN ('queued', 'running')")
-                target.execute("UPDATE workflow_steps SET state='interrupted' WHERE state IN ('queued', 'running')")
-                target.execute("COMMIT")
-            except BaseException:
-                if target.in_transaction:
-                    target.execute("ROLLBACK")
-                raise
             finally:
                 target.close()
-            _stage(on_stage, "verify")
-            report = validate_copy(staged, allow_damaged_copies=allow_damaged_copies)
-            _release_wal_files(staged)
         except BaseException:
-            # Ф204-2 (слово владельца 26.11.2026): до публикации убрать только свой временный файл этого вызова;
-            # назначение, база, другие .incomplete-* и резервы не трогаются; не удалось удалить — файл остаётся
             _remove_unpublished(staged)
             raise
-        return report
 
     def rebind_restored_copy(self, root_mapping, installation_id, user_id):
         """Явно переназначить все корни и новую установку в подготовленной копии."""

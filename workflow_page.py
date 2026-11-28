@@ -195,11 +195,17 @@ class BackupTasks:
         raise TimeoutError("backup task did not finish")
 
 
-def health_lines():
-    """Строки полосы о состоянии базы (БД-4): пусто — всё в порядке или база ещё не проверялась."""
+def health():
+    """Полоса о состоянии базы (БД-4): строки и вопрос о пределе резервов; пусто — всё в порядке."""
+    import autobackup
     import dbguard
     known = dbguard.view()
-    return [known["message"]] if known.get("ok") is False else []
+    lines = [known["message"]] if known.get("ok") is False else []
+    try:
+        backups = autobackup.status_view()
+    except Exception:                               # полоса не должна ломать экран
+        backups = {"lines": [], "question": None}
+    return {"lines": lines + backups["lines"], "question": backups["question"]}
 
 
 def make_server(port):
@@ -291,7 +297,7 @@ def make_server(port):
                 if u == "api/pick":
                     return self._send(200, {"path": pick_audio_path()})
                 if u == "api/health":
-                    return self._send(200, {"lines": health_lines()})
+                    return self._send(200, health())
                 if u == "api/backup/status":
                     return self._send(200, backups.status(q.get("task_id", "")))
                 if u == "api/requests":
@@ -387,6 +393,10 @@ def make_server(port):
                     if not destination or len(destination) > 300:
                         return self._send(400, {"error": "укажите путь к новому файлу резерва"})
                     return self._send(200, core.backup_store(destination))
+                if u == "api/autobackup/answer":     # ответ человека на вопрос о пределе резервов (БД-4(б))
+                    import autobackup
+                    limit = body.get("limit_gb")
+                    return self._send(200, autobackup.answer(str(body.get("choice", "")), limit))
                 if u == "api/backup/start":          # то же в фоне с ходом (БД-7): страница спрашивает api/backup/status
                     destination = str(body.get("destination", "")).strip()
                     if not destination or len(destination) > 300:
@@ -457,11 +467,13 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8766)
     ap.add_argument("--hours", type=float, default=6.0)
     a = ap.parse_args(argv)
+    import autobackup
     import dbguard
     checked = dbguard.ensure_checked()              # БД-4(а): провал увидит полоса экрана и журнал
     if checked is not None and checked["ok"] is False:
         print("[экран] база записей не прошла проверку целостности: запись в неё остановлена", file=sys.stderr,
               flush=True)
+    autobackup.start_at_launch("экран")             # БД-4(б): снимок до первой записи экрана
     srv, url, last = make_server(a.port)
     print(f"[экран] {url}", file=sys.stderr, flush=True)
 

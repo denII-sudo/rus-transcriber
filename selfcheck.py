@@ -245,8 +245,11 @@ def run_morph():
 def run_database():
     """БД-4(а): quick_check базы записей этой установки — только чтение; база и её файлы не меняются."""
     try:
+        import autobackup
         import dbguard
-        return dbguard.self_check_report()
+        report = dbguard.self_check_report()
+        report["autobackup"] = autobackup.self_check_report()    # строки для человека; ok не меняют
+        return report
     except Exception as ex:
         return {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:300]}
 
