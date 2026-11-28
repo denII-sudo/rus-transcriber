@@ -11,11 +11,13 @@ words.doubt_flags; RunWordsTests — настоящий worker.run_words и work
 получает `overlap`; голос слов не меняется; служебный признак `margin_unmeasured` в стенограмму не выходит.
 """
 import atexit
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,6 +28,9 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 if "paths" not in sys.modules:
     os.environ["RUS_TRANSCRIBER_DATA"] = _TMP
 
+import conspect  # noqa: E402
+import core  # noqa: E402
+import quotes  # noqa: E402
 import transcript  # noqa: E402
 import words as W  # noqa: E402
 import worker  # noqa: E402
@@ -256,6 +261,10 @@ class EchoShareTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 info = transcript.overlap_skipped_info({"share": 0.5, "sec": 1.0, "spans": bad})
                 self.assertEqual(info, {"share": 0.5, "sec": 1.0})
+        # Р255-2: испорченный отрезок отбрасывается по одному, годные остаются
+        info = transcript.overlap_skipped_info({"share": 0.5, "sec": 1.0,
+                                                "spans": [[2.0, 4.0], [6.0, "x"], [12.0, 12.0], (14.0, 15)]})
+        self.assertEqual(info["spans"], [[2.0, 4.0], [14.0, 15]])
 
     def test_status_summary_caps_spans(self):
         """Н28-2: сводка quality статуса задачи несёт поле; отрезков — не больше десяти и число остальных."""
@@ -264,6 +273,15 @@ class EchoShareTests(unittest.TestCase):
         self.assertEqual(out, {"share": 0.5, "sec": 6.0, "spans": spans[:10], "spans_more": 2})
         self.assertIsNone(worker._overlap_status({}))
 
+    def test_spans_only_where_unmeasured_words_are(self):
+        """Р255-4: в spans — только наложения со словами без измеренного отрыва; наложение двух посторонних
+        меток вне реплик основного голоса (слов нет) в перечень не попадает."""
+        extra = [(22.0, 26.0, "SPEAKER_01"), (22.0, 26.0, "SPEAKER_02")]
+        data = run_words(RAW_ONE, RAW_ONE + [(1.0, 8.0, "SPEAKER_01")] + extra, 99.0)
+        info = data["quality"]["overlap_unmeasured_skipped"]
+        self.assertGreater(info["share"], W.OVERLAP_UNMEASURED_MAX_SHARE)
+        self.assertEqual(info["spans"], [[1.0, 8.0]])
+
     def test_doubt_flags_switch_touches_only_unmeasured(self):
         """Прямо doubt_flags: unmeasured_overlap=False снимает только пометку неизмеренных слов."""
         unmeasured = [dict(w, spk=S1, margin=1.0, margin_unmeasured=True) for w in words_between(0.0, 5.0)]
@@ -271,10 +289,6 @@ class EchoShareTests(unittest.TestCase):
         W.doubt_flags(unmeasured + close, [(1.0, 4.0), (11.0, 14.0)], unmeasured_overlap=False)
         self.assertEqual(flagged(unmeasured, "overlap"), [])
         self.assertEqual(flagged(close, "overlap"), inside(close, 11.0, 14.0))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 def quote_data(spans):
@@ -327,3 +341,76 @@ class QuoteBlockersTests(unittest.TestCase):
         words_[0].pop("s")
         self.assertEqual(workflow.quote_blockers(data, [words_[0]["word_id"]]),
                          [{"id": "overlap_skipped", "reason": "unlocated"}])
+
+
+TOK = ["альфа", "бета", "гамма", "дельта", "эпсилон", "дзета", "эта", "тета", "йота", "каппа", "лямбда",
+       "мю", "ню", "кси", "омикрон", "пи", "ро", "сигма", "тау", "ипсилон", "йота", "каппа", "лямбда", "мю"]
+SPANS = [[2.0, 4.0], [6.0, 9.0], [12.0, 14.0]]
+IN_SPAN = ["w8", "w9", "w10", "w11"]          # «йота каппа лямбда мю» с 6,4 с — в отрезке [6, 9)
+OUTSIDE = ["w20", "w21", "w22", "w23"]        # та же фраза с 16 с — вне отрезков
+
+
+def agent_data(spans=SPANS):
+    """Одна реплика «Спикер 1», 24 слова, слово k — с k·0,8 с; фраза «йота каппа лямбда мю» дважды."""
+    field = {"share": 0.35, "sec": 7.0, **({"spans": spans} if spans is not None else {})}
+    ws = [{"word_id": f"w{k}", "w": t, "s": round(k * 0.8, 2), "e": round(k * 0.8 + 0.3, 2), "c": 1.0}
+          for k, t in enumerate(TOK)]
+    return {"recording_id": "rec", "source_revision": 1, "speaker_names": {}, "review": [], "file": "s.wav",
+            "duration": "00:00:20", "speakers": [S1], "quality": {"overlap_unmeasured_skipped": field},
+            "segments": [{"segment_id": "g1", "speaker": S1, "start": 0.0, "end": 20.0, "text": " ".join(TOK),
+                          "words": ws}]}
+
+
+class AgentConspectTests(unittest.TestCase):
+    """Р255-1: конспект агента (check_quotes, conspect_link/conspect_render, conspect_link_selected) — цитата
+    из слов отрезка пропущенного наложения даёт сомнение и в «» как сверенная не выходит."""
+
+    TEXT = "Итог: Спикер 1: «йота каппа лямбда мю»."
+
+    def test_check_quotes_reports_overlap_doubt(self):
+        check = quotes.check("Спикер 1: «альфа бета гамма» и «эта тета йота каппа»", agent_data())
+        self.assertEqual(check["summary"]["in_doubt"], 1)
+        row = next(r for r in check["problems"] if r.get("doubt"))
+        self.assertEqual(row["doubt"], ["overlap_skipped:1"])
+        old = quotes.check("Спикер 1: «эта тета йота каппа»", agent_data(spans=None))     # запись до Н28-1
+        self.assertEqual(old["summary"]["in_doubt"], 0)
+
+    def test_link_and_render_drop_quotes_for_overlap_words(self):
+        for spans, word_ids, quoted in ((SPANS, IN_SPAN, False), (SPANS, OUTSIDE, True), (None, IN_SPAN, True)):
+            with self.subTest(spans=spans, word_ids=word_ids):
+                data = agent_data(spans)
+                selection = {"recording_id": "rec", "source_revision": 1, "word_ids": word_ids}
+                obj, rep = conspect.link(self.TEXT, data, selections={"1": selection})      # путь link_selected
+                self.assertEqual(rep["linked"], 1)
+                md, rrep = conspect.render(obj, data, update_last=False)
+                if quoted:
+                    self.assertIn("Спикер 1: «йота каппа лямбда мю»", md)
+                    self.assertNotIn("overlap_unchecked", rrep)
+                else:
+                    self.assertIn("Спикер 1: йота каппа лямбда мю (по распознаванию, не проверено, 00:00:06)", md)
+                    self.assertNotIn("«йота", md)
+                    self.assertEqual(len(rrep["overlap_unchecked"]), 1)
+                    self.assertEqual(quotes.check(md, data)["summary"]["verbatim"], 0)
+
+    def test_plain_link_of_unique_quote_in_span(self):
+        """conspect_link без выбора: цитата однозначна — связана и всё равно печатается без кавычек."""
+        data = agent_data()
+        obj, rep = conspect.link("Итог: Спикер 1: «тета йота каппа».", data)
+        self.assertEqual(rep["linked"], 1)
+        md, _ = conspect.render(obj, data, update_last=False)
+        self.assertIn("Спикер 1: тета йота каппа (по распознаванию, не проверено, 00:00:05)", md)
+
+    def test_read_transcript_json_summary_is_checked_and_capped(self):
+        """Р255-5: JSON read_transcript — поле проверено (испорченные отрезки отброшены) и сокращено."""
+        spans = [[float(k), k + 0.5] for k in range(12)] + [[3.0, "x"]]
+        data = dict(agent_data(spans), segments=[])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "t.json"
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            summary = json.loads(core._text_only({"json": str(path)}, "json"))["asr_summary"]
+        self.assertEqual(summary["overlap_unmeasured_skipped"],
+                         {"share": 0.35, "sec": 7.0, "spans": spans[:10], "spans_more": 2})
+
+
+if __name__ == "__main__":
+    unittest.main()

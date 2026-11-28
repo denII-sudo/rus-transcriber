@@ -1000,14 +1000,7 @@ def _asr_problem_items(evidence, segments, note):
 def _overlap_status(quality, limit=10):
     """Поле overlap_unmeasured_skipped для сводки статуса задачи: доля, секунды, первые limit отрезков и число
     остальных (spans_more) — длинная запись с эхом не раздувает статус."""
-    info = quality.get("overlap_unmeasured_skipped")
-    if not isinstance(info, dict):
-        return None
-    spans = info.get("spans") or []
-    out = {"share": info.get("share"), "sec": info.get("sec"), "spans": spans[:limit]}
-    if len(spans) > limit:
-        out["spans_more"] = len(spans) - limit
-    return out
+    return transcript.overlap_skipped_summary(quality.get("overlap_unmeasured_skipped"), limit)
 
 
 def _review_places(words, segments, turns, full_ann, cfg, label_name, evidence, quality, speech_sec=None):

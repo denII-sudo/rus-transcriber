@@ -412,23 +412,23 @@ def quote_blockers(data, word_ids):
                 hit = bool(wanted & set(found[0]))
         if hit:
             blockers.append({"id": item.get("id"), "reason": reason})
+    return blockers + overlap_blockers(data, word_ids)
+
+
+def overlap_blockers(data, word_ids):
+    """Часть quote_blockers по отрезкам пропущенных наложений (Н28-1): [{"id", "reason"}], reason —
+    overlap_skipped (id «overlap_skipped:N») или unlocated (у слова цитаты нет времени, id «overlap_skipped»).
+    Её же читает сборка конспекта агента (conspect.render без quote_policy, Р255-1)."""
     spans = transcript.overlap_skipped_spans(data)
-    if spans:
-        hits = set()
-        for segment in data.get("segments") or []:
-            for word in segment.get("words") or []:
-                if word.get("word_id") not in wanted or transcript.human_touched(word):
-                    continue
-                start = word.get("s")
-                if not _seconds(start):
-                    hits.add(None)                 # время слова неизвестно — отрезок не исключить
-                    continue
-                hits.update(n for n, (a, b) in enumerate(spans) if a <= start + 0.1 < b)
-        if None in hits:
-            blockers.append({"id": "overlap_skipped", "reason": "unlocated"})
-        blockers.extend({"id": f"overlap_skipped:{n}", "reason": "overlap_skipped"}
-                        for n in sorted(x for x in hits if x is not None))
-    return blockers
+    if not spans:
+        return []
+    wanted = set(word_ids)
+    hits = {transcript.overlap_skipped_word(data, word, spans)
+            for segment in data.get("segments") or [] for word in segment.get("words") or []
+            if word.get("word_id") in wanted} - {None}
+    out = [{"id": "overlap_skipped", "reason": "unlocated"}] if "overlap_skipped" in hits else []
+    return out + [{"id": h, "reason": "overlap_skipped"}
+                  for h in sorted(hits - {"overlap_skipped"}, key=lambda h: int(h.rsplit(":", 1)[1]))]
 
 
 def _precise_doubts(transcript, review):

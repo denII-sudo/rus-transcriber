@@ -516,12 +516,12 @@ def render(obj, data, update_last=True):
 
     policy = obj.get("quote_policy") == 1
     stats = {"quoted": 0, "marked": obj.get("unlinked_count", 0) if policy else 0, "unheard": 0}
+    import workflow
+    starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
+              for word in seg.get("words") or [] if _start(word) is not None}
     if policy:
-        import workflow
         rep["author_corrected"] = []
         author_of = _author_of(obj, data)
-        starts = {word.get("word_id"): word["s"] for seg in data.get("segments") or []
-                  for word in seg.get("words") or [] if _start(word) is not None}
 
     slots = {item.get("id"): item for item in obj.get("unlinked") or [] if isinstance(item, dict)}
 
@@ -562,6 +562,13 @@ def render(obj, data, update_last=True):
             q["last"], q["last_speaker"] = cur, cur_spk
         if policy:
             return one_by_one(key, q, body, cur_spk)
+        ids = [wid for part in q["parts"] for wid in part.get("word_ids", [])]
+        if ids and workflow.overlap_blockers(data, ids):
+            # слова цитаты в отрезке наложения без места (Н28-1, Р255-1): не «дословно и сверено»
+            rep.setdefault("overlap_unchecked", []).append(key)
+            found = [starts[wid] for wid in ids if wid in starts]
+            when = f", {_clock(min(found))}" if found else ""
+            return (f"{spk}: " if spk else "") + f"{body} (по распознаванию, не проверено{when})"
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
     def one_by_one(key, q, body, speaker):
