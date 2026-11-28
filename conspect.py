@@ -489,9 +489,8 @@ SECTION_TIME = re.compile(r"^\[\d{2,}:\d\d:\d\d\]$", re.M)
 
 MODEL_LEAD = re.compile("# Конспект"+"\n\n"+"Создан моделью[^\n]*\n\n")
 # Сведения шапки (7.6а), поставленные программой: при повторном вводе готового Markdown не дублируются (T260-5)
-INFO_BLOCK = re.compile(r"(?:Событие: [^\n]*\nДата[^\n]*\n|Источник не подтверждён[^\n]*\n)"
-                        r"Составлен: [^\n]*\n(?:Стенограмма: [^\n]*\n)?(?:Места разбора: [^\n]*\n)?"
-                        r"(?:Источник не подтверждён[^\n]*\n)?\n")
+INFO_MARK = "<!-- rus-transcriber: сведения шапки, ставит программа -->"
+INFO_BLOCK = re.compile(re.escape(INFO_MARK) + r"\n(?:[^\n]+\n){1,8}\n")   # только с невидимой отметкой программы
 
 
 def _strip_info(text):
@@ -585,7 +584,7 @@ def _info_lines(obj, data, rep, model, hdr):
     import workflow
     who = f"Составлен: {'моделью OpenAI через OpenCode' if model else 'ИИ-агентом'}" + chr(10)
     if rep.get("source_conflict"):
-        return ("Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны."
+        return (INFO_MARK + chr(10) + "Источник не подтверждён: конспект относится к другой записи; сведения о записи не показаны."
                 + chr(10) + who + chr(10))
     event, date = _event_and_date(data)
     if isinstance(data.get("review"), list):
@@ -606,7 +605,7 @@ def _info_lines(obj, data, rep, model, hdr):
     note = ""
     if rep.get("legacy_unverified"):
         note = "Источник не подтверждён: у конспекта нет признака записи; сведения взяты из записи, к которой он привязан." + chr(10)
-    return (f"Событие: {event}" + chr(10) + f"{date}" + chr(10) + who +
+    return (INFO_MARK + chr(10) + f"Событие: {event}" + chr(10) + f"{date}" + chr(10) + who +
             f"Стенограмма: {version}" + chr(10) + f"Места разбора: {review}" + chr(10) + note + chr(10))
 
 
@@ -687,6 +686,7 @@ def render(obj, data, update_last=True):
         ids = [wid for _, _, part_ids in resolved for wid in part_ids or []]
         if any(t is None for t, _ in texts):
             rep["missing"].append({"id": key, "author": q["author"]})
+            hdr["speaker_unknown"] = True        # слова не найдены — сменился ли говорящий, определить нельзя
             if policy:
                 stats["marked"] += 1
                 return f"{q['author']} (место в стенограмме не найдено)"

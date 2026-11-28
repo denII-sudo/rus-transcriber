@@ -35,7 +35,7 @@ class HeaderTests(unittest.TestCase):
 
     def test_agent_header_has_no_model_wording(self):
         md, _ = conspect.render(agent_obj(), data(title="Планёрка", recorded_at="2026-11-20"))
-        self.assertTrue(md.startswith("Событие: Планёрка\n"))
+        self.assertTrue(md.startswith(conspect.INFO_MARK + "\nСобытие: Планёрка\n"))
         self.assertIn("Составлен: ИИ-агентом\n", md)
         self.assertNotIn("OpenAI", md)
         self.assertTrue(md.endswith("Текст агента."))
@@ -129,6 +129,35 @@ class ReviewFindingsTests(unittest.TestCase):
             relinked, _ = conspect.link(md, data(title="А"))
             self.assertNotIn("Событие:", relinked["template"])
             self.assertEqual(conspect.render(dict(relinked, recording_id="r1"), data(title="А"))[0].count("Составлен:"), 1)
+
+
+    def test_t260_7_human_text_that_looks_like_the_header_survives(self):
+        mine = "Событие: Мой план\nДата встречи: вторник\nСоставлен: мной\n\nОсновной текст."
+        data_ = data(title="Планёрка")
+        obj, _ = conspect.link(mine, data_)
+        self.assertEqual(obj["template"], mine)
+        md, _ = conspect.render(dict(agent_obj(), template=mine), data_)
+        self.assertTrue(md.endswith("\n\n" + mine), md)
+        self.assertEqual(md.count("Составлен: мной"), 1)
+        # цикл render → link → render по-прежнему даёт одну шапку и сохраняет текст человека
+        relinked, _ = conspect.link(md, data_)
+        self.assertEqual(relinked["template"], mine)
+        again, _ = conspect.render(dict(agent_obj(), template=relinked["template"]), data_)
+        self.assertEqual(again.count("Составлен: ИИ-агентом"), 1)
+        self.assertTrue(again.endswith("\n\n" + mine))
+
+    def test_t260_3_missing_quote_with_changed_speaker_is_unknown(self):
+        obj = conspect.link("Анна: «мы решили купить новый стол»", spoken("Анна"))[0]
+        obj.update(recording_id="r1", analysis_revision=3, assembly_revision=3)
+        changed = spoken("Борис", 4)
+        for seg in changed["segments"]:
+            for word in seg["words"]:
+                word["word_id"] = "новый-" + word["word_id"]        # слова цитаты заменены: место не найдено
+                word["w"] = "иное"
+        md, rep = conspect.render(obj, changed)
+        self.assertTrue(rep["missing"])
+        self.assertIn("у говорящих не определено", md)
+        self.assertNotIn("у говорящих 0", md)
 
 
 if __name__ == "__main__":

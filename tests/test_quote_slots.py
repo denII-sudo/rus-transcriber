@@ -112,6 +112,7 @@ class SlotRenderTests(unittest.TestCase):
         md, rep = conspect.render(obj, data, update_last=False)
         self.assertEqual(md, (
             "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
+            "<!-- rus-transcriber: сведения шапки, ставит программа -->\n"
             "Событие: не указано\nДата записи: не установлена\nСоставлен: моделью OpenAI через OpenCode\n"
             "Стенограмма: версия 1\nМеста разбора: разобрано 0 из 1\n\n"
             "Участники (условные метки; имена — по текущей стенограмме):\n\n"

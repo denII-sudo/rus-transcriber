@@ -522,7 +522,7 @@ class WorkflowTests(unittest.TestCase):
         payload, md = self.conspect_files(recording)
         # файл версии 1 — прежнего вида: без расшифровки меток и времени
         self.assertTrue(md.startswith("# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
-                                      "Событие: "))
+                                      + conspect.INFO_MARK + "\nСобытие: "))
         self.assertIn("Составлен: моделью OpenAI через OpenCode\n", md)
         self.assertTrue(md.endswith("\n\nИтог блока.\n\nИтог блока.\n"))
         self.assertNotIn("Участники", md)
@@ -623,6 +623,7 @@ class WorkflowTests(unittest.TestCase):
         md, _ = conspect.render(obj, data, update_last=False)
         self.assertEqual(md, (
             "# Конспект\n\nСоздан моделью; проверка человеком не подтверждена.\n\n"
+            "<!-- rus-transcriber: сведения шапки, ставит программа -->\n"
             "Событие: не указано\nДата записи: не установлена\nСоставлен: моделью OpenAI через OpenCode\n"
             "Стенограмма: версия 2\nМеста разбора: неизвестно (данные разбора не переданы)\n\n"
             "Участники (условные метки; имена — по текущей стенограмме):\n\n"
