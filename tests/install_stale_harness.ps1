@@ -80,7 +80,7 @@ Check "B emptied subfolder removed, folders kept" (-not (Has "tests/sub") -and (
 Check "B new and kept files in place" ((Has "tools/new_tool.py") -and (Has "tools/check.py") -and (Has "tests/test_keep.py") -and (Has "cards.html") -and (Has "server.py"))
 Check "B file edited by the user is kept" ((Has "tests/test_changed_old.py") -and ((Get-Content (At "tests/test_changed_old.py") -Raw) -match "edited by the user"))
 Check "B user files kept (default does not delete)" ((Has "tools/mine.txt") -and (Has "mine_script.py"))
-Check "B removed files are listed" ($r.flat -match "old_mod\.py" -and $r.flat -match "tools/gone\.py" -and $r.flat -match "tests/test_old\.py")
+Check "B removed files are listed with the way to keep them" ($r.flat -match "-KeepStaleFiles" -and $r.flat -match "old_mod\.py" -and $r.flat -match "tools/gone\.py" -and $r.flat -match "tests/test_old\.py")
 Check "B kept files are listed with a hint" ($r.flat -match "mine\.txt" -and $r.flat -match "mine_script\.py" -and $r.flat -match "-ExtraFilesDelete")
 Check "B manifest describes the new build" (-not ((Manifest-Files) -contains "old_mod.py") -and ((Manifest-Files) -contains "tools/new_tool.py"))
 Check "B data folder untouched" ((Get-Content (Join-Path $data "user-sentinel.txt") -Raw).Trim() -eq "preserve")
@@ -166,6 +166,18 @@ try { $r = Install $v9 } finally { $lock.Dispose() }
 Check "I2 locked file: copy error reported" ($r.flat -match "неудалосьскопировать")
 Check "I2 locked file: nothing is deleted after a failed copy" ((Has "gone_late.py") -and (Has "tools/gone_tool.py"))
 Check "I2 locked file: deletion skipped message" ($r.flat -match "копированиепрошлосошибками")
+
+# ---------- K: -KeepStaleFiles ----------
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$v10 = New-Source "v10" @("cards.html", "tools/check.py", "stale_root.py", "tools/stale_tool.py", "tests/test_stale.py")
+$r = Install $v10
+Check "K setup: install" ($r.code -eq 0 -and (Has "stale_root.py"))
+$v11 = New-Source "v11" @("cards.html", "tools/check.py")
+$r = Install $v11 @{ KeepStaleFiles = $true; ExtraFiles = "Delete" }
+Check "K keep stale: exit 0" ($r.code -eq 0)
+Check "K keep stale: nothing of the previous build is deleted" ((Has "stale_root.py") -and (Has "tools/stale_tool.py") -and (Has "tests/test_stale.py"))
+Check "K keep stale: files are listed as kept" ($r.flat -match "stale_root\.py" -and $r.flat -match "tools/stale_tool\.py" -and $r.flat -match "оставлены\(-KeepStaleFiles\)")
+Check "K keep stale: no deletion announced" ($r.flat -notmatch "будутудалены")
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 if ($global:Diag) { $global:Diag }

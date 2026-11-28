@@ -22,6 +22,8 @@
       -AllowUnreviewedSource ставить из клона с незакоммиченными изменениями или из коммита,
                              которого нет в origin/main и на котором нет тега
       -SkipSelfCheck         не запускать самопроверку в конце
+      -KeepStaleFiles        не удалять устаревшие файлы прежней сборки (по умолчанию они удаляются
+                             сами, список печатается до копирования): оставить и только показать
       -ExtraFiles <режим>    что делать с файлами в tools/tests/examples, которых нет в комплекте и
                              которых прежняя сборка не ставила (возможно, ваши): Show — показать и
                              оставить (умолчание без терминала), Delete — удалить, Keep — оставить
@@ -63,7 +65,8 @@ param(
     [switch]$AllowRunningServer,
     [switch]$AllowUnreviewedSource,
     [switch]$SkipSelfCheck,
-    [string]$ExtraFiles = ""
+    [string]$ExtraFiles = "",
+    [switch]$KeepStaleFiles
 )
 $ErrorActionPreference = "Continue"
 # Windows PowerShell 5.1: без этого ConvertTo-Json пишет массивы как {"value":[...],"Count":n}
@@ -822,9 +825,14 @@ if ($Source -ne $Target) {
         $goneList = @($stale.stale); $changedList = @($stale.modified)
         $unknownList = @($stale.unknown); $rootList = @($stale.root_unknown)
         if ($goneList.Count) {
-            Write-Host "  устаревшие файлы прежней сборки ($($goneList.Count)): они были в её build-info.json, в новой версии их нет, после установки не менялись — будут удалены:" -ForegroundColor Yellow
-            Show-FileList $goneList -All
-            $pruneStale = $true
+            if ($KeepStaleFiles) {
+                Write-Host "  устаревшие файлы прежней сборки ($($goneList.Count)): были в её build-info.json, в новой версии их нет, после установки не менялись — оставлены (-KeepStaleFiles):" -ForegroundColor Yellow
+                Show-FileList $goneList -All
+            } else {
+                Write-Host "  устаревшие файлы прежней сборки ($($goneList.Count)): они были в её build-info.json, в новой версии их нет, после установки не менялись — будут удалены (чтобы оставить: -KeepStaleFiles):" -ForegroundColor Yellow
+                Show-FileList $goneList -All
+                $pruneStale = $true
+            }
         } elseif (-not $stale.manifest) {
             Write-Host "  прежнего build-info.json нет (или он не читается): какие файлы ставила прежняя сборка, неизвестно — ничего не удаляю" -ForegroundColor DarkGray
         }
