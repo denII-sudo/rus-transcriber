@@ -1,7 +1,7 @@
 """Анализ обычной работы (шаг 3а лаборатории): сохранённые гипотезы моделей и ответы человека на карточки.
 
 Читает только песочницу prepare --work: копию базы записей source/state.sqlite3 (штатно,
-storage.open_store_readonly) и копию файлов гипотез source/hypotheses/ (hypotheses.read). Модели не
+storage.open_snapshot_readonly) и копию файлов гипотез source/hypotheses/ (hypotheses.read). Модели не
 запускаются, настоящая папка данных не открывается. Подробности — lab/README.md, раздел «Анализ», 6.
 
 Связь записи и гипотез — по recording_id (ids.recording_id файла), проверка — хэшем файла audio_sha256,
@@ -69,7 +69,7 @@ def _norm(words, W):
 def read_recordings(db_path):
     """Записи копии базы: [{recording_id, first, current, review}] — ревизия 1 стенограммы, текущая
     стенограмма и текущий снимок разбора."""
-    store = _repo("storage").open_store_readonly(db_path)
+    store = _repo("storage").open_snapshot_readonly(db_path)
     try:
         rows = store.db.execute(
             "SELECT r.recording_id AS rid, t1.payload AS first, t.payload AS cur, v.payload AS rev "
