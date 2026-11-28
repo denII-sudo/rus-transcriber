@@ -376,7 +376,7 @@ def place_holds_quote(item):
     return not _place_unresolved(item) and not _closed_unheard(item)
 
 
-def quote_blockers(data, word_ids):
+def quote_blockers(data, word_ids, overlap_ids=None):
     """Места разбора, из-за которых цитата из слов word_ids не держится в кавычках.
 
     data — стенограмма с ключом review (как у transcript.load): список мест. -> [{"id", "reason"}], reason:
@@ -390,6 +390,10 @@ def quote_blockers(data, word_ids):
     Место со ссылками на слова (и не пропуск) — эти слова. Остальные места — слова по transcript.place_words
     (PR 6а) с pause_neighbors=True: у места-паузы (слов внутри нет) это последнее слово до неё и первое после,
     так что пауза между словами цитаты или вплотную к её краю цитату задевает, а пауза в стороне — нет.
+
+    overlap_ids — слова, по которым проверяются отрезки наложений; по умолчанию word_ids. Сборка конспекта передаёт
+    в word_ids объединение сохранённых и напечатанных ID (место могло сослаться на корневой ID, которого в
+    стенограмме уже нет, С255-2), а в overlap_ids — только напечатанные слова (О255-2).
     """
     wanted = set(word_ids)
     quote_untimed = any(
@@ -412,7 +416,7 @@ def quote_blockers(data, word_ids):
                 hit = bool(wanted & set(found[0]))
         if hit:
             blockers.append({"id": item.get("id"), "reason": reason})
-    return blockers + overlap_blockers(data, word_ids)
+    return blockers + overlap_blockers(data, word_ids if overlap_ids is None else overlap_ids)
 
 
 def overlap_blockers(data, word_ids):

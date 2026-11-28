@@ -567,6 +567,176 @@ class SplitWordQuoteTests(unittest.TestCase):
         self.assertEqual(len(prep["missing"]), 1)
         self.assert_header_matches(pmd)
 
+    # --- О255-1, О255-2 (первый приём OpenCode №255): ссылка на часть разбитого слова ---------------------------
+
+    def link_after_split(self, quote, spans=((5.65, 7.0),)):
+        """Слово w1 разбито на «альфа» (w1, 4,8 с) и «бета» (новый ID, part_of=w1, 5,4 с); ссылка — на quote."""
+        data = split_data(spans=spans)
+        ids = split_word(data, "w1", "альфа бета")
+        obj, rep = conspect.link(f"Итог: Спикер 1: «{quote}».", data)
+        self.assertEqual(rep["linked"], 1)
+        return data, obj, ids
+
+    def assert_not_found(self, md, rep, pmd, text):
+        """Слова ссылки нельзя раскрыть однозначно: кавычек и «проверенной» цитаты нет, место названо в отчёте."""
+        self.assertEqual(len(rep["missing"]), 1)
+        self.assertNotIn(f"«{text}»", md)
+        self.assertIn(f"«{text} [место в стенограмме не найдено]»", md)
+        self.assertNotIn("«", pmd.split("Итог:", 1)[1])
+        self.assertIn(f"{text} (место в стенограмме не найдено)", pmd)
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 0 в кавычках, 1 без проверки", pmd)
+
+    def test_o255_1_link_to_second_part_then_part_split_again(self):
+        """О255-1, воспроизведение на штатной _diff_words: ссылка только на «бета» (part_of=w1); «бета» разбита ещё
+        раз («бета гамма»), у «гаммы» часть того же корня w1, не ID «беты», и «гамма» лежит в отрезке наложения.
+        Прежде ссылка раскрывалась только в «бета», «гамма» не проверялась. Теперь — неоднозначно, без кавычек."""
+        data, obj, ids = self.link_after_split("бета")
+        beta = ids[1]
+        self.assertEqual(obj["quotes"]["1"]["parts"][0]["word_ids"], [beta])
+        self.assertEqual(obj["quotes"]["1"]["parts"][0]["family"], ids)            # снимок семьи при связывании
+        self.assertEqual(conspect._id_words(data, [beta], ids), ("бета", S1, [beta]))
+        self.assert_quoted_at(self.render_both(obj, data), "бета")                   # пока не тронута — чисто
+        split_word(data, beta, "бета гамма", item="span@2")
+        words = {w["w"]: w for w in data["segments"][0]["words"]}
+        self.assertEqual(words["гамма"]["part_of"], "w1")                           # корень, а не ID «беты»
+        self.assertEqual(conspect._id_words(data, [beta], ids), (None, None, None))
+        self.assert_not_found(*self.render_both(obj, data), "бета")
+
+    def test_o255_1_link_to_second_part_then_part_replaced(self):
+        """О255-1 с заменой: «бета» заменена двумя словами «дельта эпсилон» (первое наследует ID «беты»); «эпсилон»
+        в отрезке. Прежде в кавычках выходило «дельта» — урезанная цитата; теперь место не найдено."""
+        data, obj, ids = self.link_after_split("бета")
+        split_word(data, ids[1], "дельта эпсилон", item="span@1")
+        self.assertEqual([w["w"] for w in data["segments"][0]["words"]], ["начало", "альфа", "дельта", "эпсилон", "конец"])
+        self.assert_not_found(*self.render_both(obj, data), "бета")
+
+    def test_o255_1_other_part_split_is_not_ours_but_unclear(self):
+        """Ссылка на «бета», а «альфу» (корень w1) заменяют двумя словами: новое слово — тоже член семьи w1. По
+        записи не определить, чьё оно, — неоднозначно, кавычек нет (осторожно: цитата «бета» от этого не менялась)."""
+        data, obj, ids = self.link_after_split("бета")
+        split_word(data, "w1", "эта дельта", item="span@1")
+        self.assert_not_found(*self.render_both(obj, data), "бета")
+
+    def test_second_part_link_without_later_edits(self):
+        """Контроль: ссылка на вторую часть, пока части не трогали, — как всегда: проверяются слова ссылки, и
+        только они. Отрезок на первой части цитату «бета» не задевает, на самой «бета» — задевает."""
+        data, obj, ids = self.link_after_split("бета", spans=((4.5, 5.3),))      # отрезок только на «альфа»
+        self.assert_quoted_at(self.render_both(obj, data), "бета")
+        data, obj, ids = self.link_after_split("бета", spans=((5.35, 5.6),))     # «бета»: 5,4 + 0,1 = 5,5 внутри
+        md, rep, pmd = self.render_both(obj, data)
+        self.assertIn("Спикер 1: бета (по распознаванию, не проверено, 00:00:05)", md)
+        self.assertIn("бета (по распознаванию, не проверено, 00:00:05)", pmd)
+        self.assert_header_matches(pmd)
+
+    def test_second_part_link_that_covers_the_root_follows_the_root(self):
+        """Ссылка на обе части («альфа бета», корень w1 выбран): новые части корня входят, как и раньше; гамма в
+        отрезке — цитата без кавычек, напечатано «альфа бета гамма»."""
+        data, obj, ids = self.link_after_split("альфа бета")
+        self.assertEqual(obj["quotes"]["1"]["parts"][0]["word_ids"], ids)
+        split_word(data, ids[1], "бета гамма", item="span@2")
+        self.assert_blocked(*self.render_both(obj, data), "альфа бета гамма")
+
+    def test_o255_2_link_to_first_part_does_not_pull_in_the_neighbour(self):
+        """О255-2, воспроизведение: ссылка только на «альфа» после разбиения (ID корня w1); отрезок — только на
+        «бета». Прежде w1 раскрывался и на «бета» — чистая цитата «альфа» теряла кавычки. Теперь печатается и
+        проверяется ровно «альфа»."""
+        data, obj, ids = self.link_after_split("альфа", spans=((5.5, 7.0),))
+        self.assertEqual(ids[0], "w1")
+        self.assertEqual(obj["quotes"]["1"]["base"], "альфа")                        # не «альфа бета»
+        self.assertEqual(conspect._id_words(data, ["w1"], obj["quotes"]["1"]["parts"][0]["family"]),
+                         ("альфа", S1, ["w1"]))
+        self.assert_quoted_at(self.render_both(obj, data), "альфа")
+        # отрезок на самой «альфа» — цитата без кавычек, время — слова «альфа»
+        data, obj, ids = self.link_after_split("альфа", spans=((4.5, 5.0),))
+        md, rep, pmd = self.render_both(obj, data)
+        self.assertIn("Спикер 1: альфа (по распознаванию, не проверено, 00:00:04)", md)
+        self.assertIn("альфа (по распознаванию, не проверено, 00:00:04)", pmd)
+        self.assert_header_matches(pmd)
+
+    def test_o255_2_open_place_on_neighbour_does_not_block_policy_quote(self):
+        """О255-2 для «цитат по одной»: открытое место на соседней части не снимает кавычки; на самой цитируемой —
+        снимает."""
+        for on_word, blocked in ((1, False), (0, True)):
+            with self.subTest(place_on_part=on_word):
+                data, obj, ids = self.link_after_split("альфа", spans=None)
+                data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.0, "t1": 5.0, "t2": 6.0,
+                                   "speaker": S1, "word_ids": [ids[on_word]]}]
+                pmd, _ = conspect.render(policy_copy(obj), data, update_last=False)
+                body = pmd.split("Итог:", 1)[1]
+                self.assertEqual("«альфа»" in body, not blocked)
+                self.assertEqual("(по распознаванию, не проверено" in body, blocked)
+                self.assert_header_matches(pmd)
+
+    def test_o255_2_link_to_first_part_follows_its_own_later_split(self):
+        """Ссылка на «альфа» (после разбиения), потом саму «альфу» заменяют двумя словами «эта дельта»: новая часть
+        «дельта» — часть «альфы», в цитате и в проверке; соседняя «бета» по-прежнему вне цитаты."""
+        data, obj, ids = self.link_after_split("альфа", spans=None)
+        split_word(data, "w1", "эта дельта", item="span@1")
+        delta = next(w["word_id"] for w in data["segments"][0]["words"] if w["w"] == "дельта")
+        self.assertEqual(conspect._id_words(data, ["w1"], obj["quotes"]["1"]["parts"][0]["family"])[2], ["w1", delta])
+        for place, blocked in (({"word_ids": [ids[1]]}, False), ({"word_ids": [delta]}, True)):
+            with self.subTest(place=place):
+                data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.0, "t1": 5.0, "t2": 6.0,
+                                   "speaker": S1, **place}]
+                pmd, rep = conspect.render(policy_copy(obj), data, update_last=False)
+                body = pmd.split("Итог:", 1)[1]
+                self.assertEqual("(по распознаванию, не проверено" in body, blocked)
+                self.assertIn("эта дельта", body)                                    # текст изменился — выводится новый
+                self.assertNotIn("бета", body)
+                self.assert_header_matches(pmd)
+
+    def test_s255_2_place_on_a_root_id_missing_from_the_transcript(self):
+        """С255-2 (проверка Sonnet, S9): место разбора ссылается на корневой ID w1, слова с этим ID в стенограмме
+        уже нет (остались части), поэтому раскрытый набор его не содержит. Блокировка мест идёт по объединению
+        сохранённых и напечатанных ID — цитата свёртки без кавычек; отрезки наложений — по-прежнему только по
+        напечатанным словам (О255-2)."""
+        data = split_data(spans=None)
+        obj, _ = conspect.link(self.TEXT, data)
+        data["segments"][0]["words"][1] = {"word_id": "p1", "w": "оригинал", "part_of": "w1", "s": 4.8, "e": 6.0, "c": 1.0}
+        data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.4, "t1": 5.4, "t2": 6.0,
+                           "speaker": S1, "word_ids": ["w1"]}]
+        self.assertEqual(conspect._id_words(data, ["w1"]), ("оригинал", S1, ["p1"]))
+        self.assertEqual(workflow.quote_blockers(data, ["p1"]), [])                  # по раскрытому — пусто (как в S9)
+        pmd, _ = conspect.render(policy_copy(obj), data, update_last=False)
+        self.assertIn("оригинал (по распознаванию, не проверено, 00:00:04)", pmd)
+        self.assertNotIn("«", pmd.split("Итог:", 1)[1])
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 0 в кавычках, 1 без проверки", pmd)
+
+    def test_quote_blockers_overlap_ids_limit_only_the_spans(self):
+        """overlap_ids сужает проверку отрезков, но не мест: слово w0 лежит в отрезке, w1 — нет."""
+        data = split_data(spans=((0.5, 2.0),))
+        data["review"] = [{"id": "r9", "status": "open", "reasons": ["low_conf"], "t": 5.4, "t1": 5.4, "t2": 6.0,
+                           "speaker": S1, "word_ids": ["w3"]}]
+        self.assertEqual([b["id"] for b in workflow.quote_blockers(data, ["w1", "w0"])], ["overlap_skipped:0"])
+        self.assertEqual(workflow.quote_blockers(data, ["w1", "w0"], overlap_ids=["w1"]), [])
+        self.assertEqual([b["id"] for b in workflow.quote_blockers(data, ["w1", "w3"], overlap_ids=["w1"])], ["r9"])
+
+    def test_old_link_to_a_part_without_family_snapshot(self):
+        """Ссылка без снимка семьи (связана до этой правки): часть без новых слов рядом — как раньше, в кавычках;
+        сразу за частью идёт слово её семьи (новая часть или сосед) — неоднозначно, без кавычек."""
+        data, obj, ids = self.link_after_split("бета", spans=None)
+        del obj["quotes"]["1"]["parts"][0]["family"]
+        self.assert_quoted_at(self.render_both(obj, data), "бета")
+        split_word(data, ids[1], "бета гамма", item="span@2")
+        self.assert_not_found(*self.render_both(obj, data), "бета")
+
+    def test_family_snapshot_only_when_words_were_split(self):
+        """Снимок семьи пишется, только если слова уже разбиты: обычная ссылка на неразбитое слово — как раньше."""
+        data = split_data()
+        obj, _ = conspect.link(self.TEXT, data)
+        self.assertEqual(set(obj["quotes"]["1"]["parts"][0]), {"t1", "t2", "word_ids"})
+
+    def assert_quoted_at(self, result, text):
+        md, rep, pmd = result
+        self.assertIn(f"Спикер 1: «{text}»", md)
+        self.assertNotIn("overlap_unchecked", rep)
+        self.assertEqual(rep["missing"], [])
+        self.assertIn(f"«{text}»", pmd)
+        self.assert_header_matches(pmd)
+        self.assertIn("Цитат: 1 в кавычках, 0 без проверки", pmd)
+
     def test_end_to_end_words_link_edit_render(self):
         """Сквозной путь на файлах: стенограмма → conspect.save_linked (ссылка) → transcript.edit_span
         (агент разбивает слово) → conspect.rerender (сборка) — обе разновидности конспекта и check_quotes."""
