@@ -337,30 +337,44 @@ class RefusalAfterCopyTests(RestoreCase):
         """Р258-10: сторонняя программа SQLite («создать, если нет») между переименованием и публикацией создаёт
         пустую базу на месте рабочей. Отказ говорит, какой файл во что переименовать; по его словам база
         возвращается. Окно кодом не закрывается."""
+        self.check_foreign_database(foreign_wal=False)
+
+    def test_foreign_database_with_its_journal_says_if_they_exist(self):
+        """Н258-1: чужие -wal/-shm SQLite убирает, когда чужая программа закрывается, — шаг «если они есть»."""
+        self.check_foreign_database(foreign_wal=True)
+
+    def check_foreign_database(self, foreign_wal):
         original = core_conflicts._move_aside
 
         def move_aside(destination):
             moved = original(destination)
             sqlite3.connect(destination).close()     # пустой файл на месте базы
+            if foreign_wal:
+                Path(str(destination) + "-wal").write_bytes(b"foreign journal")
             return moved
         with mock.patch.object(core_conflicts, "_move_aside", side_effect=move_aside):
             with self.assertRaises(core.CoreError) as caught:
                 self.restore()
         message = str(caught.exception)
         self.assertIn("появился чужой файл", message)
+        self.assertEqual("если они есть" in message, foreign_wal)
         self.assert_names_staged(message)
         self.assertEqual(self.db.stat().st_size, 0)
         saved = [name for name in self.names() if ".before-restore-" in name]
         self.assertEqual(len(saved), 1)
         quoted = re.findall(r"«([^»]+)»", message.split("Осталось:")[0])
         foreign = str(self.db) + ".foreign-"
-        steps = [(a, b) for a, b in zip(quoted[1::2], quoted[2::2])]
+        steps = list(zip(quoted[1::2], quoted[2::2]))
         self.assertEqual(quoted[0], str(self.db))
         self.assertEqual(steps[0][0], str(self.db))
         self.assertTrue(steps[0][1].startswith(foreign))
-        self.assertEqual(steps[1], (str(self.base / saved[0]), str(self.db)))
+        if foreign_wal:
+            self.assertEqual(steps[1], (str(self.db) + "-wal", steps[0][1] + "-wal"))
+        self.assertEqual(steps[-1], (str(self.base / saved[0]), str(self.db)))
+        self.assertEqual(len(steps), 3 if foreign_wal else 2)
         for source, target in steps:                 # человек делает, что сказано
             os.rename(source, target)
+        self.assertFalse(Path(str(self.db) + "-wal").exists())
         self.assertEqual(self.counted(self.db), (1, "ok"))
         self.assertEqual(Path(steps[0][1]).stat().st_size, 0)
 

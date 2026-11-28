@@ -1266,11 +1266,19 @@ def _not_returned(left):
     for original, renamed in left:
         if os.path.lexists(original):
             aside = original.name + ".foreign-" + stamp
-            foreign = [original] + [side for side in _side_files(original) if side not in ours]
-            moves = ", ".join(f"«{item}» в «{item.with_name(aside + item.name[len(original.name):])}»"
-                              for item in foreign)
-            steps.append(f"на месте «{original}» появился чужой файл — его создала другая программа, пока прежняя "
-                         f"база была отложена; сначала переименуйте {moves}, затем «{renamed}» — в «{original}»")
+
+            def move(item):
+                return f"«{item}» в «{item.with_name(aside + item.name[len(original.name):])}»"
+            # Н258-1: чужие -wal/-shm SQLite убирает, когда чужая программа закрывается, — «если они есть»
+            sides = [side for side in _side_files(original) if side not in ours]
+            moves = move(original) + (", а также, если они есть, " + ", ".join(map(move, sides)) if sides else "")
+            if str(original).endswith(_SIDE_SUFFIXES):
+                steps.append(f"если на месте «{original}» ещё лежит чужой файл, сначала переименуйте {moves}, "
+                             f"затем «{renamed}» — в «{original}»")
+            else:
+                steps.append(f"на месте «{original}» появился чужой файл — его создала другая программа, пока "
+                             f"прежняя база была отложена; сначала переименуйте {moves}, затем «{renamed}» — в "
+                             f"«{original}»")
         else:
             steps.append(f"«{renamed}» должен называться «{original}»")
     return ("восстановление не выполнено, и прежнюю базу не удалось вернуть на место. Ничего не удалено: "
