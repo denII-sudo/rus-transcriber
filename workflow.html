@@ -941,7 +941,7 @@ async function loadRequests() {
     const table = $("requests");
     table.innerHTML = "<tr><th>Запущен</th><th>Состояние</th><th>Запись</th><th></th></tr>" +
       d.requests.map(r => `<tr><td>${esc(fmtTime(r.created_at))}</td>
-        <td>${esc(stateRu(r.state))}</td><td class="muted">${esc((r.source || "").split("\\").pop())}</td>
+        <td>${esc(r.abandoned && r.state === "failed" ? "запуск отменён" : stateRu(r.state))}</td><td class="muted">${esc((r.source || "").split("\\").pop())}</td>
         <td><button data-id="${r.request_id}">открыть</button></td></tr>`).join("");
     table.querySelectorAll("button").forEach(b => b.onclick = () => openRequest(b.dataset.id));
   } catch (ex) { say(ex.message, true); }

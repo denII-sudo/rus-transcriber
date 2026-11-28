@@ -49,9 +49,14 @@ def create(store, source, policy=None):
 def list_recent(store, limit=20):
     """Короткий список последних запросов для локального экрана."""
     limit = max(0, min(int(limit), 100))
-    return [dict(row) for row in store.db.execute(
-        "SELECT request_id, state, source, recording_id, policy_revision, created_at, updated_at "
+    rows = [dict(row) for row in store.db.execute(
+        "SELECT request_id, state, source, recording_id, policy_revision, created_at, updated_at, "
+        "EXISTS(SELECT 1 FROM workflow_runs r WHERE r.request_id=workflow_requests.request_id "
+        "AND r.kind='asr' AND r.state='abandoned') AS abandoned "
         "FROM workflow_requests ORDER BY updated_at DESC LIMIT ?", (limit,))]
+    for row in rows:
+        row["abandoned"] = bool(row["abandoned"])     # человек отказался от запуска: экран пишет «запуск отменён»
+    return rows
 
 
 def policy_head(store, request_id):

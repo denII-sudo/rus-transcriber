@@ -674,6 +674,8 @@ class P5ScreenHTTPTests(unittest.TestCase):
         self.assertEqual((status, done["state"]), (200, "failed"))
         status, after = self.get(f"api/status?request_id={request}")
         self.assertEqual((after["state"], after["state_ru"]), ("failed", "запуск отменён"))
+        listed = self.get("api/requests")[1]["requests"]
+        self.assertEqual([(row["request_id"], row["abandoned"]) for row in listed], [(request, True)])
         self.assertIsNone(after["launch_note"])
         # повторно отменить уже отменённое нельзя
         self.assertEqual(self.post("api/abandon/prepare", {"request_id": request})[0], 400)
