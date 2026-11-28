@@ -422,7 +422,7 @@ audio{width:100%;height:36px}
     // «было → стало» без видимой разницы (was_now показывает не всю замену) — сама замена
     const shown = (c) => c.was_now && !/^(.*) → \1$/.test(c.was_now) ? c.was_now : (c.applied || []).join("; ");
     if (rep.free_text) (rep.free_text.cards || []).forEach(c => { if (shown(c)) lines.push(`${cardName(c.id)}: ${shown(c)}`); });
-    if (rep.free_text) (rep.free_text.cards || []).forEach(c => (c.warnings || []).forEach(w => action.push(`${cardName(c.id)}: внимание — ${w}`)));
+    if (rep.free_text) (rep.free_text.cards || []).forEach(c => (c.warnings_done || c.warnings || []).forEach(w => action.push(`${cardName(c.id)}: внимание — ${w}`)));
     if (quiet.length) lines.push(`Без изменений: ${quiet.length} — применены раньше или пропущены (карточки ${quiet.map(num).join(", ")})`);
     // apply_conflict: уточнение программы (версия стенограммы, слова вне места) полнее общей причины — без повтора
     rows.filter(o => !DONE.includes(o.outcome) && !QUIET.includes(o.outcome)).forEach(o =>

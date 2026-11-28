@@ -1742,6 +1742,8 @@ def edit_span_files(jp, md, t1, t2, text, speaker=None, note=None, by=None):
         except _card_errors() as ex:
             rep["card"] = "not_replaced"
             rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)}]
+        state = rep["card"] if rep["card"] in ("pending", "not_replaced") else "sent"
+        rep["text"] = rep.get("text", "") + transcript.CONTRADICTION_NEXT[state].format(rid=rid)
     return rep
 
 

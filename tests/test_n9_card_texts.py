@@ -7,6 +7,7 @@
 """
 import pathlib
 import unittest
+from unittest import mock
 
 import test_contradiction_card as cc
 import test_pause_buttons_short_answers as six
@@ -38,7 +39,10 @@ class NeighborDupWarningTests(six.Case):
                 (warn,) = card["warnings"]
                 self.assertIn("последнее слово ответа «вот»", warn)
                 self.assertIn("Анна, 2,00 с", warn)
-                self.assertIn("второй раз", warn)
+                self.assertIn("будет вписано второй раз", warn)
+                (done,) = card["warnings_done"]                          # отчёт «Применить» — итог, не прогноз
+                self.assertIn("вписано второй раз", done)
+                self.assertNotIn("будет", done)
 
     def test_same_speaker_neighbor_is_not_inserted_and_not_warned(self):
         for backend in BACKENDS:
@@ -56,7 +60,7 @@ class NeighborDupWarningTests(six.Case):
 
     def test_page_shows_warnings_in_preview_and_report(self):
         self.assertIn('one.warnings.join("; ")', CARDS)
-        self.assertIn("(c.warnings || []).forEach(w => action.push(", CARDS)
+        self.assertIn("(c.warnings_done || c.warnings || []).forEach(w => action.push(", CARDS)
 
 
 class GapCardTextTests(unittest.TestCase):
@@ -76,13 +80,54 @@ class ContradictionReasonTests(cc.Base):
                 self.assertIn("эти слова решил человек (карточка r4)", rep["text"])
                 self.assertIn("не повторяйте правку", rep["text"])
                 self.assertEqual(self.contradiction(jp, "r4")["proposals"][-1]["note"], "по смыслу фразы")
-                self.assertIn("причина: по смыслу фразы", self.card(jp, "r4")["question"])
+                accept = [o for o in self.labels(jp, "r4") if o.startswith("Принять новое")]
+                self.assertEqual(len(accept), 1)
+                self.assertIn("причина: по смыслу фразы", accept[0])
+
+    def test_each_proposal_option_has_its_own_reason(self):
+        """Находка (1) проверки №257: причина у каждого варианта, а не только у последнего предложения."""
+        with files("sqlite") as (jp, md, version):
+            self.answer_r4(jp, md, version)
+            core.edit_span_files(jp, md, 3.0, 3.0, "тут", note="первая причина", by="claude")
+            core.edit_span_files(jp, md, 3.0, 3.0, "там", note="вторая причина", by="claude")
+            accept = [o for o in self.labels(jp, "r4") if o.startswith("Принять новое")]
+            self.assertEqual(len(accept), 2, accept)
+            self.assertIn("«тут»", accept[0])
+            self.assertIn("первая причина", accept[0])
+            self.assertIn("вторая причина", accept[1])
+
+    def test_same_proposal_with_new_reason_is_kept(self):
+        """Находка (2): повтор того же текста с новой причиной сохраняет и её."""
+        with files("sqlite") as (jp, md, version):
+            self.answer_r4(jp, md, version)
+            core.edit_span_files(jp, md, 3.0, 3.0, "тут", note="первая причина", by="claude")
+            again = core.edit_span_files(jp, md, 3.0, 3.0, "тут", note="уточнённая причина", by="claude")
+            self.assertTrue(again["new"], again)
+            notes = [p.get("note") for p in self.contradiction(jp, "r4")["proposals"]]
+            self.assertEqual(notes, ["первая причина", "уточнённая причина"])
+            same = core.edit_span_files(jp, md, 3.0, 3.0, "тут", note="уточнённая причина", by="claude")
+            self.assertFalse(same["new"], same)
+
+    def test_message_follows_card_state(self):
+        """Находка (3): без открытого пакета не обещать, что предложение отправлено карточкой."""
+        with files("sqlite") as (jp, md, version):
+            self.answer_r4(jp, md, version)
+            with mock.patch.object(review_pack, "contradiction_cards", return_value={"r4": "pending"}):
+                rep = core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="claude")
+            self.assertEqual(rep["card"], "pending")
+            self.assertNotIn("отправлено ему карточкой", rep["text"])
+            self.assertIn("открытого пакета карточек нет", rep["text"])
+            with mock.patch.object(review_pack, "contradiction_cards", side_effect=OSError("диск")):
+                rep = core.edit_span_files(jp, md, 3.0, 3.0, "там", by="claude")
+            self.assertEqual(rep["card"], "not_replaced")
+            self.assertIn("повторите ту же правку", rep["text"])
 
     def test_without_note_question_has_no_reason(self):
         with files("sqlite") as (jp, md, version):
             self.answer_r4(jp, md, version)
             core.edit_span_files(jp, md, 3.0, 3.0, "тут", by="claude")
             self.assertNotIn("note", self.contradiction(jp, "r4")["proposals"][-1])
+            self.assertFalse(any("причина:" in o for o in self.labels(jp, "r4")))
             self.assertNotIn("причина:", self.card(jp, "r4")["question"])
 
     def test_human_own_span_is_named_in_message(self):

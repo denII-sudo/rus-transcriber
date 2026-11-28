@@ -380,7 +380,8 @@ def _contradiction_options(T, data, it):
     opts = [{"label": f"Оставить подтверждённое: «{confirmed.get('text', '')}» ({_who(T, confirmed)})",
              "decision": {"contradiction": "keep"}}]
     for p in proposals[-(2 if raw_needed else 3):]:
-        opts.append({"label": f"Принять новое: «{p['text']}» ({_who(T, p)})",
+        opts.append({"label": f"Принять новое: «{p['text']}» ({_who(T, p)}" +
+                          (f"; причина: {p['note']}" if p.get("note") else "") + ")",
                      "decision": {"text": p["text"], "contradiction": "accept", "proposal": p["key"],
                                   **({"speaker": p["speaker"]} if p.get("speaker") else {})}})
     if raw_needed:
@@ -393,8 +394,7 @@ def _contradiction_question(T, data, it):
     last = record["proposals"][-1]
     current = " ".join(w["w"] for w in _place_words(data, it))
     return (f"Вы подтвердили «{(record.get('confirmed') or {}).get('text', '')}». "
-            f"Предложено «{last.get('text', '')}» ({_who(T, last)})" +
-            (f", причина: {last['note']}" if last.get("note") else "") + f". Сейчас в стенограмме: «{current}». "
+            f"Предложено «{last.get('text', '')}» ({_who(T, last)}). Сейчас в стенограмме: «{current}». "
             "Что верно?")
 
 
@@ -2015,7 +2015,8 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
                        "was_now": rep["cards"].get(r["id"], {}).get("before", "") + " → " +
                        rep["cards"].get(r["id"], {}).get("after", "") if r["id"] in rep["cards"] else None,
                        "applied": r["applied"], "inserted": r["inserted"], "typos": r["typos"],
-                       **({"warnings": r["warnings"]} if r.get("warnings") else {})} for r in reports],
+                       **({"warnings": r["warnings"], "warnings_done": r.get("warnings_done") or r["warnings"]}
+                          if r.get("warnings") else {})} for r in reports],
             "closed_via": closed, "conflicts": conflicts, "left_to_human": human, "hints": sorted(hint_ids),
             "successful_ids": [r["id"] for r in reports if (r["id"] in rep["cards"] or r["id"] in confirmed)
                                and r["id"] not in rep["failed"] and r["id"] not in conflict_ids

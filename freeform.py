@@ -502,10 +502,12 @@ def _pause_answer(item, rep, flat, words, inside):
                 continue
             if abs(cents(w["s"]) - cents(t_a if edge == "первое" else t_b)) > limit:
                 continue
-            warn.append(PAUSE_NEIGHBOR_DUP.format(edge=edge, word=tok[1], speaker=w["_spk"] or "без подписи",
-                                                  sec=f"{float(w['s']):.2f}".replace(".", ",")))
+            fields = dict(edge=edge, word=tok[1], speaker=w["_spk"] or "без подписи",
+                          sec=f"{float(w['s']):.2f}".replace(".", ","))
+            warn.append((PAUSE_NEIGHBOR_DUP.format(**fields), PAUSE_NEIGHBOR_DUP_DONE.format(**fields)))
         if warn:
-            rep["warnings"] = warn
+            rep["warnings"] = [x for x, _ in warn]            # предпросмотр: что произойдёт
+            rep["warnings_done"] = [x for _, x in warn]       # отчёт «Применить»: что произошло
         rep["inserted"] = [f"{spk}: {' '.join(x for s2, x in grp)}"
                            for spk, grp in itertools.groupby(middle, key=lambda t: t[0])]
         return {"kind": "missed", "edits": eds, "covered": (t_a, t_b), "report": rep}
@@ -520,6 +522,9 @@ def _pause_answer(item, rep, flat, words, inside):
     return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
 
 
+PAUSE_NEIGHBOR_DUP_DONE = ("{edge} слово ответа «{word}» совпадало с соседним словом стенограммы ({speaker}, "
+                           "{sec} с) и вписано второй раз; если это то же слово — уберите лишнее: скажите Claude "
+                           "«исправь место этой карточки»")
 PAUSE_NEIGHBOR_DUP = ("{edge} слово ответа «{word}» совпадает с соседним словом стенограммы ({speaker}, {sec} с): "
                       "оно будет вписано второй раз; если это то же слово — уберите его из ответа")
 
