@@ -376,16 +376,24 @@ def place_holds_quote(item):
     return not _place_unresolved(item) and not _closed_unheard(item)
 
 
-def quote_blockers(data, word_ids):
+def quote_blockers(data, word_ids, overlap_ids=None):
     """Места разбора, из-за которых цитата из слов word_ids не держится в кавычках.
 
     data — стенограмма с ключом review (как у transcript.load): список мест. -> [{"id", "reason"}], reason:
     open — место не решено; unheard — закрыто без прослушивания; unlocated — место или слова цитаты
-    привязать к словам нельзя, и оно задевает все цитаты. Пусто — цитата чистая.
+    привязать к словам нельзя, и оно задевает все цитаты; overlap_skipped — слово цитаты лежит в отрезке
+    наложения, где место overlap не поставлено, потому что наложений в записи больше
+    words.OVERLAP_UNMEASURED_MAX_SHARE (quality.overlap_unmeasured_skipped.spans, Н28-1; id — «overlap_skipped:N»,
+    N — номер отрезка). Слово, которое тронул человек (transcript.human_touched), отрезок не задевает. Пусто —
+    цитата чистая.
 
     Место со ссылками на слова (и не пропуск) — эти слова. Остальные места — слова по transcript.place_words
     (PR 6а) с pause_neighbors=True: у места-паузы (слов внутри нет) это последнее слово до неё и первое после,
     так что пауза между словами цитаты или вплотную к её краю цитату задевает, а пауза в стороне — нет.
+
+    overlap_ids — слова, по которым проверяются отрезки наложений; по умолчанию word_ids. Сборка конспекта передаёт
+    в word_ids объединение сохранённых и напечатанных ID (место могло сослаться на корневой ID, которого в
+    стенограмме уже нет, С255-2), а в overlap_ids — только напечатанные слова (О255-2).
     """
     wanted = set(word_ids)
     quote_untimed = any(
@@ -408,7 +416,23 @@ def quote_blockers(data, word_ids):
                 hit = bool(wanted & set(found[0]))
         if hit:
             blockers.append({"id": item.get("id"), "reason": reason})
-    return blockers
+    return blockers + overlap_blockers(data, word_ids if overlap_ids is None else overlap_ids)
+
+
+def overlap_blockers(data, word_ids):
+    """Часть quote_blockers по отрезкам пропущенных наложений (Н28-1): [{"id", "reason"}], reason —
+    overlap_skipped (id «overlap_skipped:N») или unlocated (у слова цитаты нет времени, id «overlap_skipped»).
+    Её же читает сборка конспекта агента (conspect.render без quote_policy, Р255-1)."""
+    spans = transcript.overlap_skipped_spans(data)
+    if not spans:
+        return []
+    wanted = set(word_ids)
+    hits = {transcript.overlap_skipped_word(data, word, spans)
+            for segment in data.get("segments") or [] for word in segment.get("words") or []
+            if word.get("word_id") in wanted} - {None}
+    out = [{"id": "overlap_skipped", "reason": "unlocated"}] if "overlap_skipped" in hits else []
+    return out + [{"id": h, "reason": "overlap_skipped"}
+                  for h in sorted(hits - {"overlap_skipped"}, key=lambda h: int(h.rsplit(":", 1)[1]))]
 
 
 def _precise_doubts(transcript, review):

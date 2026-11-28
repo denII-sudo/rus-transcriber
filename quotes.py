@@ -5,6 +5,8 @@
 (так в конспекте отмечаются явные ошибки распознавания) и в счёт не идёт.
 Пометки ⟦…⟧ (нерешённые места стенограммы) словами не считаются; если цитата задевает нерешённое
 место, в строке отчёта "doubt": [id мест] — такую цитату надо проверить по клипу или дождаться разбора.
+Слово в отрезке наложения, где место не поставлено (доля наложений записи выше порога, Н28-1), даёт
+сомнение «overlap_skipped:N» — так же, как нерешённое место.
 «Дословно» — точное совпадение нормализованных слов одной непрерывной части без неоднозначности;
 похожесть от 0.6 — «близко», ниже — «не найдено». Скобки и составные цитаты требуют проверки.
 """
@@ -25,17 +27,20 @@ def _tokens(data):
     try:
         import transcript
         marks = transcript.doubt_marks(data) if data.get("review") else {}
+        spans = transcript.overlap_skipped_spans(data)
+        overlap = (lambda w: transcript.overlap_skipped_word(data, w, spans)) if spans else (lambda w: None)
     except Exception:
-        marks = {}
+        marks, overlap = {}, (lambda w: None)
     out = []
     for si, seg in enumerate(data["segments"]):
         ws = seg.get("words")
         if ws:
             m = marks.get(si) or {}
             for k, w in enumerate(ws):
+                doubt = m.get(k) or overlap(w)
                 for x in WORD.findall(w["w"]):
                     start = w.get("s")                     # у слова без времени — None
-                    out.append((_n(x), seg["speaker"], start if type(start) in (int, float) else None, m.get(k)))
+                    out.append((_n(x), seg["speaker"], start if type(start) in (int, float) else None, doubt))
         else:
             for w in WORD.findall(seg["text"]):
                 out.append((_n(w), seg["speaker"], seg["start"], None))

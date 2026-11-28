@@ -54,7 +54,7 @@ class StatusTests(unittest.TestCase):
             compact = json.loads(core._text_only(job, "json"))
             self.assertEqual(compact["asr_summary"]["overlap_unmeasured_skipped"], skipped)
             self.assertNotIn("quality", compact)
-            self.assertIn("одновременную речь на 82 % речи", core._text_only(job, "markdown"))
+            self.assertIn("на 82 % речи звучит больше одного голоса сразу", core._text_only(job, "markdown"))
 
     def test_cli_and_mcp_show_incomplete_result(self):
         status = {"state": "done", "quality": {"asr_incomplete_chunks": 2,
