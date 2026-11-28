@@ -22,6 +22,7 @@
   * место не найдено (слова удалены) — выводится авторская версия с пометкой, место в отчёте.
 Связь односторонняя: правки в документе Claude Docs в стенограмму не возвращаются.
 """
+import copy
 import json
 import re
 import base64
@@ -664,12 +665,13 @@ def _author_of(obj, data):
     return author
 
 
-def render(obj, data, update_last=True):
+def render(obj, data, update_last=True, _parts=None):
     """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания.
 
     Свёртка с quote_policy 1 («цитаты по одной», РАР-7, 7.5): автора пишет программа, цитата в «» только
     если ни одно место разбора её не задевает (workflow.quote_blockers), иначе она печатается без кавычек
     с пометкой; в шапке — строка «Цитат: …». Остальные свёртки собираются как раньше.
+    _parts — словарь-приёмник: туда кладутся шапка и тело отдельно (для render_parts).
     """
     hdr = {"speaker_changes": 0, "speaker_unknown": False}
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
@@ -766,6 +768,8 @@ def render(obj, data, update_last=True):
             stats["quoted"] += 1
             return f"{author}: «{body}»"
         stats["marked"] += 1
+        if any(str(blocker["id"]).startswith("overlap_skipped") for blocker in blockers):
+            rep.setdefault("overlap_unchecked", []).append(key)      # как у конспекта агента: сигнал для conspect_render
         unheard = all(blocker["reason"] == "unheard" for blocker in blockers)
         stats["unheard"] += unheard
         found = [starts[wid] for wid in ids if wid in starts]
@@ -787,6 +791,8 @@ def render(obj, data, update_last=True):
     if policy and (stats["quoted"] or stats["marked"]):
         header += (f"Цитат: {stats['quoted']} в кавычках, {stats['marked']} без проверки"
                    + (f" (из них не прослушано: {stats['unheard']})" if stats["unheard"] else "") + "\n\n")
+    if _parts is not None:
+        _parts.update(header=header, body=body_md)
     md = header + body_md
     if update_last and not source_conflict:
         obj["assembly_revision"] = data.get("source_revision")
@@ -794,6 +800,17 @@ def render(obj, data, update_last=True):
             obj["assembly_review_revision"] = data["review_revision"]
     rep["assembly_revision"] = obj.get("assembly_revision")
     return md, rep
+
+
+def render_parts(obj, data):
+    """-> (шапка, тело) свёртки так, как их печатает render в файл, но ничего не пишет и obj не меняет.
+
+    Для локального экрана: те же кавычки, пометки «по распознаванию, не проверено», метки участников и расшифровка
+    меток, что в файле. Шапка — как в файле (в ней служебная строка-маркер, которую экран убирает сам).
+    """
+    parts = {}
+    render(copy.deepcopy(obj), data, update_last=False, _parts=parts)
+    return parts["header"], parts["body"]
 
 
 def confirm_analysis(obj, data):
@@ -837,7 +854,9 @@ def _save_linked_locked(json_path, name, conspect_md):
     return {"conspect_json": str(cj), "conspect_md": str(cm), **rep,
             "analysis_needs_review": rrep["analysis_needs_review"],
             "assembly_revision": rrep["assembly_revision"], "analysis_revision": rrep["analysis_revision"],
-            "external_publication": rrep["external_publication"], "check": check}
+            "external_publication": rrep["external_publication"],
+            **({"overlap_unchecked": rrep["overlap_unchecked"]} if "overlap_unchecked" in rrep else {}),
+            "check": check}
 
 
 def rerender(json_path, name=None):
