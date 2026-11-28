@@ -118,11 +118,12 @@ Remove-Item (At "tools/jn") -Recurse -Force
 New-Item -ItemType Junction -Path (At "tools/jn") -Target $outside | Out-Null
 $jn = Get-Item -LiteralPath (At "tools/jn") -Force
 Check "F setup: junction created" ([bool]($jn.Attributes -band [IO.FileAttributes]::ReparsePoint))
-$v4 = New-Source "v4" @("cards.html", "tools/check.py")
+$v4 = New-Source "v4" @("cards.html", "tools/check.py", "tools/v4_only.py", "tools/jn/victim.py")
 $r = Install $v4 @{ ExtraFiles = "Delete" }
-# код выхода здесь 1: сборка со ссылкой внутри tools отвергается при записи build-info.json (это прежнее правило) — важно, что файл за ссылкой цел
-Check "F junction: file behind the link is not removed" (Test-Path -LiteralPath (Join-Path $outside "victim.py"))
-if (-not (Test-Path -LiteralPath (Join-Path $outside "victim.py"))) { $global:Diag = "---- F: code=$($r.code) ----`n" + $r.text.Substring([Math]::Max(0, $r.text.Length - 2500)) }
+# ссылка внутри tools: установка отказывает до копирования, файл за ссылкой не перезаписан и не удалён
+Check "F junction: refused before any change" ($r.code -eq 1 -and $r.flat -match "ссылки" -and $r.flat -match "tools/jn")
+Check "F junction: file behind the link is intact, kit not written through it" ((Get-Content (Join-Path $outside "victim.py") -Raw).Trim() -eq "# synthetic victim")
+Check "F junction: nothing of the new kit copied" (-not (Has "tools/v4_only.py"))
 Check "F junction: the link itself is not touched" (Test-Path -LiteralPath (At "tools/jn"))
 [IO.Directory]::Delete((At "tools/jn"))
 Check "F junction removed without touching its target" (Test-Path -LiteralPath (Join-Path $outside "victim.py"))
@@ -135,6 +136,36 @@ Check "G source without tools: installed tools kept" ((Has "tools/check.py") -an
 # ---------- H: неверное значение параметра ----------
 $r = Install $v2 @{ ExtraFiles = "Purge" }
 Check "H wrong -ExtraFiles value: refused before any change" ($r.code -eq 1 -and $r.flat -match "ExtraFilesпринимает")
+
+# ---------- I: переименование только регистра, файл с точкой, сбой копирования ----------
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$v6 = New-Source "v6" @("cards.html", "tools/Foo.py", "tools/check.py", "gone_late.py", "tools/gone_tool.py")
+$r = Install $v6
+Check "I setup: install" ($r.code -eq 0 -and (Has "gone_late.py") -and (Has "tools/Foo.py"))
+# новая версия: tools/Foo.py -> tools/foo.py (содержимое то же), в комплекте файл с точкой, устаревшие файлы убраны из комплекта
+$v7 = New-Source "v7" @("cards.html", "tools/check.py")
+Put $v7 "tools/foo.py" "# synthetic tools/Foo.py"
+Put $v7 "tools/.keep" "shipped dot-file"
+Put $prog "tools/mine.txt" "mine"
+$r = Install $v7 @{ ExtraFiles = "Delete" }
+Check "I update: exit 0" ($r.code -eq 0)
+Check "I case-only rename: the installed file is not removed" (Has "tools/Foo.py")
+Check "I stale files of the previous build removed" (-not (Has "gone_late.py") -and -not (Has "tools/gone_tool.py"))
+Check "I dot-file of the kit survives -ExtraFiles Delete" (Has "tools/.keep")
+Check "I user file shown before the copy is deleted, kit dot-file reported as not shown" (-not (Has "tools/mine.txt") -and $r.flat -match "неподказывали|непоказывали")
+
+# сбой копирования (файл назначения заперт): удаление не выполняется
+Get-ChildItem $prog -Force | Remove-Item -Recurse -Force
+$v8 = New-Source "v8" @("cards.html", "tools/check.py", "gone_late.py", "tools/gone_tool.py")
+$r = Install $v8
+Check "I2 setup: install" ($r.code -eq 0 -and (Has "gone_late.py"))
+$v9 = New-Source "v9" @("cards.html", "tools/check.py")
+Put $v9 "tools/check.py" "# changed content so that the copy has to overwrite the locked file"
+$lock = [IO.File]::Open((At "tools/check.py"), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+try { $r = Install $v9 } finally { $lock.Dispose() }
+Check "I2 locked file: copy error reported" ($r.flat -match "неудалосьскопировать")
+Check "I2 locked file: nothing is deleted after a failed copy" ((Has "gone_late.py") -and (Has "tools/gone_tool.py"))
+Check "I2 locked file: deletion skipped message" ($r.flat -match "копированиепрошлосошибками")
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 if ($global:Diag) { $global:Diag }

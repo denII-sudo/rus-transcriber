@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 MANIFEST = "build-info.json"
 # Top-level program files are taken by suffix, so a new module needs no list entry here
@@ -260,6 +261,31 @@ def _regular_file(path):
     return path.is_file() and not _linked(path)
 
 
+def _links_under(target):
+    """Links inside the folders an update writes to (a link at the top counts as one)."""
+    target = Path(target)
+    found = []
+    for sub in SUPPORT_DIRS + ("docs",):
+        base = target / sub
+        if _linked(base):
+            found.append(sub)
+            continue
+        if not base.is_dir():
+            continue
+        for root, dirs, files in os.walk(base, followlinks=False):
+            parent = Path(root)
+            keep = []
+            for d in sorted(dirs):
+                if _linked(parent / d):
+                    found.append((parent / d).relative_to(target).as_posix())
+                else:
+                    keep.append(d)
+            dirs[:] = keep
+            found.extend((parent / n).relative_to(target).as_posix()
+                         for n in sorted(files) if _linked(parent / n))
+    return sorted(found)
+
+
 def stale_report(source, target):
     """What an update could remove from target, without changing anything.
 
@@ -270,15 +296,22 @@ def stale_report(source, target):
                  the previous manifest never listed: possibly the user's own;
     root_unknown program files at the top level of target that the source does not ship
                  and the previous manifest never listed (shown only, never removed).
+    links        links (symlink, junction) under tools/, tests/, examples/, docs/: an update
+                 would write through them, so install.ps1 refuses to start.
     Without a valid previous manifest nothing is stale: files are only shown.
+    Names are compared without regard to case (Windows keeps the old spelling of a file
+    that a new version spells differently, so Foo.py -> foo.py must not look removed).
     """
     source, target = Path(source), Path(target)
     new = delivery_hashes(source)
     old = _manifest(target)
     old_files = old["files"] if old else {}
     report = {"manifest": old is not None, "stale": [], "modified": [], "unknown": [],
-              "root_unknown": []}
+              "root_unknown": [], "links": _links_under(target)}
+    new_keys = {n.casefold() for n in new}
     for name in sorted(set(old_files) - set(new)):
+        if name.casefold() in new_keys:
+            continue  # the same file under another spelling of its name: still shipped
         top = name.split("/")[0]
         if top in SUPPORT_DIRS and not (source / top).is_dir():
             continue  # the source ships no such folder at all: leave the installed one alone
@@ -290,7 +323,7 @@ def stale_report(source, target):
         except (OSError, ValueError):
             same = False
         report["stale" if same else "modified"].append(name)
-    seen = set(new) | set(old_files)
+    seen = new_keys | {n.casefold() for n in old_files}
     for sub in SUPPORT_DIRS:
         base = target / sub
         if not base.is_dir() or _linked(base):
@@ -303,29 +336,40 @@ def stale_report(source, target):
                     continue
                 rel = (parent / n).relative_to(target).as_posix()
                 # tools/tools/..., tests/tests/...: copies by an old installer, removed by it
-                if rel in seen or rel.startswith(f"{sub}/{sub}/"):
+                if rel.casefold() in seen or rel.startswith(f"{sub}/{sub}/"):
                     continue
                 if _inside(target, rel) is not None and _regular_file(parent / n):
                     report["unknown"].append(rel)
     report["unknown"].sort()
     if target.is_dir():
-        wanted = {n for n in new if "/" not in n}
+        wanted = {n for n in new_keys if "/" not in n}
+        known = {n.casefold() for n in old_files}
         report["root_unknown"] = [n for n in root_files(target)
-                                  if n not in wanted and n not in old_files
+                                  if n.casefold() not in wanted and n.casefold() not in known
                                   and _regular_file(target / n)]
     return report
 
 
-def prune(source, target, what):
-    """Delete the files stale_report names under `what` ("stale" or "unknown").
+def prune(source, target, what, shown):
+    """Delete the files of stale_report under `what` ("stale" or "unknown") that were shown.
 
-    Each name is checked again right before deletion; only plain files are removed,
-    never folders (empty folders left under tools/, tests/, examples/ and docs/ are
-    removed), never anything outside target. Returns (removed, failed).
+    `shown` is the report install.ps1 printed to the person before it copied anything:
+    only names in both that report and the current one are deleted. A name that appeared
+    since (the copy itself, a dot-file) is `skipped`, a shown name that is no longer a
+    candidate is `gone`; neither is touched. Each name is checked again right before
+    deletion; only plain files are removed, never folders (empty folders left under
+    tools/, tests/, examples/ and docs/ are removed), never anything outside target.
+    Returns (removed, failed, skipped, gone).
     """
     report = stale_report(source, target)
+    shown_names = {n for n in shown.get(what, []) if isinstance(n, str)}
+    current = set(report[what])
     removed, failed = [], []
+    skipped = sorted(current - shown_names)
+    gone = sorted(shown_names - current)
     for name in report[what]:
+        if name not in shown_names:
+            continue
         path = _inside(target, name)
         if path is None or not _regular_file(path):
             failed.append(name)
@@ -343,7 +387,7 @@ def prune(source, target, what):
             except OSError:
                 break
             folder = folder.parent
-    return removed, failed
+    return removed, failed, skipped, gone
 
 
 def main():
@@ -355,15 +399,23 @@ def main():
     p.add_argument("--stale-report", action="store_true",
                    help="print JSON: files an update could remove from --target (changes nothing)")
     p.add_argument("--prune", choices=("stale", "unknown"),
-                   help="delete the files named in the report under this heading; print JSON")
+                   help="delete the files under this heading of the report; print JSON")
+    p.add_argument("--shown-stdin", action="store_true",
+                   help="with --prune: the --stale-report JSON shown to the person, read from stdin; "
+                        "only names present in it are deleted")
     a = p.parse_args()
     if a.stale_report or a.prune:
         if not a.target:
             p.exit(2, "Build identity: --target is required.\n")
         try:
             if a.prune:
-                removed, failed = prune(a.source, a.target, a.prune)
-                out = {"removed": removed, "failed": failed}
+                if not a.shown_stdin:
+                    p.exit(2, "Build identity: --prune requires --shown-stdin.\n")
+                shown = json.loads(sys.stdin.read())
+                if not isinstance(shown, dict):
+                    raise ValueError("shown list")
+                removed, failed, skipped, gone = prune(a.source, a.target, a.prune, shown)
+                out = {"removed": removed, "failed": failed, "skipped": skipped, "gone": gone}
             else:
                 out = stale_report(a.source, a.target)
         except (OSError, ValueError):

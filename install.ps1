@@ -180,9 +180,23 @@ function Get-ExtraFilesAnswer([string]$answer) {
     return "Keep"
 }
 # Печатает имена файлов отступом, не больше 20 строк.
-function Show-FileList([string[]]$names) {
-    foreach ($n in @($names | Select-Object -First 20)) { Write-Host "    $n" -ForegroundColor Yellow }
-    if (@($names).Count -gt 20) { Write-Host "    и ещё $(@($names).Count - 20)" -ForegroundColor Yellow }
+function Show-FileList([string[]]$names, [switch]$All) {
+    $shown = @($names)
+    if (-not $All) { $shown = @($names | Select-Object -First 20) }
+    foreach ($n in $shown) { Write-Host "    $n" -ForegroundColor Yellow }
+    if ($shown.Count -lt @($names).Count) { Write-Host "    и ещё $(@($names).Count - $shown.Count)" -ForegroundColor Yellow }
+}
+# Копирование с учётом ошибок: после любой неудачи удалять файлы нельзя (смесь версий не должна ещё и терять файлы).
+$script:CopyFailed = $false
+function Copy-Checked([string]$Path, [string]$Destination, [switch]$Literal, [switch]$Recurse) {
+    try {
+        if ($Literal) { Copy-Item -LiteralPath $Path -Destination $Destination -Force -ErrorAction Stop }
+        elseif ($Recurse) { Copy-Item -Path $Path -Destination $Destination -Recurse -Force -ErrorAction Stop }
+        else { Copy-Item -Path $Path -Destination $Destination -Force -ErrorAction Stop }
+    } catch {
+        $script:CopyFailed = $true
+        Write-Host "  не удалось скопировать $Path : $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 # Разница двух списков pip freeze: какие пакеты добавлены, удалены или сменили версию.
 function Compare-PipFreeze([string[]]$before, [string[]]$after) {
@@ -784,21 +798,32 @@ if ($Source -ne $Target) {
     }
     # Что обновление могло бы убрать, — до любых изменений. Список составляет buildinfo.py по прежнему
     # build-info.json: «устаревшие» — файлы, которые ставила прежняя сборка, их нет в новой и они не
-    # менялись (хэш совпадает); остальные лишние файлы только показываются. Сбой — ничего не удаляется.
+    # менялись (хэш совпадает); остальные лишние файлы только показываются. Удаляется ровно показанный
+    # здесь список (его же получает buildinfo.py при удалении). Сбой составления списка — установка не начата.
     $stale = $null
     $staleText = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --stale-report)
     if ($LASTEXITCODE -eq 0 -and $staleText.Count) {
         try { $stale = ($staleText -join "`n") | ConvertFrom-Json } catch { $stale = $null }
     }
-    $pruneStale = $false; $pruneExtra = $false
     if (-not $stale) {
-        Write-Host "  не удалось составить список устаревших файлов: ничего не удаляю" -ForegroundColor Yellow
-    } else {
+        Fail "Не удалось составить список файлов установленной копии (buildinfo.py --stale-report). Установка не начата, ничего не изменено."
+    }
+    # Ссылка (junction/symlink) в tools/tests/examples/docs: копирование писало бы сквозь неё в чужую папку.
+    # Прежний установщик стирал такие папки целиком; теперь они не стираются, поэтому отказ до копирования.
+    $linkList = @($stale.links)
+    if ($linkList.Count) {
+        Write-Host "  в папке программы есть ссылки (junction/symlink) в местах, куда пишет обновление ($($linkList.Count)):" -ForegroundColor Red
+        Show-FileList $linkList -All
+        Fail ("Установка не начата, ничего не изменено. Копирование писало бы сквозь ссылки в другие папки. " +
+              "Уберите ссылки (удаляйте саму ссылку, не её содержимое) или замените их обычными папками и запустите снова.")
+    }
+    $pruneStale = $false; $pruneExtra = $false
+    if ($stale) {
         $goneList = @($stale.stale); $changedList = @($stale.modified)
         $unknownList = @($stale.unknown); $rootList = @($stale.root_unknown)
         if ($goneList.Count) {
             Write-Host "  устаревшие файлы прежней сборки ($($goneList.Count)): они были в её build-info.json, в новой версии их нет, после установки не менялись — будут удалены:" -ForegroundColor Yellow
-            Show-FileList $goneList
+            Show-FileList $goneList -All
             $pruneStale = $true
         } elseif (-not $stale.manifest) {
             Write-Host "  прежнего build-info.json нет (или он не читается): какие файлы ставила прежняя сборка, неизвестно — ничего не удаляю" -ForegroundColor DarkGray
@@ -815,7 +840,7 @@ if ($Source -ne $Target) {
             $extraMode = Get-ExtraFilesMode $ExtraFiles $nonInteractive
             if ($extraMode -ne "Keep") {
                 Write-Host "  в папках tools/tests/examples есть файлы, которых нет в комплекте программы и которых прежняя сборка не ставила ($($unknownList.Count)):" -ForegroundColor Yellow
-                Show-FileList $unknownList
+                Show-FileList $unknownList -All
                 Write-Host "  возможно, это ваши файлы; если это старые тесты, они попадут в самопроверку (self_check)" -ForegroundColor Yellow
             }
             if ($extraMode -eq "Ask") {
@@ -828,14 +853,14 @@ if ($Source -ne $Target) {
         }
     }
     foreach ($f in $rootFiles) {
-        Copy-Item -LiteralPath (Join-Path $Source $f) -Destination (Join-Path $Target $f) -Force
+        Copy-Checked (Join-Path $Source $f) (Join-Path $Target $f) -Literal
     }
     $docsTarget = Join-Path $Target "docs"
     New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
-    Copy-Item (Join-Path $Source "docs\model-download-certificate.md") (Join-Path $docsTarget "model-download-certificate.md") -Force
-    Copy-Item (Join-Path $Source "docs\2026-11-17-p3-workflow-handoff.md") (Join-Path $docsTarget "2026-11-17-p3-workflow-handoff.md") -Force
-    Copy-Item (Join-Path $Source "docs\2026-11-17-p4-opencode-openai-handoff.md") (Join-Path $docsTarget "2026-11-17-p4-opencode-openai-handoff.md") -Force
-    Copy-Item (Join-Path $Source "docs\2026-11-17-p5-screen-handoff.md") (Join-Path $docsTarget "2026-11-17-p5-screen-handoff.md") -Force
+    Copy-Checked (Join-Path $Source "docs\model-download-certificate.md") (Join-Path $docsTarget "model-download-certificate.md")
+    Copy-Checked (Join-Path $Source "docs\2026-11-17-p3-workflow-handoff.md") (Join-Path $docsTarget "2026-11-17-p3-workflow-handoff.md")
+    Copy-Checked (Join-Path $Source "docs\2026-11-17-p4-opencode-openai-handoff.md") (Join-Path $docsTarget "2026-11-17-p4-opencode-openai-handoff.md")
+    Copy-Checked (Join-Path $Source "docs\2026-11-17-p5-screen-handoff.md") (Join-Path $docsTarget "2026-11-17-p5-screen-handoff.md")
     # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
     # examples — вымышленный пример группы. Это копии комплекта программы: файлы комплекта
     # перезаписываются поверх. Папки целиком установщик не удаляет: лишнее убирается только
@@ -845,24 +870,38 @@ if ($Source -ne $Target) {
         if (-not (Test-Path $sd)) { continue }
         $dd = Join-Path $Target $sub
         New-Item -ItemType Directory -Path $dd -Force | Out-Null
-        Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
+        Copy-Checked (Join-Path $sd "*") $dd -Recurse
         # вложенные дубли прошлых версий установщика и кэш байткода — не данные пользователя
         $dup = Join-Path $dd $sub
         if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
         Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
-    # Удаление по списку: buildinfo.py ещё раз проверяет каждое имя, удаляет только обычные файлы внутри
-    # папки программы и не заходит в ссылки (junction/symlink).
+    # Удаление по показанному списку: buildinfo.py получает его на входе, пересчитывает кандидатов и удаляет
+    # только пересечение (имя, появившееся после копирования, не удаляется), проверяет каждое имя, удаляет
+    # только обычные файлы внутри папки программы и не заходит в ссылки (junction/symlink).
+    # После любой ошибки копирования ничего не удаляется.
     foreach ($kind in @(@{ run = $pruneStale; arg = "stale"; what = "устаревших файлов прежней сборки" },
                         @{ run = $pruneExtra; arg = "unknown"; what = "лишних файлов в tools/tests/examples" })) {
         if (-not $kind.run) { continue }
-        $pruneText = @(& $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --prune $kind.arg)
+        if ($script:CopyFailed) {
+            Write-Host "  удаление $($kind.what) не выполнено: копирование прошло с ошибками (см. выше)" -ForegroundColor Yellow
+            continue
+        }
+        $pruneText = @(($staleText -join "`n") | & $manifestPython -B (Join-Path $Source "buildinfo.py") --source $Source --target $Target --prune $kind.arg --shown-stdin)
         $pruned = $null
         if ($LASTEXITCODE -eq 0 -and $pruneText.Count) { try { $pruned = ($pruneText -join "`n") | ConvertFrom-Json } catch { $pruned = $null } }
         if (-not $pruned) { Write-Host "  не удалось удалить список $($kind.what): ничего не удалено" -ForegroundColor Yellow; continue }
         Write-Host "  удалено $($kind.what): $(@($pruned.removed).Count)" -ForegroundColor Green
-        if (@($pruned.failed).Count) { Write-Host "  не удалось удалить ($(@($pruned.failed).Count)):" -ForegroundColor Yellow; Show-FileList @($pruned.failed) }
+        if (@($pruned.failed).Count) { Write-Host "  не удалось удалить ($(@($pruned.failed).Count)):" -ForegroundColor Yellow; Show-FileList @($pruned.failed) -All }
+        if (@($pruned.skipped).Count) {
+            Write-Host "  после копирования появились кандидаты, которых человеку не показывали — оставлены ($(@($pruned.skipped).Count)):" -ForegroundColor Yellow
+            Show-FileList @($pruned.skipped) -All
+        }
+        if (@($pruned.gone).Count) {
+            Write-Host "  показанные файлы больше не кандидаты (стали частью комплекта или исчезли) — не тронуты ($(@($pruned.gone).Count)):" -ForegroundColor Yellow
+            Show-FileList @($pruned.gone) -All
+        }
     }
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает
 } else { Write-Host "  запуск из папки программы, копировать нечего" }

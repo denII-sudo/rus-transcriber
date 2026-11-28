@@ -322,10 +322,17 @@ class StaleFilesTests(unittest.TestCase):
     def report(self):
         return buildinfo.stale_report(self.source, self.target)
 
-    def cli(self, *args):
+    def prune_now(self, what):
+        """Delete what the report shows right now (install.ps1 passes the report it printed)."""
+        removed, failed, skipped, gone = buildinfo.prune(self.source, self.target, what, self.report())
+        self.assertEqual((skipped, gone), ([], []))
+        return removed, failed
+
+    def cli(self, *args, stdin=""):
         stdout = io.StringIO()
         with patch.object(sys, "argv", ["buildinfo.py", "--source", str(self.source),
                                         "--target", str(self.target), *args]), \
+                patch.object(sys, "stdin", io.StringIO(stdin)), \
                 redirect_stdout(stdout), redirect_stderr(io.StringIO()):
             try:
                 buildinfo.main()
@@ -349,7 +356,7 @@ class StaleFilesTests(unittest.TestCase):
     def test_prune_removes_stale_files_and_empty_folders_but_nothing_else(self):
         self.write(self.target, "tools/mine.txt", "mine")
         self.write(self.target, "mine_script.py", "# mine")
-        removed, failed = buildinfo.prune(self.source, self.target, "stale")
+        removed, failed = self.prune_now("stale")
         self.assertEqual((sorted(removed), failed), (
             ["old_mod.py", "tests/sub/nested_old.py", "tests/test_old.py", "tools/gone.py"], []))
         self.assertFalse((self.target / "tests/sub").exists())
@@ -357,14 +364,14 @@ class StaleFilesTests(unittest.TestCase):
                      "mine_script.py", "server.py", "cards.html", buildinfo.MANIFEST,
                      "docs/model-download-certificate.md"):
             self.assertTrue((self.target / kept).exists(), kept)
-        self.assertEqual(buildinfo.prune(self.source, self.target, "stale"), ([], []))
+        self.assertEqual(self.prune_now("stale"), ([], []))
 
     def test_file_changed_after_installation_is_kept_and_reported(self):
         (self.target / "tests/test_old.py").write_text("# the user edited it", encoding="utf-8")
         got = self.report()
         self.assertEqual(got["modified"], ["tests/test_old.py"])
         self.assertNotIn("tests/test_old.py", got["stale"])
-        buildinfo.prune(self.source, self.target, "stale")
+        self.prune_now("stale")
         self.assertEqual((self.target / "tests/test_old.py").read_text(encoding="utf-8"), "# the user edited it")
 
     def test_without_previous_manifest_nothing_is_stale_only_shown(self):
@@ -374,7 +381,7 @@ class StaleFilesTests(unittest.TestCase):
         self.assertEqual((got["stale"], got["modified"]), ([], []))
         self.assertEqual(got["unknown"], ["tests/sub/nested_old.py", "tests/test_old.py", "tools/gone.py"])
         self.assertEqual(got["root_unknown"], ["old_mod.py"])
-        self.assertEqual(buildinfo.prune(self.source, self.target, "stale"), ([], []))
+        self.assertEqual(self.prune_now("stale"), ([], []))
         self.assertTrue((self.target / "old_mod.py").exists())
 
     def test_invalid_previous_manifest_is_the_same_as_none(self):
@@ -388,16 +395,16 @@ class StaleFilesTests(unittest.TestCase):
         self.write(self.target, "examples/note.txt", "mine")
         self.write(self.target, "tools/__pycache__/check.cpython-312.pyc", "bytecode")
         self.write(self.target, "tools/tools/dup.py", "# nested copy of an old installer")
-        buildinfo.prune(self.source, self.target, "stale")
+        self.prune_now("stale")
         got = self.report()
         self.assertEqual(got["unknown"], ["examples/note.txt", "tools/mine.txt"])
-        removed, failed = buildinfo.prune(self.source, self.target, "unknown")
+        removed, failed = self.prune_now("unknown")
         self.assertEqual((removed, failed), (["examples/note.txt", "tools/mine.txt"], []))
         self.assertTrue((self.target / "tools/check.py").exists())
 
     def test_prune_unknown_does_not_touch_stale_files(self):
         self.write(self.target, "tools/mine.txt", "mine")
-        buildinfo.prune(self.source, self.target, "unknown")
+        self.prune_now("unknown")
         self.assertTrue((self.target / "tools/gone.py").exists())
         self.assertTrue((self.target / "old_mod.py").exists())
 
@@ -406,7 +413,7 @@ class StaleFilesTests(unittest.TestCase):
         self.write(self.target, "notes.txt", "not a program file")
         self.assertEqual(self.report()["root_unknown"], ["mine_script.py"])
         for what in ("stale", "unknown"):
-            buildinfo.prune(self.source, self.target, what)
+            self.prune_now(what)
         self.assertTrue((self.target / "mine_script.py").exists())
         self.assertTrue((self.target / "notes.txt").exists())
 
@@ -414,7 +421,7 @@ class StaleFilesTests(unittest.TestCase):
         shutil.rmtree(self.source / "tests")
         got = self.report()
         self.assertFalse([n for n in got["stale"] if n.startswith("tests/")])
-        buildinfo.prune(self.source, self.target, "stale")
+        self.prune_now("stale")
         self.assertTrue((self.target / "tests/test_old.py").exists())
         self.assertFalse((self.target / "tools/gone.py").exists())
 
@@ -431,7 +438,7 @@ class StaleFilesTests(unittest.TestCase):
         (self.target / buildinfo.MANIFEST).write_text(json.dumps(data), encoding="utf-8")
         (self.target / "config.json").write_text("{}", encoding="utf-8")
         self.report()
-        buildinfo.prune(self.source, self.target, "stale")
+        self.prune_now("stale")
         self.assertEqual(victim.read_text(encoding="utf-8"), "outside")
         self.assertTrue((self.target / "config.json").exists())
 
@@ -443,8 +450,8 @@ class StaleFilesTests(unittest.TestCase):
         got = self.report()
         self.assertEqual([n for n in got["stale"] + got["modified"] + got["unknown"]
                           if n.startswith("tools/")], [])
-        buildinfo.prune(self.source, self.target, "stale")
-        buildinfo.prune(self.source, self.target, "unknown")
+        self.prune_now("stale")
+        self.prune_now("unknown")
         self.assertEqual((outside / "gone.py").read_text(encoding="utf-8"), "# gone\n")
 
     def test_linked_file_is_not_removed(self):
@@ -456,7 +463,7 @@ class StaleFilesTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("symbolic links are not available")
         self.assertNotIn("old_mod.py", self.report()["stale"])
-        buildinfo.prune(self.source, self.target, "stale")
+        self.prune_now("stale")
         self.assertTrue(outside.exists())
         self.assertTrue((self.target / "old_mod.py").is_symlink())
 
@@ -472,10 +479,10 @@ class StaleFilesTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.isascii())
         self.assertEqual(len(json.loads(out)["unknown"]), 1)
-        self.assertEqual(self.cli("--prune", "stale")[0], 0)
+        self.assertEqual(self.cli("--prune", "stale", "--shown-stdin", stdin=json.dumps(self.report()))[0], 0)
         self.assertFalse((self.target / "old_mod.py").exists())
         self.assertEqual(len(list((self.target / "tools").glob("*.txt"))), 1)
-        code, out = self.cli("--prune", "unknown")
+        code, out = self.cli("--prune", "unknown", "--shown-stdin", stdin=json.dumps(self.report()))
         self.assertEqual((code, json.loads(out)["failed"]), (0, []))
         self.assertEqual(list((self.target / "tools").glob("*.txt")), [])
 
@@ -490,6 +497,76 @@ class StaleFilesTests(unittest.TestCase):
         with patch.object(buildinfo, "_link",
                           side_effect=lambda p: (p.name == "cards.html" and p.parent == self.source) or real(p)):
             self.assertEqual(self.cli("--stale-report"), (1, ""))
+
+    def test_case_only_rename_is_not_stale_root_and_tools(self):
+        # the previous build shipped Mod.py and tools/Foo.py; the new one ships mod.py and
+        # tools/foo.py with the same bytes. On Windows the installed files keep their old names.
+        self.write(self.source, "Mod.py", "# mod\n")
+        self.write(self.source, "tools/Foo.py", "# foo\n")
+        shutil.copy2(self.source / "Mod.py", self.target / "Mod.py")
+        shutil.copy2(self.source / "tools/Foo.py", self.target / "tools/Foo.py")
+        manifest = self.target / buildinfo.MANIFEST
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        for name in ("Mod.py", "tools/Foo.py"):
+            data["files"][name] = buildinfo.file_hash(self.target / name)
+        data["payload_sha256"] = buildinfo.payload_hash(data["files"])
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        (self.source / "Mod.py").rename(self.source / "mod.py")
+        (self.source / "tools/Foo.py").rename(self.source / "tools/foo.py")
+        got = self.report()
+        self.assertNotIn("Mod.py", got["stale"] + got["modified"])
+        self.assertNotIn("tools/Foo.py", got["stale"] + got["modified"])
+        self.assertEqual(got["stale"], ["old_mod.py", "tests/sub/nested_old.py", "tests/test_old.py",
+                                        "tools/gone.py"])
+        self.assertNotIn("Mod.py", got["root_unknown"])
+        self.assertNotIn("tools/Foo.py", got["unknown"])
+        self.prune_now("stale")
+        self.prune_now("unknown")
+        self.assertTrue((self.target / "Mod.py").exists())
+        self.assertTrue((self.target / "tools/Foo.py").exists())
+
+    def test_prune_deletes_only_the_shown_list_and_reports_the_difference(self):
+        shown = self.report()
+        self.write(self.target, "tools/.hidden", "appeared after the report")
+        self.write(self.target, "tools/later.txt", "appeared after the report")
+        self.assertEqual(self.report()["unknown"], ["tools/.hidden", "tools/later.txt"])
+        removed, failed, skipped, gone = buildinfo.prune(self.source, self.target, "unknown", shown)
+        self.assertEqual((removed, failed, skipped, gone), ([], [], ["tools/.hidden", "tools/later.txt"], []))
+        self.assertTrue((self.target / "tools/.hidden").exists())
+        shown["stale"].append("tests/test_keep.py")  # shown as stale, but it is shipped: never a candidate
+        removed, failed, skipped, gone = buildinfo.prune(self.source, self.target, "stale", shown)
+        self.assertEqual(sorted(removed), ["old_mod.py", "tests/sub/nested_old.py", "tests/test_old.py",
+                                           "tools/gone.py"])
+        self.assertEqual((skipped, gone), ([], ["tests/test_keep.py"]))
+        self.assertTrue((self.target / "tests/test_keep.py").exists())
+
+    def test_dot_file_shipped_in_the_kit_survives_delete_mode(self):
+        # install.ps1: the report is taken before the copy, the kit's dot-file arrives with the copy
+        shown = self.report()
+        self.write(self.source, "tools/.keep", "shipped")
+        shutil.copytree(self.source / "tools", self.target / "tools", dirs_exist_ok=True)
+        removed, failed, skipped, gone = buildinfo.prune(self.source, self.target, "unknown", shown)
+        self.assertEqual((removed, failed), ([], []))
+        self.assertTrue((self.target / "tools/.keep").exists())
+
+    def test_cli_prune_needs_the_shown_list(self):
+        self.assertEqual(self.cli("--prune", "stale")[0], 2)
+        self.assertEqual(self.cli("--prune", "stale", "--shown-stdin", stdin="not json")[0], 1)
+        self.assertEqual(self.cli("--prune", "stale", "--shown-stdin", stdin="[]")[0], 1)
+        self.assertTrue((self.target / "old_mod.py").exists())
+        code, out = self.cli("--prune", "stale", "--shown-stdin", stdin="{}")
+        self.assertEqual((code, json.loads(out)["removed"]), (0, []))
+        self.assertTrue((self.target / "old_mod.py").exists())
+
+    def test_report_lists_links_in_the_folders_an_update_writes_to(self):
+        self.assertEqual(self.report()["links"], [])
+        outside = Path(self.tmp.name) / "outside"
+        self.write(outside, "x.py", "# outside\n")
+        self.link_dir(self.target / "tools/jn", outside)
+        self.link_dir(self.target / "examples", outside)
+        links = self.report()["links"]
+        self.assertEqual(links, ["examples", "tools/jn"])
+        self.assertEqual((outside / "x.py").read_text(encoding="utf-8"), "# outside\n")
 
 
 if __name__ == "__main__":
