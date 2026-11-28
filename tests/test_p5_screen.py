@@ -2,10 +2,12 @@
 import gc
 import http.client
 import json
+import datetime
 import os
 import select
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -637,6 +639,88 @@ class P5ScreenHTTPTests(unittest.TestCase):
             status, error = self.post("api/start", {**base, "speaker_hints": {"count_mode": "exact", "count": 99}})
             self.assertEqual(status, 400)
             start.assert_not_called()
+
+    def interrupted_request(self):
+        """Запрос, запущенный давно и без файла статуса задачи: программа сама считает запуск не подтвердившимся."""
+        source = self.base / "synthetic.wav"
+        source.write_bytes(b"synthetic")
+        store = recordings.open_store()
+        try:
+            request = workflow.create(store, source, {"require_conspect": False})
+            workflow.claim_start(store, request)
+            old = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(seconds=workflow.LAUNCH_CONFIRM_SEC + 60)).isoformat()
+            with store._transaction():
+                store.db.execute("UPDATE workflow_requests SET updated_at=? WHERE request_id=?", (old, request))
+        finally:
+            store.close()
+        return request, source
+
+    def test_unconfirmed_launch_shows_note_and_cancel_goes_through_confirmation(self):
+        request, source = self.interrupted_request()
+        status, shown = self.get(f"api/status?request_id={request}")
+        self.assertEqual(status, 200)
+        self.assertEqual((shown["state"], shown["state_ru"]), ("interrupted", "прервано"))
+        self.assertIn("не подтвердился", shown["launch_note"])
+        self.assertEqual(shown["source"], str(source.resolve()))
+        # «Отменить»: сначала снимок, отказ — только по подтверждению; без снимка ничего не меняется
+        status, error = self.post("api/abandon/confirm", {"snapshot": None})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.get(f"api/status?request_id={request}")[1]["state"], "interrupted")
+        status, snapshot = self.post("api/abandon/prepare", {"request_id": request})
+        self.assertEqual((status, snapshot["request_id"]), (200, request))
+        self.assertEqual(self.get(f"api/status?request_id={request}")[1]["state"], "interrupted")
+        status, done = self.post("api/abandon/confirm", {"snapshot": snapshot})
+        self.assertEqual((status, done["state"]), (200, "failed"))
+        status, after = self.get(f"api/status?request_id={request}")
+        self.assertEqual((after["state"], after["state_ru"]), ("failed", "запуск отменён"))
+        self.assertIsNone(after["launch_note"])
+        # повторно отменить уже отменённое нельзя
+        self.assertEqual(self.post("api/abandon/prepare", {"request_id": request})[0], 400)
+
+    def test_young_launch_has_no_note(self):
+        source = self.base / "synthetic.wav"
+        source.write_bytes(b"synthetic")
+        store = recordings.open_store()
+        try:
+            request = workflow.create(store, source)
+            workflow.claim_start(store, request)
+        finally:
+            store.close()
+        status, shown = self.get(f"api/status?request_id={request}")
+        self.assertEqual((shown["state"], shown["launch_note"]), ("starting", None))
+
+    @unittest.skipUnless(shutil.which("node"), "для проверки JavaScript нужен Node.js")
+    def test_page_shows_note_and_two_buttons_only_for_unconfirmed_launch(self):
+        """Вид страницы: что видит человек на прерванном запросе (JavaScript экрана выполняется в Node)."""
+        html = (Path(workflow_page.__file__).parent / "workflow.html").read_text(encoding="utf-8")
+        esc = [line for line in html.splitlines() if line.startswith("const esc = ")][0]
+        code = html[html.index("function renderStatus(s)"):html.index("async function showVerify()")]
+        program = esc + chr(10) + code + """
+        const note = "Запуск не подтвердился или был прерван: можно запустить снова или отменить.";
+        const base = {state: "interrupted", state_ru: "прервано", source: "C:/a.wav", recording_id: null,
+                      launch_note: note, readiness: {}, policy: {require_conspect: true, allow_cloud_model: false,
+                      goal: "цель", question_budget: 3, speaker_hints: null, participation: undefined}};
+        const out = {
+          shown: renderStatus(base),
+          running: renderStatus({...base, state: "running", launch_note: null}),
+          saved: renderStatus({...base, recording_id: "r1"}),
+          body: launchAgainBody(base)};
+        console.log(JSON.stringify(out));
+        """
+        result = subprocess.run([shutil.which("node")], input=program, capture_output=True, text=True,
+                                encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        for needle in ("Запуск не подтвердился", 'id="launch-again">Запустить снова<',
+                       'id="launch-cancel">Отменить<'):
+            self.assertIn(needle, out["shown"])
+        for other in ("running", "saved"):                      # не прерван или результат уже есть — ни текста, ни кнопок
+            self.assertNotIn("launch-again", out[other])
+            self.assertNotIn("Запуск не подтвердился", out[other])
+        # «Запустить снова» вызывает обычный запуск с тем же файлом и настройками, без пустых полей
+        self.assertEqual(out["body"], {"audio": "C:/a.wav", "require_conspect": True,
+                                       "allow_cloud_model": False, "goal": "цель", "question_budget": 3})
 
     def test_unknown_route_and_bad_body(self):
         self.assertEqual(self.get("api/none")[0], 404)

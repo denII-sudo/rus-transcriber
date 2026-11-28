@@ -6,7 +6,9 @@ APPDATA, LOCALAPPDATA и USERPROFILE подменены на пустую вре
 import contextlib
 import io
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -114,6 +116,91 @@ class MoveDataGuardTests(unittest.TestCase):
         self.run_tool()
         self.assertEqual(db.read_bytes(), b"live")
         self.assertEqual([p.name for p in self.tmp.glob("src*")], ["src"])         # не переименована в .moved-*
+
+
+POWERSHELL = shutil.which("powershell")        # Windows PowerShell 5.1 (powershell.exe); pwsh 7 — другой файл
+
+
+@unittest.skipUnless(POWERSHELL and os.name == "nt", "для проверки move_data.ps1 нужен Windows PowerShell")
+class MoveDataPowerShellGuardTests(unittest.TestCase):
+    """tools/move_data.ps1 — тот же отказ, что у move_data.py: до любых изменений, в том числе с -DryRun."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        home = self.tmp / "home"
+        (home / "l").mkdir(parents=True)
+        (home / "r").mkdir()
+        self.env = dict(os.environ, APPDATA=str(home / "r"), LOCALAPPDATA=str(home / "l"), USERPROFILE=str(home))
+        self.src = self.tmp / "src"
+        self.dest = self.tmp / "dest"
+        self.src.mkdir()
+        self.script = TOOLS / "move_data.ps1"
+
+    def run_script(self, *extra):
+        command = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                   str(self.script), "-Src", str(self.src), "-Dest", str(self.dest), *extra]
+        return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=self.env, cwd=str(self.tmp), timeout=120)
+
+    def tree(self):
+        return sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*")
+                      if "home" not in p.relative_to(self.tmp).parts)
+
+    def test_script_keeps_bom_and_lf(self):
+        raw = self.script.read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r", raw)
+
+    def test_plain_folder_is_still_moved(self):
+        (self.src / "note.txt").write_text("синтетика", encoding="utf-8")
+        result = self.run_script("-KeepSource")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.dest / "note.txt").read_text(encoding="utf-8"), "синтетика")
+
+    def test_dry_run_on_plain_folder_creates_nothing(self):
+        (self.src / "note.txt").write_text("x", encoding="utf-8")
+        before = self.tree()
+        result = self.run_script("-DryRun")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.tree(), before)
+
+    def test_source_with_database_set_is_refused_before_any_change(self):
+        for number, name in enumerate(("state.sqlite3", "state.sqlite3-wal", "STATE.SQLITE3-SHM",
+                                       "state.sqlite3.before-restore-20260101-000000",
+                                       "state-before-hypotheses-20260101.sqlite3")):
+            with self.subTest(name=name):
+                folder = self.tmp / f"src-{number}"
+                folder.mkdir()
+                (folder / name).write_bytes(b"not really a database")
+                self.src = folder
+                before = self.tree()
+                for extra in ((), ("-DryRun",)):
+                    result = self.run_script(*extra)
+                    self.assertNotEqual(result.returncode, 0, extra)
+                    # консоль PowerShell 5.1 отдаёт кириллицу в OEM-кодировке: по тексту проверяем только «SQLite»
+                    self.assertIn("SQLite", result.stdout + result.stderr)
+                    self.assertEqual(self.tree(), before)
+                self.assertFalse(self.dest.exists())
+
+    def test_database_header_and_destination_are_checked(self):
+        con = sqlite3.connect(self.src / "copy.bin")
+        con.execute("CREATE TABLE t(x)")
+        con.commit()
+        con.close()
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SQLite", result.stdout + result.stderr)
+        self.assertFalse(self.dest.exists())
+        (self.src / "copy.bin").unlink()
+        (self.src / "note.txt").write_text("x", encoding="utf-8")
+        self.dest.mkdir()
+        (self.dest / "state.sqlite3").write_bytes(b"live")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.dest / "state.sqlite3").read_bytes(), b"live")
+        self.assertFalse((self.dest / "note.txt").exists())
 
 
 if __name__ == "__main__":
