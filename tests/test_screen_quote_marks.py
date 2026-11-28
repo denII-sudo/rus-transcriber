@@ -150,7 +150,10 @@ class ScreenSectionsTests(unittest.TestCase):
         # шаблон без словаря цитат (повреждённая запись): сырой evidence всё равно не показывается
         broken = {key: value for key, value in payload.items() if key != "quotes"}
         _, sections = core_screen._conspect_screen_text(broken, lambda: data)
-        self.assertNotIn("«согласен", "\n\n".join(item["text"] for item in sections))
+        shown = "\n\n".join(item["text"] for item in sections)
+        self.assertNotIn("«согласен", shown)
+        self.assertNotIn("{{", shown)                       # T263-12: ни служебных меток, ни обрывков текста
+        self.assertIn("Не удалось собрать текст свёртки", shown)
 
     def test_old_sections_and_evidence_without_a_template_are_shown_as_before(self):
         # без шаблона собирать не из чего (формата, где цитаты по одной лежат без шаблона, программа не пишет)
@@ -182,6 +185,42 @@ class ScreenSectionsTests(unittest.TestCase):
         shown = "\n\n".join(s["text"] for s in self.screen_items(recording)["агент"]["sections"])
         self.assertIn("«согласен с этим»", shown)               # наложений нет: цитата проверена
         self.assertNotIn(MARK, shown)
+
+    def test_t263_11_quotes_in_different_sections(self):
+        self.quality = {"overlap_unmeasured_skipped": SKIPPED}
+        request, recording, task = self.prepared([])
+        ids = [word["word_id"] for word in task["words"]]
+        answer = {"source_revision": task["source_revision"], "sections": [
+            {"text": "Итог: «решили перенести».", "evidence": ids[:5]},
+            {"text": "Потом «согласен с этим».", "evidence": ids[5:]}]}
+        workflow.accept_model_result(self.store, request, answer)
+        _, md = self.conspect_files(recording)
+        shown = self.screen_texts(recording)
+        self.assertEqual(len(shown), 2)
+        self.assertIn("Участник 1: «решили перенести»", shown[0])
+        self.assertIn(f"Участник 2: согласен с этим ({MARK}, 00:00:05)", shown[1])
+        self.assertIn("\n\n".join(shown), md)
+
+    def test_t263_11_screen_equals_the_file_after_edits_and_rebuild(self):
+        import transcript as T
+        self.quality = {"overlap_unmeasured_skipped": SKIPPED}
+        request, recording, task = self.prepared([])
+        workflow.accept_model_result(self.store, request, self.answer(task, self.TEXT))
+        self.save_agent(recording)
+        jp = self.document_path(recording)
+        mp = jp.with_name(jp.name.replace(".transcript.json", ".transcript.md"))
+        # правка агента слова в отрезке, затем правка человека всего отрезка другим текстом; после каждой — пересборка
+        for by, t1, t2, text in (("claude", 5.0, 5.4, "согласен"), ("human", 5.0, 7.4, "согласен с этим же")):
+            with mock.patch.object(paths, "STATE_DB", self.root / "state.sqlite3"):
+                T.edit_span(jp, mp, t1, t2, text, None, None, by)
+                recordings.refresh_conspects(self.store, recording, jp)
+            items = self.screen_items(recording)
+            root = recordings.document_binding(self.store, recording)["root"]
+            for saved in self.store.list_conspects(recording):
+                md = (root / saved["md_relative"]).read_text(encoding="utf-8")
+                shown = "\n\n".join(s["text"] for s in items[saved["name"]]["sections"])
+                with self.subTest(by=by, name=saved["name"]):
+                    self.assertIn(shown, md)
 
     def test_t263_3_screen_gets_the_header_of_the_file(self):
         self.quality = {"overlap_unmeasured_skipped": SKIPPED}

@@ -241,6 +241,8 @@ def _conspect_screen_text(payload, data_of=None):
         import storage
         try:
             header, body = conspect.render_parts({**payload, "quotes": payload.get("quotes") or {}}, data_of())
+            if any(mark in body for mark in conspect.SLOT_MARKS):   # слот остался: словарь цитат повреждён (T263-12)
+                raise ValueError("в тексте остались служебные метки цитат")
         except (KeyError, ValueError, TypeError, IndexError, storage.StorageError):
             return "", [{"text": "Не удалось собрать текст свёртки для показа. Сырой ответ модели не показан: в нём "
                                  "цитаты стоят в кавычках без проверки. Откройте файл свёртки."}]
