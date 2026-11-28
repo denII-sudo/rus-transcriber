@@ -5,7 +5,8 @@
   "name": "конспект", "job_json": "...transcript.json",
   "template": "markdown с {{q:1}} на местах цитат",
   "quotes": {"1": {"parts": [{"t1": 12.34, "t2": 15.6, "word_ids": [...],
-                              "family": [...]}],   — «family» — только если слова уже разбиты ответами (_family_snapshot)
+                              "family": [...],     — «family» — только если слова уже разбиты ответами (_family_snapshot)
+                              "exact": {"roots": {...}, "span": [t1, t2]}}],  — строение слов при связывании (_shape)
                    "author": "текст как в конспекте",
                    "speaker": "Вера" | null,               — имя перед цитатой («Вера: «…»»)
                    "base": "текст стенограммы при связывании", "base_speaker": "...",
@@ -226,10 +227,48 @@ def _clean(s):
     return " ".join(Q._n(x) for x in Q.WORD.findall(s))
 
 
-def _id_text(data, ids, family=None):
+def _id_text(data, ids, family=None, exact=None):
     """-> (текст, говорящий) слов ссылки ids; (None, None) — место не найдено или неоднозначно (см. _id_words)."""
-    text, speaker, _ = _id_words(data, ids, family)
+    text, speaker, _ = _id_words(data, ids, family, exact)
     return text, speaker
+
+
+def _shape(data, ids):
+    """Строение слов цитаты при связывании (Н28-3…Н28-5): для корня каждого слова цитаты (`part_of` или само слово) —
+    все ID его частей. Ссылка с этой отметкой сделана на конкретные слова: её текст — ровно эти ID."""
+    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
+    cited = [w for w in words if w["word_id"] in set(ids or [])]
+    roots = {w.get("part_of") or w["word_id"] for w in cited}
+    return {"roots": {root: sorted(w["word_id"] for w in words if (w.get("part_of") or w["word_id"]) == root)
+                      for root in sorted(roots)},
+            "span": [min(w["s"] for w in cited), max(w["e"] for w in cited)]
+            if cited and all(_timed(w) for w in cited) else None}       # слово без времени — как у старой ссылки
+
+
+def _timed(word):
+    return isinstance(word.get("s"), (int, float)) and isinstance(word.get("e"), (int, float))
+
+
+def _exact_holds(data, ids, exact):
+    """Точная ссылка остаётся точной, пока ни одно слово цитаты не разбили после связывания: новая часть корня
+    цитаты, лежащая во времени слов цитаты, — это разбиение её слова, и укороченный текст выдать нельзя (Н-7).
+    Новая часть вне этого времени — разбиение соседнего слова того же корня: цитату не меняет (Н28-5); на самой
+    границе (вставка нулевой длины) не различить — как у старой ссылки. Слово цитаты,
+    вышедшее за время цитаты при связывании, вобрало соседнее слово: тоже не точная. Время — на момент связывания."""
+    if not isinstance(exact, dict) or not exact.get("span"):
+        return False
+    known = {wid for parts in (exact.get("roots") or {}).values() for wid in parts}
+    words = [w for seg in data.get("segments") or [] for w in seg.get("words") or [] if w.get("word_id")]
+    cited = [w for w in words if w["word_id"] in set(ids or [])]
+    if not cited:
+        return True                                       # слов нет — «не найдено» решит общий разбор
+    roots = set(exact.get("roots") or {})
+    lo, hi = exact["span"]
+    eps = 0.005
+    if any(not _timed(w) or w["s"] < lo - eps or w["e"] > hi + eps for w in cited):
+        return False
+    return not any((w.get("part_of") or w["word_id"]) in roots and w["word_id"] not in known
+                   and (not _timed(w) or w["s"] <= hi + eps and w["e"] >= lo - eps) for w in words)
 
 
 def _word_families(data):
@@ -257,7 +296,7 @@ def _family_snapshot(data, ids):
     return None if set(seen) == set(ids) and all(roots.get(wid, wid) == wid for wid in ids) else seen
 
 
-def _id_words(data, ids, family=None):
+def _id_words(data, ids, family=None, exact=None):
     """-> (текст, говорящий, [ID слов, которые фактически напечатаны]) или (None, None, None).
     Набор ID — тот, по которому проверяются блокировки цитаты (А255-1): сохранённый ID слова, разбитого
     ответом на части, раскрывается на все части, и проверять надо каждую напечатанную.
@@ -277,13 +316,19 @@ def _id_words(data, ids, family=None):
     * ссылка без снимка (связана до разбиения слова, либо старая) на корень покрывает всю его семью, как на main
       (Ф234-11б); на часть (не корень) — только если у корня нет других слов семьи, с любой стороны (О255-4);
     * ссылка со снимком, в котором нет невыбранных слов (выбрана вся семья), покрывает всю семью, в том числе
-      новые части: они получились из выбранных слов."""
+      новые части: они получились из выбранных слов.
+
+    exact — строение слов при связывании (`_shape`, ключ part["exact"], Н28-3…Н28-5): ссылка сделана на конкретные
+    слова, и пока ни одно слово цитаты не разбили и не склеили с соседом после связывания (`_exact_holds`), её
+    текст — ровно эти ID: семья не разворачивается, `merged_from` не мешает. Иначе — правила выше, как у ссылки
+    без отметки."""
     families, roots, _ = _word_families(data)
+    exact_ok = exact is not None and _exact_holds(data, ids, exact)
     merged = {x for seg in data.get("segments") or [] for word in seg.get("words") or []
               for x in word.get("merged_from") or []}
-    if any(wid in merged for wid in ids or []):
+    if not exact_ok and any(wid in merged for wid in ids or []):
         return None, None, None
-    if ids and any(root != wid for wid, root in roots.items()):
+    if not exact_ok and ids and any(root != wid for wid, root in roots.items()):
         wanted, snap = set(ids), set(family or [])
         out = []
         if family is not None and snap - wanted:
@@ -450,6 +495,9 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
                 break
             t1, t2 = _part_times(toks[i:i + L])
             parts.append({"t1": t1, "t2": t2, "word_ids": ids})
+            exact = _shape(data, ids)
+            if exact["span"]:           # слова со временем: ссылка точная на эти слова (Н28-3…Н28-5)
+                parts[-1]["exact"] = exact
             family = _family_snapshot(data, ids)
             if family:                  # слова уже разбиты ответами: запомнить семьи (А255-1, О255-1/2)
                 parts[-1]["family"] = family
@@ -459,8 +507,9 @@ def link(conspect_md, data, min_score=0.75, selections=None, *, within=None, unl
         n += 1
         key = str(n)
         t1, t2 = parts[0]["t1"], parts[-1]["t2"]
-        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0].get("family"))
-        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p.get("family"))[0] for p in parts)))
+        base, base_spk = _id_text(data, parts[0]["word_ids"], parts[0].get("family"), parts[0].get("exact"))
+        joined = " … ".join(filter(None, (_id_text(data, p["word_ids"], p.get("family"), p.get("exact"))[0]
+                                          for p in parts)))
         quotes[key] = {"parts": parts, "author": q, "speaker": None if labels else spk, "base": joined,
                        "base_speaker": base_spk, "last": joined, "last_speaker": base_spk}
         # «Имя: «…»» — имя тоже часть ссылки, чтобы обновлялось вместе с говорящим
@@ -708,7 +757,7 @@ def render(obj, data, update_last=True):
             return m.group(0)
         # Один раз раскрыть ссылку: текст и ID слов, которые фактически печатаются (А255-1). Все блокировки
         # цитаты проверяются по этим ID — сохранённый ID разбитого слова покрывает и его части.
-        resolved = [(None, None, None) if source_conflict else _id_words(data, p["word_ids"], p.get("family")) if "word_ids" in p
+        resolved = [(None, None, None) if source_conflict else _id_words(data, p["word_ids"], p.get("family"), p.get("exact")) if "word_ids" in p
                     else (*_legacy_span(data, p["t1"], p["t2"]), []) for p in q["parts"]]
         texts = [(t, s) for t, s, _ in resolved]
         ids = [wid for _, _, part_ids in resolved for wid in part_ids or []]
