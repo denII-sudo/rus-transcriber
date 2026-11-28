@@ -1266,4 +1266,5 @@ if ($script:InstallProblems.Count) {
     Write-Host "Установка завершена, но не всё удалось (код выхода 2):" -ForegroundColor Yellow
     $script:InstallProblems | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
 }
-if (($storeOk -eq $false) -or -not $selfCheckOk -or $script:InstallProblems.Count) { exit 2 }
+if (($storeOk -eq $false) -or -not $selfCheckOk) { exit 2 }
+if ($script:InstallProblems.Count) { exit 2 }
